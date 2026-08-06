@@ -1,0 +1,95 @@
+id: hg-win-lsass-memory-access
+info:
+  name: Unusual process opening LSASS memory
+  severity: critical
+  description: >-
+    A process requesting read access to lsass.exe memory, which is how credential
+    dumpers reach cached secrets. The handle request matters more than the tool name —
+    renaming mimikatz.exe changes nothing about this behaviour.
+  author:
+    - huntgraph
+  tags:
+    - credential-access
+    - lsass
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1003/001/
+  mitre:
+    tactics:
+      - TA0006
+    techniques:
+      - T1003.001
+
+hypothesis: |
+  To harvest credentials from memory an adversary must open a handle to lsass.exe with
+  read rights. Detection by tool name fails immediately against renamed or custom
+  dumpers, so the durable signal is *which processes* legitimately touch LSASS.
+
+  In any given environment that set is small and stable — EDR, the OS itself, and a
+  handful of monitoring agents. It differs between environments, which is exactly why
+  this template baselines the accessor set before hunting rather than shipping a
+  hard-coded allowlist that would be wrong everywhere.
+
+requires:
+  platforms:
+    - windows
+  data_sources:
+    - process_access
+  connectors:
+    - crowdstrike-ngsiem
+
+baseline:
+  window: 30d
+  queries:
+    - id: lsass_accessors
+      description: Which processes open LSASS here, and how often.
+      query: |
+        #event_simpleName=ProcessAccess TargetImageFileName=/lsass\.exe$/i
+        | groupBy([SourceImageFileName], function=[count(as=hits), count(ComputerName, distinct=true, as=hosts)])
+        | sort(hits, order=desc)
+    - id: lsass_accessor_rights
+      description: Access-mask distribution, to separate read-memory from benign queries.
+      query: |
+        #event_simpleName=ProcessAccess TargetImageFileName=/lsass\.exe$/i
+        | groupBy([SourceImageFileName, DesiredAccess], function=count(as=hits))
+  signals:
+    - value_distribution
+    - per_host_frequency
+    - first_seen
+    - rare_command_lines
+
+hunt:
+  connector: crowdstrike-ngsiem
+  window: 7d
+  max_results: 2000
+  query: |
+    #event_simpleName=ProcessAccess TargetImageFileName=/lsass\.exe$/i
+    | DesiredAccess=/0x1010|0x1410|0x143a|0x1fffff/i
+    {{tuning_filters}}
+  tunable:
+    exclude_source_images: []
+    exclude_hosts: []
+    min_rarity: 0.01
+
+triage:
+  fields:
+    - ComputerName
+    - UserName
+    - SourceImageFileName
+    - SourceCommandLine
+    - DesiredAccess
+    - ParentBaseFileName
+  escalate_when: |
+    The accessing process was absent from the baseline accessor set, runs from a user
+    writable directory (Temp, Downloads, ProgramData, AppData) rather than System32 or
+    a Program Files subtree, is unsigned, or was spawned by a shell, script host, or
+    Office application. A single host accounting for a first-ever accessor is stronger
+    than the same binary appearing fleet-wide, which usually means a new agent rollout.
+  false_positive_hints:
+    - EDR and antivirus agents open LSASS continuously; they dominate the baseline.
+    - Windows Error Reporting (WerFault.exe) opens LSASS when the process crashes.
+    - Backup and DLP agents may read LSASS for credential-protection features.
+    - A fleet-wide software deployment introduces a new accessor on every host at once.
+
+output:
+  finding_title: Unusual process opened LSASS memory on {{ComputerName}}

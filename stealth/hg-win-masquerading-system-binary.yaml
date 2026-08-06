@@ -1,0 +1,98 @@
+id: hg-win-masquerading-system-binary
+info:
+  name: Process masquerading as a system binary
+  severity: high
+  description: >-
+    A process using the name of a trusted Windows binary while running from the wrong
+    directory, or a system binary name with subtle spelling or spacing tricks.
+  author:
+    - huntgraph
+  tags:
+    - stealth
+    - masquerading
+    - defense-evasion
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1036/005/
+  mitre:
+    tactics:
+      - TA0005
+    techniques:
+      - T1036.005
+
+hypothesis: |
+  Analysts triage by process name. Naming a payload svchost.exe buys an adversary the
+  benefit of the doubt in every list it appears in, and defeats name-based allowlists
+  outright.
+
+  What the name cannot fake is the path: the real svchost.exe lives in System32 and
+  nowhere else. Name-path disagreement is therefore a high-fidelity signal that needs
+  almost no environmental context — but the set of legitimately relocated binaries does
+  vary between environments, so the exception list must still be learned rather than
+  guessed.
+
+requires:
+  platforms:
+    - windows
+  data_sources:
+    - process_creation
+  connectors:
+    - crowdstrike-ngsiem
+
+baseline:
+  window: 45d
+  queries:
+    - id: system_binary_paths
+      description: Where each system binary name legitimately runs from here.
+      query: |
+        #event_simpleName=ProcessRollup2
+        | FileName=/svchost\.exe|lsass\.exe|services\.exe|winlogon\.exe|csrss\.exe|explorer\.exe|taskhostw\.exe|smss\.exe|spoolsv\.exe|rundll32\.exe/i
+        | groupBy([FileName, ImageFileName], function=count(as=hits))
+    - id: system_binary_parents
+      description: Normal parentage, since masquerading usually breaks the process tree too.
+      query: |
+        #event_simpleName=ProcessRollup2
+        | FileName=/svchost\.exe|lsass\.exe|services\.exe|winlogon\.exe/i
+        | groupBy([FileName, ParentBaseFileName], function=count(as=hits))
+  signals:
+    - value_distribution
+    - parent_process_distribution
+    - first_seen
+    - rare_command_lines
+
+hunt:
+  connector: crowdstrike-ngsiem
+  window: 7d
+  max_results: 5000
+  query: |
+    #event_simpleName=ProcessRollup2
+    | FileName=/svchost\.exe|lsass\.exe|services\.exe|winlogon\.exe|csrss\.exe|smss\.exe|taskhostw\.exe|spoolsv\.exe/i
+    | ImageFileName!=/\\Windows\\(System32|SysWOW64|WinSxS)\\/i
+    {{tuning_filters}}
+  tunable:
+    exclude_paths: []
+    exclude_hosts: []
+    min_rarity: 0.01
+
+triage:
+  fields:
+    - ComputerName
+    - UserName
+    - FileName
+    - ImageFileName
+    - CommandLine
+    - ParentBaseFileName
+  escalate_when: |
+    A protected system binary name runs from anywhere outside System32, SysWOW64, or
+    WinSxS. Escalate hardest when the path is user-writable (Temp, AppData, Downloads,
+    ProgramData), when the parent process is wrong for that binary (svchost.exe should
+    be a child of services.exe, never of a shell or Office application), or when the
+    name is a near-miss of a real binary — trailing space, doubled letter, homoglyph,
+    or scvhost/svch0st style transposition.
+  false_positive_hints:
+    - Installers and patch processes stage genuine copies of system binaries in Temp.
+    - Some virtualisation and application-layering products relocate system binaries.
+    - Windows servicing may run WinSxS copies with unfamiliar-looking paths.
+
+output:
+  finding_title: "{{FileName}} masquerading from {{ImageFileName}} on {{ComputerName}}"

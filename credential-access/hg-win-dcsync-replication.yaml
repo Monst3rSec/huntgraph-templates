@@ -1,0 +1,94 @@
+id: hg-win-dcsync-replication
+info:
+  name: DCSync — directory replication from a non-domain-controller
+  severity: critical
+  description: >-
+    Use of the directory replication right (DS-Replication-Get-Changes-All) by an
+    account or host that is not a domain controller, which yields password hashes for
+    the entire domain.
+  author:
+    - huntgraph
+  tags:
+    - credential-access
+    - active-directory
+    - dcsync
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1003/006/
+  mitre:
+    tactics:
+      - TA0006
+    techniques:
+      - T1003.006
+
+hypothesis: |
+  Replication is a legitimate protocol between domain controllers. An adversary who has
+  obtained the replication right can impersonate a DC and pull the krbtgt hash and every
+  account secret in the domain, without ever touching a DC's disk or running code there.
+
+  The signal is not the operation — it is the *actor*. Replication requested by anything
+  outside the known DC set is anomalous by definition. That set is environment-specific
+  and changes when DCs are promoted or retired, so it must be learned rather than
+  assumed, and re-learned over time.
+
+requires:
+  platforms:
+    - windows
+  data_sources:
+    - windows_event_log
+    - directory_service_access
+  connectors:
+    - crowdstrike-ngsiem
+
+baseline:
+  window: 60d
+  queries:
+    - id: known_replication_actors
+      description: Accounts and hosts that legitimately replicate — effectively the DC set.
+      query: |
+        #event_simpleName=DirectoryServiceAccess Properties=/1131f6a[ad]-9c07-11d1-f79f-00c04fc2dcd2/i
+        | groupBy([SubjectUserName, ComputerName], function=count(as=hits))
+        | sort(hits, order=desc)
+    - id: domain_controller_inventory
+      description: Hosts holding a DC role, for comparison against the actor set.
+      query: |
+        #event_simpleName=OsVersionInfo ProductType=2
+        | groupBy([ComputerName])
+  signals:
+    - value_distribution
+    - first_seen
+    - peer_comparison
+
+hunt:
+  connector: crowdstrike-ngsiem
+  window: 7d
+  max_results: 500
+  query: |
+    #event_simpleName=DirectoryServiceAccess
+    | Properties=/1131f6a[ad]-9c07-11d1-f79f-00c04fc2dcd2|89e95b76-444d-4c62-991a-0facbeda640c/i
+    {{tuning_filters}}
+  tunable:
+    exclude_accounts: []
+    exclude_hosts: []
+
+triage:
+  fields:
+    - ComputerName
+    - SubjectUserName
+    - SubjectDomainName
+    - ClientIPAddress
+    - Properties
+  escalate_when: |
+    The requesting account is not a domain controller computer account (does not end in
+    a trailing $ matching a known DC) and is not one of the recognised directory
+    synchronisation service accounts from the baseline. Escalate immediately if the
+    source IP belongs to a workstation subnet, or if the account is a normal user
+    account rather than a service or machine account — there is no benign reason for
+    an interactive user to replicate the directory.
+  false_positive_hints:
+    - Azure AD Connect / Entra Connect sync accounts replicate legitimately.
+    - Some backup, migration, and identity-governance products request replication.
+    - A newly promoted domain controller appears as a first-time actor.
+
+output:
+  finding_title: DCSync replication requested by {{SubjectUserName}} from {{ComputerName}}

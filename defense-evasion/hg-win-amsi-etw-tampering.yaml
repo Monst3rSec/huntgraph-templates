@@ -1,0 +1,98 @@
+id: hg-win-amsi-etw-tampering
+info:
+  name: AMSI or ETW tampering to blind script inspection
+  severity: critical
+  description: >-
+    In-memory patching of AMSI or ETW, or configuration changes that disable script
+    block logging and antimalware scanning, so later payloads execute unseen.
+  author:
+    - huntgraph
+  tags:
+    - defense-evasion
+    - amsi
+    - etw
+    - powershell
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1562/001/
+  mitre:
+    tactics:
+      - TA0005
+    techniques:
+      - T1562.001
+
+hypothesis: |
+  AMSI is what lets antivirus see script content after it has been deobfuscated, and
+  ETW is what feeds most .NET and PowerShell telemetry. Both are in-process and
+  therefore modifiable by the process being watched. Patching them costs an adversary
+  a few lines and blinds every downstream detection for that process.
+
+  Because the tampering happens before the payload, it is often the *only* thing
+  visible. This makes it disproportionately valuable to hunt for, and the artefacts —
+  the specific string constants and API sequences used — are stable across tooling
+  even as payloads change.
+
+requires:
+  platforms:
+    - windows
+  data_sources:
+    - process_creation
+    - script_block_logging
+    - registry
+  connectors:
+    - crowdstrike-ngsiem
+
+baseline:
+  window: 30d
+  queries:
+    - id: powershell_script_hosts
+      description: Which processes run PowerShell here, to ground what is normal.
+      query: |
+        #event_simpleName=ProcessRollup2 FileName=/powershell\.exe|pwsh\.exe/i
+        | groupBy([ParentBaseFileName, ComputerName], function=count(as=hits))
+    - id: security_config_changes
+      description: Prior antimalware configuration changes and who made them.
+      query: |
+        #event_simpleName=/RegistryOperation|ProcessRollup2/
+        | CommandLine=/Set-MpPreference|Add-MpPreference/i
+        | groupBy([ComputerName, UserName, CommandLine])
+  signals:
+    - parent_process_distribution
+    - rare_command_lines
+    - first_seen
+
+hunt:
+  connector: crowdstrike-ngsiem
+  window: 7d
+  max_results: 2000
+  query: |
+    #event_simpleName=/ProcessRollup2|ScriptControlScanTelemetry/
+    | CommandLine=/amsiInitFailed|AmsiScanBuffer|AmsiUtils|EtwEventWrite|EtwProvider|Set-MpPreference\s+-Disable|DisableRealtimeMonitoring|DisableScriptScanning|DisableIOAVProtection|-EncodedCommand/i
+    {{tuning_filters}}
+  tunable:
+    exclude_hosts: []
+    exclude_parents: []
+    exclude_command_lines: []
+    min_rarity: 0.01
+
+triage:
+  fields:
+    - ComputerName
+    - UserName
+    - FileName
+    - CommandLine
+    - ParentBaseFileName
+  escalate_when: |
+    The command references AMSI or ETW internals (amsiInitFailed, AmsiScanBuffer,
+    EtwEventWrite) in any form, including base64 or string-concatenation obfuscation —
+    there is no administrative reason to name these symbols. Real-time monitoring being
+    disabled outside a change window, or a parent process that is a browser, Office
+    application, or archive utility, escalates. Exclusion paths added by Set-MpPreference
+    that point at user-writable directories are an adversary establishing a safe zone.
+  false_positive_hints:
+    - Security researchers and red teams generate these on purpose; check for authorised testing.
+    - Some EDR deployment scripts disable Defender real-time protection during install.
+    - Legitimate software installers add Defender exclusions for their own directories.
+
+output:
+  finding_title: AMSI/ETW tampering attempt on {{ComputerName}}
