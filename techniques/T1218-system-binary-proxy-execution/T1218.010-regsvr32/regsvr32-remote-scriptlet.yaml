@@ -1,0 +1,293 @@
+type: detection
+
+id: hg-win-regsvr32-remote-scriptlet-t1218-010
+version: 1.0.0
+
+info:
+  name: Regsvr32 registering a remote or scriptlet COM object
+  description: >-
+    regsvr32.exe registers COM objects, and through scrobj.dll it will register a
+    scriptlet — including one fetched from a URL. The published form, often called the
+    Squiblydoo pattern, executes attacker script inside a signed Microsoft binary without
+    writing the payload to disk and without producing a scripting host process. Ordinary
+    software registration passes a local DLL or OCX from an installation directory, so the
+    presence of a URL, an .sct file or scrobj.dll on the command line separates the abuse
+    from the intended use almost cleanly.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - proxy-execution
+    - lolbin
+    - regsvr32
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1218/010
+    - https://attack.mitre.org/detectionstrategies/DET0282
+    - https://lolbas-project.github.io/lolbas/Binaries/Regsvr32/
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1218
+  sub_techniques:
+    - T1218.010
+  detection_strategies:
+    - DET0282
+  analytics:
+    - AN0785
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may invoke regsvr32.exe against a scriptlet, optionally hosted at a
+    remote URL, so that scrobj.dll executes the embedded script inside a trusted signed
+    binary with no payload written to disk and no scripting host in the process tree.
+  attacker_behavior:
+    - Passes /i with an http or https URL together with /s and scrobj.dll.
+    - References a local .sct file staged in a user-writable directory.
+    - Registers a DLL from AppData, Temp or ProgramData rather than an installation path.
+    - Launches regsvr32.exe from a document handler or archive utility after user interaction.
+  legitimate_behavior:
+    - Installers register their own COM DLLs and OCX controls from Program Files during setup.
+    - Repair and reinstall routines re-register components after an upgrade.
+    - Legacy application support scripts re-register controls to fix broken associations.
+  risk_indicator:
+    - The command line references a URL or a scriptlet rather than a local library.
+    - The registered object lives in a user-writable directory.
+    - The parent process implies a user opening content rather than an installer.
+    - The regsvr32 process connects outbound or spawns another interpreter.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: regsvr32-remote-scriptlet
+        name: Regsvr32 registering a scriptlet from a URL
+        purpose: >-
+          Surface the fully remote form, where the scriptlet body never touches disk and
+          the only artefact is the command line and the resulting network activity.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^regsvr32\.exe$/i
+          | CommandLine=/(?<sct_url>https?\s*:?\s*(\[:\])?\/\/[^\s"']+)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, sct_url],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: regsvr32-scrobj-or-sct
+        name: Regsvr32 invoking scrobj.dll or a local scriptlet
+        purpose: >-
+          Catch the locally staged variant, where a .sct file or an explicit scrobj.dll
+          reference performs the same script execution without a URL on the command line.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^regsvr32\.exe$/i
+          | CommandLine=/scrobj\.dll|\.sct\b/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "CommandLine referencing vendor scriptlets under an approved installation path"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - command_line
+
+      - id: regsvr32-user-writable-object
+        name: Regsvr32 registering an object from a user-writable path
+        purpose: >-
+          Identify registration of libraries staged outside the installation trees, which
+          is inconsistent with how software registers its own components.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^regsvr32\.exe$/i
+          | CommandLine=/(?<object_path>[A-Za-z]:\\[^",]+\.(dll|ocx|sct))/i
+          | object_path=/\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\/i
+          | object_path!=/\\Program Files( \(x86\))?\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, object_path],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "object_path under approved installer staging directories"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+            - parent_process
+
+evidence:
+  required:
+    - id: untrusted_registration_target
+      name: Scriptlet, remote URL or user-writable object registered
+      description: >-
+        The regsvr32.exe command line references a URL, a scriptlet or scrobj.dll, or
+        points at a library in a user-writable directory, none of which describe a normal
+        software registration.
+      source: process_creation
+      field: CommandLine
+      indicates: proxy_execution_of_untrusted_module
+
+  supporting:
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        regsvr32.exe was launched by a document handler, archive utility, mail client,
+        browser or script host rather than by an installer or a maintenance script.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: silent_flags
+      name: Silent registration flags present
+      description: >-
+        The invocation suppresses its dialog output with /s alongside /i or /u, which
+        keeps the registration invisible to a user who is present at the keyboard.
+      source: process_creation
+      field: CommandLine
+      indicates: execution_concealment
+    - id: external_egress
+      name: Outbound connection from the regsvr32 process
+      description: >-
+        The regsvr32 process connected to a routable external address, consistent with
+        retrieving a remote scriptlet or with post-execution communication.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: possible_payload_retrieval
+    - id: rare_registration
+      name: Registration unprecedented for this host
+      description: >-
+        This command shape has not been seen on the host or in the estate during the
+        baseline window, unlike the repeatable registrations that installers produce.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: installer_parent
+      name: Installer or maintenance routine as parent
+      description: >-
+        regsvr32.exe was launched by an approved installer, patching agent or repair
+        routine, which registers COM components as part of normal setup.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: vendor_component_path
+      name: Object inside a vendor installation directory
+      description: >-
+        The registered library resolves to a Program Files subtree or another documented
+        vendor directory.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_application_component
+    - id: rollout_pattern
+      name: Same registration across the estate
+      description: >-
+        The identical registration appears on many hosts within one maintenance window,
+        which is a package rollout rather than a targeted execution.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - untrusted_registration_target
+
+    supporting:
+      any:
+        - delivery_parent
+        - silent_flags
+        - external_egress
+        - rare_registration
+      all:
+        - delivery_parent
+        - external_egress
+
+    contradicting:
+      any:
+        - installer_parent
+        - vendor_component_path
+        - rollout_pattern
+      all: []
+
+  verdict:
+    low_risk_when:
+      - untrusted_registration_target
+      - installer_parent
+      - vendor_component_path
+      - rollout_pattern
+    suspicious_when:
+      - untrusted_registration_target
+      - rare_registration
+    high_risk_when:
+      - untrusted_registration_target
+      - delivery_parent
+      - silent_flags
+      - external_egress
+
+  false_positive:
+    - condition: An installer registers its own COM DLLs during setup or repair.
+      explanation: >-
+        Registration is exactly what regsvr32 is for, and silent flags are common in
+        unattended installs. The library path is inside a vendor directory and the same
+        registration repeats across every host receiving the package.
+    - condition: A support script re-registers a broken control from a temporary copy.
+      explanation: >-
+        Troubleshooting sometimes involves copying a control to a working directory before
+        re-registering it, producing the user-writable-path evidence. This is interactive,
+        tied to a named user and usually has an incident record.
+    - condition: A legacy application ships a scriptlet component it registers at first run.
+      explanation: >-
+        A small number of older products genuinely use scriptlets. These reference a fixed
+        path inside the installation directory rather than a URL, and recur predictably
+        for every user of the application.

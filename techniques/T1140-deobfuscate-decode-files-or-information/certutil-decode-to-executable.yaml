@@ -1,0 +1,309 @@
+type: detection
+
+id: hg-win-certutil-decode-to-executable-t1140
+version: 1.0.0
+
+info:
+  name: Encoded payload decoded on the endpoint into an executable
+  description: >-
+    A payload that crosses the network as base64 text passes content inspection that would
+    have stopped the executable, which means the adversary must decode it once it lands.
+    certutil.exe, PowerShell's FromBase64String and the certreq utility all do this
+    without anything unusual being installed. The decode step is therefore a reliable
+    waypoint: it happens after delivery and before execution, it produces a new file in a
+    writable directory, and unlike the payload itself its shape does not change between
+    campaigns.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - obfuscation
+    - certutil
+    - lolbin
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1140
+    - https://attack.mitre.org/detectionstrategies/DET0275
+    - https://lolbas-project.github.io/lolbas/Binaries/Certutil/
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1140
+  sub_techniques: []
+  detection_strategies:
+    - DET0275
+  analytics:
+    - AN0767
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary may decode a base64 or hex-encoded payload on the endpoint using a
+    built-in utility, converting content that survived network and mail inspection into an
+    executable file staged in a writable directory immediately before it is run.
+  attacker_behavior:
+    - Runs certutil with -decode or -decodehex against a text file to produce a binary.
+    - Uses certutil -urlcache -split -f to retrieve and stage content in one step.
+    - Calls FromBase64String in PowerShell and writes the result to disk or loads it in memory.
+    - Decodes into AppData, Temp or ProgramData and executes the output shortly afterwards.
+  legitimate_behavior:
+    - Certificate management genuinely uses certutil to encode and decode certificate files.
+    - Administrators transfer configuration blobs as base64 to avoid encoding problems.
+    - Build and packaging pipelines decode embedded resources during a build.
+    - Some vendor installers decode bundled payloads as part of setup.
+  risk_indicator:
+    - The decode output is an executable or script rather than a certificate file.
+    - The output lands in a user-writable directory.
+    - An execution of the decoded path follows shortly after the decode.
+    - The parent process is a document handler, archive tool or remote-execution channel.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: certutil-decode
+        name: Certutil decoding to a non-certificate output
+        purpose: >-
+          Surface decode operations whose output is not a certificate file, which is the
+          shape that separates payload staging from certificate administration.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^certutil\.exe$/i
+          | CommandLine=/-decode(hex)?\b|-urlcache\b/i
+          | CommandLine!=/\.(cer|crt|p7b|pfx|der|csr)\b/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=decodes), collect([CommandLine], limit=5)])
+          | sort(decodes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the certificate-management tooling"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - parent_process
+            - command_line
+
+      - id: powershell-base64-to-disk
+        name: PowerShell decoding base64 and writing the result
+        purpose: >-
+          Cover the scripted equivalent, where the decode and the file write happen inside
+          one PowerShell invocation and certutil never appears.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/FromBase64String|::UnicodeEncoding|\[Convert\]::FromBase64/i
+          | CommandLine=/(WriteAllBytes|Set-Content|Out-File|New-Object\s+IO\.FileStream)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=decodes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Build agents that decode embedded resources during packaging"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: decode-then-execute
+        name: Executable written by a decoder and then run
+        purpose: >-
+          Join the decode to the subsequent execution, which is the observation that turns
+          a staging step into a confirmed foothold.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten|ProcessRollup2)$/
+          | case {
+              #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+                | TargetFileName=/\\(AppData|Temp|ProgramData|Users|Public)\\/i
+                | decoded_file := TargetFileName ;
+              #event_simpleName=ProcessRollup2
+                | ImageFileName=/\\(AppData|Temp|ProgramData|Users|Public)\\/i ;
+            }
+          | groupBy([ComputerName],
+                    function=[collect([decoded_file, ImageFileName, ParentBaseFileName, UserName]),
+                              count(as=events)])
+          | decoded_file=/.+/ and ImageFileName=/.+/
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of approved installers and build agents"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+
+evidence:
+  required:
+    - id: decode_operation
+      name: Encoded content decoded on the endpoint
+      description: >-
+        A built-in utility was invoked to decode base64 or hex content into a file, with an
+        output that is not a certificate, meaning encoded data is being converted into
+        usable content locally.
+      source: process_creation
+      field: CommandLine
+      indicates: payload_deobfuscation
+
+  supporting:
+    - id: writable_output_path
+      name: Decoded output in a user-writable directory
+      description: >-
+        The decoded file lands under AppData, Temp, ProgramData, Public or a user profile
+        rather than in a certificate store or an installation directory.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: subsequent_execution
+      name: Decoded file executed afterwards
+      description: >-
+        A process started from the path the decoder wrote, confirming the decoded content
+        was intended to run rather than to be read.
+      source: process_creation
+      field: ImageFileName
+      indicates: execution_chain_progression
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        The decoder was launched by a document handler, archive utility, mail client or
+        script host rather than by certificate tooling or a build agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: rare_decode_for_host
+      name: Decode unprecedented for this host
+      description: >-
+        No comparable decode has been observed for this host or user during the baseline
+        window, unlike certificate administration which recurs predictably.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: certificate_workflow
+      name: Genuine certificate operation
+      description: >-
+        The decode operates on certificate file types as part of enrolment, renewal or
+        troubleshooting performed by certificate-management tooling.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_enterprise_activity
+    - id: build_pipeline_context
+      name: Build or packaging pipeline
+      description: >-
+        The decode is performed by a build agent or packaging tool that unpacks embedded
+        resources as a normal part of producing an artefact.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: recurring_installer_decode
+      name: Recurring decode during software rollout
+      description: >-
+        The same decode appears on many hosts within one maintenance window, matching a
+        vendor installer unpacking bundled content.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - decode_operation
+
+    supporting:
+      any:
+        - writable_output_path
+        - subsequent_execution
+        - delivery_parent
+        - rare_decode_for_host
+      all:
+        - writable_output_path
+        - subsequent_execution
+
+    contradicting:
+      any:
+        - certificate_workflow
+        - build_pipeline_context
+        - recurring_installer_decode
+      all: []
+
+  verdict:
+    low_risk_when:
+      - decode_operation
+      - certificate_workflow
+      - build_pipeline_context
+      - recurring_installer_decode
+    suspicious_when:
+      - decode_operation
+      - writable_output_path
+    high_risk_when:
+      - decode_operation
+      - writable_output_path
+      - subsequent_execution
+      - delivery_parent
+
+  false_positive:
+    - condition: A certificate administrator decodes a base64 certificate during enrolment.
+      explanation: >-
+        This is certutil's intended purpose, and it is common on servers and on the
+        workstations of PKI staff. The output file type is a certificate format, which the
+        hunt excludes explicitly rather than leaving to triage.
+    - condition: A build pipeline decodes an embedded resource while packaging.
+      explanation: >-
+        Build tooling frequently base64-encodes binary assets inside text configuration.
+        The decode runs under a build agent on an engineering host and repeats on every
+        pipeline execution.
+    - condition: An installer decodes a bundled payload during setup.
+      explanation: >-
+        Some vendor packages ship encoded content and expand it locally. This produces the
+        decode and the writable-path evidence together, and is separated by the installer
+        being the parent and by the estate-wide rollout footprint.
+    - condition: An administrator transfers a configuration blob as base64 and decodes it.
+      explanation: >-
+        Encoding avoids corruption when configuration is pasted through a console or
+        ticket. The activity is interactive, one-off, and the output is a text or
+        configuration file rather than an executable.

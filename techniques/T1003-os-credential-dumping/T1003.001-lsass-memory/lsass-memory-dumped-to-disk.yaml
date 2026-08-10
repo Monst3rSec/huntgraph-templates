@@ -1,0 +1,299 @@
+type: detection
+
+id: hg-win-lsass-memory-dumped-to-disk-t1003-001
+version: 1.0.0
+
+info:
+  name: LSASS process memory dumped to disk
+  description: >-
+    To harvest cached credentials from memory an adversary must get the contents of
+    lsass.exe out of the process and into something they can parse. Detecting the tool
+    that does it fails immediately against renamed or custom dumpers, so the durable
+    observations are the mechanisms themselves: the small set of signed utilities that can
+    write a process dump, the MiniDumpWriteDump path, and the appearance of a dump file
+    whose size and location suggest process memory rather than a crash report. In any
+    given estate the set of processes that legitimately produce LSASS dumps is small,
+    stable and worth learning before hunting.
+  severity: critical
+  author: huntgraph
+  tags:
+    - credential-access
+    - credential-dumping
+    - lsass
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1003/001
+    - https://attack.mitre.org/detectionstrategies/DET0363
+    - https://attack.mitre.org/techniques/T1003
+
+mitre:
+  tactics:
+    - TA0006
+  techniques:
+    - T1003
+  sub_techniques:
+    - T1003.001
+  detection_strategies:
+    - DET0363
+  analytics:
+    - AN1030
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary may capture the memory of lsass.exe into a file using a signed system
+    utility or a dumping API, so that cached credentials can be extracted offline on
+    another machine rather than parsed on the victim host where tooling would be noticed.
+  attacker_behavior:
+    - Runs comsvcs.dll MiniDump through rundll32 against the LSASS process id.
+    - Uses procdump, createdump, or a renamed copy of either, with flags that force a full dump.
+    - Invokes Out-Minidump or a .NET MiniDumpWriteDump wrapper from PowerShell.
+    - Writes the dump into a user-writable directory and then removes or exfiltrates it.
+  legitimate_behavior:
+    - Windows Error Reporting captures LSASS memory when the process genuinely crashes.
+    - Microsoft support engagements ask administrators to collect a full process dump.
+    - Some EDR and diagnostic agents capture process memory as part of an investigation.
+    - Developers use procdump against their own applications on engineering workstations.
+  risk_indicator:
+    - The dump target is LSASS specifically rather than an arbitrary application.
+    - The dumping tool is running from a user-writable directory or under an unusual name.
+    - The output file lands somewhere other than a crash-report directory.
+    - The dump is followed by compression, copying or deletion of the output.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - SHA256HashData
+    - source: file_creation
+      event_types:
+        - NewExecutableWritten
+        - PeFileWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: comsvcs-minidump
+        name: LSASS dumped through the comsvcs.dll MiniDump export
+        purpose: >-
+          Catch the living-off-the-land form, which needs no tooling on the host at all and
+          is therefore the variant most likely to survive application control.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/comsvcs\.dll\s*,?\s*#?\s*24|comsvcs\.dll\s*,\s*MiniDump/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=dumps), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: dump-utility-against-lsass
+        name: Dump utility invoked against LSASS
+        purpose: >-
+          Surface the signed-utility path, matching on the target rather than on the tool
+          name so that a renamed procdump is still caught.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\blsass(\.exe)?\b/i
+          | CommandLine=/-ma\b|--?accepteula|\bfull\b|MiniDumpWriteDump|Out-Minidump|createdump|\bdump\b/i
+          | FileName!=/^(WerFault|WerFaultSecure|wermgr)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=dumps), collect([CommandLine, SHA256HashData], limit=5)])
+          | sort(dumps, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ImageFileName of the approved EDR or diagnostic agent performing memory capture"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - process
+            - organization
+
+      - id: dumper-from-writable-path
+        name: Dump utility executing from a user-writable directory
+        purpose: >-
+          Separate a support engineer running procdump from an installed location from an
+          operator who has just staged a copy of it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\blsass(\.exe)?\b/i
+          | ImageFileName=/\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\/i
+          | ImageFileName!=/\\Program Files( \(x86\))?\\/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=dumps), collect([CommandLine, SHA256HashData], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - process
+
+evidence:
+  required:
+    - id: lsass_dump_attempt
+      name: Process-dump mechanism directed at LSASS
+      description: >-
+        A command line invokes a memory-dump mechanism — the comsvcs MiniDump export, a
+        dump utility flag set, or a MiniDumpWriteDump wrapper — against the LSASS process.
+      source: process_creation
+      field: CommandLine
+      indicates: credential_material_capture
+
+  supporting:
+    - id: writable_tool_location
+      name: Dumping tool run from a user-writable directory
+      description: >-
+        The executable performing the dump sits under AppData, Temp, ProgramData or a user
+        profile rather than in an installation directory, indicating it was staged for this
+        purpose.
+      source: process_creation
+      field: ImageFileName
+      indicates: untrusted_execution_location
+    - id: tool_recently_staged
+      name: Dumping tool written to the host recently
+      description: >-
+        The executable was written to the host shortly before it ran, which is
+        inconsistent with an installed diagnostic utility.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: scripted_parent
+      name: Script host or remote-execution parent
+      description: >-
+        The dump was initiated by a script interpreter or through a remote-execution
+        channel rather than from an interactive administrative session.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: unique_tool_hash
+      name: Tool hash unique in the estate
+      description: >-
+        The hash of the dumping executable appears on one or very few hosts, whereas an
+        approved diagnostic utility is uniform wherever it is deployed.
+      source: baseline
+      field: SHA256HashData
+      indicates: unusual_binary_in_environment
+
+  contradicting:
+    - id: crash_reporting
+      name: Windows Error Reporting handling a crash
+      description: >-
+        The capture is performed by the error-reporting components in response to an
+        actual LSASS fault, which produces process memory legitimately.
+      source: process_creation
+      field: FileName
+      indicates: operating_system_behaviour
+    - id: approved_diagnostic_agent
+      name: Approved diagnostic or EDR agent
+      description: >-
+        The capture is performed by a sanctioned security or diagnostic agent from its
+        installation directory as part of documented investigation tooling.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_enterprise_activity
+    - id: support_engagement
+      name: Recorded support engagement
+      description: >-
+        A change or incident record covers a vendor support request for a full process
+        dump, naming the host, the engineer and the window.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - lsass_dump_attempt
+
+    supporting:
+      any:
+        - writable_tool_location
+        - tool_recently_staged
+        - scripted_parent
+        - unique_tool_hash
+      all:
+        - writable_tool_location
+        - tool_recently_staged
+
+    contradicting:
+      any:
+        - crash_reporting
+        - approved_diagnostic_agent
+        - support_engagement
+      all: []
+
+  verdict:
+    low_risk_when:
+      - lsass_dump_attempt
+      - crash_reporting
+      - approved_diagnostic_agent
+      - support_engagement
+    suspicious_when:
+      - lsass_dump_attempt
+      - unique_tool_hash
+    high_risk_when:
+      - lsass_dump_attempt
+      - writable_tool_location
+      - tool_recently_staged
+      - scripted_parent
+
+  false_positive:
+    - condition: Windows Error Reporting captures LSASS memory after a genuine crash.
+      explanation: >-
+        A faulting LSASS produces a real memory dump written by the error-reporting
+        components. These are excluded by acting process rather than by output path, since
+        the path alone does not separate them reliably.
+    - condition: An administrator collects a full LSASS dump for a Microsoft support case.
+      explanation: >-
+        Support engagements genuinely request this, and the command line is
+        indistinguishable from an attack. The engagement record and the interactive
+        administrative context are the only discriminators.
+    - condition: An EDR or diagnostic agent captures process memory during an investigation.
+      explanation: >-
+        Security tooling captures memory by design, sometimes including LSASS. The acting
+        binary runs from the agent's installation directory with a hash that is uniform
+        across the estate.
+    - condition: A developer runs procdump against their own application on an engineering host.
+      explanation: >-
+        Procdump is a normal developer tool, and its presence in a user directory is
+        unremarkable on engineering workstations. What matters is whether LSASS is the
+        target, which is why the hunt keys on the target rather than on the tool.

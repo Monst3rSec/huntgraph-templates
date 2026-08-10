@@ -1,0 +1,290 @@
+type: detection
+
+id: hg-win-alternate-data-stream-execution-t1564-004
+version: 1.0.0
+
+info:
+  name: Content written to or executed from an NTFS alternate data stream
+  description: >-
+    An NTFS alternate data stream stores content attached to a file without changing the
+    file's visible size or appearing in a directory listing. Storing a payload in a stream
+    hides it from casual inspection and from tooling that only enumerates primary streams,
+    and Windows will execute several kinds of content directly out of one. Because the
+    stream is addressed with a colon inside the path, the syntax itself is the artefact,
+    and it is rare enough in ordinary command lines that its presence is worth
+    investigating on its own.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - hide-artifacts
+    - alternate-data-stream
+    - ntfs
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1564/004
+    - https://attack.mitre.org/detectionstrategies/DET0432
+    - https://attack.mitre.org/techniques/T1564
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1564
+  sub_techniques:
+    - T1564.004
+  detection_strategies:
+    - DET0432
+  analytics:
+    - AN1206
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary may hide a payload or script in an NTFS alternate data stream so that it
+    does not appear in directory listings or affect the host file's reported size, and may
+    then execute or read it back directly from the stream.
+  attacker_behavior:
+    - Redirects or copies content into a path of the form `file.txt:stream` to conceal it.
+    - Executes a script or binary directly from a stream through an interpreter or WMIC.
+    - Uses `type`, `more` or PowerShell stream parameters to read hidden content back at runtime.
+    - Attaches the stream to an innocuous host file such as a log or a text document.
+  legitimate_behavior:
+    - Windows marks downloaded files with the Zone.Identifier stream to record their origin.
+    - Some backup, indexing and document-management products store metadata in named streams.
+    - Developers occasionally use streams deliberately when testing NTFS behaviour.
+  risk_indicator:
+    - The stream name is not Zone.Identifier or another well-known metadata stream.
+    - The stream is being executed or piped into an interpreter rather than merely read.
+    - The host file sits in a user-writable directory.
+    - The parent process is a document handler, archive tool or script host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+        - PeFileWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: stream-write-syntax
+        name: Content redirected into an alternate data stream
+        purpose: >-
+          Surface command lines that write into a named stream, excluding the
+          Zone.Identifier stream that Windows itself maintains on downloaded files.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/[A-Za-z]:\\[^\s"',:]+\.[A-Za-z0-9]{1,6}:(?<stream_name>[A-Za-z0-9_.\-]+)/
+          | stream_name!=/^(Zone\.Identifier|SummaryInformation|favicon|encryptable)$/i
+          | CommandLine=/(>|>>|set-content|add-content|copy|cmd\s*\/c)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName, stream_name],
+                    function=[count(as=writes), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude:
+            - "stream_name used by an approved document-management or indexing product"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: execution-from-stream
+        name: Interpreter executing content held in a stream
+        purpose: >-
+          Isolate the cases where stream content is executed rather than merely stored,
+          which is the difference between concealment and active use of the payload.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(powershell|pwsh|cmd|wscript|cscript|wmic|rundll32|mshta)\.exe$/i
+          | CommandLine=/[A-Za-z]:\\[^\s"',:]+\.[A-Za-z0-9]{1,6}:[A-Za-z0-9_.\-]+/
+          | CommandLine!=/Zone\.Identifier/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: powershell-stream-parameter
+        name: PowerShell reading or writing an explicit stream
+        purpose: >-
+          Cover the cmdlet form, where the stream is addressed through the -Stream
+          parameter rather than through colon syntax inside a path.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/-Stream\s+[^\s]+/i
+          | CommandLine!=/-Stream\s+["']?Zone\.Identifier/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+evidence:
+  required:
+    - id: named_stream_reference
+      name: Non-standard alternate data stream referenced
+      description: >-
+        A command line addresses a named NTFS stream that is not Zone.Identifier or
+        another well-known metadata stream, meaning content is being placed in or read
+        from a location that does not appear in a directory listing.
+      source: process_creation
+      field: CommandLine
+      indicates: artifact_concealment
+
+  supporting:
+    - id: stream_execution
+      name: Stream content passed to an interpreter
+      description: >-
+        The stream is referenced by a script interpreter, WMIC or a proxy-execution binary
+        rather than by a copy or read operation, so the hidden content is being executed.
+      source: process_creation
+      field: FileName
+      indicates: dynamic_code_execution
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        The process referencing the stream was launched by a document handler, archive
+        utility, mail client or browser rather than by an administrative shell.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: host_file_recently_written
+      name: Host file recently created in a writable directory
+      description: >-
+        The file carrying the stream was itself written recently into a user-writable
+        directory, indicating staging rather than an existing document acquiring metadata.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: unprecedented_stream_use
+      name: Stream usage unseen in the estate
+      description: >-
+        No comparable stream reference has been observed across the estate during the
+        baseline window, which is the normal state outside a few metadata-using products.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: known_metadata_stream
+      name: Stream belongs to a known product
+      description: >-
+        The stream name matches one used by an approved backup, indexing or
+        document-management product to store its own metadata.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_application_component
+    - id: recurring_product_behaviour
+      name: Recurring usage tied to one product
+      description: >-
+        The same stream name is written continuously across many hosts by the same
+        process, consistent with deployed software rather than an intrusion.
+      source: baseline
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: developer_workstation
+      name: Known engineering workstation
+      description: >-
+        The host is an engineering system where deliberate experimentation with NTFS
+        streams is plausible routine work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - named_stream_reference
+
+    supporting:
+      any:
+        - stream_execution
+        - delivery_parent
+        - host_file_recently_written
+        - unprecedented_stream_use
+      all:
+        - stream_execution
+        - delivery_parent
+
+    contradicting:
+      any:
+        - known_metadata_stream
+        - recurring_product_behaviour
+        - developer_workstation
+      all: []
+
+  verdict:
+    low_risk_when:
+      - named_stream_reference
+      - known_metadata_stream
+      - recurring_product_behaviour
+      - developer_workstation
+    suspicious_when:
+      - named_stream_reference
+      - unprecedented_stream_use
+    high_risk_when:
+      - named_stream_reference
+      - stream_execution
+      - delivery_parent
+      - host_file_recently_written
+
+  false_positive:
+    - condition: Windows tags a downloaded file with the Zone.Identifier stream.
+      explanation: >-
+        Mark-of-the-web is applied to essentially every downloaded file, which would
+        swamp the hunt entirely. It is excluded by name in every case rather than left to
+        triage.
+    - condition: A document-management or indexing product stores metadata in named streams.
+      explanation: >-
+        A handful of products use streams for thumbnails, classification labels or index
+        data. These use a consistent stream name written by the same process across the
+        whole estate.
+    - condition: A backup agent preserves alternate streams when restoring files.
+      explanation: >-
+        Faithful restore requires copying every stream, so the syntax appears in the
+        agent's activity. The acting process is an approved backup client rather than an
+        interpreter.

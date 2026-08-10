@@ -1,0 +1,290 @@
+type: detection
+
+id: hg-win-mshta-remote-or-inline-script-t1218-005
+version: 1.0.0
+
+info:
+  name: Mshta executing remote or inline script content
+  description: >-
+    mshta.exe exists to run HTML applications, and it will happily run one served from a
+    URL or expressed inline as a `vbscript:` or `javascript:` argument. Both forms give an
+    adversary script execution inside a signed Microsoft binary with no scripting host in
+    the process tree and, in the remote case, nothing written to disk. Enterprises that
+    still use HTAs almost always serve them from a fixed internal path, which makes the
+    origin of the content — external URL or inline argument rather than a known local
+    file — the discriminator that survives payload changes.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - proxy-execution
+    - lolbin
+    - mshta
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1218/005
+    - https://attack.mitre.org/detectionstrategies/DET0506
+    - https://lolbas-project.github.io/lolbas/Binaries/Mshta/
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1218
+  sub_techniques:
+    - T1218.005
+  detection_strategies:
+    - DET0506
+  analytics:
+    - AN1397
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may use mshta.exe to execute script content fetched from a remote URL or
+    supplied inline on the command line, obtaining script execution inside a trusted
+    signed binary without dropping a script file or spawning a recognisable scripting
+    host.
+  attacker_behavior:
+    - Passes an http or https URL to mshta.exe so the HTA is fetched and executed from memory.
+    - Supplies inline `vbscript:` or `javascript:` content terminated with a window close call.
+    - Chains mshta.exe from a document handler immediately after a user opens a lure.
+    - Spawns a follow-on interpreter or performs outbound communication from the mshta process.
+  legitimate_behavior:
+    - Legacy line-of-business applications ship HTA front-ends served from an internal file share.
+    - Vendor administrative consoles and older management tools are implemented as HTAs.
+    - Internal IT tooling launches HTAs from a fixed intranet URL for helpdesk workflows.
+  risk_indicator:
+    - The HTA is fetched from an external URL rather than an internal path.
+    - Script content is supplied inline rather than referencing a file at all.
+    - The parent process is a document, archive or mail application.
+    - The mshta process spawns a further interpreter or connects outbound.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: mshta-remote-url
+        name: Mshta fetching an HTA from a URL
+        purpose: >-
+          Surface executions where the HTA content is retrieved over the network, which is
+          the fully fileless variant of this technique.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^mshta\.exe$/i
+          | CommandLine=/(?<hta_url>https?\s*:?\s*(\[:\])?\/\/[^\s"']+)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, hta_url],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "hta_url on the approved internal application allowlist"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - domain
+            - command_line
+
+      - id: mshta-inline-script
+        name: Mshta running inline script content
+        purpose: >-
+          Catch script supplied directly on the command line, which no packaged HTA
+          application produces and which leaves no file for later analysis.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^mshta\.exe$/i
+          | CommandLine=/(vbscript|javascript)\s*:/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: mshta-spawns-interpreter
+        name: Mshta spawning a command interpreter
+        purpose: >-
+          Identify the follow-on execution that turns an HTA into a foothold, which is a
+          stronger observation than the mshta invocation on its own.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^mshta\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd|wscript|cscript|rundll32|regsvr32|certutil|bitsadmin)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - process
+
+evidence:
+  required:
+    - id: untrusted_hta_source
+      name: HTA content from a URL or supplied inline
+      description: >-
+        The mshta.exe command line references an http or https URL, or carries inline
+        vbscript or javascript content, so the executed script did not come from a known
+        local application file.
+      source: process_creation
+      field: CommandLine
+      indicates: fileless_script_execution
+
+  supporting:
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        mshta.exe was launched by an Office application, PDF reader, mail client, browser
+        or archive utility, placing the execution immediately after a user opened a file.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: interpreter_child
+      name: Interpreter or LOLBin spawned by mshta
+      description: >-
+        The mshta process created a command interpreter or another proxy-execution binary,
+        which is the handoff from initial script to a working foothold.
+      source: process_creation
+      field: FileName
+      indicates: execution_chain_progression
+    - id: external_egress
+      name: Outbound connection from the mshta process
+      description: >-
+        The mshta process connected to a routable external address, consistent with
+        fetching the HTA body or beaconing after execution.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: possible_payload_retrieval
+    - id: unseen_hta_source
+      name: HTA source new to the environment
+      description: >-
+        The URL or command shape has not been observed during the baseline window, unlike
+        the small fixed set of internal HTAs a business application uses.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: internal_application_url
+      name: Approved internal HTA endpoint
+      description: >-
+        The HTA is served from an intranet path or file share belonging to a documented
+        line-of-business application.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_application_component
+    - id: helpdesk_tooling_parent
+      name: Sanctioned IT tooling as parent
+      description: >-
+        mshta.exe was launched by an approved helpdesk or management console that uses HTA
+        front-ends by design.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: recurring_business_usage
+      name: Stable recurring usage across the estate
+      description: >-
+        The same HTA source is invoked repeatedly by many users over the baseline window,
+        which is the footprint of a deployed application rather than an intrusion.
+      source: baseline
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - untrusted_hta_source
+
+    supporting:
+      any:
+        - delivery_parent
+        - interpreter_child
+        - external_egress
+        - unseen_hta_source
+      all:
+        - delivery_parent
+        - interpreter_child
+
+    contradicting:
+      any:
+        - internal_application_url
+        - helpdesk_tooling_parent
+        - recurring_business_usage
+      all: []
+
+  verdict:
+    low_risk_when:
+      - untrusted_hta_source
+      - internal_application_url
+      - helpdesk_tooling_parent
+      - recurring_business_usage
+    suspicious_when:
+      - untrusted_hta_source
+      - unseen_hta_source
+    high_risk_when:
+      - untrusted_hta_source
+      - delivery_parent
+      - interpreter_child
+      - external_egress
+
+  false_positive:
+    - condition: A legacy business application launches its HTA front-end from an intranet URL.
+      explanation: >-
+        Remote HTA execution is the intended deployment model for some older internal
+        tools, so the required evidence is present by design. The URL is internal, stable
+        over time and shared by many users.
+    - condition: A helpdesk console opens an administrative HTA during a support session.
+      explanation: >-
+        IT tooling implemented as HTAs still exists in many estates. These launches come
+        from a known parent console and recur on support workstations rather than on
+        general user endpoints.
+    - condition: A security team demonstrates mshta abuse during an authorised exercise.
+      explanation: >-
+        Validation and red-team activity reproduces the inline-script form exactly. Only
+        the engagement record and the originating host distinguish it from an intrusion.

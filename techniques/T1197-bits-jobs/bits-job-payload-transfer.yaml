@@ -1,0 +1,289 @@
+type: detection
+
+id: hg-win-bits-job-payload-transfer-t1197
+version: 1.0.0
+
+info:
+  name: BITS job transferring or executing content
+  description: >-
+    The Background Intelligent Transfer Service moves files on behalf of a caller, retries
+    across reboots, and does the work from a service host rather than from the process
+    that queued the job. For an adversary that means a download whose network activity is
+    attributed to a Microsoft service, survives a logoff, and can carry a notification
+    command that executes when the transfer completes. Windows Update and management
+    agents use BITS constantly, so the question is never whether BITS ran but who queued
+    the job, where the content came from, and whether a command was attached to it.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - persistence
+    - ingress-transfer
+    - bits
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1197
+    - https://attack.mitre.org/detectionstrategies/DET0098
+    - https://lolbas-project.github.io/lolbas/Binaries/Bitsadmin/
+
+mitre:
+  tactics:
+    - TA0005
+    - TA0003
+    - TA0002
+  techniques:
+    - T1197
+  sub_techniques: []
+  detection_strategies:
+    - DET0098
+  analytics:
+    - AN0274
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+    - Command Execution
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may queue a BITS job to retrieve a payload or to run a command on
+    completion, so that the transfer is performed by a trusted Windows service, persists
+    across reboots and logoffs, and is not attributed to the process that created it.
+  attacker_behavior:
+    - Uses bitsadmin.exe with /transfer or /addfile to pull a file from an external host.
+    - Attaches a completion command with /SetNotifyCmdLine so the payload runs when the transfer finishes.
+    - Uses the Start-BitsTransfer or Add-BitsFile cmdlets from PowerShell for the same purpose.
+    - Sets a long retry period so an interrupted job resumes later without further interaction.
+  legitimate_behavior:
+    - Windows Update and Microsoft Store use BITS for their own content delivery.
+    - Endpoint management and patching agents queue BITS jobs to distribute packages.
+    - Telemetry and diagnostic uploads are sent through BITS to reduce network impact.
+    - Administrators occasionally script a bitsadmin transfer for a large internal file copy.
+  risk_indicator:
+    - The job source is an external host rather than an internal distribution point.
+    - A notification command line is attached to the job.
+    - The queuing process is a script host or a document handler rather than a management agent.
+    - The destination path is a user-writable directory.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: bitsadmin-external-transfer
+        name: Bitsadmin transfer from an external source
+        purpose: >-
+          Surface BITS jobs queued from the command line whose source is a URL, which is
+          the ingress form of the technique.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^bitsadmin\.exe$/i
+          | CommandLine=/\/(transfer|addfile|create)\b/i
+          | CommandLine=/(?<source_url>https?\s*:?\s*(\[:\])?\/\/[^\s"']+)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, source_url],
+                    function=[count(as=jobs), collect([CommandLine], limit=3)])
+          | sort(jobs, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "source_url within the internal software-distribution points"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - domain
+            - parent_process
+
+      - id: bits-notify-command
+        name: BITS job with a completion command attached
+        purpose: >-
+          Isolate jobs that carry a notification command line, which converts a file
+          transfer into delayed execution and is the persistence-flavoured use of BITS.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^bitsadmin\.exe$/i
+          | CommandLine=/setnotifycmdline|\/SetNotifyFlags/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=jobs), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: powershell-bits-cmdlets
+        name: BITS transfer queued through PowerShell
+        purpose: >-
+          Cover the cmdlet path, which achieves the same result without bitsadmin.exe
+          appearing anywhere in the process tree.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/(Start-BitsTransfer|Add-BitsFile|New-Object\s+-ComObject\s+["']?Microsoft\.BackgroundIntelligentTransferService)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=jobs), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the configuration-management agent"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+evidence:
+  required:
+    - id: bits_job_queued
+      name: BITS job created by a user-mode caller
+      description: >-
+        A BITS transfer was queued through bitsadmin.exe, the BITS PowerShell cmdlets or
+        the BITS COM object, rather than by the operating system's own update path.
+      source: process_creation
+      field: CommandLine
+      indicates: background_transfer_requested
+
+  supporting:
+    - id: external_source
+      name: Transfer source outside the estate
+      description: >-
+        The job pulls content from an external URL rather than from an internal
+        distribution point or update server.
+      source: process_creation
+      field: CommandLine
+      indicates: possible_payload_retrieval
+    - id: notify_command
+      name: Completion command attached to the job
+      description: >-
+        A notification command line is set on the job, so a program runs when the transfer
+        finishes, turning a download into deferred execution that survives reboots.
+      source: process_creation
+      field: CommandLine
+      indicates: deferred_execution_persistence
+    - id: script_host_caller
+      name: Script host or document handler queued the job
+      description: >-
+        The process that queued the transfer is a script interpreter, document handler or
+        archive tool rather than a management agent or the update service.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: rare_bits_usage
+      name: BITS usage unprecedented for this host
+      description: >-
+        No comparable BITS job has been queued by this host or user during the baseline
+        window, unlike the steady cadence produced by update and management tooling.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: management_agent_caller
+      name: Endpoint management agent queued the job
+      description: >-
+        The approved patching, distribution or monitoring agent created the transfer,
+        which is its documented content-delivery mechanism.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: internal_distribution_source
+      name: Source is an internal distribution point
+      description: >-
+        The transfer source resolves to an internal update server or content
+        distribution host operated by the organisation.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_enterprise_activity
+    - id: fleetwide_job_pattern
+      name: Identical job across many hosts
+      description: >-
+        The same job definition appears broadly across the estate in one window, which is
+        a distribution wave rather than a targeted transfer.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - bits_job_queued
+
+    supporting:
+      any:
+        - external_source
+        - notify_command
+        - script_host_caller
+        - rare_bits_usage
+      all:
+        - external_source
+        - notify_command
+
+    contradicting:
+      any:
+        - management_agent_caller
+        - internal_distribution_source
+        - fleetwide_job_pattern
+      all: []
+
+  verdict:
+    low_risk_when:
+      - bits_job_queued
+      - management_agent_caller
+      - internal_distribution_source
+      - fleetwide_job_pattern
+    suspicious_when:
+      - bits_job_queued
+      - external_source
+    high_risk_when:
+      - bits_job_queued
+      - external_source
+      - notify_command
+      - script_host_caller
+
+  false_positive:
+    - condition: An endpoint management agent distributes packages through BITS.
+      explanation: >-
+        BITS is the intended transport for large managed downloads, so agents queue jobs
+        continuously. The source is an internal distribution point and the same job shape
+        appears across every host in the collection.
+    - condition: Windows Update or the Microsoft Store retrieves content.
+      explanation: >-
+        Operating-system components use BITS by design. These jobs are not queued by a
+        user-mode command line at all, which is why the required evidence is scoped to
+        caller-initiated jobs.
+    - condition: An administrator scripts a bitsadmin transfer for a large internal file copy.
+      explanation: >-
+        BITS is a sensible choice for resilient copying over a constrained link. The
+        source is internal, the activity is interactive and it usually accompanies a
+        migration or maintenance record.
+    - condition: A diagnostic tool uploads logs through BITS.
+      explanation: >-
+        Support tooling uses BITS for background uploads. The destination is a vendor
+        support endpoint and the job carries no notification command.

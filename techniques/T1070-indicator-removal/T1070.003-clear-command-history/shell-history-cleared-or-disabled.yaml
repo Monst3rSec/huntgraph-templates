@@ -1,0 +1,293 @@
+type: detection
+
+id: hg-any-shell-history-cleared-or-disabled-t1070-003
+version: 1.0.0
+
+info:
+  name: Shell command history cleared or disabled
+  description: >-
+    Command history is one of the few records of an interactive session that an
+    investigator can read directly, which is why an operator working by hand tends to
+    remove it. Two shapes matter and they are not equally interesting: clearing history
+    after the fact destroys evidence, while disabling history before working prevents it
+    from ever existing. The second is the stronger signal, because no administrative
+    workflow requires unsetting HISTFILE, whereas a user occasionally does clear a
+    console. Both are cheap to observe and both happen close in time to hands-on-keyboard
+    activity.
+  severity: medium
+  author: huntgraph
+  tags:
+    - stealth
+    - anti-forensics
+    - indicator-removal
+    - shell-history
+    - windows
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1070/003
+    - https://attack.mitre.org/detectionstrategies/DET0165
+    - https://attack.mitre.org/techniques/T1070
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1070
+  sub_techniques:
+    - T1070.003
+  detection_strategies:
+    - DET0165
+  analytics:
+    - AN0467
+    - AN0469
+  platforms:
+    - Windows
+    - Linux
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:PowerShell
+    - auditd:SYSCALL
+  data_components:
+    - Command Execution
+    - File Deletion
+    - File Modification
+
+hypothesis:
+  statement: >-
+    An adversary working interactively may clear or disable shell command history so that
+    the sequence of commands issued during the session cannot be recovered, removing the
+    clearest record of hands-on-keyboard activity from the host.
+  attacker_behavior:
+    - Runs `history -c`, `history -w` against an emptied buffer, or truncates the history file.
+    - Unsets HISTFILE or sets HISTSIZE to zero so the session is never recorded.
+    - Deletes or links ~/.bash_history or ~/.zsh_history to /dev/null.
+    - Calls Clear-History or removes the PowerShell PSReadLine history file on Windows.
+  legitimate_behavior:
+    - Users clear history after mistakenly typing a password or token on the command line.
+    - Hardened build images disable shell history for ephemeral or containerised hosts.
+    - Automation running under a shell sets HISTFILE handling to avoid growing files.
+    - Privileged-access management tooling scrubs session artefacts by policy.
+  risk_indicator:
+    - History is disabled before work rather than cleared after it.
+    - The history file is redirected to /dev/null or replaced by a link.
+    - The account is a service or shared account rather than a named interactive user.
+    - The clearing sits inside a session that also shows discovery or credential access.
+
+requires:
+  platforms:
+    - windows
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: history-cleared
+        name: Shell history cleared or truncated
+        purpose: >-
+          Surface the after-the-fact removal of history through the shell builtin, file
+          truncation or deletion of the history file.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/history\s+-c\b|history\s+-w\b|\brm\s+(-[a-z]+\s+)*[^\s]*\.(bash|zsh|sh)_history|>\s*[^\s]*\.(bash|zsh)_history|truncate\s+-s\s*0\s+[^\s]*_history/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of ephemeral build or container hosts where history is disabled by image policy"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: history-disabled
+        name: History recording disabled for the session
+        purpose: >-
+          Isolate pre-emptive suppression, which prevents the record from existing at all
+          and has no routine administrative equivalent.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/unset\s+HISTFILE\b|HISTFILE\s*=\s*\/dev\/null|HISTSIZE\s*=\s*0\b|set\s+\+o\s+history|ln\s+-sf?\s+\/dev\/null\s+[^\s]*_history/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: powershell-history-removed
+        name: PowerShell console history cleared or its file removed
+        purpose: >-
+          Cover the Windows equivalent, where the PSReadLine history file is the durable
+          record rather than a shell dotfile.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(powershell|pwsh|cmd)\.exe$/i
+          | CommandLine=/Clear-History|Remove-Item\s+.*ConsoleHost_history\.txt|ConsoleHost_history\.txt.*(Remove|del|Set-Content)|Set-PSReadLineOption\s+.*-HistorySaveStyle\s+SaveNothing/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Privileged-access management tooling that scrubs session artefacts by policy"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+evidence:
+  required:
+    - id: history_removal
+      name: Command history cleared or suppressed
+      description: >-
+        A command clears the shell history buffer, truncates or deletes a history file, or
+        disables history recording for the session, removing the record of interactive
+        commands.
+      source: process_creation
+      field: CommandLine
+      indicates: evidence_destruction
+
+  supporting:
+    - id: preemptive_suppression
+      name: History disabled rather than cleared
+      description: >-
+        The action prevents history from being written at all, through unsetting HISTFILE,
+        zeroing HISTSIZE or redirecting the file, which is deliberate concealment rather
+        than tidying up after a mistake.
+      source: process_creation
+      field: CommandLine
+      indicates: deliberate_evasion
+    - id: service_or_shared_account
+      name: Service or shared account performing the removal
+      description: >-
+        The account is a service, shared or generic account rather than a named
+        interactive user, so there is no person with a routine reason to curate history.
+      source: process_creation
+      field: UserName
+      indicates: suspicious_account_context
+    - id: remote_session_parent
+      name: Remote or non-interactive parent process
+      description: >-
+        The shell was reached through a remote-execution channel or spawned by a service
+        rather than by a console logon, which is how hands-on-keyboard intrusion activity
+        usually arrives.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: rare_for_account
+      name: Unprecedented for this account
+      description: >-
+        This account has not cleared or disabled history during the baseline window,
+        distinguishing it from users and images where the behaviour is routine.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: hardened_image_policy
+      name: History disabled by image policy
+      description: >-
+        The host is built from an image that disables shell history by design, such as an
+        ephemeral build agent or container host.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: pam_session_scrubbing
+      name: Privileged-access tooling scrubbing artefacts
+      description: >-
+        An approved privileged-access management product removes session artefacts as part
+        of its documented behaviour.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: routine_for_this_user
+      name: Routine behaviour for a named user
+      description: >-
+        This named interactive user clears history regularly across the baseline window,
+        which reads as personal habit rather than as an intrusion step.
+      source: baseline
+      field: UserName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - history_removal
+
+    supporting:
+      any:
+        - preemptive_suppression
+        - service_or_shared_account
+        - remote_session_parent
+        - rare_for_account
+      all:
+        - preemptive_suppression
+        - remote_session_parent
+
+    contradicting:
+      any:
+        - hardened_image_policy
+        - pam_session_scrubbing
+        - routine_for_this_user
+      all: []
+
+  verdict:
+    low_risk_when:
+      - history_removal
+      - hardened_image_policy
+      - pam_session_scrubbing
+      - routine_for_this_user
+    suspicious_when:
+      - history_removal
+      - rare_for_account
+    high_risk_when:
+      - history_removal
+      - preemptive_suppression
+      - remote_session_parent
+      - service_or_shared_account
+
+  false_positive:
+    - condition: A user clears history after typing a password on the command line.
+      explanation: >-
+        This is the single most common benign cause and it is good practice. It occurs
+        under a named interactive user at a console, and typically once rather than as part
+        of a wider burst of activity.
+    - condition: A hardened or ephemeral image disables shell history by default.
+      explanation: >-
+        Build agents, container hosts and jump boxes frequently ship with history disabled,
+        which produces the strongest supporting evidence on every session. Asset context is
+        the only reliable discriminator.
+    - condition: A privileged-access management product scrubs session artefacts.
+      explanation: >-
+        Session recording tools often clear local history because the authoritative record
+        lives in the vault. The parent process is the PAM agent and the behaviour is
+        uniform across every managed session.
+    - condition: Automation sets HISTFILE handling to keep files from growing.
+      explanation: >-
+        Long-running scripted shells sometimes manage history size deliberately. These run
+        under a service account on a fixed schedule with an unchanging command line.

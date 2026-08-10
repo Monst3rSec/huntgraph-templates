@@ -1,0 +1,283 @@
+type: detection
+
+id: hg-win-windows-event-log-cleared-t1685-005
+version: 1.0.0
+
+info:
+  name: Windows event logs cleared
+  description: >-
+    Clearing an event log is unusual in two directions at once: it is rare, and it is
+    destructive to exactly the record an investigator would read next. There is almost no
+    operational reason to clear Security or PowerShell logs on a running production
+    system — retention is handled by forwarding and by log size policy, not by manual
+    clearing. The behaviour is therefore close to self-evidently interesting; what triage
+    has to establish is which account did it, through which mechanism, and whether it
+    followed other activity on the same host.
+  severity: high
+  author: huntgraph
+  tags:
+    - defense-impairment
+    - anti-forensics
+    - event-log
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1685/005
+    - https://attack.mitre.org/detectionstrategies/DET0532
+    - https://attack.mitre.org/techniques/T1685
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1685
+  sub_techniques:
+    - T1685.005
+  detection_strategies:
+    - DET0532
+  analytics:
+    - AN1472
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Deletion
+
+hypothesis:
+  statement: >-
+    An adversary who has obtained elevated privileges may clear Windows event logs, or
+    delete the underlying .evtx files, to destroy the record of how that access was
+    obtained and what was done with it before defenders can review the host.
+  attacker_behavior:
+    - Runs wevtutil with cl or clear-log against Security, System or PowerShell channels.
+    - Uses Clear-EventLog or the .NET EventLog class from PowerShell to clear channels in bulk.
+    - Deletes or overwrites .evtx files directly on disk after stopping the log service.
+    - Clears several channels in quick succession rather than a single application log.
+  legitimate_behavior:
+    - Image preparation and sysprep clear logs so a golden image ships without host history.
+    - Test and lab rebuild scripts clear logs between runs to keep results readable.
+    - An administrator occasionally clears a noisy application log while troubleshooting.
+    - Some appliance-style build processes clear logs at the end of provisioning.
+  risk_indicator:
+    - Security, System or PowerShell channels are cleared rather than an application log.
+    - Several channels are cleared within a short window.
+    - The host is a production system rather than an image being prepared.
+    - The clearing account is a service or newly privileged account.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: wevtutil-clear
+        name: Event log cleared through wevtutil
+        purpose: >-
+          Surface the most direct mechanism and capture which channel was targeted, since
+          Security and PowerShell channels carry very different weight from an application
+          log.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^wevtutil\.exe$/i
+          | CommandLine=/\b(cl|clear-log)\b/i
+          | CommandLine=/(?<channel>Security|System|Application|Microsoft-Windows-PowerShell|Windows PowerShell|Sysmon|TerminalServices|Defender)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, channel],
+                    function=[count(as=clears), collect([CommandLine], limit=5)])
+          | sort(clears, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of hosts undergoing image preparation or sysprep"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: powershell-clear-eventlog
+        name: Event logs cleared from PowerShell
+        purpose: >-
+          Cover the scripted path, which is the usual way several channels are cleared in
+          one action and which never involves wevtutil at all.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/Clear-EventLog|\[System\.Diagnostics\.EventLog\]::Delete|Remove-EventLog|ClearEventLog/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=clears), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Provisioning automation that clears logs at the end of a build"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: evtx-file-deletion
+        name: Event log files deleted or the log service stopped
+        purpose: >-
+          Catch the cruder variant, where the .evtx files are removed on disk or the
+          service is stopped first so that they can be, which leaves no cleared-log record
+          behind at all.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\.evtx\b/i
+          | CommandLine=/\b(del|erase|rm|Remove-Item|move|ren)\b|net\s+stop\s+eventlog|Stop-Service\s+.*eventlog/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: log_clearing_action
+      name: Event log cleared or its files removed
+      description: >-
+        A command clears one or more Windows event log channels, or deletes the underlying
+        .evtx files, destroying the host-side record of prior activity.
+      source: process_creation
+      field: CommandLine
+      indicates: evidence_destruction
+
+  supporting:
+    - id: security_channel_targeted
+      name: Security or PowerShell channel targeted
+      description: >-
+        The cleared channel is Security, System, Sysmon or a PowerShell log rather than a
+        noisy application log, so the record destroyed is the one that documents access
+        and execution.
+      source: process_creation
+      field: CommandLine
+      indicates: targeted_evidence_destruction
+    - id: service_account_actor
+      name: Service or non-administrative account performing the clear
+      description: >-
+        The clearing account is a service, shared or recently privileged account rather
+        than a named administrator with a routine reason to maintain logs.
+      source: process_creation
+      field: UserName
+      indicates: suspicious_account_context
+    - id: scripted_parent
+      name: Script host or remote-execution parent
+      description: >-
+        The clearing command was issued by a script host or through a remote-execution
+        channel rather than from an interactive administrative console.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: unprecedented_for_host
+      name: No prior clearing on this host
+      description: >-
+        This host has not cleared event logs during the baseline window, which is the
+        normal state for a production system that is not being reimaged.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: image_preparation
+      name: Host undergoing image preparation
+      description: >-
+        The host is being sysprepped, provisioned or rebuilt, where clearing logs is a
+        deliberate step so the resulting image carries no prior history.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: provisioning_automation
+      name: Provisioning automation as parent
+      description: >-
+        The approved build or provisioning automation issued the clear as a documented
+        final step of a host build.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: application_log_only
+      name: Only a noisy application log cleared
+      description: >-
+        The single channel cleared is an application log with a known noise problem, which
+        matches routine troubleshooting rather than record destruction.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - log_clearing_action
+
+    supporting:
+      any:
+        - security_channel_targeted
+        - service_account_actor
+        - scripted_parent
+        - unprecedented_for_host
+      all:
+        - security_channel_targeted
+        - scripted_parent
+
+    contradicting:
+      any:
+        - image_preparation
+        - provisioning_automation
+        - application_log_only
+      all: []
+
+  verdict:
+    low_risk_when:
+      - log_clearing_action
+      - image_preparation
+      - provisioning_automation
+      - application_log_only
+    suspicious_when:
+      - log_clearing_action
+      - unprecedented_for_host
+    high_risk_when:
+      - log_clearing_action
+      - security_channel_targeted
+      - scripted_parent
+      - service_account_actor
+
+  false_positive:
+    - condition: Sysprep or image capture clears logs before a golden image is sealed.
+      explanation: >-
+        Shipping an image with the build host's Security log would leak build history, so
+        clearing is correct practice. It happens on hosts in a build state rather than in
+        production, and the whole channel set is cleared at once by automation.
+    - condition: A lab or test rebuild script clears logs between runs.
+      explanation: >-
+        Test automation clears logs so each run starts from a clean record. These hosts
+        clear repeatedly on a predictable cadence, which the baseline exposes immediately.
+    - condition: An administrator clears a noisy application log while troubleshooting.
+      explanation: >-
+        Clearing a single application channel to make a reproduction readable is ordinary
+        support work. The channel targeted is the discriminator, which is why it is
+        captured explicitly rather than inferred.
