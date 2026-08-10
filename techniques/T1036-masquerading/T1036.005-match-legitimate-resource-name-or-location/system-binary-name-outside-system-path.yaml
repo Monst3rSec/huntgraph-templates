@@ -1,0 +1,309 @@
+type: detection
+
+id: hg-win-system-binary-name-outside-system-path-t1036-005
+version: 1.0.0
+
+info:
+  name: System binary name executing from outside the system path
+  description: >-
+    Naming a payload svchost.exe, lsass.exe or taskhostw.exe costs an adversary nothing
+    and buys a great deal: analysts skim process lists for unfamiliar names, and a
+    familiar one stops the eye. The deception fails on location, because the genuine
+    binaries only ever execute from System32, SysWOW64 or WinSxS. A process carrying a
+    protected Windows name from AppData, Temp, ProgramData or a user profile is
+    misrepresenting itself, and unlike a hash or a signature that observation does not
+    decay as the payload changes.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - masquerading
+    - process-lineage
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1036/005
+    - https://attack.mitre.org/detectionstrategies/DET0347
+    - https://attack.mitre.org/techniques/T1036
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1036
+  sub_techniques:
+    - T1036.005
+  detection_strategies:
+    - DET0347
+  analytics:
+    - AN0983
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary may name a payload after a core Windows binary and run it from a
+    directory the real binary never occupies, so that process listings and analyst triage
+    read the name as trusted while the execution path betrays that it is not the genuine
+    component.
+  attacker_behavior:
+    - Copies or drops a payload named svchost.exe, lsass.exe, services.exe or taskhostw.exe into a writable directory.
+    - Executes it from AppData, Temp, ProgramData, Public or a user profile path.
+    - Pairs the name with a plausible parent so the process tree reads as ordinary at a glance.
+    - Uses subtle spelling variants such as scvhost.exe or svch0st.exe to survive exact-name comparison.
+  legitimate_behavior:
+    - Installers stage a temporary copy of a system utility in a working directory during setup.
+    - Virtualisation, imaging and recovery tooling ships its own copies of Windows utilities.
+    - Software distribution caches extract binaries under ProgramData before moving them into place.
+    - Developer build outputs may coincidentally produce a binary with a common Windows name.
+  risk_indicator:
+    - A protected system binary name executes from a path where that binary never legitimately lives.
+    - The binary was written to that path shortly before it executed.
+    - The parent process is a document handler, archive tool or script host.
+    - The path and name pairing has not been seen anywhere in the estate during the baseline window.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - SHA256HashData
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: protected-name-wrong-path
+        name: Protected Windows binary name running outside System32
+        purpose: >-
+          Surface processes whose file name matches a core Windows binary but whose image
+          path is not a system directory, which is the location-versus-name contradiction
+          at the heart of this hypothesis.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(svchost|lsass|services|csrss|winlogon|smss|wininit|taskhostw|spoolsv|dllhost|conhost|explorer|rundll32|lsm)\.exe$/i
+          | ImageFileName!=/\\Windows\\(System32|SysWOW64|WinSxS|servicing)\\/i
+          | ImageFileName!=/^\\Device\\HarddiskVolume\d+\\Windows\\(System32|SysWOW64|WinSxS)\\/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine, SHA256HashData], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ImageFileName under approved imaging, recovery or virtualisation tool directories"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - process
+            - organization
+
+      - id: lookalike-system-name
+        name: Near-miss spelling of a system binary
+        purpose: >-
+          Catch transposed and substituted spellings that evade exact-name comparison
+          while still reading as familiar to an analyst.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(scvhost|svch0st|svhost|sv chost|lsasss|lsas|csrsss|winlogin|explore|taskhosts|sppolsv)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine, SHA256HashData], limit=3)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: masquerade-write-then-execute
+        name: System-named binary written then executed from the same path
+        purpose: >-
+          Correlate the drop with the run, separating a payload that was just staged from
+          a long-standing vendor file that merely shares a Windows name.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten|ProcessRollup2)$/
+          | case {
+              #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+                | TargetFileName=/\\(svchost|lsass|services|taskhostw|spoolsv|dllhost)\.exe$/i
+                | TargetFileName!=/\\Windows\\(System32|SysWOW64|WinSxS)\\/i
+                | staged_image := TargetFileName ;
+              #event_simpleName=ProcessRollup2
+                | FileName=/^(svchost|lsass|services|taskhostw|spoolsv|dllhost)\.exe$/i
+                | ImageFileName!=/\\Windows\\(System32|SysWOW64|WinSxS)\\/i ;
+            }
+          | groupBy([ComputerName],
+                    function=[collect([staged_image, ImageFileName, ParentBaseFileName, UserName]),
+                              count(as=events)])
+          | staged_image=/.+/ and ImageFileName=/.+/
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of the approved software-distribution agent"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+
+evidence:
+  required:
+    - id: system_name_wrong_path
+      name: System binary name executing from a non-system path
+      description: >-
+        A process carries the file name of a core Windows binary while its image path is
+        outside System32, SysWOW64, WinSxS or the servicing directory, so the name and the
+        location contradict each other.
+      source: process_creation
+      field: ImageFileName
+      indicates: process_masquerading
+
+  supporting:
+    - id: recent_image_write
+      name: Image written shortly before execution
+      description: >-
+        The executable was created at that path by a file write shortly before it ran,
+        indicating a staged payload rather than a pre-existing vendor component.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        The masquerading process was launched by a document handler, archive utility, mail
+        client, browser or script host rather than by services.exe or an installer.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: unique_hash_in_estate
+      name: Image hash unique to a single host
+      description: >-
+        The SHA256 of the running image appears on one or very few hosts, whereas a
+        genuine vendor-shipped copy of a system utility is uniform across the fleet.
+      source: baseline
+      field: SHA256HashData
+      indicates: unusual_binary_in_environment
+    - id: user_writable_location
+      name: Image located in a user-writable directory
+      description: >-
+        The image path sits under AppData, Temp, ProgramData, Public or a user profile,
+        which any unprivileged process can write to and no system binary occupies.
+      source: process_creation
+      field: ImageFileName
+      indicates: untrusted_execution_location
+
+  contradicting:
+    - id: known_vendor_tool_path
+      name: Approved imaging or virtualisation tool directory
+      description: >-
+        The image resolves to a documented directory belonging to an approved imaging,
+        recovery, virtualisation or support utility that ships its own copies of Windows
+        binaries.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: fleetwide_identical_hash
+      name: Same hash and path across the estate
+      description: >-
+        The identical hash and path pairing is present across a large share of the estate,
+        consistent with a deployed package rather than a targeted drop.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+    - id: installer_parent
+      name: Installer or distribution agent as parent
+      description: >-
+        The process was launched by an approved installer or software-distribution agent
+        during a recorded maintenance window.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - system_name_wrong_path
+
+    supporting:
+      any:
+        - recent_image_write
+        - delivery_parent
+        - unique_hash_in_estate
+        - user_writable_location
+      all:
+        - user_writable_location
+        - unique_hash_in_estate
+
+    contradicting:
+      any:
+        - known_vendor_tool_path
+        - fleetwide_identical_hash
+        - installer_parent
+      all: []
+
+  verdict:
+    low_risk_when:
+      - system_name_wrong_path
+      - known_vendor_tool_path
+      - fleetwide_identical_hash
+      - installer_parent
+    suspicious_when:
+      - system_name_wrong_path
+      - user_writable_location
+    high_risk_when:
+      - system_name_wrong_path
+      - user_writable_location
+      - recent_image_write
+      - unique_hash_in_estate
+
+  false_positive:
+    - condition: An imaging or recovery product ships its own copy of a Windows utility under Program Files.
+      explanation: >-
+        Deployment, backup and virtualisation suites bundle system utilities so they can
+        run in a recovery context. The name and path contradiction is real but the hash is
+        uniform across the estate and the directory belongs to a known product.
+    - condition: An installer extracts a temporary copy of a system binary into a working directory.
+      explanation: >-
+        Setup routines occasionally stage a utility under Temp or ProgramData before
+        placing it. The write and execution are adjacent, so the staging evidence appears;
+        the installer as parent and the rollout footprint are the separators.
+    - condition: A build pipeline produces an output binary that happens to share a Windows name.
+      explanation: >-
+        Engineering hosts can emit a binary called explorer.exe or dllhost.exe from a test
+        project. Such executions cluster on developer machines, run under the developer's
+        account and originate from a build directory.
+    - condition: A support engineer runs a copied system utility from a scratch directory during troubleshooting.
+      explanation: >-
+        Copying a utility to a working folder to compare behaviour is ordinary support
+        practice. It is interactive, tied to a named user, and usually accompanied by an
+        incident record.

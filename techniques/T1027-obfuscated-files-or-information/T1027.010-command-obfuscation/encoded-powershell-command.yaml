@@ -1,0 +1,327 @@
+type: detection
+
+id: hg-win-encoded-powershell-command-t1027-010
+version: 1.0.0
+
+info:
+  name: Encoded PowerShell command line
+  description: >-
+    PowerShell accepts a base64-encoded script block through -EncodedCommand and its
+    abbreviations, which hides the actual instructions from any inspection that reads the
+    command line literally. Encoding is used legitimately to pass multi-line script
+    through tooling that cannot quote it safely, so the fact of encoding is interesting
+    rather than malicious. What makes it risky is the company it keeps: an execution
+    chain that starts at a document or archive, an encoded payload long enough to carry a
+    stager, execution-policy suppression, and network activity from the same process.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - obfuscation
+    - powershell
+    - command-line
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1027/010
+    - https://attack.mitre.org/detectionstrategies/DET0505
+    - https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_powershell_exe
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1027
+  sub_techniques:
+    - T1027.010
+  detection_strategies:
+    - DET0505
+  analytics:
+    - AN1394
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may pass a base64-encoded script block to PowerShell so that the
+    instructions being executed are unreadable to command-line inspection and to any
+    control that matches on plaintext keywords, concealing the intent of the execution
+    until the block is decoded.
+  attacker_behavior:
+    - Invokes powershell.exe with -EncodedCommand, -enc, -e or another prefix abbreviation.
+    - Combines encoding with -NoProfile, -WindowStyle Hidden and -ExecutionPolicy Bypass.
+    - Carries a downloader or in-memory loader inside the encoded block, producing an unusually long argument.
+    - Is launched from a document handler, script host, archive tool or service rather than from an interactive shell.
+  legitimate_behavior:
+    - Configuration management and deployment platforms encode script blocks to pass them through agents safely.
+    - Scheduled tasks created by administrators embed encoded commands to survive quoting issues.
+    - Monitoring and backup agents invoke short encoded helper snippets on a fixed schedule.
+    - Installer packages encode a post-install step rather than shipping a separate script file.
+  risk_indicator:
+    - The encoded block is long enough to contain a stager rather than a one-line helper.
+    - The parent process is a delivery application rather than an automation agent.
+    - Execution policy or profile suppression accompanies the encoding.
+    - The exact encoded string is unique to one host instead of repeating estate-wide.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: encoded-command-with-length
+        name: Encoded PowerShell block with payload length
+        purpose: >-
+          Surface encoded invocations and measure the encoded block, so that long
+          stager-sized payloads separate from the short helper snippets that dominate
+          normal automation.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/\s-(e|en|enc|enco|encod|encode|encoded|encodedc|encodedco|encodedcom|encodedcomm|encodedcomma|encodedcomman|encodedcommand)\s+(?<blob>[A-Za-z0-9+\/=]{40,})/i
+          | blob_length := length(blob)
+          | blob_length >= 350
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), max(blob_length, as=longest_blob),
+                              collect([CommandLine], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the configuration-management agent"
+            - "blob values enumerated as approved automation payloads"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - parent_process
+            - command_line
+
+      - id: encoded-with-policy-suppression
+        name: Encoded block combined with policy and profile suppression
+        purpose: >-
+          Isolate encoded invocations that also disable the execution policy, skip the
+          profile or hide the window, a combination that indicates the caller wants the
+          run to be both unreadable and unobtrusive.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/\s-e(nc(odedcommand)?)?\s+[A-Za-z0-9+\/=]{40,}/i
+          | CommandLine=/-ex(ec(ution)?(policy)?)?\s+bypass|-nop(rofile)?|-w(in(dowstyle)?)?\s+hidden/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the endpoint management or patching agent"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - command_line
+
+      - id: encoded-powershell-egress
+        name: Encoded PowerShell process reaching an external address
+        purpose: >-
+          Confirm that an encoded invocation acted on the network, which upgrades an
+          obfuscated command line into an observed retrieval or beaconing attempt.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | FileName=/^(powershell|pwsh)\.exe$/i
+                | CommandLine=/\s-e(nc(odedcommand)?)?\s+[A-Za-z0-9+\/=]{40,}/i
+                | encoded_pid := TargetProcessId ;
+              #event_simpleName=NetworkConnectIP4
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/ ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([CommandLine, ParentBaseFileName, RemoteAddressIP4, RemotePort]),
+                              count(as=events)])
+          | encoded_pid = ContextProcessId
+        filters:
+          include: []
+          exclude:
+            - "RemoteAddressIP4 within the approved software-distribution ranges"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: encoded_command
+      name: Base64-encoded PowerShell script block
+      description: >-
+        The PowerShell command line supplies a script block through -EncodedCommand or an
+        accepted abbreviation, so the executed instructions are not readable from the
+        command line itself.
+      source: process_creation
+      field: CommandLine
+      indicates: command_obfuscation
+
+  supporting:
+    - id: stager_sized_payload
+      name: Encoded block long enough to carry a stager
+      description: >-
+        The encoded argument is substantially longer than the short helper snippets that
+        automation platforms emit, which is consistent with an embedded loader or
+        download cradle rather than a single cmdlet.
+      source: process_creation
+      field: CommandLine
+      indicates: embedded_payload
+    - id: policy_suppression
+      name: Execution policy or profile suppression
+      description: >-
+        The same invocation disables the execution policy, skips the user profile or
+        hides the window, showing an intent to run without interference or visibility.
+      source: process_creation
+      field: CommandLine
+      indicates: defensive_control_avoidance
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        PowerShell was launched by an Office application, archive utility, mail client,
+        browser or script host rather than by an automation agent, an administrator shell
+        or the task scheduler.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: external_egress
+      name: Outbound connection from the encoded process
+      description: >-
+        The PowerShell process that carried the encoded block connected to a routable
+        external address, consistent with payload retrieval or command and control.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: possible_payload_retrieval
+    - id: rare_encoded_blob
+      name: Encoded block unique to a single host
+      description: >-
+        The identical encoded string was seen on one or very few hosts during the
+        baseline window, whereas automation reuses the same block across the estate.
+      source: baseline
+      field: CommandLine
+      indicates: non_standard_automation
+
+  contradicting:
+    - id: automation_agent_parent
+      name: Configuration-management agent as parent
+      description: >-
+        The encoded invocation was spawned by the approved configuration-management,
+        patching or monitoring agent, which encodes script blocks as a matter of design.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: estate_wide_identical_blob
+      name: Identical encoded block across many hosts
+      description: >-
+        The same encoded string appears broadly across the estate on a regular cadence,
+        which is the footprint of a deployed job rather than a targeted execution.
+      source: baseline
+      field: ComputerName
+      indicates: scheduled_automation_job
+    - id: approved_admin_session
+      name: Interactive administrator session
+      description: >-
+        The invocation belongs to an interactive session by a named administrator with a
+        corresponding change record, launched from an administrative console host.
+      source: change_management
+      field: UserName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - encoded_command
+
+    supporting:
+      any:
+        - stager_sized_payload
+        - policy_suppression
+        - delivery_parent
+        - external_egress
+        - rare_encoded_blob
+      all:
+        - delivery_parent
+        - external_egress
+
+    contradicting:
+      any:
+        - automation_agent_parent
+        - estate_wide_identical_blob
+        - approved_admin_session
+      all: []
+
+  verdict:
+    low_risk_when:
+      - encoded_command
+      - automation_agent_parent
+      - estate_wide_identical_blob
+      - approved_admin_session
+    suspicious_when:
+      - encoded_command
+      - stager_sized_payload
+      - rare_encoded_blob
+    high_risk_when:
+      - encoded_command
+      - stager_sized_payload
+      - policy_suppression
+      - delivery_parent
+      - external_egress
+
+  false_positive:
+    - condition: A configuration-management platform runs encoded script blocks on every managed host.
+      explanation: >-
+        Encoding is the standard way these platforms pass multi-line script through an
+        agent without quoting problems. The blocks are long, frequent and often paired
+        with -NoProfile, so they reproduce most of the supporting evidence; the parent
+        process and the estate-wide repetition are what separate them.
+    - condition: A scheduled task created by an administrator carries an encoded command.
+      explanation: >-
+        Administrators encode task actions to avoid escaping issues in the task
+        definition. These run from taskeng or svchost on a fixed schedule and the encoded
+        string is stable over time rather than unique per execution.
+    - condition: An installer executes an encoded post-installation step.
+      explanation: >-
+        Vendor packages sometimes embed a post-install configuration step as an encoded
+        block. This appears once per host during a rollout window and correlates with the
+        installer as the parent process.
+    - condition: A security team runs an encoded command during an authorised assessment.
+      explanation: >-
+        Red-team and validation activity deliberately reproduces adversary tradecraft and
+        will match the required and several supporting items. Only the engagement record
+        and the source host distinguish it.

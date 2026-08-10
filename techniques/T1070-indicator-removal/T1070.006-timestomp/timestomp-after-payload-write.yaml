@@ -1,0 +1,310 @@
+type: detection
+
+id: hg-win-timestomp-after-payload-write-t1070-006
+version: 1.0.0
+
+info:
+  name: File timestamps rewritten after a payload is written
+  description: >-
+    The first question in any host investigation is what changed recently, and
+    timestomping answers it wrongly. A file back-dated to match the operating system
+    around it drops out of every recently-modified listing an analyst builds, which is why
+    the technique is worth the adversary's effort even though it changes nothing about how
+    the payload runs. Normal software has almost no reason to rewrite creation times, so
+    the difficulty is not volume but visibility: unless the rewrite is looked for
+    explicitly it is never seen. The strongest form of the observation pairs the rewrite
+    with a write to the same path moments earlier.
+  severity: medium
+  author: huntgraph
+  tags:
+    - stealth
+    - anti-forensics
+    - indicator-removal
+    - timestomp
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1070/006
+    - https://attack.mitre.org/detectionstrategies/DET0591
+    - https://attack.mitre.org/techniques/T1070
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1070
+  sub_techniques:
+    - T1070.006
+  detection_strategies:
+    - DET0591
+  analytics:
+    - AN1626
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+  data_components:
+    - File Access
+
+hypothesis:
+  statement: >-
+    An adversary may rewrite the creation and modification timestamps of a payload they
+    have just dropped so that the file blends into the surrounding directory and does not
+    surface in the recently-modified listings that host triage and timeline analysis
+    depend on.
+  attacker_behavior:
+    - Sets CreationTime, LastWriteTime or LastAccessTime through PowerShell on a file just written.
+    - Copies timestamps from a system file onto the payload so the values look native to the directory.
+    - Calls SetFileTime through a compiled tool or a reflectively loaded assembly.
+    - Performs the rewrite within moments of the write, in the same session as the drop.
+  legitimate_behavior:
+    - Build systems set deterministic timestamps so that builds are reproducible.
+    - Backup and archive restores deliberately preserve original timestamps.
+    - Source-control and file-sync clients rewrite times when materialising files locally.
+    - Packaging and signing tooling normalises timestamps across an output directory.
+  risk_indicator:
+    - The rewrite targets a file in a user-writable or temporary directory rather than a build output.
+    - The new timestamp is back-dated rather than set to the current time.
+    - A write to the same path occurred shortly before the rewrite.
+    - The rewriting process is a script host rather than build or packaging tooling.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: timestamp-rewrite-command
+        name: Timestamp property assignment in a command line
+        purpose: >-
+          Surface the explicit rewrite constructs — property assignment on a FileInfo
+          object, SetFileTime, or a copy of another file's timestamps — that indicate
+          metadata is being altered rather than read.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(powershell|pwsh|cmd|wscript|cscript)\.exe$/i
+          | CommandLine=/\.(CreationTime|CreationTimeUtc|LastWriteTime|LastWriteTimeUtc|LastAccessTime|LastAccessTimeUtc)\s*=|SetFileTime|Set-ItemProperty\s+.*-Name\s+(CreationTime|LastWriteTime)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of build agents and packaging tooling"
+            - "ComputerName of dedicated build servers"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - parent_process
+            - command_line
+
+      - id: timestamp-copied-from-system-file
+        name: Timestamps copied from a system file onto another path
+        purpose: >-
+          Catch the specific pattern of sourcing timestamp values from a System32 file,
+          which serves no purpose other than making a dropped file look native to the
+          host.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/(CreationTime|LastWriteTime)\s*=\s*\(?\s*(Get-Item|\[System\.IO\.File\]::Get)/i
+          | CommandLine=/(System32|SysWOW64|\\Windows\\)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: write-then-timestomp-sequence
+        name: Payload written then timestamps rewritten on the same host
+        purpose: >-
+          Join the drop with the rewrite so that only timestamp changes following a fresh
+          executable or script write are returned, which is the anti-forensic sequence
+          rather than routine metadata handling.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten|NewScriptWritten|ProcessRollup2)$/
+          | case {
+              #event_simpleName=/^(PeFileWritten|NewExecutableWritten|NewScriptWritten)$/
+                | TargetFileName=/\\(AppData|Temp|ProgramData|Users|Public)\\/i
+                | dropped_file := TargetFileName ;
+              #event_simpleName=ProcessRollup2
+                | CommandLine=/\.(CreationTime|LastWriteTime|LastAccessTime)\s*=|SetFileTime/i
+                | stomp_command := CommandLine ;
+            }
+          | groupBy([ComputerName],
+                    function=[collect([dropped_file, stomp_command, UserName, ParentBaseFileName]),
+                              count(as=events)])
+          | dropped_file=/.+/ and stomp_command=/.+/
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of approved backup, sync or restore agents"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+
+evidence:
+  required:
+    - id: timestamp_rewrite
+      name: File timestamp rewrite invoked
+      description: >-
+        A command line assigns a creation, write or access timestamp on a file, or calls a
+        timestamp-setting API, which alters file metadata rather than reading it.
+      source: process_creation
+      field: CommandLine
+      indicates: metadata_tampering
+
+  supporting:
+    - id: recent_payload_write
+      name: Executable or script written shortly before the rewrite
+      description: >-
+        A PE or script file was created in a user-writable directory on the same host
+        shortly before the timestamp rewrite, giving the drop-then-conceal sequence.
+      source: file_creation
+      field: TargetFileName
+      indicates: anti_forensic_sequence
+    - id: system_file_source
+      name: Timestamps sourced from a Windows system file
+      description: >-
+        The values being applied are read from a file under the Windows directory, which
+        serves only to make the target look native to the host.
+      source: process_creation
+      field: CommandLine
+      indicates: deliberate_backdating
+    - id: script_host_actor
+      name: Script host performing the rewrite
+      description: >-
+        The rewrite was performed by PowerShell, cmd or a Windows script host rather than
+        by build, packaging or backup tooling that has a legitimate reason to normalise
+        timestamps.
+      source: process_creation
+      field: FileName
+      indicates: non_standard_automation
+    - id: rare_for_host
+      name: Rewrite unprecedented on this host
+      description: >-
+        No timestamp rewrite has been observed for this host or user during the baseline
+        window, which is the normal state for anything that is not a build machine.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: build_or_packaging_context
+      name: Build or packaging tooling
+      description: >-
+        The rewrite is performed by a build, packaging or signing pipeline that normalises
+        timestamps to produce reproducible output.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: backup_or_sync_agent
+      name: Backup, restore or file-sync agent
+      description: >-
+        The process performing the rewrite is an approved backup, restore or file-sync
+        client, which preserves original timestamps by design when materialising files.
+      source: process_creation
+      field: FileName
+      indicates: legitimate_application_component
+    - id: designated_build_host
+      name: Dedicated build server
+      description: >-
+        The host is a registered build or packaging server where timestamp normalisation
+        is expected and continuous.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - timestamp_rewrite
+
+    supporting:
+      any:
+        - recent_payload_write
+        - system_file_source
+        - script_host_actor
+        - rare_for_host
+      all:
+        - recent_payload_write
+        - script_host_actor
+
+    contradicting:
+      any:
+        - build_or_packaging_context
+        - backup_or_sync_agent
+        - designated_build_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - timestamp_rewrite
+      - build_or_packaging_context
+      - backup_or_sync_agent
+      - designated_build_host
+    suspicious_when:
+      - timestamp_rewrite
+      - script_host_actor
+    high_risk_when:
+      - timestamp_rewrite
+      - script_host_actor
+      - recent_payload_write
+      - system_file_source
+
+  false_positive:
+    - condition: A build pipeline sets deterministic timestamps across its output directory.
+      explanation: >-
+        Reproducible builds require normalised timestamps, so build hosts generate this
+        activity continuously and at volume. The host role and the parent tooling are the
+        discriminators, not the command line itself.
+    - condition: A backup or archive restore preserves the original timestamps of restored files.
+      explanation: >-
+        Restoring metadata alongside content is correct behaviour for backup software, and
+        it can coincide with fresh file writes, reproducing the sequence evidence. The
+        acting process is an approved agent rather than a script host.
+    - condition: A file-sync client materialises cloud files and applies their stored timestamps.
+      explanation: >-
+        Sync clients rewrite times whenever they hydrate a placeholder file. This recurs
+        constantly for the same user and process rather than appearing once beside a
+        dropped executable.
+    - condition: An administrator corrects timestamps after a migration.
+      explanation: >-
+        Migration cleanup occasionally involves bulk timestamp correction through
+        PowerShell. It is interactive, affects many files at once, and normally has a
+        change record attached.

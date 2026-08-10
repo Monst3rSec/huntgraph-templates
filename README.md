@@ -1,120 +1,179 @@
 # huntgraph-templates
 
-Hypothesis templates for [HuntGraph](https://github.com/Monst3rSec/HuntGraph).
+Agentic threat-hunting **detection knowledge**, expressed as YAML, derived from MITRE
+ATT&CK Enterprise.
 
-A template is not a detection rule. A rule fires the same query in every environment
-and hands you the false positives. A HuntGraph template describes a **hypothesis** —
-why an adversary would produce a signal — plus the queries needed to learn what normal
-looks like *here* before hunting for the abnormal.
+A file here is not an alert rule. A rule fires the same query everywhere and hands you
+the false positives. These files answer a different question:
 
-HuntGraph clones this repo on startup and pulls on every subsequent run.
+> What evidence should an agent collect to decide whether an observed behaviour
+> represents meaningful security risk?
+
+The chain every file follows:
+
+```
+MITRE TTP -> attacker behaviour -> hunting hypothesis -> observable telemetry
+          -> query -> evidence -> risk logic -> verdict
+```
+
+**One file = one hypothesis.** A single sub-technique usually produces several files.
+A file that tries to cover every behaviour of a technique cannot produce an explainable
+verdict, which is the entire point of the format.
 
 ## Layout
 
+The MITRE technique and sub-technique are carried by the directory, not by the filename.
+The filename is the behaviour.
+
 ```
-credential-access/    TA0006 — getting hold of secrets
-defense-evasion/      TA0005 — avoiding or blinding controls
-stealth/              masquerading, anti-forensics, covert channels
+techniques/
+└── T1218-system-binary-proxy-execution/
+    └── T1218.011-rundll32/
+        ├── rundll32-user-writable-dll.yaml
+        └── rundll32-script-protocol-handler.yaml
 ```
 
-## Template anatomy
+Stable ids: `hg-<platform>-<behaviour>-<mitre-id>`, e.g.
+`hg-win-rundll32-user-writable-dll-t1218-011`. The id must survive rewrites of the
+description and the query — only a change of hypothesis justifies a new id.
 
-Two sections make a template adaptive rather than static:
+## Authority
 
-**`baseline:`** — queries run *before* the hunt, to learn the environment. Their results
-feed the declared `signals`, and never become findings themselves.
+MITRE facts are never written from memory. They are read from the Enterprise ATT&CK
+STIX bundle by `tools/attack_extract.py`, which is the only sanctioned source for
+technique ids, tactics, platforms, detection strategies, analytics, log sources, data
+components and procedure examples.
 
-**`hunt.tunable:`** — the only keys the agent may rewrite when adapting the hunt to an
-environment. Everything else, including the detection logic, is immutable at runtime.
-This boundary is the safety property of the whole system: an agent that could rewrite
-the query body could quietly delete the part that catches the attacker.
+```bash
+python3 tools/attack_extract.py T1218.011              # everything MITRE says
+python3 tools/attack_extract.py --tactic stealth --list # enumerate a tactic
+```
+
+Current bundle: **Enterprise ATT&CK v19.2**. Note that v19 renamed Defense Evasion to
+**Stealth (TA0005)** and split out **Defense Impairment (TA0112)**; v19 also replaced the
+old data-source model with `Detection Strategy (DETxxxx) -> Analytic (ANxxxx) -> log
+source -> data component (DCxxxx)`, which is the chain `mitre:` records.
+
+## File anatomy
+
+Top-level keys, in this order, and no others:
 
 ```yaml
-id: hg-win-lsass-memory-access          # lowercase kebab-case, globally unique
-info:
-  name: Unusual process opening LSASS memory
-  severity: critical                     # info | low | medium | high | critical
-  tags: [credential-access, lsass, windows]
-  mitre:
-    tactics: [TA0006]                    # TA0001 form
-    techniques: [T1003.001]              # T1234 or T1234.001 form
-
-hypothesis: |
-  Why an adversary produces this signal, and why the naive version of the
-  detection fails. This grounds the agent's reasoning — write it for a human.
-
-requires:
-  platforms: [windows]
-  data_sources: [process_access]
-  connectors: [crowdstrike-ngsiem]       # must include hunt.connector
-
-baseline:
-  window: 30d
-  queries:
-    - id: lsass_accessors
-      description: Which processes open LSASS here, and how often.
-      query: |
-        ...
-  signals: [value_distribution, per_host_frequency, first_seen]
-
-hunt:
-  connector: crowdstrike-ngsiem
-  window: 7d
-  max_results: 2000
-  query: |
-    ...
-    {{tuning_filters}}                   # required if `tunable` is non-empty
-  tunable:
-    exclude_source_images: []
-    min_rarity: 0.01
-
-triage:
-  fields: [ComputerName, UserName, SourceImageFileName]
-  escalate_when: |
-    Natural-language criteria, evaluated against the baseline.
-  false_positive_hints:
-    - What benign activity looks like this, and why.
-
-output:
-  finding_title: Unusual process opened LSASS memory on {{ComputerName}}
+type: detection          # constant
+id:                      # hg-<platform>-<behaviour>-<mitre-id>
+version:                 # semver, bumped on meaningful change
+info:                    # name, description, severity, author, tags, references
+mitre:                   # tactics, techniques, sub_techniques, detection_strategies,
+                         # analytics, platforms, data_sources, data_components
+hypothesis:              # statement, attacker_behavior, legitimate_behavior, risk_indicator
+requires:                # platforms, connectors, logs[{source, event_types, fields}]
+query:                   # [{platform: crowdstrike, language: cql, cases: [...]}]
+evidence:                # required, supporting, contradicting,
+                         # risk_logic, verdict, false_positive
 ```
 
-### Available baseline signals
+Three sections carry the weight:
 
-`rare_command_lines`, `per_host_frequency`, `parent_process_distribution`,
-`first_seen`, `last_seen`, `field_cardinality`, `value_distribution`,
-`peer_comparison`.
+**`hypothesis:`** — one specific attacker behaviour, not a restatement of the MITRE
+description, and always paired with the legitimate behaviour that produces similar
+telemetry. If you cannot name the legitimate twin, the hypothesis is not finished.
 
-Declaring a signal outside this set is a load-time error — a template must never
-silently depend on analysis that will not happen.
+**`evidence:`** — split into `required` (establishes the behaviour), `supporting`
+(raises confidence) and `contradicting` (indicates benign activity). Every item says
+what it `indicates:`, because the agent reasons over that field, not over the prose.
+
+**`risk_logic:` / `verdict:`** — a query hit is never a verdict. Risk is a combination:
+
+```
+encoded command                                        -> interesting
+encoded command + unusual parent                       -> suspicious
+encoded command + unusual parent + network activity    -> high risk
+```
+
+### Query platforms
+
+The schema is multi-platform by construction, but only CrowdStrike is implemented:
+
+```yaml
+query:
+  - platform: crowdstrike
+    language: cql
+```
+
+`microsoft-kql`, `splunk-spl`, `elastic-eql`, `sentinel` and `chronicle` are reserved
+and deliberately not generated. The validator rejects foreign dialects leaking into a
+CQL block.
+
+## Validating
+
+```bash
+pip install -r tools/requirements.txt
+python3 tools/validate.py            # whole repo
+python3 tools/validate.py --strict   # warnings fail too
+python3 tools/test_validator.py      # prove the validator still catches defects
+```
+
+Five layers run per file. L1 short-circuits; the rest all run so one pass reports
+everything wrong with a template.
+
+| Layer | Checks |
+|---|---|
+| **L1 structure** | parses; conforms to `schema/detection.schema.json`; unknown keys are errors |
+| **L2 mitre** | every ATT&CK id exists, and the relationships the file asserts are the ones MITRE publishes — technique↔tactic, sub↔parent, DET↔technique, AN↔DET, platform↔technique, DC↔analytic; the technique URL is cited |
+| **L3 evidence** | evidence ids unique; `risk_logic` and `verdict` reference only real ids; `risk_logic.required` equals `evidence.required`; escalation tiers include the required evidence and never cite contradicting evidence; every evidence field is declared in `requires.logs` |
+| **L4 query** | CrowdStrike CQL only; no SPL/KQL/EQL/SQL/Sigma; the event stream is constrained; queries use the declared event types; baselines are complete when required |
+| **L5 convention** | directory encodes the technique; id ends with its most specific MITRE id; kebab-case filenames; ids unique across the corpus |
+
+`tools/test_validator.py` injects 24 known defects into a good file and asserts the
+right layer catches each one. A validator nobody tests is indistinguishable from no
+validator.
+
+## The iteration loop
+
+The format is validated tactic by tactic, in batches, so that defects are found while
+the corpus is small enough to fix cheaply.
+
+Each iteration:
+
+1. **Enumerate** the tactic with `attack_extract.py --tactic <name> --list`.
+2. **Select** a batch of techniques with genuinely distinct telemetry. Skip techniques
+   where no observable evidence exists — a forced detection is worse than none.
+3. **Extract** ground truth per technique. Nothing enters a YAML that is not in that
+   output or in the cited references.
+4. **Author** one file per hypothesis.
+5. **Validate** with `validate.py --strict` and `test_validator.py`.
+6. **Amend the contract** when a batch exposes a gap — a missing check, an over-strict
+   pattern, a schema field that does not carry its weight — then re-run the whole corpus
+   against the amended contract before starting the next batch.
+
+Step 6 is the loop. The schema and the validator are expected to change between
+iterations; the corpus is re-validated in full each time so drift cannot accumulate.
+
+### Status
+
+| Iteration | Tactic | Scope | State |
+|---|---|---|---|
+| 1 | Stealth (TA0005) | batch S1 — 6 sub-techniques, 8 hypotheses | complete, 8/8 valid |
+| 2 | Stealth (TA0005) | batches S2+ — remaining 142 techniques | not started |
+| 3 | Defense Impairment (TA0112) | full tactic | not started |
+| 4 | Credential Access (TA0006) | full tactic | not started |
+
+Batch S1 covers T1218.011, T1027.010, T1036.005, T1574.001, T1564.003 and T1070.006 —
+chosen to exercise process, file, network and correlation telemetry rather than to cover
+the tactic.
 
 ## Contributing
 
-Validate before opening a PR:
-
-```bash
-huntgraph template validate --path .
-```
-
-Rules the loader enforces, and why:
-
-- **Unknown fields are rejected.** A typo should fail loudly, not silently disable a hunt.
-- **`tunable` requires a `{{tuning_filters}}` placeholder** (and vice versa). Otherwise
-  tuning appears to succeed while changing nothing.
-- **`hunt.connector` must appear in `requires.connectors`.** Catches a template
-  retargeted at a new backend with stale requirements.
-- **Windows are `<number><unit>`** — `m`, `h`, `d`, `w`. No bare numbers.
-
-Content guidance:
-
-- Write `hypothesis` for a human analyst. If it only restates the query, it is not
+- Write the hypothesis for a human analyst. If it only restates the query, it is not
   pulling its weight.
-- Put real environmental exceptions in `false_positive_hints`. This is what stops the
-  agent from re-discovering the same benign pattern in every environment.
-- Prefer behaviour over indicators. Tool names and hashes age out in weeks; the reason
-  the behaviour is necessary to the adversary does not.
-- `baseline` is optional, but a template without one cannot be tuned to an environment
-  and will behave like a static rule.
+- Prefer behaviour over indicators. `FileName = powershell.exe` is not a hunt; process
+  plus parent plus command line plus path plus network activity is.
+- Put real environmental exceptions in `false_positive:`. This is what stops an agent
+  from rediscovering the same benign pattern in every environment.
+- Do not invent event types or fields. If CrowdStrike telemetry for a behaviour is
+  uncertain, build the hypothesis on telemetry that is certain.
+- Cases within a `query:` block must be meaningfully different hunts, not spelling
+  variants of one another.
 
 ## Licence
 

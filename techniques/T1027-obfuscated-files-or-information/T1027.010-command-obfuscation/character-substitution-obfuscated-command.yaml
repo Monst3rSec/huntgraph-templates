@@ -1,0 +1,300 @@
+type: detection
+
+id: hg-win-character-substitution-obfuscated-command-t1027-010
+version: 1.0.0
+
+info:
+  name: Command line obfuscated by character substitution and concatenation
+  description: >-
+    Where base64 encoding hides a command wholesale, syntactic obfuscation leaves it in
+    plain sight but unreadable to literal matching: carets inside cmd.exe tokens, string
+    concatenation and format operators in PowerShell, environment-variable substring
+    expansion, and backtick escapes. The command still executes correctly, which is
+    precisely the point — the interpreter reassembles it while a signature or an analyst
+    skimming the line does not. Density is the discriminator, because a single caret or
+    one concatenation is ordinary, whereas a line carrying many of them at once is being
+    deliberately mangled.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - obfuscation
+    - command-line
+    - cmd
+    - powershell
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1027/010
+    - https://attack.mitre.org/detectionstrategies/DET0505
+    - https://attack.mitre.org/techniques/T1059/003
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1027
+  sub_techniques:
+    - T1027.010
+  detection_strategies:
+    - DET0505
+  analytics:
+    - AN1394
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may fragment a command with escape characters, string concatenation,
+    format operators or environment-variable substring expansion so that the interpreter
+    reconstructs the intended command at runtime while static inspection and keyword
+    matching see only disassembled tokens.
+  attacker_behavior:
+    - Inserts carets inside cmd.exe keywords so that `p^o^w^e^r^s^h^e^l^l` still resolves.
+    - Builds cmdlet or path strings in PowerShell through concatenation, -join or the -f format operator.
+    - Uses environment-variable substring expansion such as %COMSPEC:~0,1% to assemble characters indirectly.
+    - Wraps the reassembled string in Invoke-Expression, IEX or a call operator to execute it.
+  legitimate_behavior:
+    - Batch scripts escape special characters such as ampersands and pipes with carets by necessity.
+    - Build and packaging systems generate long generated command lines containing quoting and concatenation.
+    - Installers pass paths that legitimately contain environment-variable expansion.
+    - Developers use PowerShell format operators and string joining in routine scripting.
+  risk_indicator:
+    - Several distinct obfuscation constructs appear in one command line rather than a single escape.
+    - The reassembled string is passed straight into Invoke-Expression or a call operator.
+    - The parent process is a document handler, archive tool or mail client.
+    - The command line is far longer than the host's normal distribution for that interpreter.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: caret-escaped-cmd-tokens
+        name: Caret-escaped tokens inside a cmd.exe command line
+        purpose: >-
+          Find cmd.exe invocations carrying repeated carets in positions where no escaping
+          is required, which is character-level obfuscation rather than ordinary quoting.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^cmd\.exe$/i
+          | CommandLine=/\w\^\w/
+          | caret_count := length(CommandLine) - length(replace("\\^", with="", field=CommandLine))
+          | caret_count >= 4
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), max(caret_count, as=max_carets),
+                              collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of build agents that emit generated batch command lines"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - command_line
+
+      - id: powershell-string-reassembly
+        name: PowerShell command reassembled and passed to Invoke-Expression
+        purpose: >-
+          Catch the reassembly-then-execute pattern, where a string is built with
+          concatenation, joining or the format operator and then handed to IEX or a call
+          operator.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/(\'\s*\+\s*\'|-join\s|-f\s+["']|\[char\]\s*\d+|\[string\]::join)/i
+          | CommandLine=/(iex|invoke-expression|\&\s*\(|\.invoke\s*\()/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude:
+            - "Developer workstations enumerated as expected scripting hosts"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: environment-variable-substring
+        name: Environment-variable substring expansion used to assemble characters
+        purpose: >-
+          Identify indirect character assembly through substring expansion, a construct
+          with almost no legitimate use outside deliberately obscured batch content.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(cmd|powershell|pwsh)\.exe$/i
+          | CommandLine=/%[A-Za-z_]+:~\s*-?\d+\s*,\s*-?\d+%/
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - command_line
+
+evidence:
+  required:
+    - id: syntactic_obfuscation
+      name: Obfuscation construct present in the command line
+      description: >-
+        The command line contains caret escaping inside tokens, string concatenation or
+        format operators, character casting, or environment-variable substring expansion
+        used to assemble text that the interpreter resolves at runtime.
+      source: process_creation
+      field: CommandLine
+      indicates: command_obfuscation
+
+  supporting:
+    - id: obfuscation_density
+      name: Multiple obfuscation constructs in one command line
+      description: >-
+        Several escape or reassembly constructs appear together, which distinguishes
+        deliberate mangling from the single caret or quote that ordinary batch scripting
+        requires.
+      source: process_creation
+      field: CommandLine
+      indicates: deliberate_evasion
+    - id: reassembled_execution
+      name: Reassembled string executed directly
+      description: >-
+        The assembled string is passed into Invoke-Expression, IEX, a call operator or an
+        Invoke method, so the obfuscated text is executed rather than merely printed or
+        stored.
+      source: process_creation
+      field: CommandLine
+      indicates: dynamic_code_execution
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        The interpreter was launched by an Office application, archive utility, mail
+        client, browser or another script host rather than by an interactive shell or a
+        build agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: rare_command_shape
+      name: Command line unlike the host's normal distribution
+      description: >-
+        The command line is far longer or structurally unlike anything that interpreter
+        has run on this host during the baseline window.
+      source: baseline
+      field: CommandLine
+      indicates: non_standard_automation
+
+  contradicting:
+    - id: build_agent_context
+      name: Build or packaging agent as parent
+      description: >-
+        The command line was generated by a continuous-integration agent, packaging system
+        or installer, which routinely emit long machine-generated invocations with heavy
+        quoting.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: recurring_identical_command
+      name: Identical command recurring on a schedule
+      description: >-
+        The same command line repeats on a stable cadence across multiple hosts, which is
+        the shape of a deployed job rather than an interactive intrusion step.
+      source: baseline
+      field: CommandLine
+      indicates: scheduled_automation_job
+    - id: developer_workstation
+      name: Known developer or engineering workstation
+      description: >-
+        The host is an engineering workstation where scripting with format operators and
+        string joining is expected routine work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - syntactic_obfuscation
+
+    supporting:
+      any:
+        - obfuscation_density
+        - reassembled_execution
+        - delivery_parent
+        - rare_command_shape
+      all:
+        - obfuscation_density
+        - reassembled_execution
+
+    contradicting:
+      any:
+        - build_agent_context
+        - recurring_identical_command
+        - developer_workstation
+      all: []
+
+  verdict:
+    low_risk_when:
+      - syntactic_obfuscation
+      - build_agent_context
+      - recurring_identical_command
+      - developer_workstation
+    suspicious_when:
+      - syntactic_obfuscation
+      - obfuscation_density
+    high_risk_when:
+      - syntactic_obfuscation
+      - obfuscation_density
+      - reassembled_execution
+      - delivery_parent
+
+  false_positive:
+    - condition: A batch script escapes ampersands, pipes or redirection characters with carets.
+      explanation: >-
+        Caret escaping is mandatory in cmd.exe whenever a special character must be passed
+        literally, so legitimate scripts do produce carets. They appear next to the
+        characters being escaped rather than inside ordinary words, and rarely reach the
+        density threshold this hunt applies.
+    - condition: A continuous-integration job emits a long generated command line with concatenation.
+      explanation: >-
+        Build tooling assembles command lines programmatically and often quotes and joins
+        strings heavily. The parent process is a build agent and the same shape repeats on
+        every pipeline run.
+    - condition: An installer passes a path containing environment-variable expansion.
+      explanation: >-
+        Ordinary expansion such as %ProgramData% is routine; only substring expansion of
+        the form %VAR:~n,m%, used to pull individual characters, indicates assembly rather
+        than reference.
+    - condition: A PowerShell script uses the -f format operator for readable string building.
+      explanation: >-
+        Format operators are normal scripting practice. Without a reassembled string being
+        handed to Invoke-Expression or a call operator, the construct is formatting rather
+        than dynamic execution.

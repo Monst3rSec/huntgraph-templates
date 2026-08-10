@@ -1,0 +1,278 @@
+type: detection
+
+id: hg-win-rundll32-script-protocol-handler-t1218-011
+version: 1.0.0
+
+info:
+  name: Rundll32 executing script content through a protocol handler
+  description: >-
+    rundll32.exe can be coerced into running script code instead of a DLL export by
+    invoking mshtml's RunHTMLApplication with a `javascript:` or `vbscript:` argument.
+    Nothing is written to disk, no scripting engine appears in the process tree, and the
+    executing image is a signed Microsoft binary. Because no legitimate Windows component
+    or vendor installer invokes rundll32 this way, the pattern is far closer to a
+    high-confidence signal than the general LOLBin case, and it survives renaming of the
+    payload because the syntax itself is the artefact.
+  severity: critical
+  author: huntgraph
+  tags:
+    - stealth
+    - proxy-execution
+    - fileless
+    - rundll32
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1218/011
+    - https://attack.mitre.org/detectionstrategies/DET0475
+    - https://lolbas-project.github.io/lolbas/Binaries/Rundll32/
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1218
+  sub_techniques:
+    - T1218.011
+  detection_strategies:
+    - DET0475
+  analytics:
+    - AN1308
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may execute script code entirely in memory by passing a `javascript:` or
+    `vbscript:` protocol argument to rundll32.exe together with mshtml's
+    RunHTMLApplication entry point, avoiding both a payload file on disk and the
+    appearance of a scripting host in the process tree.
+  attacker_behavior:
+    - Invokes rundll32.exe with `javascript:"\..\mshtml,RunHTMLApplication "` followed by inline script.
+    - Uses GetObject with a `script:` or `scriptlet:` moniker to pull remote SCT content at runtime.
+    - Chains document.write or ActiveX object creation to bootstrap a larger stage in memory.
+    - Spawns the invocation from a document-handling parent after a phishing lure is opened.
+  legitimate_behavior:
+    - Security testing and red-team tooling reproduce the documented Poweliks syntax during authorised exercises.
+    - Detection engineers execute the pattern deliberately to validate telemetry coverage.
+    - Malware analysis sandboxes running on managed endpoints replay samples using this syntax.
+  risk_indicator:
+    - The command line combines rundll32.exe with a protocol scheme and RunHTMLApplication.
+    - A remote scriptlet URL appears inside the command line or a DNS lookup follows immediately.
+    - The parent process is a document, mail or browser application.
+    - The host is not a designated testing or analysis endpoint.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - DomainName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: protocol-handler-invocation
+        name: Rundll32 invoked with a script protocol and RunHTMLApplication
+        purpose: >-
+          Catch the mshtml RunHTMLApplication syntax in any spacing or casing variant,
+          which is the defining artefact of script execution through rundll32.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^rundll32\.exe$/i
+          | CommandLine=/(javascript|vbscript)\s*:/i
+          | CommandLine=/RunHTMLApplication|mshtml/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "ComputerName belonging to the designated malware-analysis or purple-team subnet"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: remote-scriptlet-moniker
+        name: Rundll32 pulling a remote scriptlet
+        purpose: >-
+          Isolate the subset that reaches out for remote script content through a
+          GetObject script moniker, which converts an in-memory execution into a staged
+          download.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^rundll32\.exe$/i
+          | CommandLine=/GetObject\s*\(\s*["']?script(let)?\s*:/i
+          | CommandLine=/(?<payload_url>https?\s*:?\s*(\[:\])?\/\/[^\s"']+)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, payload_url],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: rundll32-dns-followup
+        name: DNS lookup issued by a script-invoking rundll32 process
+        purpose: >-
+          Confirm that a protocol-handler invocation actually resolved an external name,
+          distinguishing a live retrieval attempt from an inert command line.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|DnsRequest)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | FileName=/^rundll32\.exe$/i
+                | CommandLine=/(javascript|vbscript)\s*:/i
+                | script_rundll_pid := TargetProcessId ;
+              #event_simpleName=DnsRequest ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([CommandLine, ParentBaseFileName, DomainName]),
+                              count(as=events)])
+          | script_rundll_pid = ContextProcessId
+        filters:
+          include: []
+          exclude:
+            - "DomainName on the approved corporate allowlist"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - domain
+            - host
+
+evidence:
+  required:
+    - id: script_protocol_invocation
+      name: Script protocol handler passed to rundll32
+      description: >-
+        The rundll32.exe command line contains a `javascript:` or `vbscript:` scheme
+        together with mshtml or RunHTMLApplication, which is the documented syntax for
+        executing script through the binary.
+      source: process_creation
+      field: CommandLine
+      indicates: fileless_script_execution
+
+  supporting:
+    - id: remote_scriptlet_url
+      name: Remote scriptlet URL in the command line
+      description: >-
+        A GetObject script moniker references an http or https URL, showing that the
+        in-memory stub is designed to fetch further code at runtime.
+      source: process_creation
+      field: CommandLine
+      indicates: possible_payload_retrieval
+    - id: delivery_parent
+      name: Document or mail application as parent
+      description: >-
+        rundll32.exe was spawned by an Office application, PDF reader, mail client,
+        browser or archive utility, which places the execution immediately after a
+        user-opened lure.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: outbound_resolution
+      name: DNS resolution from the invoking process
+      description: >-
+        The same rundll32.exe process issued a DNS query, confirming the script attempted
+        to reach an external host rather than failing inertly.
+      source: dns_request
+      field: DomainName
+      indicates: active_command_and_control_attempt
+
+  contradicting:
+    - id: sanctioned_test_host
+      name: Designated testing or analysis endpoint
+      description: >-
+        The host is a registered malware-analysis, detection-validation or purple-team
+        system where this syntax is executed deliberately.
+      source: asset_inventory
+      field: ComputerName
+      indicates: authorised_security_testing
+    - id: scheduled_validation_window
+      name: Execution inside an approved validation window
+      description: >-
+        The execution falls inside a change-managed detection-validation exercise with a
+        recorded start and end time and a named owner.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_security_testing
+
+  risk_logic:
+    required:
+      - script_protocol_invocation
+
+    supporting:
+      any:
+        - remote_scriptlet_url
+        - delivery_parent
+        - outbound_resolution
+      all:
+        - remote_scriptlet_url
+        - outbound_resolution
+
+    contradicting:
+      any:
+        - sanctioned_test_host
+        - scheduled_validation_window
+      all: []
+
+  verdict:
+    low_risk_when:
+      - script_protocol_invocation
+      - sanctioned_test_host
+      - scheduled_validation_window
+    suspicious_when:
+      - script_protocol_invocation
+      - delivery_parent
+    high_risk_when:
+      - script_protocol_invocation
+      - delivery_parent
+      - remote_scriptlet_url
+      - outbound_resolution
+
+  false_positive:
+    - condition: A detection engineer executes the published Poweliks syntax to validate coverage.
+      explanation: >-
+        Coverage testing reproduces the exact command line an adversary would use, so the
+        required evidence is indistinguishable. Only asset context — the host being a
+        known validation endpoint, or the run falling inside a recorded exercise —
+        separates the two.
+    - condition: A malware sandbox running on a managed endpoint detonates a sample using this syntax.
+      explanation: >-
+        Analysis hosts are frequently enrolled in the same EDR tenant as production. The
+        activity is real execution of real malware and will look identical; scoping it out
+        depends on the asset inventory rather than on any telemetry field.
+    - condition: A security awareness or training platform simulates a fileless execution chain.
+      explanation: >-
+        Simulation platforms deliberately emit LOLBin behaviour to exercise the response
+        process. These runs cluster tightly in time across a defined user population and
+        correlate with a scheduled campaign.

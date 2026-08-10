@@ -1,0 +1,332 @@
+type: detection
+
+id: hg-win-rundll32-user-writable-dll-t1218-011
+version: 1.0.0
+
+info:
+  name: Rundll32 loading a DLL from a user-writable directory
+  description: >-
+    rundll32.exe is a signed Microsoft binary that will load and execute an exported
+    function from any DLL it is handed. Adversaries use it so that the DLL — not the
+    process — carries the payload, keeping the visible process tree entirely
+    Microsoft-signed. The durable discriminator is not that rundll32 ran, but where the
+    DLL it was told to load lives: legitimate callers pass DLLs out of System32, SysWOW64
+    or a Program Files subtree, while dropped payloads sit in AppData, Temp, ProgramData
+    or a user profile directory that any unprivileged process can write to.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - proxy-execution
+    - lolbin
+    - rundll32
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1218/011
+    - https://attack.mitre.org/detectionstrategies/DET0475
+    - https://lolbas-project.github.io/lolbas/Binaries/Rundll32/
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1218
+  sub_techniques:
+    - T1218.011
+  detection_strategies:
+    - DET0475
+  analytics:
+    - AN1308
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may proxy execution of a malicious DLL through rundll32.exe by pointing
+    it at a payload staged in a user-writable directory, so that the executing image
+    remains a trusted, Microsoft-signed binary and the malicious code never appears as a
+    process of its own.
+  attacker_behavior:
+    - Drops a DLL into AppData, Temp, ProgramData or a user profile path and invokes rundll32.exe against it.
+    - Exports the payload entry point under an innocuous or ordinal name (for example `#1`) to frustrate command-line triage.
+    - Launches rundll32.exe from a delivery parent such as an Office application, browser, archive tool or script host.
+    - Follows execution with outbound network activity from the rundll32.exe process to stage or beacon.
+  legitimate_behavior:
+    - Installers and updaters invoke rundll32.exe against DLLs inside their own Program Files installation directory.
+    - Windows shell operations call rundll32.exe with System32 DLLs such as shell32.dll and printui.dll.
+    - Control Panel applets execute .cpl files through rundll32.exe via Control_RunDLL.
+    - Software deployment tooling may briefly stage vendor DLLs under ProgramData during an upgrade.
+  risk_indicator:
+    - The DLL path is user-writable rather than a system or Program Files location.
+    - The parent process has no business launching rundll32.exe.
+    - The same DLL path appears on very few hosts, or has never been seen before in the estate.
+    - The rundll32.exe process makes an external network connection shortly after start.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - ImageFileName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+        - SHA256HashData
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: dll-from-user-writable-path
+        name: Rundll32 pointed at a DLL under a user-writable directory
+        purpose: >-
+          Surface rundll32.exe executions whose command line references a DLL staged
+          outside the system and Program Files trees.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^rundll32\.exe$/i
+          | CommandLine=/(?<dllpath>[A-Za-z]:\\[^",]+\.(dll|cpl))/i
+          | dllpath=/\\(AppData|Temp|ProgramData|Users|Public|Downloads|Windows\\Temp)\\/i
+          | dllpath!=/\\Program Files( \(x86\))?\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, dllpath],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "dllpath matching an approved software-distribution staging path"
+            - "ParentBaseFileName of the endpoint management agent performing package installs"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - path
+            - command_line
+
+      - id: dll-write-then-rundll32-execute
+        name: DLL written and then executed by rundll32 from the same path
+        purpose: >-
+          Correlate a PE write into a user-writable directory with a subsequent
+          rundll32.exe execution referencing that path, which is the drop-then-proxy
+          sequence rather than an ordinary shell invocation.
+        query: |
+          #event_simpleName=/^(PeFileWritten|ProcessRollup2)$/
+          | case {
+              #event_simpleName=PeFileWritten
+                | TargetFileName=/\.dll$/i
+                | TargetFileName=/\\(AppData|Temp|ProgramData|Users|Public)\\/i
+                | dropped_dll := TargetFileName ;
+              #event_simpleName=ProcessRollup2
+                | FileName=/^rundll32\.exe$/i
+                | CommandLine=/(?<loaded_dll>[A-Za-z]:\\[^",]+\.dll)/i ;
+            }
+          | groupBy([ComputerName],
+                    function=[collect([dropped_dll, loaded_dll, ParentBaseFileName, UserName]),
+                              count(as=events)])
+          | loaded_dll=/.+/ and dropped_dll=/.+/
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId belonging to an approved installer or patching agent"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+
+      - id: rundll32-external-egress
+        name: Rundll32 making an external network connection
+        purpose: >-
+          Identify rundll32.exe processes that talk to a routable external address, which
+          separates payload retrieval and beaconing from local shell operations.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | FileName=/^rundll32\.exe$/i
+                | rundll_pid := TargetProcessId ;
+              #event_simpleName=NetworkConnectIP4
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/ ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([CommandLine, ParentBaseFileName, RemoteAddressIP4, RemotePort]),
+                              count(as=events)])
+          | rundll_pid = ContextProcessId
+        filters:
+          include: []
+          exclude:
+            - "RemoteAddressIP4 within vendor update or telemetry ranges confirmed by the platform team"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: rundll32_user_writable_dll
+      name: Rundll32 loading a DLL from a user-writable path
+      description: >-
+        The rundll32.exe command line references a DLL or CPL located under AppData,
+        Temp, ProgramData, Public or a user profile directory rather than a system or
+        Program Files path.
+      source: process_creation
+      field: CommandLine
+      indicates: proxy_execution_of_untrusted_module
+
+  supporting:
+    - id: suspicious_parent
+      name: Delivery-style parent process
+      description: >-
+        rundll32.exe was launched by an Office application, browser, archive utility,
+        mail client or script host rather than by explorer.exe, services.exe or an
+        installer.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: recent_dll_write
+      name: DLL written to the same path shortly before execution
+      description: >-
+        A PE file write created the DLL in the user-writable directory that rundll32.exe
+        subsequently loaded, showing a drop-then-execute sequence rather than an existing
+        component.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: external_egress
+      name: Outbound connection from rundll32
+      description: >-
+        The rundll32.exe process opened a connection to a routable external address,
+        consistent with second-stage retrieval or command and control.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: possible_payload_retrieval
+    - id: rare_dll_path
+      name: DLL path rare across the estate
+      description: >-
+        The loaded DLL path has been observed on a small number of hosts, or not at all,
+        during the baseline window, which is inconsistent with deployed software.
+      source: baseline
+      field: dllpath
+      indicates: unusual_module_in_environment
+
+  contradicting:
+    - id: vendor_install_path
+      name: DLL inside a vendor installation directory
+      description: >-
+        The loaded DLL resolves to a Program Files subtree or a documented vendor
+        staging directory used by an approved application.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_application_component
+    - id: managed_deployment_parent
+      name: Endpoint management agent as parent
+      description: >-
+        rundll32.exe was launched by the approved software-deployment or patching agent,
+        which routinely invokes it to register vendor components.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: fleetwide_rollout
+      name: Same DLL path appearing fleet-wide at once
+      description: >-
+        The DLL path appeared simultaneously across a large share of the estate within a
+        short window, which is the signature of a package rollout rather than an intrusion.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - rundll32_user_writable_dll
+
+    supporting:
+      any:
+        - suspicious_parent
+        - recent_dll_write
+        - external_egress
+        - rare_dll_path
+      all:
+        - suspicious_parent
+        - external_egress
+
+    contradicting:
+      any:
+        - vendor_install_path
+        - managed_deployment_parent
+        - fleetwide_rollout
+      all: []
+
+  verdict:
+    low_risk_when:
+      - rundll32_user_writable_dll
+      - vendor_install_path
+      - managed_deployment_parent
+      - fleetwide_rollout
+    suspicious_when:
+      - rundll32_user_writable_dll
+      - rare_dll_path
+    high_risk_when:
+      - rundll32_user_writable_dll
+      - suspicious_parent
+      - recent_dll_write
+      - external_egress
+
+  false_positive:
+    - condition: An application updater invokes rundll32.exe against a DLL it has just written under ProgramData.
+      explanation: >-
+        Several vendors stage components under ProgramData during an upgrade and register
+        them through rundll32.exe. The write and the execution are genuinely adjacent, so
+        the sequence evidence alone does not separate this from an intrusion — the parent
+        process and the rollout footprint do.
+    - condition: A Control Panel applet is opened by a user, producing rundll32.exe with a .cpl argument.
+      explanation: >-
+        Double-clicking a .cpl file causes explorer.exe to spawn rundll32.exe with
+        Control_RunDLL. This is expected interactive behaviour whenever the applet resides
+        in System32; only applets loaded from user-writable paths are of interest.
+    - condition: A developer or support engineer runs rundll32.exe manually against a DLL in their profile.
+      explanation: >-
+        Ad hoc troubleshooting and driver installation from a downloaded package produce
+        exactly the required evidence. Such activity is typically interactive, tied to a
+        single known user, and correlates with a change ticket.
+    - condition: Software distribution stages an MSI-extracted DLL under the user Temp directory.
+      explanation: >-
+        Installers frequently expand payloads into Temp before registering them. The
+        parent process is the installer service rather than a delivery application, and
+        the same path appears across many hosts in the same maintenance window.

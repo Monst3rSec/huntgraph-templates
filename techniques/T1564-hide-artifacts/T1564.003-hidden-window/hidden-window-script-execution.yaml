@@ -1,0 +1,308 @@
+type: detection
+
+id: hg-win-hidden-window-script-execution-t1564-003
+version: 1.0.0
+
+info:
+  name: Script interpreter launched with a hidden window
+  description: >-
+    A script that runs with no visible window produces no flicker, no taskbar entry and
+    nothing for the user at the keyboard to notice or close. Automation uses window
+    suppression for the same reason, so on its own the flag proves nothing. It becomes a
+    signal when the execution has a human in front of it: a hidden interpreter launched
+    by a document, an archive or a browser is hiding from the person who just opened the
+    file, whereas a hidden interpreter launched by the task scheduler is simply not
+    bothering an empty desktop.
+  severity: medium
+  author: huntgraph
+  tags:
+    - stealth
+    - hide-artifacts
+    - hidden-window
+    - script-host
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1564/003
+    - https://attack.mitre.org/detectionstrategies/DET0128
+    - https://attack.mitre.org/techniques/T1564
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1564
+  sub_techniques:
+    - T1564.003
+  detection_strategies:
+    - DET0128
+  analytics:
+    - AN0360
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may suppress the window of a script interpreter so that execution
+    triggered by a user action produces no visible evidence, allowing a payload to run,
+    persist or beacon while the user sees only the document or file they intended to open.
+  attacker_behavior:
+    - Passes -WindowStyle Hidden, -w h or an equivalent abbreviation to PowerShell.
+    - Uses wscript.exe with a hidden window object or cscript with output suppressed.
+    - Combines window suppression with profile skipping and execution-policy bypass.
+    - Launches the hidden interpreter from a document, archive or browser immediately after user interaction.
+  legitimate_behavior:
+    - Scheduled tasks and service-invoked scripts hide windows so that background work does not flash on screen.
+    - Logon scripts suppress their window to avoid disrupting the desktop during sign-in.
+    - Configuration management agents run hidden interpreters as their normal execution mode.
+    - Installer post-configuration steps hide script windows to keep the setup experience clean.
+  risk_indicator:
+    - The parent process implies a user action rather than a scheduled or service context.
+    - Window suppression is combined with execution-policy bypass or profile skipping.
+    - The hidden interpreter spawns a further process or connects outbound.
+    - The command line is new for that host and user during the baseline window.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: hidden-window-from-user-parent
+        name: Hidden script window launched from a user-facing application
+        purpose: >-
+          Restrict window suppression to executions whose parent implies a person at the
+          keyboard, where hiding the window conceals activity from that person rather than
+          from an empty desktop.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(powershell|pwsh|wscript|cscript|mshta)\.exe$/i
+          | CommandLine=/-w(in(dow)?(style)?)?\s+h(id(den)?)?\b|CreateObject\(["']WScript\.Shell["']\).*?,\s*0\s*,|WindowStyle\s*=\s*["']?Hidden/i
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|acrobat|acrord32|chrome|msedge|firefox|7zfm|winrar|explorer|onenote)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of a scripted kiosk or shared-desktop application"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - parent_process
+            - command_line
+
+      - id: hidden-window-with-policy-bypass
+        name: Hidden window combined with policy and profile suppression
+        purpose: >-
+          Isolate the flag stacking that indicates a caller wants the run to be invisible
+          and unrestricted at the same time, independent of which parent launched it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/-w(in(dow)?(style)?)?\s+h(id(den)?)?\b/i
+          | CommandLine=/-ex(ec(ution)?(policy)?)?\s+bypass|-nop(rofile)?|-noni(nteractive)?/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the configuration-management agent"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - command_line
+
+      - id: hidden-window-egress
+        name: Hidden interpreter connecting outbound
+        purpose: >-
+          Confirm that a hidden execution acted on the network, converting a concealment
+          flag into observed retrieval or beaconing behaviour.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | FileName=/^(powershell|pwsh|wscript|cscript|mshta)\.exe$/i
+                | CommandLine=/-w(in(dow)?(style)?)?\s+h(id(den)?)?\b/i
+                | hidden_pid := TargetProcessId ;
+              #event_simpleName=NetworkConnectIP4
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/ ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([CommandLine, ParentBaseFileName, RemoteAddressIP4, RemotePort]),
+                              count(as=events)])
+          | hidden_pid = ContextProcessId
+        filters:
+          include: []
+          exclude:
+            - "RemoteAddressIP4 within approved vendor update ranges"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: hidden_window_flag
+      name: Window suppression requested at launch
+      description: >-
+        The interpreter was started with a hidden window style or an equivalent shell
+        object argument, so its execution produces no visible window or taskbar presence.
+      source: process_creation
+      field: CommandLine
+      indicates: execution_concealment
+
+  supporting:
+    - id: interactive_parent
+      name: User-facing application as parent
+      description: >-
+        The hidden interpreter was launched by a document handler, archive tool, mail
+        client or browser, implying a user was present and the concealment was aimed at
+        that user.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: policy_suppression
+      name: Execution policy or profile suppression
+      description: >-
+        The same command line disables the execution policy, skips the profile or forces
+        non-interactive mode alongside hiding the window.
+      source: process_creation
+      field: CommandLine
+      indicates: defensive_control_avoidance
+    - id: external_egress
+      name: Outbound connection from the hidden process
+      description: >-
+        The hidden interpreter connected to a routable external address, showing that the
+        concealed execution had a network objective.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: possible_payload_retrieval
+    - id: new_for_host_and_user
+      name: Command line new for this host and user
+      description: >-
+        This hidden invocation has not been seen for the host or user during the baseline
+        window, unlike the recurring hidden jobs that automation produces.
+      source: baseline
+      field: CommandLine
+      indicates: non_standard_automation
+
+  contradicting:
+    - id: scheduler_or_service_parent
+      name: Scheduler or service context as parent
+      description: >-
+        The hidden interpreter was launched by the task scheduler, a service host or a
+        logon-script mechanism, where window suppression is the expected default and no
+        user is present to deceive.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: management_agent_parent
+      name: Configuration-management agent as parent
+      description: >-
+        The approved configuration-management or monitoring agent launched the
+        interpreter, and hidden execution is its documented operating mode.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: recurring_hidden_job
+      name: Recurring identical hidden invocation
+      description: >-
+        The same hidden command line recurs on a stable cadence across many hosts, which
+        is the shape of a deployed job rather than an opportunistic execution.
+      source: baseline
+      field: CommandLine
+      indicates: scheduled_automation_job
+
+  risk_logic:
+    required:
+      - hidden_window_flag
+
+    supporting:
+      any:
+        - interactive_parent
+        - policy_suppression
+        - external_egress
+        - new_for_host_and_user
+      all:
+        - interactive_parent
+        - external_egress
+
+    contradicting:
+      any:
+        - scheduler_or_service_parent
+        - management_agent_parent
+        - recurring_hidden_job
+      all: []
+
+  verdict:
+    low_risk_when:
+      - hidden_window_flag
+      - scheduler_or_service_parent
+      - management_agent_parent
+      - recurring_hidden_job
+    suspicious_when:
+      - hidden_window_flag
+      - interactive_parent
+    high_risk_when:
+      - hidden_window_flag
+      - interactive_parent
+      - policy_suppression
+      - external_egress
+
+  false_positive:
+    - condition: A scheduled task runs a PowerShell script with a hidden window.
+      explanation: >-
+        Hiding the window is the correct way to run background work without disturbing a
+        logged-on user, so the required evidence is present by design. The scheduler as
+        parent and the repeating cadence separate it from opportunistic execution.
+    - condition: A logon script suppresses its window during sign-in.
+      explanation: >-
+        Logon and startup scripts routinely hide their windows so the desktop is not
+        interrupted. These fire once per session for many users at similar times of day.
+    - condition: A configuration-management agent executes hidden interpreters continuously.
+      explanation: >-
+        Hidden execution is the normal operating mode for these agents and they often also
+        pass -NoProfile, reproducing the policy-suppression evidence as well. The parent
+        process is the reliable discriminator.
+    - condition: An application installer hides a post-configuration script window.
+      explanation: >-
+        Setup routines suppress script windows to keep the installation experience clean.
+        These occur once per host during a rollout and correlate with the installer as the
+        parent process.

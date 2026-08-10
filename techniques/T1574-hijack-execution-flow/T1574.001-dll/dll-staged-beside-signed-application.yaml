@@ -1,0 +1,320 @@
+type: detection
+
+id: hg-win-dll-staged-beside-signed-application-t1574-001
+version: 1.0.0
+
+info:
+  name: DLL staged beside a signed application in a user-writable directory
+  description: >-
+    Search-order hijacking works because Windows resolves an unqualified DLL name against
+    the directory of the loading executable before it consults the system paths. An
+    adversary who can write next to a signed application can therefore have that
+    application load their code, and every downstream artefact — the process name, the
+    signature, the parent — belongs to the legitimate program. The observable that
+    survives is the staging itself: a DLL appearing in a writable directory alongside a
+    copied signed executable, followed by that executable running from there rather than
+    from its installed location.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - execution
+    - dll-sideloading
+    - search-order-hijacking
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1574/001
+    - https://attack.mitre.org/detectionstrategies/DET0201
+    - https://attack.mitre.org/techniques/T1574
+
+mitre:
+  tactics:
+    - TA0005
+    - TA0002
+  techniques:
+    - T1574
+  sub_techniques:
+    - T1574.001
+  detection_strategies:
+    - DET0201
+  analytics:
+    - AN0577
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - File Creation
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may place a malicious DLL next to a copy of a legitimate signed
+    executable in a directory they control, so that Windows search order causes the
+    trusted program to load adversary code and all subsequent activity is attributed to a
+    signed vendor binary.
+  attacker_behavior:
+    - Copies a signed vendor executable out of Program Files into AppData, Temp, ProgramData or a user profile.
+    - Writes a DLL with the name the executable imports into that same directory.
+    - Launches the relocated executable so it resolves the DLL from its own directory first.
+    - Relies on the signed host process for subsequent network activity and persistence, keeping its own code off the process list.
+  legitimate_behavior:
+    - Portable applications are designed to run from a single directory carrying their own dependencies.
+    - Installers unpack an executable and its DLLs into a temporary directory before moving them into place.
+    - Development and test builds place a program next to freshly compiled libraries.
+    - Some vendor updaters run a copied helper executable from a cache directory alongside its libraries.
+  risk_indicator:
+    - A signed executable is running from a user-writable directory rather than its installed location.
+    - A DLL was written into that same directory shortly before the executable ran.
+    - The DLL and the executable were written by different processes, or by a delivery application.
+    - The directory and executable pairing is unique to one host rather than part of a deployment.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: dll-and-exe-staged-together
+        name: DLL and executable written into the same user-writable directory
+        purpose: >-
+          Find directories under user-writable paths that received both a PE executable
+          and a DLL, which is the staging arrangement a sideload requires.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+          | TargetFileName=/\\(AppData|Temp|ProgramData|Users|Public)\\/i
+          | TargetFileName!=/\\Program Files( \(x86\))?\\/i
+          | staged_dir := replace("\\\\[^\\\\]+$", with="", field=TargetFileName)
+          | file_kind := if(TargetFileName=/\.dll$/i, then="dll", else="exe")
+          | groupBy([ComputerName, staged_dir],
+                    function=[count(as=writes), collect([TargetFileName, file_kind, ContextProcessId]),
+                              count(file_kind, distinct=true, as=kinds)])
+          | kinds >= 2
+        filters:
+          include: []
+          exclude:
+            - "staged_dir under approved installer or updater cache directories"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: relocated-signed-executable
+        name: Known signed executable running outside its installed location
+        purpose: >-
+          Identify commonly abused sideload host executables running from a writable
+          directory instead of their vendor installation path.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/\\(AppData|Temp|ProgramData|Users|Public)\\/i
+          | ImageFileName!=/\\Program Files( \(x86\))?\\/i
+          | FileName=/^(onedrive|winword|excel|iexplore|msiexec|dbgcore|wermgr|explorer|chrome|firefox|teams|python|java|javaw|regsvr32|node)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ImageFileName under approved portable-application directories"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+            - process
+
+      - id: stage-then-launch-sequence
+        name: DLL written into a directory from which an executable then runs
+        purpose: >-
+          Join the write and the execution so that only directories where staging was
+          actually followed by a launch are returned, rather than every writable folder
+          containing a DLL.
+        query: |
+          #event_simpleName=/^(PeFileWritten|ProcessRollup2)$/
+          | case {
+              #event_simpleName=PeFileWritten
+                | TargetFileName=/\.dll$/i
+                | TargetFileName=/\\(AppData|Temp|ProgramData|Users|Public)\\/i
+                | staged_dir := replace("\\\\[^\\\\]+$", with="", field=TargetFileName)
+                | staged_dll := TargetFileName ;
+              #event_simpleName=ProcessRollup2
+                | ImageFileName=/\\(AppData|Temp|ProgramData|Users|Public)\\/i
+                | staged_dir := replace("\\\\[^\\\\]+$", with="", field=ImageFileName) ;
+            }
+          | groupBy([ComputerName, staged_dir],
+                    function=[collect([staged_dll, ImageFileName, ParentBaseFileName, UserName]),
+                              count(as=events)])
+          | staged_dll=/.+/ and ImageFileName=/.+/
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of the approved software-distribution agent"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+
+evidence:
+  required:
+    - id: dll_staged_with_executable
+      name: DLL and executable staged in the same writable directory
+      description: >-
+        A DLL and a PE executable were written into the same user-writable directory,
+        creating the adjacency that Windows search order resolves in favour of the local
+        DLL.
+      source: file_creation
+      field: TargetFileName
+      indicates: sideload_staging
+
+  supporting:
+    - id: relocated_signed_host
+      name: Signed application running from the staging directory
+      description: >-
+        A vendor executable that normally lives under Program Files is executing from the
+        writable staging directory, which is the condition under which the local DLL wins
+        the search order.
+      source: process_creation
+      field: ImageFileName
+      indicates: hijacked_execution_flow
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        The staged executable was launched by a document handler, archive utility, mail
+        client, browser or script host rather than by a shell or an installer.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: split_write_origin
+      name: DLL and executable written by different processes
+      description: >-
+        The DLL and the host executable were created by different writing processes,
+        which is inconsistent with a single installer unpacking a coherent package.
+      source: file_creation
+      field: ContextProcessId
+      indicates: assembled_rather_than_installed
+    - id: rare_staging_directory
+      name: Staging directory unique to one host
+      description: >-
+        The directory and executable pairing has not been seen elsewhere in the estate
+        during the baseline window, unlike a portable application deployed to many users.
+      source: baseline
+      field: TargetFileName
+      indicates: unusual_module_in_environment
+
+  contradicting:
+    - id: installer_unpack
+      name: Installer unpacking its own package
+      description: >-
+        Both files were written by an approved installer or updater process into its own
+        documented cache directory as part of a normal unpack step.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_enterprise_activity
+    - id: approved_portable_app
+      name: Sanctioned portable application directory
+      description: >-
+        The directory belongs to an approved portable application that is designed to run
+        with its dependencies alongside it.
+      source: asset_inventory
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: fleetwide_staging
+      name: Identical staging across many hosts
+      description: >-
+        The same directory, executable and DLL set appears across a large share of the
+        estate within one window, which is a package rollout rather than a targeted stage.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - dll_staged_with_executable
+
+    supporting:
+      any:
+        - relocated_signed_host
+        - delivery_parent
+        - split_write_origin
+        - rare_staging_directory
+      all:
+        - relocated_signed_host
+        - rare_staging_directory
+
+    contradicting:
+      any:
+        - installer_unpack
+        - approved_portable_app
+        - fleetwide_staging
+      all: []
+
+  verdict:
+    low_risk_when:
+      - dll_staged_with_executable
+      - installer_unpack
+      - approved_portable_app
+      - fleetwide_staging
+    suspicious_when:
+      - dll_staged_with_executable
+      - relocated_signed_host
+    high_risk_when:
+      - dll_staged_with_executable
+      - relocated_signed_host
+      - delivery_parent
+      - rare_staging_directory
+
+  false_positive:
+    - condition: An installer unpacks an executable and its libraries into a temporary directory before installing.
+      explanation: >-
+        Unpack-then-install is the normal shape of many setup routines, and it produces the
+        required evidence exactly. The writing process is the installer itself and the same
+        directory pattern recurs on every host that receives the package.
+    - condition: A sanctioned portable application runs from a user profile directory with its own DLLs.
+      explanation: >-
+        Portable tools are built to be self-contained, so a signed executable beside its
+        libraries in AppData is by design. These appear consistently for the same user over
+        time rather than as a one-off staging event.
+    - condition: A developer runs a freshly built binary next to its compiled dependencies.
+      explanation: >-
+        Build output directories contain exactly this arrangement. The activity is confined
+        to engineering hosts, runs under the developer's account, and the files are written
+        by a compiler or linker.
+    - condition: A vendor updater executes a helper from its own cache directory under ProgramData.
+      explanation: >-
+        Several updaters copy a helper executable and its libraries into a cache before
+        running them. The parent is the updater service and the directory is documented by
+        the vendor.
