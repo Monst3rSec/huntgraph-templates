@@ -1,0 +1,279 @@
+type: detection
+
+id: hg-win-as-rep-roastable-accounts-harvested-t1558-004
+version: 1.0.0
+
+info:
+  name: AS-REP roastable accounts enumerated and requested
+  description: >-
+    Accounts configured without Kerberos pre-authentication will hand out an encrypted
+    response to anyone who asks, and that response is crackable offline against the
+    account's password. No credential is needed to request it — only the account name —
+    which makes AS-REP roasting available to an unauthenticated attacker who can reach a
+    domain controller. The population of such accounts is usually small and stable, so the
+    hunt is really for someone looking for them: an LDAP query filtering on the
+    pre-authentication flag has essentially one purpose.
+  severity: high
+  author: huntgraph
+  tags:
+    - credential-access
+    - kerberos
+    - as-rep-roasting
+    - active-directory
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1558/004
+    - https://attack.mitre.org/detectionstrategies/DET0113
+    - https://attack.mitre.org/techniques/T1558
+
+mitre:
+  tactics:
+    - TA0006
+  techniques:
+    - T1558
+  sub_techniques:
+    - T1558.004
+  detection_strategies:
+    - DET0113
+  analytics:
+    - AN0316
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Active Directory Credential Request
+
+hypothesis:
+  statement: >-
+    An adversary may enumerate accounts that do not require Kerberos pre-authentication and
+    request their authentication responses, obtaining material that can be cracked offline
+    to recover passwords without holding any credential to begin with.
+  attacker_behavior:
+    - Queries the directory filtering on the do-not-require-preauthentication flag.
+    - Requests authentication responses for the accounts found and saves them.
+    - Uses tooling that automates both the enumeration and the request in one step.
+    - Runs the activity from a workstation, since no privilege is required.
+  legitimate_behavior:
+    - Directory administrators audit account flags during hygiene reviews.
+    - Identity governance tooling reports on weak account configuration.
+    - Security teams run roasting assessments deliberately.
+    - Migration tooling reads account attributes in bulk.
+  risk_indicator:
+    - A directory query filters specifically on the pre-authentication flag.
+    - Roasting tooling syntax appears in the command line.
+    - The activity originates from a workstation rather than an administration host.
+    - Output is written to a file for offline processing.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: preauth-flag-query
+        name: Directory queried for accounts without pre-authentication
+        purpose: >-
+          Surface the enumeration, which is the step that identifies roastable accounts and
+          has essentially one purpose outside a hygiene audit.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(DONT_REQ_PREAUTH|DONT_REQUIRE_PREAUTH|userAccountControl.*4194304|4194304.*userAccountControl|PreAuthNotRequired|DoesNotRequirePreAuth)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=queries), collect([CommandLine], limit=5)])
+          | sort(queries, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Identity governance tooling reporting on weak account configuration"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: roasting-tooling
+        name: AS-REP roasting tooling invoked
+        purpose: >-
+          Catch tooling that automates enumeration and request together, which is the
+          packaged form of the technique.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(asreproast|Invoke-ASREPRoast|GetNPUsers|Rubeus\s+.*asrep|asktgt\s+.*\/nopreauth)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: output-written-for-cracking
+        name: Roasting output written to a file
+        purpose: >-
+          Identify the collection step, where responses are saved for offline cracking
+          rather than discarded.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(asrep|krb5asrep|GetNPUsers|Rubeus)/i
+          | CommandLine=/(-outputfile|>\s*[A-Za-z]:\\|Out-File|-o\s+[^\s]+\.(txt|hash|json))/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: roastable_account_activity
+      name: Pre-authentication flag queried or roasting tooling invoked
+      description: >-
+        The directory was queried for accounts that do not require Kerberos
+        pre-authentication, or roasting tooling was run, which identifies and requests
+        crackable authentication material.
+      source: process_creation
+      field: CommandLine
+      indicates: credential_material_capture
+
+  supporting:
+    - id: roasting_tooling_used
+      name: Published roasting tooling invoked
+      description: >-
+        The command matches known roasting utilities rather than a directory audit cmdlet,
+        which automates the request as well as the enumeration.
+      source: process_creation
+      field: CommandLine
+      indicates: offline_cracking_attempt
+    - id: output_saved
+      name: Responses written to a file
+      description: >-
+        The authentication responses were saved rather than displayed, which is collection
+        for offline cracking.
+      source: process_creation
+      field: CommandLine
+      indicates: collection_staging
+    - id: workstation_origin
+      name: Activity from a workstation
+      description: >-
+        The host is an ordinary workstation rather than a directory administration system
+        where account audits are routine.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: rare_for_account
+      name: Unprecedented for this account
+      description: >-
+        This account has not queried pre-authentication flags or requested roastable
+        material during the baseline window.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: directory_admin_host
+      name: Directory administration or governance host
+      description: >-
+        The activity originates from a designated directory administration system or
+        identity governance product where auditing account flags is routine work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: governance_reporting
+      name: Identity governance reporting
+      description: >-
+        An approved governance product enumerates weak account configuration on a schedule
+        as part of its documented reporting.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: scheduled_automation_job
+    - id: recorded_assessment
+      name: Recorded security assessment
+      description: >-
+        An engagement record covers an authorised roasting assessment, naming the operator,
+        the source host and the window.
+      source: change_management
+      field: UserName
+      indicates: authorised_security_testing
+
+  risk_logic:
+    required:
+      - roastable_account_activity
+
+    supporting:
+      any:
+        - roasting_tooling_used
+        - output_saved
+        - workstation_origin
+        - rare_for_account
+      all:
+        - roasting_tooling_used
+        - output_saved
+
+    contradicting:
+      any:
+        - directory_admin_host
+        - governance_reporting
+        - recorded_assessment
+      all: []
+
+  verdict:
+    low_risk_when:
+      - roastable_account_activity
+      - directory_admin_host
+      - governance_reporting
+      - recorded_assessment
+    suspicious_when:
+      - roastable_account_activity
+      - workstation_origin
+    high_risk_when:
+      - roastable_account_activity
+      - roasting_tooling_used
+      - output_saved
+      - workstation_origin
+
+  false_positive:
+    - condition: A directory administrator audits accounts lacking pre-authentication.
+      explanation: >-
+        Finding these accounts is exactly what a hygiene review should do, and the query is
+        identical to the adversary's. The administration host and the account's history are
+        the discriminators.
+    - condition: Identity governance tooling reports on weak account configuration.
+      explanation: >-
+        Governance products enumerate this flag on a schedule as part of posture reporting.
+        They run from known systems with an unchanging query.
+    - condition: A security team runs a roasting assessment.
+      explanation: >-
+        Assessments reproduce the technique exactly, including the tooling and the saved
+        output. Only the engagement record separates them.
+    - condition: Migration tooling reads account attributes in bulk.
+      explanation: >-
+        Bulk attribute reads during a migration can include the flag among many others.
+        These run under a migration service account against the whole directory rather than
+        filtering for this attribute specifically.

@@ -1,0 +1,279 @@
+type: detection
+
+id: hg-win-directory-replication-requested-by-a-non-controller-t1003-006
+version: 1.0.0
+
+info:
+  name: Directory replication requested from a host that is not a domain controller
+  description: >-
+    DCSync does not break into a domain controller — it asks one, politely, using the
+    replication interface controllers use to synchronise with each other. An account
+    holding replication rights can therefore retrieve the hash of any principal in the
+    domain, including krbtgt, from an ordinary workstation, and the controller responds
+    because the request is legitimate by design. That is what makes the technique
+    dangerous and also what makes it tractable: replication should only ever be requested
+    by a domain controller, so the origin is the whole signal.
+  severity: critical
+  author: huntgraph
+  tags:
+    - credential-access
+    - dcsync
+    - active-directory
+    - domain-replication
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1003/006
+    - https://attack.mitre.org/detectionstrategies/DET0594
+    - https://attack.mitre.org/techniques/T1003
+
+mitre:
+  tactics:
+    - TA0006
+  techniques:
+    - T1003
+  sub_techniques:
+    - T1003.006
+  detection_strategies:
+    - DET0594
+  analytics:
+    - AN1632
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+  data_components:
+    - Active Directory Object Access
+    - Network Traffic Content
+
+hypothesis:
+  statement: >-
+    An adversary holding directory replication rights may request replication of secret
+    attributes from a domain controller, retrieving password hashes for any account in the
+    domain from an ordinary host without ever compromising a controller directly.
+  attacker_behavior:
+    - Invokes replication tooling such as lsadump::dcsync or a directory replication cmdlet.
+    - Requests the krbtgt account specifically so a golden ticket can be forged afterwards.
+    - Runs the request from a workstation or member server rather than a domain controller.
+    - Follows a successful pull with ticket forging or with authentication as recovered accounts.
+  legitimate_behavior:
+    - Domain controllers replicate with one another continuously.
+    - Directory synchronisation and identity federation products replicate by design.
+    - Migration tooling reads directory objects during a domain consolidation.
+    - Backup products protecting Active Directory read directory data.
+  risk_indicator:
+    - The requesting host is not a domain controller or a sanctioned synchronisation server.
+    - The tooling used is a known credential-manipulation utility rather than a directory product.
+    - The krbtgt account is among the targets.
+    - Ticket forging or unusual authentication follows shortly afterwards.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: replication-tooling-invoked
+        name: Directory replication tooling invoked on an endpoint
+        purpose: >-
+          Surface the endpoint-side artefact, since the replication request itself is
+          answered by the controller and looks legitimate to it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(lsadump::dcsync|dcsync\s+\/|Get-ADReplAccount|DSInternals|\/domain\s*:.*\/user\s*:|drsuapi)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: krbtgt-targeted
+        name: Replication request naming the krbtgt account
+        purpose: >-
+          Isolate requests for the account whose hash enables ticket forging, which has no
+          administrative purpose outside a deliberate key rotation.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/krbtgt/i
+          | CommandLine=/(dcsync|Get-ADReplAccount|DSInternals|replicat)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: replication-then-ticket-forging
+        name: Replication followed by ticket forging
+        purpose: >-
+          Join the credential pull to what it enables, which is the sequence that turns a
+          hash into durable domain-wide access.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(dcsync|Get-ADReplAccount|DSInternals)/i
+                | replication_request := CommandLine ;
+              CommandLine=/(kerberos::golden|kerberos::ptt|golden\s+\/|silver\s+\/|\.kirbi)/i
+                | ticket_forging := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([replication_request, ticket_forging, ParentBaseFileName]),
+                              count(as=events)])
+          | replication_request=/.+/ and ticket_forging=/.+/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: replication_requested
+      name: Directory replication requested from an endpoint
+      description: >-
+        Replication tooling was invoked on a host, requesting secret directory attributes
+        through the interface that domain controllers use to synchronise with each other.
+      source: process_creation
+      field: CommandLine
+      indicates: domain_credential_capture
+
+  supporting:
+    - id: krbtgt_requested
+      name: The krbtgt account was targeted
+      description: >-
+        The request names krbtgt, whose hash allows Kerberos tickets to be forged for any
+        principal, which is the highest-value outcome of this technique.
+      source: process_creation
+      field: CommandLine
+      indicates: high_impact_credential_theft
+    - id: ticket_forging_followed
+      name: Ticket forging followed the request
+      description: >-
+        Golden or silver ticket tooling was invoked after the replication request, turning
+        the recovered hash into durable domain-wide authentication.
+      source: process_creation
+      field: CommandLine
+      indicates: durable_privileged_access
+    - id: non_controller_origin
+      name: Request from a host that is not a domain controller
+      description: >-
+        The requesting host is a workstation or member server rather than a domain
+        controller or a sanctioned synchronisation product, and replication should only
+        originate from those.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: credential_tooling
+      name: Known credential-manipulation tooling used
+      description: >-
+        The invocation matches published credential-manipulation utilities rather than a
+        directory synchronisation or migration product.
+      source: process_creation
+      field: FileName
+      indicates: credential_material_capture
+
+  contradicting:
+    - id: domain_controller_host
+      name: Host is a domain controller
+      description: >-
+        The activity originates from a domain controller, where replication is the normal
+        mechanism by which the directory stays consistent.
+      source: asset_inventory
+      field: ComputerName
+      indicates: operating_system_behaviour
+    - id: synchronisation_product
+      name: Approved directory synchronisation product
+      description: >-
+        The request belongs to a sanctioned identity synchronisation, federation or
+        migration product that replicates directory data by design.
+      source: process_creation
+      field: FileName
+      indicates: legitimate_enterprise_activity
+    - id: recorded_krbtgt_rotation
+      name: Recorded krbtgt rotation or recovery exercise
+      description: >-
+        A change record covers a deliberate krbtgt key rotation or a directory recovery
+        exercise, naming the operator and the window.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - replication_requested
+
+    supporting:
+      any:
+        - krbtgt_requested
+        - ticket_forging_followed
+        - non_controller_origin
+        - credential_tooling
+      all:
+        - krbtgt_requested
+        - non_controller_origin
+
+    contradicting:
+      any:
+        - domain_controller_host
+        - synchronisation_product
+        - recorded_krbtgt_rotation
+      all: []
+
+  verdict:
+    low_risk_when:
+      - replication_requested
+      - domain_controller_host
+      - synchronisation_product
+      - recorded_krbtgt_rotation
+    suspicious_when:
+      - replication_requested
+      - non_controller_origin
+    high_risk_when:
+      - replication_requested
+      - krbtgt_requested
+      - ticket_forging_followed
+      - credential_tooling
+
+  false_positive:
+    - condition: Domain controllers replicate with one another.
+      explanation: >-
+        Replication between controllers is continuous and essential, which is exactly why
+        the origin rather than the request carries the signal. A controller replicating is
+        the system working correctly.
+    - condition: An identity synchronisation or federation product replicates directory data.
+      explanation: >-
+        Directory synchronisation products hold replication rights legitimately and use
+        them constantly. They run from designated servers under known service accounts.
+    - condition: Migration tooling reads directory objects during a consolidation.
+      explanation: >-
+        Domain migrations replicate account data deliberately, including secret attributes.
+        These are planned projects with change records and dedicated hosts.
+    - condition: An administrator rotates the krbtgt key.
+      explanation: >-
+        Key rotation is recommended practice after a suspected compromise and involves the
+        krbtgt account directly. It is a documented operation with an approved window.
