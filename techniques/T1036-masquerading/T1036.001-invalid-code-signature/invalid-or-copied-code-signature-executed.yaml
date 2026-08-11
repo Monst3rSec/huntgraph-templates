@@ -1,0 +1,301 @@
+type: detection
+
+id: hg-win-invalid-or-copied-code-signature-executed-t1036-001
+version: 1.0.0
+
+info:
+  name: Binary executed with an invalid or copied code signature
+  description: >-
+    A signature block copied from a legitimate binary does not validate, but it does make
+    the file look signed to anything that reads properties rather than verifying them — and
+    to a person glancing at a Details tab. The adversary gets the appearance of trust
+    without the private key. Genuine signature failures do occur, usually because a
+    certificate expired or a file was truncated in transit, so the observation only carries
+    weight alongside where the binary came from and what it does next.
+  severity: medium
+  author: huntgraph
+  tags:
+    - stealth
+    - masquerading
+    - code-signing
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1036/001
+    - https://attack.mitre.org/detectionstrategies/DET0031
+    - https://attack.mitre.org/techniques/T1036
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1036
+  sub_techniques:
+    - T1036.001
+  detection_strategies:
+    - DET0031
+  analytics:
+    - AN0089
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:PowerShell
+  data_components:
+    - Process Creation
+    - Command Execution
+    - File Metadata
+
+hypothesis:
+  statement: >-
+    An adversary may attach an invalid or copied signature block to a payload so that it
+    presents as signed software to reviewers and to controls that read signature properties
+    without verifying them, gaining apparent trust without possessing a signing key.
+  attacker_behavior:
+    - Copies a signature block from a legitimate binary onto a payload.
+    - Presents publisher details borrowed from a well-known vendor.
+    - Runs the binary from a user-writable directory where signed software does not live.
+    - Relies on reviewers reading the publisher field rather than verifying the signature.
+  legitimate_behavior:
+    - Certificates expire, so older signed software fails validation over time.
+    - Files truncated or altered in transit fail signature checks.
+    - Internally built tools are often unsigned or self-signed.
+    - Development builds are signed with test certificates that do not chain.
+  risk_indicator:
+    - The binary claims a well-known publisher while running from a user-writable path.
+    - Signature verification is queried by a script rather than by a management tool.
+    - The binary was written to the host shortly before it ran.
+    - The hash is unknown across the estate.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - SHA256HashData
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: vendor-named-binary-outside-install-path
+        name: Vendor-named binary running from a user-writable directory
+        purpose: >-
+          Surface binaries presenting as well-known software while executing from locations
+          that signed vendor software never occupies.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\/i
+          | ImageFileName!=/\\Program Files( \(x86\))?\\/i
+          | FileName=/^(chrome|msedge|firefox|acrord32|acrobat|teams|zoom|onedrive|dropbox|slack|winword|excel|vlc|7z|notepad\+\+)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, SHA256HashData],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved portable-application directories"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - process
+            - organization
+
+      - id: signature-verification-queried-by-script
+        name: Signature status queried from a script
+        purpose: >-
+          Catch an operator checking whether their own forgery passes, which is a distinct
+          behaviour from a management tool auditing signatures.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Get-AuthenticodeSignature|signtool(\.exe)?\s+verify|WinVerifyTrust)/i
+          | ParentBaseFileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|winword|excel|outlook|chrome|msedge)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=checks), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Software inventory and compliance tooling auditing signatures"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: vendor-named-binary-recently-written
+        name: Vendor-named executable written into a writable directory
+        purpose: >-
+          Catch the binary at delivery, where a file claiming a known publisher arrives
+          somewhere that publisher's installer would never place it.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+          | TargetFileName=/\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\/i
+          | TargetFileName=/\\(chrome|msedge|firefox|acrord32|teams|zoom|onedrive|dropbox|slack|vlc)\.exe$/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId, SHA256HashData],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+evidence:
+  required:
+    - id: signature_appearance_mismatch
+      name: Binary presenting as vendor software outside an installation path
+      description: >-
+        An executable named after well-known signed software is running from, or was
+        written into, a user-writable directory where that vendor's installer would never
+        place it.
+      source: process_creation
+      field: ImageFileName
+      indicates: apparent_trust_without_provenance
+
+  supporting:
+    - id: recently_written
+      name: Binary written shortly before execution
+      description: >-
+        The executable arrived on the host shortly before it ran, which is delivery rather
+        than an installed component that failed validation over time.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: signature_checked_by_script
+      name: Signature status queried from a script
+      description: >-
+        Signature verification was invoked from an interpreter or a document handler rather
+        than by inventory tooling, which is an operator checking their own forgery.
+      source: process_creation
+      field: CommandLine
+      indicates: deliberate_evasion
+    - id: unique_hash
+      name: Hash unknown across the estate
+      description: >-
+        The binary's hash appears on very few hosts, unlike genuine vendor software whose
+        hash is uniform wherever it is deployed.
+      source: baseline
+      field: SHA256HashData
+      indicates: unusual_binary_in_environment
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        The binary was launched by an archive utility, browser or mail client rather than by
+        explorer or a service.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+
+  contradicting:
+    - id: portable_application
+      name: Approved portable application
+      description: >-
+        The binary belongs to a sanctioned portable application designed to run from a user
+        directory.
+      source: asset_inventory
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: expired_certificate
+      name: Genuine software with an expired certificate
+      description: >-
+        The binary is installed vendor software whose signature no longer validates because
+        the certificate has expired, which affects many hosts identically.
+      source: baseline
+      field: SHA256HashData
+      indicates: legitimate_application_component
+    - id: internal_build
+      name: Internally built or test-signed software
+      description: >-
+        The binary is an internal tool or development build signed with a test certificate
+        that does not chain, running on an engineering host.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - signature_appearance_mismatch
+
+    supporting:
+      any:
+        - recently_written
+        - signature_checked_by_script
+        - unique_hash
+        - delivery_parent
+      all:
+        - recently_written
+        - unique_hash
+
+    contradicting:
+      any:
+        - portable_application
+        - expired_certificate
+        - internal_build
+      all: []
+
+  verdict:
+    low_risk_when:
+      - signature_appearance_mismatch
+      - portable_application
+      - expired_certificate
+      - internal_build
+    suspicious_when:
+      - signature_appearance_mismatch
+      - unique_hash
+    high_risk_when:
+      - signature_appearance_mismatch
+      - recently_written
+      - unique_hash
+      - delivery_parent
+
+  false_positive:
+    - condition: Installed vendor software fails validation because its certificate expired.
+      explanation: >-
+        Signature failures accumulate naturally as certificates age, which is why an invalid
+        signature alone cannot carry a verdict. Genuine software affected this way has a
+        hash present across many hosts and lives in an installation directory.
+    - condition: A sanctioned portable application runs from a user directory.
+      explanation: >-
+        Portable tools are designed to run from a profile path, reproducing the required
+        evidence. These appear consistently for the same users over long periods.
+    - condition: An internal tool is unsigned or signed with a test certificate.
+      explanation: >-
+        In-house software frequently lacks a chaining signature. It runs on engineering
+        hosts and its hash is stable across the teams using it.
+    - condition: A file was truncated in transit and no longer validates.
+      explanation: >-
+        Damaged downloads fail signature checks legitimately. These usually fail to run at
+        all, which is why execution and delivery context carry the escalation.
