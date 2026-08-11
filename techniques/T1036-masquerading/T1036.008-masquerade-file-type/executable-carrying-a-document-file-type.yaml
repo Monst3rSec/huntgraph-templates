@@ -1,0 +1,292 @@
+type: detection
+
+id: hg-win-executable-carrying-a-document-file-type-t1036-008
+version: 1.0.0
+
+info:
+  name: Executable delivered under a document file type
+  description: >-
+    Controls and users both judge files by their extension, and neither reads the header
+    that says what the file really is. Giving a payload a document extension therefore
+    lets it past mail filters that block executables and past a user who thinks they are
+    opening a spreadsheet — until something has to run it, at which point the mismatch
+    becomes visible: a process starts from a file whose extension says it should not be
+    executable, or a document extension is handed to an interpreter.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - masquerading
+    - file-type
+    - phishing-payload
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1036/008
+    - https://attack.mitre.org/detectionstrategies/DET0226
+    - https://attack.mitre.org/techniques/T1036
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1036
+  sub_techniques:
+    - T1036.008
+  detection_strategies:
+    - DET0226
+  analytics:
+    - AN0630
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary may give an executable payload a document or media file extension so that
+    mail and content controls treat it as inert and the user treats it as safe, then have
+    it executed through an interpreter or a rename once it has landed.
+  attacker_behavior:
+    - Delivers a payload with a document, image or media extension that does not match its contents.
+    - Renames the file to its real extension after it lands and before running it.
+    - Passes the document-named file directly to an interpreter that ignores the extension.
+    - Uses an archive so the mismatched file survives mail inspection intact.
+  legitimate_behavior:
+    - Some applications store data files with extensions unrelated to their contents.
+    - Backup and export tools produce files whose names do not reflect their format.
+    - Developers rename build artefacts during packaging.
+    - Installers extract payloads with temporary names before renaming them.
+  risk_indicator:
+    - A process starts from a file whose extension is not executable.
+    - A document-named file is passed to an interpreter or loader.
+    - The file was renamed to an executable extension shortly before running.
+    - The file arrived in a download or extraction directory.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: process-from-document-extension
+        name: Process started from a file with a document extension
+        purpose: >-
+          Surface the mismatch at its most visible point, where something executes from a
+          path whose extension says it should not be executable.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/\.(pdf|doc|docx|xls|xlsx|ppt|pptx|txt|rtf|jpg|jpeg|png|gif|mp4|zip|log|dat|tmp)$/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: document-named-file-loaded
+        name: Document-named file passed to an interpreter or loader
+        purpose: >-
+          Catch execution routed through a binary that ignores the extension, which is how
+          a mismatched payload runs without being renamed.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(rundll32|regsvr32|mshta|wscript|cscript|powershell|pwsh|certutil|msiexec)\.exe$/i
+          | CommandLine=/[A-Za-z]:\\[^",]+\.(pdf|doc|docx|xls|xlsx|txt|jpg|png|gif|log|dat|tmp)\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Applications documented to store data under unrelated extensions"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: renamed-to-executable
+        name: Document-named file renamed to an executable extension
+        purpose: >-
+          Identify the rename step, which converts a delivered file into something the
+          shell will run directly.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(ren|rename|move|Rename-Item|Move-Item|copy|Copy-Item)\b/i
+          | CommandLine=/\.(pdf|doc|docx|xls|xlsx|txt|jpg|png|log|dat|tmp)\b[^\n]*\.(exe|dll|scr|com|ps1|bat|cmd)\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=renames), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Installers renaming extracted payloads during setup"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+evidence:
+  required:
+    - id: extension_content_mismatch
+      name: File executed or loaded despite a document extension
+      description: >-
+        A process started from a file whose extension is not executable, a document-named
+        file was passed to an interpreter, or such a file was renamed to an executable
+        extension.
+      source: process_creation
+      field: ImageFileName
+      indicates: user_facing_deception
+
+  supporting:
+    - id: renamed_before_execution
+      name: File renamed to an executable extension
+      description: >-
+        The file was given an executable extension shortly before running, which is the
+        step that converts a delivered document into something the shell will launch.
+      source: process_creation
+      field: CommandLine
+      indicates: payload_activation
+    - id: loader_used
+      name: Execution routed through a loader
+      description: >-
+        A binary that ignores file extensions was used to run the content, so the payload
+        never needed renaming at all.
+      source: process_creation
+      field: FileName
+      indicates: proxy_execution_of_untrusted_module
+    - id: delivery_directory
+      name: File in a download or extraction directory
+      description: >-
+        The file sits in a download, extraction or temporary directory rather than in an
+        application's own data location.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: delivery_parent
+      name: Archive tool, browser or mail client as parent
+      description: >-
+        The execution was parented by a delivery application, establishing that the file
+        arrived through a channel the user acted on.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+
+  contradicting:
+    - id: application_data_convention
+      name: Application storing data under an unrelated extension
+      description: >-
+        The file belongs to an application known to store working data with an extension
+        unrelated to its contents.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: installer_rename
+      name: Installer renaming an extracted payload
+      description: >-
+        The rename was performed by an approved installer moving an extracted file into
+        place during setup.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: packaging_workflow
+      name: Build or packaging rename
+      description: >-
+        The rename belongs to a build or packaging workflow on an engineering host where
+        artefacts are renamed as a matter of course.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - extension_content_mismatch
+
+    supporting:
+      any:
+        - renamed_before_execution
+        - loader_used
+        - delivery_directory
+        - delivery_parent
+      all:
+        - renamed_before_execution
+        - delivery_directory
+
+    contradicting:
+      any:
+        - application_data_convention
+        - installer_rename
+        - packaging_workflow
+      all: []
+
+  verdict:
+    low_risk_when:
+      - extension_content_mismatch
+      - application_data_convention
+      - installer_rename
+      - packaging_workflow
+    suspicious_when:
+      - extension_content_mismatch
+      - delivery_directory
+    high_risk_when:
+      - extension_content_mismatch
+      - renamed_before_execution
+      - loader_used
+      - delivery_parent
+
+  false_positive:
+    - condition: An application stores working data under an unrelated extension.
+      explanation: >-
+        Files named .dat, .tmp or .log frequently hold arbitrary content, and some
+        applications load them through their own loaders. These occur in application data
+        directories rather than delivery paths.
+    - condition: An installer renames an extracted payload during setup.
+      explanation: >-
+        Unpacking a temporary file and renaming it to its final form is normal installation
+        behaviour, reproducing the rename evidence. The installer is the acting process.
+    - condition: A build workflow renames artefacts during packaging.
+      explanation: >-
+        Packaging pipelines rename outputs constantly. This is confined to engineering
+        hosts under build accounts.
+    - condition: A backup or export tool produces files whose names do not reflect format.
+      explanation: >-
+        Export formats often use generic extensions. These files are written by the tool
+        and are not subsequently executed, which is why execution carries the required
+        evidence.

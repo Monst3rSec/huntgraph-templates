@@ -1,0 +1,283 @@
+type: detection
+
+id: hg-win-packet-capture-started-on-an-endpoint-t1040
+version: 1.0.0
+
+info:
+  name: Packet capture started on an endpoint
+  description: >-
+    Capturing traffic on a compromised host yields credentials from protocols that still
+    carry them, internal hostnames, and a map of what the machine talks to — all without
+    touching another system. It needs a driver or the built-in trace facility, so it is not
+    silent, but the tooling is legitimate and network engineers use it constantly. What
+    separates the two is location and duration: diagnosis happens on a server or an
+    engineer's machine for minutes, collection happens on whatever host the operator
+    landed on and runs until they have enough.
+  severity: high
+  author: huntgraph
+  tags:
+    - credential-access
+    - discovery
+    - network-sniffing
+    - packet-capture
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1040
+    - https://attack.mitre.org/detectionstrategies/DET0314
+    - https://attack.mitre.org/techniques/T1557
+
+mitre:
+  tactics:
+    - TA0006
+    - TA0007
+  techniques:
+    - T1040
+  sub_techniques: []
+  detection_strategies:
+    - DET0314
+  analytics:
+    - AN0875
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:System
+  data_components:
+    - Process Creation
+    - Service Creation
+
+hypothesis:
+  statement: >-
+    An adversary may start a packet capture on a host they control to harvest credentials
+    from cleartext protocols and to map the network the host can reach, using tooling that
+    is legitimate and often already present.
+  attacker_behavior:
+    - Runs a capture utility or the built-in network trace facility against a live adapter.
+    - Installs a capture driver where one is not already present.
+    - Writes the capture to a file for later retrieval rather than viewing it live.
+    - Runs the capture on an ordinary endpoint rather than on network infrastructure.
+  legitimate_behavior:
+    - Network engineers capture traffic while diagnosing faults.
+    - Support tooling collects traces as part of a diagnostic bundle.
+    - Monitoring products capture traffic on designated collectors.
+    - Developers capture loopback traffic while debugging applications.
+  risk_indicator:
+    - The capture runs on a user workstation rather than a server or engineering host.
+    - Output is written to a file in a user-writable directory.
+    - A capture driver is installed immediately beforehand.
+    - The invoking process is a script host or a remote-execution channel.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: capture-utility-started
+        name: Packet capture utility executed
+        purpose: >-
+          Surface capture tooling running, which is uncommon enough on ordinary endpoints
+          to be worth seeing wherever it happens.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(tshark|dumpcap|windump|tcpdump|rawcap|netsh|pktmon|wireshark)\.exe$/i
+          | CommandLine=/(trace\s+start|capture=yes|-i\s|-w\s|pktmon\s+start|filter\s+add)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=captures), collect([CommandLine], limit=5)])
+          | sort(captures, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of designated network monitoring collectors and engineering hosts"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: capture-written-to-file
+        name: Capture output written to a file
+        purpose: >-
+          Isolate captures saved for later retrieval rather than viewed live, which is
+          collection rather than diagnosis.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(tshark|dumpcap|tcpdump|windump|pktmon|netsh\s+trace)/i
+          | CommandLine=/(-w\s+[^\s]+|tracefile=|\.pcap\b|\.etl\b|\.cap\b)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=captures), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: capture-driver-installed
+        name: Capture driver installed before use
+        purpose: >-
+          Catch the preparatory step on hosts where capture tooling was not already
+          present, which indicates capability being added rather than used.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(npcap|winpcap|npf\.sys|pktmon|rpcapd)/i
+          | CommandLine=/(install|sc(\.exe)?\s+.*create|msiexec|New-Service)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=installs), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Approved network diagnostic tooling deployed by the platform team"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - organization
+
+evidence:
+  required:
+    - id: capture_started
+      name: Packet capture initiated
+      description: >-
+        A capture utility or the built-in trace facility was started against a live
+        adapter, collecting traffic the host can observe.
+      source: process_creation
+      field: CommandLine
+      indicates: traffic_collection
+
+  supporting:
+    - id: output_to_file
+      name: Capture written to a file
+      description: >-
+        The capture is saved rather than displayed, which is collection for later retrieval
+        rather than live diagnosis.
+      source: process_creation
+      field: CommandLine
+      indicates: collection_staging
+    - id: driver_installed
+      name: Capture driver installed beforehand
+      description: >-
+        A capture driver was installed on a host that did not previously have one, which is
+        capability being added rather than existing tooling being used.
+      source: process_creation
+      field: CommandLine
+      indicates: capability_installation
+    - id: ordinary_endpoint
+      name: Capture running on a user workstation
+      description: >-
+        The host is an ordinary endpoint rather than a monitoring collector, a server or an
+        engineering machine where captures are routine.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: scripted_actor
+      name: Started by a script host or remote channel
+      description: >-
+        The capture was initiated by an interpreter or a remote-execution channel rather
+        than by an engineer working interactively.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+
+  contradicting:
+    - id: network_engineering_host
+      name: Monitoring collector or engineering host
+      description: >-
+        The host is a designated network monitoring collector or an engineering machine
+        where packet capture is routine work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: support_diagnostic_bundle
+      name: Support diagnostic collection
+      description: >-
+        The capture belongs to a vendor or internal diagnostic bundle collected while
+        troubleshooting a recorded incident.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: monitoring_product
+      name: Approved monitoring product capturing traffic
+      description: >-
+        The capture is performed by an approved monitoring or performance product that
+        collects traffic as its documented function.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+
+  risk_logic:
+    required:
+      - capture_started
+
+    supporting:
+      any:
+        - output_to_file
+        - driver_installed
+        - ordinary_endpoint
+        - scripted_actor
+      all:
+        - output_to_file
+        - ordinary_endpoint
+
+    contradicting:
+      any:
+        - network_engineering_host
+        - support_diagnostic_bundle
+        - monitoring_product
+      all: []
+
+  verdict:
+    low_risk_when:
+      - capture_started
+      - network_engineering_host
+      - support_diagnostic_bundle
+      - monitoring_product
+    suspicious_when:
+      - capture_started
+      - ordinary_endpoint
+    high_risk_when:
+      - capture_started
+      - output_to_file
+      - driver_installed
+      - scripted_actor
+
+  false_positive:
+    - condition: A network engineer captures traffic while diagnosing a fault.
+      explanation: >-
+        Packet capture is a core diagnostic technique and engineers save captures to files
+        routinely, which reproduces the strongest supporting evidence. The host role and an
+        incident record are the discriminators.
+    - condition: Support tooling collects a trace as part of a diagnostic bundle.
+      explanation: >-
+        Vendor and internal support bundles frequently include a network trace, often using
+        the built-in facility. These run once during a recorded troubleshooting session.
+    - condition: A monitoring product captures traffic on a collector.
+      explanation: >-
+        Traffic collection is the function of monitoring infrastructure. These hosts are
+        designated and capture continuously rather than occasionally.
+    - condition: A developer captures loopback traffic while debugging.
+      explanation: >-
+        Application debugging often involves local capture, including installing a driver.
+        This clusters on engineering hosts under the developer's own account.
