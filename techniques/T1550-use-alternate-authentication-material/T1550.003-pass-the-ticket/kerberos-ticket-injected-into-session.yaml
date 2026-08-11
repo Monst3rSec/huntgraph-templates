@@ -1,0 +1,300 @@
+type: detection
+
+id: hg-win-kerberos-ticket-injected-into-session-t1550-003
+version: 1.0.0
+
+info:
+  name: Kerberos ticket exported or injected into a logon session
+  description: >-
+    A Kerberos ticket is bearer material: whoever holds it is the account, until it
+    expires. Stealing one from memory and loading it into another session gives an
+    adversary that identity without ever knowing its password, and because the resulting
+    authentication is a normal Kerberos exchange, the domain controller sees nothing
+    unusual. As with pass-the-hash, the technique is not observable where the
+    authentication happens — it is observable on the endpoint, at the moment tickets are
+    listed, exported or injected.
+  severity: critical
+  author: huntgraph
+  tags:
+    - lateral-movement
+    - credential-reuse
+    - kerberos
+    - pass-the-ticket
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1550/003
+    - https://attack.mitre.org/detectionstrategies/DET0352
+    - https://attack.mitre.org/techniques/T1550
+
+mitre:
+  tactics:
+    - TA0008
+  techniques:
+    - T1550
+  sub_techniques:
+    - T1550.003
+  detection_strategies:
+    - DET0352
+  analytics:
+    - AN1000
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Logon Session Creation
+    - Process Access
+    - Active Directory Credential Request
+
+hypothesis:
+  statement: >-
+    An adversary may export Kerberos tickets from memory and inject them into a logon
+    session, assuming another account's identity for as long as the ticket is valid without
+    ever recovering its password.
+  attacker_behavior:
+    - Lists cached tickets to find a privileged identity worth stealing.
+    - Exports tickets from memory to files for reuse or transfer.
+    - Injects a ticket into the current session so subsequent authentication uses it.
+    - Requests a delegated ticket to obtain material for an account that is not logged on.
+  legitimate_behavior:
+    - Administrators run klist while diagnosing authentication and delegation problems.
+    - Support scripts purge tickets to force a fresh authentication.
+    - Some applications enumerate tickets as part of their own Kerberos handling.
+    - Security teams reproduce the technique during authorised assessments.
+  risk_indicator:
+    - Tickets are exported to files or injected rather than merely listed.
+    - The tooling syntax belongs to known credential-manipulation utilities.
+    - Remote authentication to new systems follows shortly afterwards.
+    - The activity originates from a workstation rather than an administration host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: ticket-export-or-injection
+        name: Tickets exported from memory or injected into a session
+        purpose: >-
+          Surface the operations that move ticket material, which is the step with no
+          administrative equivalent, as distinct from listing tickets.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(kerberos::ptt|sekurlsa::tickets|kerberos::list\s+.*\/export|tgtdeleg|asktgt|ptt\s+\/ticket|Rubeus|\.kirbi\b|\.ccache\b)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: ticket-enumeration-unusual-context
+        name: Ticket enumeration from an unusual context
+        purpose: >-
+          Cover the reconnaissance step, restricted to contexts where enumerating cached
+          identities is not ordinary administrative work.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\bklist\b/i
+          | ParentBaseFileName=/^(w3wp|wsmprovhost|WmiPrvSE|winrshost|mshta|wscript|cscript|powershell|pwsh)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=enumerations), collect([CommandLine], limit=5)])
+          | sort(enumerations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of approved jump hosts and administrative workstations"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - parent_process
+
+      - id: ticket-activity-then-remote-auth
+        name: Ticket handling followed by remote authentication
+        purpose: >-
+          Join the ticket manipulation to its purpose, since stolen material is only useful
+          once presented to another system.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | CommandLine=/(kerberos::ptt|sekurlsa::tickets|\.kirbi|tgtdeleg|asktgt)/i
+                | ticket_activity := CommandLine ;
+              #event_simpleName=NetworkConnectIP4
+                | RemotePort=/^(445|88|3389|5985|5986)$/ ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([ticket_activity, RemoteAddressIP4, RemotePort]),
+                              count(RemoteAddressIP4, distinct=true, as=distinct_targets)])
+          | ticket_activity=/.+/
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of management infrastructure that authenticates broadly by design"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - remote_address
+
+evidence:
+  required:
+    - id: ticket_material_handled
+      name: Kerberos ticket material exported, injected or enumerated
+      description: >-
+        Ticket material was exported from memory, injected into a session, or enumerated
+        from a context that does not perform routine administration, exposing bearer
+        credentials for reuse.
+      source: process_creation
+      field: CommandLine
+      indicates: credential_reuse
+
+  supporting:
+    - id: export_or_injection
+      name: Tickets exported or injected rather than listed
+      description: >-
+        The operation moves ticket material into a file or into a logon session, which has
+        no administrative equivalent, unlike listing cached tickets.
+      source: process_creation
+      field: CommandLine
+      indicates: credential_material_capture
+    - id: remote_auth_followed
+      name: Remote authentication followed
+      description: >-
+        The host authenticated to remote systems on Kerberos or administrative ports after
+        the ticket activity, which is the stolen identity being used.
+      source: network_connection
+      field: RemotePort
+      indicates: lateral_movement_attempt
+    - id: service_or_remote_context
+      name: Activity from a service or remote-execution context
+      description: >-
+        The ticket handling was issued by a web service process or a remote-execution
+        channel rather than from an interactive administrative session.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: workstation_origin
+      name: Activity originating from a workstation
+      description: >-
+        The source is an ordinary workstation rather than an administration host where
+        authentication troubleshooting is routine.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: admin_troubleshooting
+      name: Interactive authentication troubleshooting
+      description: >-
+        A named administrator listed or purged tickets from an administration host while
+        diagnosing an authentication or delegation fault.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: application_kerberos_handling
+      name: Application performing its own Kerberos handling
+      description: >-
+        The enumeration belongs to an installed application that manages Kerberos
+        credentials as part of its documented operation.
+      source: process_creation
+      field: FileName
+      indicates: legitimate_application_component
+    - id: recorded_assessment
+      name: Recorded security assessment
+      description: >-
+        An engagement record covers an authorised exercise reproducing ticket theft,
+        naming the operator, the host and the window.
+      source: change_management
+      field: UserName
+      indicates: authorised_security_testing
+
+  risk_logic:
+    required:
+      - ticket_material_handled
+
+    supporting:
+      any:
+        - export_or_injection
+        - remote_auth_followed
+        - service_or_remote_context
+        - workstation_origin
+      all:
+        - export_or_injection
+        - remote_auth_followed
+
+    contradicting:
+      any:
+        - admin_troubleshooting
+        - application_kerberos_handling
+        - recorded_assessment
+      all: []
+
+  verdict:
+    low_risk_when:
+      - ticket_material_handled
+      - admin_troubleshooting
+      - application_kerberos_handling
+      - recorded_assessment
+    suspicious_when:
+      - ticket_material_handled
+      - workstation_origin
+    high_risk_when:
+      - ticket_material_handled
+      - export_or_injection
+      - remote_auth_followed
+      - service_or_remote_context
+
+  false_positive:
+    - condition: An administrator runs klist while diagnosing a Kerberos problem.
+      explanation: >-
+        Listing cached tickets is the first step in diagnosing delegation and
+        authentication faults. This is why enumeration alone is scoped to unusual parent
+        contexts rather than treated as the finding.
+    - condition: A support script purges tickets to force fresh authentication.
+      explanation: >-
+        Clearing the ticket cache is a standard remedy for stale credential problems. It
+        runs under a support account and does not export or inject material.
+    - condition: An application performs its own Kerberos credential handling.
+      explanation: >-
+        Some middleware enumerates and requests tickets as part of delegation. The acting
+        process is installed software with a stable path present across the estate.
+    - condition: A security team reproduces ticket theft during an assessment.
+      explanation: >-
+        Assessments use the same tooling and syntax, matching the strongest supporting
+        evidence. Only the engagement record separates them from an intrusion.

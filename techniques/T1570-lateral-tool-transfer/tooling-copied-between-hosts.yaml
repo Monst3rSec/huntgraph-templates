@@ -1,0 +1,303 @@
+type: detection
+
+id: hg-win-tooling-copied-between-hosts-t1570
+version: 1.0.0
+
+info:
+  name: Tooling copied from one host to another
+  description: >-
+    An operator who has reached a second machine still needs their tools there, and the
+    cheapest way to get them is to copy from the machine they already hold. The transfer
+    is unremarkable in isolation — file copies happen constantly — but the direction and
+    the destination are not: software arrives on managed endpoints from a distribution
+    point, never from a peer workstation, and it lands in an installation directory rather
+    than in a temporary one. The transfer also precedes execution, which makes it an early
+    and useful place to intervene.
+  severity: high
+  author: huntgraph
+  tags:
+    - lateral-movement
+    - tool-transfer
+    - admin-shares
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1570
+    - https://attack.mitre.org/detectionstrategies/DET0183
+    - https://attack.mitre.org/techniques/T1021
+
+mitre:
+  tactics:
+    - TA0008
+  techniques:
+    - T1570
+  sub_techniques: []
+  detection_strategies:
+    - DET0183
+  analytics:
+    - AN0516
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - Network Share Access
+
+hypothesis:
+  statement: >-
+    An adversary may copy their tooling from a host they control onto another machine they
+    have just reached, staging capability where software is not supposed to arrive from and
+    doing so immediately before executing it.
+  attacker_behavior:
+    - Copies an executable to a peer host over an administrative share or a UNC path.
+    - Uses a remote-execution channel to pull a binary from the machine already held.
+    - Stages the file in a temporary or user-writable directory rather than an install path.
+    - Executes the transferred binary shortly after it lands.
+  legitimate_behavior:
+    - Software distribution copies packages to endpoints from a distribution point.
+    - Backup and imaging tooling moves files between systems.
+    - Administrators copy diagnostic utilities to a machine they are troubleshooting.
+    - Users copy files between their own machines and network shares.
+  risk_indicator:
+    - The source of the copy is a peer workstation rather than a distribution point.
+    - The destination is a temporary or user-writable directory.
+    - The transferred file is executed shortly after arriving.
+    - The same file spreads to several hosts in a short period.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - SHA256HashData
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: executable-copied-over-unc
+        name: Executable copied to or from a UNC path
+        purpose: >-
+          Surface transfers that cross a machine boundary, which is what distinguishes
+          lateral staging from local file movement.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\\\\\\\\[^\s"\\]+\\\\/
+          | CommandLine=/\.(exe|dll|ps1|bat|cmd|vbs|js|scr|7z|zip)\b/i
+          | CommandLine=/\b(copy|xcopy|robocopy|Copy-Item|move|certutil|bitsadmin|curl)\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=transfers), collect([CommandLine], limit=5)])
+          | sort(transfers, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "UNC paths belonging to the software distribution points and file servers"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: executable-landing-in-temp
+        name: Executable written into a temporary directory
+        purpose: >-
+          Catch the arrival of transferred tooling, which precedes execution and gives the
+          earliest point of intervention.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+          | TargetFileName=/\\(Windows\\Temp|Temp|ProgramData|Users\\Public|PerfLogs)\\/i
+          | TargetFileName!=/\\(ccmcache|SoftwareDistribution|Installer)\\/i
+          | groupBy([ComputerName, TargetFileName, SHA256HashData],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of approved deployment and patching agents"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: same-binary-spreading
+        name: Same binary appearing across several hosts
+        purpose: >-
+          Identify a tool propagating through the estate outside any distribution
+          mechanism, which is the fingerprint of hands-on lateral movement.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+          | TargetFileName=/\\(Windows\\Temp|Temp|ProgramData|Users\\Public|PerfLogs)\\/i
+          | groupBy([SHA256HashData],
+                    function=[count(ComputerName, distinct=true, as=host_count),
+                              collect([TargetFileName, ComputerName], limit=20)])
+          | host_count >= 2
+        filters:
+          include: []
+          exclude:
+            - "SHA256 values of approved deployment packages"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - organization
+            - path
+
+evidence:
+  required:
+    - id: tool_transferred
+      name: Executable transferred to or staged on the host
+      description: >-
+        An executable or script was copied across a machine boundary, or written into a
+        temporary directory outside the distribution cache, staging capability where
+        managed software does not arrive.
+      source: file_creation
+      field: TargetFileName
+      indicates: lateral_staging
+
+  supporting:
+    - id: peer_source
+      name: Transfer sourced from a peer rather than a distribution point
+      description: >-
+        The UNC path involved is a workstation or an ad hoc share rather than a
+        distribution point or file server, so the software is arriving from the wrong
+        direction.
+      source: process_creation
+      field: CommandLine
+      indicates: lateral_movement_attempt
+    - id: executed_after_landing
+      name: Transferred file executed shortly afterwards
+      description: >-
+        A process started from the path the transfer wrote, confirming the file was staged
+        in order to be run rather than merely stored.
+      source: process_creation
+      field: ImageFileName
+      indicates: execution_chain_progression
+    - id: spreading_binary
+      name: Same binary present on several hosts
+      description: >-
+        The identical hash appears in temporary directories on multiple machines outside
+        any distribution mechanism, which is a tool propagating by hand.
+      source: baseline
+      field: SHA256HashData
+      indicates: estate_wide_impact
+    - id: unique_hash
+      name: Hash unknown to the estate
+      description: >-
+        The transferred file's hash has not been seen during the baseline window, unlike
+        distributed software which is uniform and long-lived.
+      source: file_creation
+      field: SHA256HashData
+      indicates: unusual_binary_in_environment
+
+  contradicting:
+    - id: distribution_agent
+      name: Deployment or patching agent performing the transfer
+      description: >-
+        The write was performed by an approved distribution or patching agent staging a
+        package into its own cache.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_enterprise_activity
+    - id: distribution_source
+      name: Source is a distribution point or file server
+      description: >-
+        The UNC path resolves to a documented distribution point, file server or software
+        share.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_enterprise_activity
+    - id: support_transfer
+      name: Recorded support transfer
+      description: >-
+        An incident record covers an engineer copying a diagnostic utility to the machine
+        they are working on.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - tool_transferred
+
+    supporting:
+      any:
+        - peer_source
+        - executed_after_landing
+        - spreading_binary
+        - unique_hash
+      all:
+        - peer_source
+        - executed_after_landing
+
+    contradicting:
+      any:
+        - distribution_agent
+        - distribution_source
+        - support_transfer
+      all: []
+
+  verdict:
+    low_risk_when:
+      - tool_transferred
+      - distribution_agent
+      - distribution_source
+      - support_transfer
+    suspicious_when:
+      - tool_transferred
+      - unique_hash
+    high_risk_when:
+      - tool_transferred
+      - peer_source
+      - executed_after_landing
+      - spreading_binary
+
+  false_positive:
+    - condition: Software distribution copies packages to endpoints.
+      explanation: >-
+        Managed distribution stages executables constantly, which is why the cache
+        directories are excluded and the source of the transfer carries the escalation.
+    - condition: An administrator copies a diagnostic utility to a machine being fixed.
+      explanation: >-
+        Support work genuinely involves copying tools from a workstation to a target,
+        reproducing the peer-source and execution evidence. The incident record and the
+        single target are the discriminators.
+    - condition: Backup or imaging tooling moves files between systems.
+      explanation: >-
+        These products transfer executables as part of their function, sometimes into
+        temporary directories. The acting process is an approved agent with a fixed
+        schedule.
+    - condition: A user copies files between their own machines and a share.
+      explanation: >-
+        Personal file movement crosses UNC paths regularly. It typically involves documents
+        rather than executables, and the file is not executed on arrival.
