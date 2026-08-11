@@ -1,0 +1,303 @@
+type: detection
+
+id: hg-win-python-interpreter-executing-delivered-code-t1059-006
+version: 1.0.0
+
+info:
+  name: Python interpreter executing delivered or inline code
+  description: >-
+    Python is installed on a great many endpoints for reasons that have nothing to do with
+    the user — bundled with vendor software, pulled in by a data tool, left behind by an
+    engineering project. That makes it available to an adversary on hosts where nobody is
+    watching it, unlike PowerShell. The distinguishing behaviour is not Python running but
+    what it runs: inline code passed with -c, a script executing from a download directory,
+    or an interpreter reaching the network from a host with no development role.
+  severity: high
+  author: huntgraph
+  tags:
+    - execution
+    - python
+    - interpreter
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1059/006
+    - https://attack.mitre.org/detectionstrategies/DET0063
+    - https://attack.mitre.org/techniques/T1059
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1059
+  sub_techniques:
+    - T1059.006
+  detection_strategies:
+    - DET0063
+  analytics:
+    - AN0172
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Traffic Content
+
+hypothesis:
+  statement: >-
+    An adversary may use a Python interpreter already present on the host to execute inline
+    or delivered code, obtaining scripting capability on endpoints where Python is not
+    monitored the way PowerShell is.
+  attacker_behavior:
+    - Passes code inline with -c rather than running a script file.
+    - Executes a script from a download, extraction or temporary directory.
+    - Uses base64 or compile calls to obscure what the inline code does.
+    - Opens network connections from the interpreter shortly after starting.
+  legitimate_behavior:
+    - Developers and data teams run Python constantly on engineering hosts.
+    - Vendor software bundles Python and invokes it for its own components.
+    - Build and automation pipelines execute Python scripts.
+    - Administrators run Python utilities for reporting and integration.
+  risk_indicator:
+    - Code is supplied inline rather than as a script in a project directory.
+    - The script runs from a download or temporary directory.
+    - The host has no development or data-analysis role.
+    - The interpreter connects outbound shortly after starting.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: inline-code-execution
+        name: Python executing inline code
+        purpose: >-
+          Surface code supplied on the command line rather than held in a script, which is
+          how a payload runs without leaving a file to examine.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^python\d*(w)?\.exe$/i
+          | CommandLine=/\s-c\s/i
+          | CommandLine=/(exec\s*\(|eval\s*\(|base64|b64decode|urllib|socket|subprocess|compile\s*\()/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName in the engineering and data-analysis asset groups"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: script-from-delivery-directory
+        name: Python script executed from a delivery directory
+        purpose: >-
+          Separate scripts that arrived on the host from those living in a project or
+          application directory.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^python\d*(w)?\.exe$/i
+          | CommandLine=/(?<script_path>[A-Za-z]:\\[^",]+\.pyw?)/i
+          | script_path=/\\(Downloads|AppData\\Local\\Temp|Users\\Public|INetCache)\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, script_path],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude:
+            - "Installer working directories where bundled Python components run"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - path
+
+      - id: python-network-egress
+        name: Python interpreter connecting outbound
+        purpose: >-
+          Confirm the interpreter acted on the network, which turns an execution into an
+          observed retrieval or beaconing attempt.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | FileName=/^python\d*(w)?\.exe$/i
+                | python_pid := TargetProcessId ;
+              #event_simpleName=NetworkConnectIP4
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/ ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([CommandLine, ParentBaseFileName, RemoteAddressIP4, RemotePort]),
+                              count(as=events)])
+          | python_pid = ContextProcessId
+        filters:
+          include: []
+          exclude:
+            - "RemoteAddressIP4 of internal package indexes and approved public registries"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: python_untrusted_execution
+      name: Python executing inline or delivered code
+      description: >-
+        A Python interpreter ran code supplied on the command line, or executed a script
+        from a download or temporary directory, rather than running project or application
+        code from an installed location.
+      source: process_creation
+      field: CommandLine
+      indicates: dynamic_code_execution
+
+  supporting:
+    - id: obscured_inline_code
+      name: Inline code using encoding or dynamic evaluation
+      description: >-
+        The inline code decodes content or evaluates a constructed string, which conceals
+        what it does from anyone reading the command line.
+      source: process_creation
+      field: CommandLine
+      indicates: command_obfuscation
+    - id: non_developer_host
+      name: Host with no development or analysis role
+      description: >-
+        The host shows no ordinary Python activity across the baseline window, so an
+        interpreter running here is inconsistent with its role.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        The interpreter was launched by a document handler, archive utility, mail client or
+        browser rather than by a development environment or automation.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: external_egress
+      name: Outbound connection from the interpreter
+      description: >-
+        The Python process connected to a routable external address outside the known
+        package indexes, consistent with retrieval or command and control.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: possible_payload_retrieval
+
+  contradicting:
+    - id: engineering_asset
+      name: Engineering or data-analysis host
+      description: >-
+        The host belongs to an asset group where Python is a primary working tool and runs
+        continuously.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+    - id: bundled_component
+      name: Vendor software invoking its bundled Python
+      description: >-
+        The interpreter is the copy shipped inside an installed product and is running that
+        product's own scripts from its installation directory.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: automation_pipeline
+      name: Build or automation pipeline
+      description: >-
+        The execution belongs to a build agent or automation platform that runs Python
+        scripts as part of its normal work.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - python_untrusted_execution
+
+    supporting:
+      any:
+        - obscured_inline_code
+        - non_developer_host
+        - delivery_parent
+        - external_egress
+      all:
+        - obscured_inline_code
+        - external_egress
+
+    contradicting:
+      any:
+        - engineering_asset
+        - bundled_component
+        - automation_pipeline
+      all: []
+
+  verdict:
+    low_risk_when:
+      - python_untrusted_execution
+      - engineering_asset
+      - bundled_component
+      - automation_pipeline
+    suspicious_when:
+      - python_untrusted_execution
+      - non_developer_host
+    high_risk_when:
+      - python_untrusted_execution
+      - obscured_inline_code
+      - delivery_parent
+      - external_egress
+
+  false_positive:
+    - condition: A developer or data analyst runs Python continuously.
+      explanation: >-
+        Python is a primary working tool on engineering and analysis hosts, including
+        inline invocations while testing. Asset group membership removes this class.
+    - condition: Vendor software invokes its bundled Python interpreter.
+      explanation: >-
+        Many products ship Python and call it for their own components, sometimes from
+        temporary directories during installation. The interpreter path resolves inside the
+        product's installation tree.
+    - condition: A build pipeline executes Python scripts.
+      explanation: >-
+        Automation runs Python at volume, including scripts fetched into working
+        directories. The parent is a build agent and the pattern repeats on every run.
+    - condition: An administrator runs a Python utility for reporting.
+      explanation: >-
+        Integration and reporting scripts are commonly written in Python and may reach the
+        network. These run from administered locations under accounts with a history of
+        such work.

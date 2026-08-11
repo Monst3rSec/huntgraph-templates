@@ -57,15 +57,20 @@ PSEUDO_SOURCES = {
 }
 
 # Tokens that betray a non-CQL dialect leaking into a query.
+#
+# The pipe-prefixed forms are anchored to the start of a line. CQL in this
+# corpus puts its pipes there, whereas a bare "|" mid-line is almost always
+# alternation inside a regex — Python's own eval( and exec( appear that way in
+# a legitimate T1059.006 query, and an unanchored pattern flagged it as SPL.
 FOREIGN_DIALECT = [
     (r"\bindex\s*=", "Splunk SPL (index=)"),
     (r"\bsourcetype\s*=", "Splunk SPL (sourcetype=)"),
-    (r"\|\s*stats\b", "Splunk SPL (| stats)"),
-    (r"\|\s*eval\b", "Splunk SPL (| eval)"),
-    (r"\|\s*search\b", "Splunk SPL (| search)"),
-    (r"\|\s*summarize\b", "Microsoft KQL (| summarize)"),
-    (r"\|\s*project\b", "Microsoft KQL (| project)"),
-    (r"\|\s*extend\b", "Microsoft KQL (| extend)"),
+    (r"^\s*\|\s*stats\b", "Splunk SPL (| stats)"),
+    (r"^\s*\|\s*eval\b", "Splunk SPL (| eval)"),
+    (r"^\s*\|\s*search\b", "Splunk SPL (| search)"),
+    (r"^\s*\|\s*summarize\b", "Microsoft KQL (| summarize)"),
+    (r"^\s*\|\s*project\b", "Microsoft KQL (| project)"),
+    (r"^\s*\|\s*extend\b", "Microsoft KQL (| extend)"),
     (r"\bsequence\s+by\b", "Elastic EQL (sequence by)"),
     (r"\bSELECT\s+.+\bFROM\b", "SQL"),
     (r"^\s*detection\s*:", "Sigma"),

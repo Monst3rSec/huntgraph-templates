@@ -1,0 +1,308 @@
+type: detection
+
+id: hg-win-svg-delivered-payload-assembled-locally-t1027-017
+version: 1.0.0
+
+info:
+  name: Payload assembled from a delivered SVG image
+  description: >-
+    An SVG is an image to a mail gateway and a script container to a browser. That gap is
+    the whole technique: the file passes attachment filtering as a picture, then executes
+    embedded script when opened, reconstructing a payload and offering it as a download.
+    It is the same reasoning as HTML smuggling with a better disguise, because users and
+    controls alike treat images as inert. The endpoint artefact is the same — a browser
+    writing an executable — but the delivery is an image file, which is what makes it worth
+    hunting separately.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - obfuscation
+    - svg-smuggling
+    - phishing-payload
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1027/017
+    - https://attack.mitre.org/detectionstrategies/DET0510
+    - https://attack.mitre.org/techniques/T1027
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1027
+  sub_techniques:
+    - T1027.017
+  detection_strategies:
+    - DET0510
+  analytics:
+    - AN1407
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may deliver an SVG containing embedded script that reconstructs a payload
+    when the image is opened in a browser, passing attachment controls as a picture and
+    presenting the user with a download they did not request.
+  attacker_behavior:
+    - Sends an SVG whose embedded script builds an executable or archive on open.
+    - Relies on the file being treated as an image by mail and content inspection.
+    - Presents the reconstructed file as a download or a fake document viewer.
+    - Uses an archive or disk image as the output so the zone marker is also lost.
+  legitimate_behavior:
+    - Design and diagramming tools produce and open SVG files routinely.
+    - Web applications serve SVG assets constantly.
+    - Documentation workflows exchange SVG diagrams.
+    - Some applications generate SVG exports the user then opens.
+  risk_indicator:
+    - An SVG arrives in a mail attachment or download directory and is opened in a browser.
+    - The browser writes an executable or archive shortly afterwards.
+    - The written file is executed from the download directory.
+    - The hash of the written file is unknown across the estate.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: svg-written-to-delivery-path
+        name: SVG written into a mail or download directory
+        purpose: >-
+          Catch the carrier arriving, which precedes any reconstruction and is the earliest
+          point at which the delivery is visible.
+        query: |
+          #event_simpleName=/^(NewScriptWritten|PeFileWritten)$/
+          | TargetFileName=/\.svg$/i
+          | TargetFileName=/\\(Downloads|Content\.Outlook|INetCache|AppData\\Local\\Temp)\\/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Design and documentation workflows where SVG exchange is routine"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: browser-writes-executable-after-svg
+        name: Browser writing an executable after an SVG lands
+        purpose: >-
+          Join the carrier to the reconstruction, which is the sequence that separates
+          smuggling from ordinary image handling.
+        query: |
+          #event_simpleName=/^(NewScriptWritten|PeFileWritten|NewExecutableWritten)$/
+          | case {
+              TargetFileName=/\.svg$/i
+                | TargetFileName=/\\(Downloads|Content\.Outlook|INetCache)\\/i
+                | svg_delivered := TargetFileName ;
+              TargetFileName=/\.(exe|dll|scr|iso|img|vhd|7z|zip|rar|js|hta|lnk|msi)$/i
+                | TargetFileName=/\\(Downloads|INetCache)\\/i
+                | payload_written := TargetFileName ;
+            }
+          | groupBy([ComputerName],
+                    function=[collect([svg_delivered, payload_written, ContextProcessId]),
+                              count(as=events)])
+          | svg_delivered=/.+/ and payload_written=/.+/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+
+      - id: reconstructed-file-executed
+        name: Reconstructed file executed from the download directory
+        purpose: >-
+          Confirm the user acted on what the image produced, which is where the delivery
+          becomes an execution.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/\\(Downloads|INetCache|AppData\\Local\\Temp)\\/i
+          | ParentBaseFileName=/^(explorer|chrome|msedge|firefox|7zfm|winrar|outlook)\.exe$/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved self-service installers"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - path
+
+evidence:
+  required:
+    - id: svg_delivered
+      name: SVG delivered to a mail or download directory
+      description: >-
+        An SVG file arrived in an attachment, download or browser cache directory, which is
+        the carrier this technique relies on being treated as an image.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_delivery
+
+  supporting:
+    - id: payload_reconstructed
+      name: Executable or archive written after the image landed
+      description: >-
+        An executable, script or container file was written into a download directory
+        following the SVG's arrival, which is the reconstruction the embedded script
+        performs.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: payload_executed
+      name: Reconstructed file executed
+      description: >-
+        A process started from the reconstructed path under an interactive parent,
+        confirming the user opened what the image produced.
+      source: process_creation
+      field: ImageFileName
+      indicates: user_execution_foothold
+    - id: unique_hash
+      name: Reconstructed file unknown across the estate
+      description: >-
+        The written file's hash appears on very few hosts, unlike the software users
+        commonly download.
+      source: baseline
+      field: SHA256HashData
+      indicates: unusual_binary_in_environment
+    - id: mail_delivery_path
+      name: Image arrived through a mail attachment path
+      description: >-
+        The SVG was written into the mail client's attachment directory rather than being
+        fetched as a page asset, which is targeted delivery rather than browsing.
+      source: file_creation
+      field: TargetFileName
+      indicates: abnormal_execution_chain
+
+  contradicting:
+    - id: design_workflow
+      name: Design or documentation workflow
+      description: >-
+        The host and user routinely exchange SVG files as part of design, diagramming or
+        documentation work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+    - id: web_asset_traffic
+      name: SVG fetched as a page asset
+      description: >-
+        The file was written into a browser cache as part of loading a page rather than
+        being delivered as an attachment or download.
+      source: file_creation
+      field: TargetFileName
+      indicates: legitimate_application_component
+    - id: widely_downloaded_payload
+      name: Reconstructed file common across the estate
+      description: >-
+        The written file's hash appears across many hosts, which is common software rather
+        than a targeted reconstruction.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - svg_delivered
+
+    supporting:
+      any:
+        - payload_reconstructed
+        - payload_executed
+        - unique_hash
+        - mail_delivery_path
+      all:
+        - payload_reconstructed
+        - payload_executed
+
+    contradicting:
+      any:
+        - design_workflow
+        - web_asset_traffic
+        - widely_downloaded_payload
+      all: []
+
+  verdict:
+    low_risk_when:
+      - svg_delivered
+      - design_workflow
+      - web_asset_traffic
+      - widely_downloaded_payload
+    suspicious_when:
+      - svg_delivered
+      - mail_delivery_path
+    high_risk_when:
+      - svg_delivered
+      - payload_reconstructed
+      - payload_executed
+      - unique_hash
+
+  false_positive:
+    - condition: Design and diagramming tools produce and open SVG files.
+      explanation: >-
+        SVG is a normal working format for design and documentation teams, so its arrival
+        in a download directory is unremarkable there. No executable follows, which is why
+        the reconstruction carries the escalation.
+    - condition: A browser caches SVG assets while loading pages.
+      explanation: >-
+        Web pages use SVG heavily and the files land in browser caches constantly. These
+        arrive as page assets rather than as attachments or downloads.
+    - condition: An application generates an SVG export the user then opens.
+      explanation: >-
+        Reporting and charting tools export SVG deliberately. The file is produced locally
+        by the application rather than delivered from outside.
+    - condition: A user downloads a legitimate installer in the same period.
+      explanation: >-
+        Downloads of executables are common and may coincide with unrelated SVG activity.
+        The sequence evidence requires both in the same delivery directory, and hash rarity
+        separates targeted content from common software.
