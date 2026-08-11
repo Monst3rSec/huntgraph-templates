@@ -1,0 +1,284 @@
+type: detection
+
+id: hg-win-payload-stored-in-registry-value-t1027-011
+version: 1.0.0
+
+info:
+  name: Payload stored in a registry value
+  description: >-
+    A payload held in the registry rather than on disk survives file-based scanning,
+    leaves nothing for a file-integrity baseline to notice, and travels with the hive
+    through backups and migrations. The registry is designed for small configuration
+    values, so the artefact is size and shape: a value carrying kilobytes of base64 or hex
+    is not configuration, whatever key it sits under. Pairing the write with a later read
+    that feeds an interpreter turns a storage observation into an execution chain, which
+    is what makes the behaviour worth hunting rather than merely cataloguing.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - obfuscation
+    - fileless
+    - registry
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1027/011
+    - https://attack.mitre.org/detectionstrategies/DET0344
+    - https://attack.mitre.org/techniques/T1027
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1027
+  sub_techniques:
+    - T1027.011
+  detection_strategies:
+    - DET0344
+  analytics:
+    - AN0973
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Application
+  data_components:
+    - Windows Registry Key Modification
+    - WMI Creation
+
+hypothesis:
+  statement: >-
+    An adversary may store an encoded payload inside a registry value so that nothing
+    executable exists on disk for file-based controls to find, then read the value back at
+    runtime and pass it to an interpreter for in-memory execution.
+  attacker_behavior:
+    - Writes a large base64 or hex blob into a registry value through reg.exe or PowerShell.
+    - Chooses an inconspicuous key under a software or user hive rather than an obvious run key.
+    - Reads the value back with Get-ItemProperty and pipes it into Invoke-Expression or an assembly load.
+    - Stores the payload in a WMI class property as an alternative fileless location.
+  legitimate_behavior:
+    - Applications cache serialised settings, certificates and licence blobs in the registry.
+    - Group Policy and management tooling store encoded configuration in policy keys.
+    - Some products cache small images or templates as encoded values.
+    - Installers write encoded product state during setup.
+  risk_indicator:
+    - The value written is far larger than configuration data needs to be.
+    - The same value is later read and passed directly to an interpreter.
+    - The writing process is a script host rather than an installer or management agent.
+    - The key path is unique to one host rather than present across the estate.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: large-blob-written-to-registry
+        name: Large encoded value written to the registry
+        purpose: >-
+          Surface registry writes whose data is long enough to be a payload rather than a
+          setting, which is the size discriminator at the heart of the hypothesis.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(reg(\.exe)?\s+add|Set-ItemProperty|New-ItemProperty|reg(\.exe)?\s+import)/i
+          | CommandLine=/(?<blob>[A-Za-z0-9+\/=]{200,})/
+          | blob_length := length(blob)
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=writes), max(blob_length, as=largest_blob),
+                              collect([CommandLine], limit=3)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the configuration-management or licensing agent"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - parent_process
+            - command_line
+            - organization
+
+      - id: registry-value-piped-to-interpreter
+        name: Registry value read and executed
+        purpose: >-
+          Isolate the read side of the chain, where stored content is fetched and handed
+          straight to an interpreter, which is execution rather than configuration.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/(Get-ItemProperty|Get-ItemPropertyValue|\[Microsoft\.Win32\.Registry\]|reg(\.exe)?\s+query)/i
+          | CommandLine=/(iex|Invoke-Expression|FromBase64String|\[Reflection\.Assembly\]::Load|\.Invoke\s*\()/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: payload-in-wmi-class
+        name: Content stored in a WMI class property
+        purpose: >-
+          Cover the alternative fileless store, where a custom WMI class holds the payload
+          and no registry write occurs at all.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(New-Object\s+System\.Management\.ManagementClass|Set-WmiInstance|New-CimInstance|wmic\s+class\s+create)/i
+          | CommandLine=/[A-Za-z0-9+\/=]{200,}/
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=writes), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+
+evidence:
+  required:
+    - id: oversized_encoded_value
+      name: Encoded value too large to be configuration
+      description: >-
+        A registry value or WMI class property is written with an encoded blob far longer
+        than a configuration setting requires, indicating content is being stored rather
+        than configured.
+      source: process_creation
+      field: CommandLine
+      indicates: fileless_payload_storage
+
+  supporting:
+    - id: value_executed_later
+      name: Stored value read and passed to an interpreter
+      description: >-
+        The stored content is retrieved and handed to Invoke-Expression, a base64 decode
+        or an assembly load, completing a storage-to-execution chain.
+      source: process_creation
+      field: CommandLine
+      indicates: dynamic_code_execution
+    - id: script_host_writer
+      name: Script host performing the write
+      description: >-
+        The write is performed by PowerShell, cmd or a script host rather than by an
+        installer, management agent or licensing component.
+      source: process_creation
+      field: FileName
+      indicates: non_standard_automation
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        The writing process was launched by a document handler, archive utility, mail
+        client or browser rather than by a management agent or setup routine.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: unique_to_host
+      name: Value unique to one host
+      description: >-
+        This key and value shape appears on one or very few hosts, whereas application
+        caching and policy storage appear consistently across the estate.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: management_agent_writer
+      name: Management or licensing agent performing the write
+      description: >-
+        The approved configuration-management, policy or licensing component wrote the
+        value, which is its documented way of caching state.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: estate_wide_value
+      name: Same value present across the estate
+      description: >-
+        The identical key and value shape appears broadly across hosts, consistent with
+        deployed software caching serialised configuration.
+      source: baseline
+      field: ComputerName
+      indicates: legitimate_application_component
+    - id: installer_context
+      name: Written during a software installation
+      description: >-
+        The write occurred inside an installation or update performed by an approved
+        installer during a recorded maintenance window.
+      source: change_management
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - oversized_encoded_value
+
+    supporting:
+      any:
+        - value_executed_later
+        - script_host_writer
+        - delivery_parent
+        - unique_to_host
+      all:
+        - value_executed_later
+        - script_host_writer
+
+    contradicting:
+      any:
+        - management_agent_writer
+        - estate_wide_value
+        - installer_context
+      all: []
+
+  verdict:
+    low_risk_when:
+      - oversized_encoded_value
+      - management_agent_writer
+      - estate_wide_value
+      - installer_context
+    suspicious_when:
+      - oversized_encoded_value
+      - unique_to_host
+    high_risk_when:
+      - oversized_encoded_value
+      - value_executed_later
+      - script_host_writer
+      - delivery_parent
+
+  false_positive:
+    - condition: An application caches a serialised certificate or licence blob in the registry.
+      explanation: >-
+        Encoded blobs of several kilobytes are genuinely common for licences, certificates
+        and cached tokens. The writing process is the application or its installer, and the
+        same value shape appears on every host running it.
+    - condition: Group Policy or management tooling stores encoded configuration.
+      explanation: >-
+        Policy processing writes encoded settings by design, sometimes at considerable
+        size. These originate from management components and follow the policy refresh
+        cadence.
+    - condition: A product caches an image, template or theme as an encoded value.
+      explanation: >-
+        Some applications store binary assets in the registry rather than as files. These
+        are written once at first run and never read back into an interpreter, which is
+        why execution is the escalating evidence rather than storage alone.

@@ -1,0 +1,306 @@
+type: detection
+
+id: hg-win-msbuild-inline-task-execution-t1127-001
+version: 1.0.0
+
+info:
+  name: MSBuild compiling and running an inline task
+  description: >-
+    MSBuild accepts a project file containing an inline task: C# source that it compiles
+    and executes in its own process. That makes it a complete compiler and loader shipped
+    with .NET and signed by Microsoft, which is why it is attractive on hosts where
+    application control permits developer tooling. On a developer workstation MSBuild runs
+    constantly and means nothing; on a finance or HR endpoint a single invocation is
+    remarkable. The hypothesis therefore turns on where MSBuild runs and what project file
+    it is handed, not on MSBuild running at all.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - execution
+    - proxy-execution
+    - msbuild
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1127/001
+    - https://attack.mitre.org/detectionstrategies/DET0556
+    - https://lolbas-project.github.io/lolbas/Binaries/Msbuild/
+
+mitre:
+  tactics:
+    - TA0005
+    - TA0002
+  techniques:
+    - T1127
+  sub_techniques:
+    - T1127.001
+  detection_strategies:
+    - DET0556
+  analytics:
+    - AN1535
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may pass MSBuild a project file containing an inline task so that
+    attacker-supplied source is compiled and executed inside a signed Microsoft build
+    binary, obtaining arbitrary code execution on a host where a compiler was never
+    expected to run.
+  attacker_behavior:
+    - Invokes msbuild.exe against a .xml, .csproj or .proj file staged in a user-writable directory.
+    - Embeds a UsingTask with inline C# that loads shellcode or a downloader at build time.
+    - Runs MSBuild on an endpoint with no development role, where a build has no business occurring.
+    - Follows the build with outbound communication from the msbuild.exe process itself.
+  legitimate_behavior:
+    - Developers build solutions locally and continuously on engineering workstations.
+    - Continuous-integration agents invoke MSBuild as their core function.
+    - Some installers and .NET tooling call MSBuild during setup or package restore.
+    - Visual Studio invokes MSBuild whenever a project is compiled.
+  risk_indicator:
+    - The host has no development or build role.
+    - The project file lives in a user-writable directory rather than a source tree.
+    - The parent process is a document handler, archive tool or script host.
+    - The msbuild.exe process connects outbound during or immediately after the build.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: msbuild-project-in-writable-path
+        name: MSBuild building a project from a user-writable directory
+        purpose: >-
+          Surface builds whose project file sits outside a source tree, which is the shape
+          of a staged payload rather than of development work.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^msbuild\.exe$/i
+          | CommandLine=/(?<project_file>[A-Za-z]:\\[^",]+\.(xml|csproj|vbproj|proj|targets|sln))/i
+          | project_file=/\\(AppData|Temp|ProgramData|Users\\Public|Downloads)\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, project_file],
+                    function=[count(as=builds), collect([CommandLine], limit=3)])
+          | sort(builds, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "project_file under approved package-restore or installer working directories"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: msbuild-on-non-developer-host
+        name: MSBuild running on a host that never builds
+        purpose: >-
+          Use the estate itself as the discriminator: MSBuild appearing on a host with no
+          build history is far more interesting than any single command line.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^msbuild\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=builds), collect([CommandLine], limit=3)])
+          | builds <= 3
+        filters:
+          include: []
+          exclude:
+            - "ComputerName in the engineering and build-server asset groups"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: msbuild-network-egress
+        name: MSBuild process connecting outbound
+        purpose: >-
+          Confirm that a build acted on the network, which for an ordinary compile of a
+          local project should not happen outside package restore.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | FileName=/^msbuild\.exe$/i
+                | msbuild_pid := TargetProcessId ;
+              #event_simpleName=NetworkConnectIP4
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/ ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([CommandLine, ParentBaseFileName, RemoteAddressIP4, RemotePort]),
+                              count(as=events)])
+          | msbuild_pid = ContextProcessId
+        filters:
+          include: []
+          exclude:
+            - "RemoteAddressIP4 of the internal package feed and approved public package registries"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: msbuild_execution
+      name: MSBuild invoked
+      description: >-
+        msbuild.exe executed with a project file, meaning a signed Microsoft binary is
+        prepared to compile and run source it is handed.
+      source: process_creation
+      field: CommandLine
+      indicates: compiler_available_for_execution
+
+  supporting:
+    - id: project_in_writable_path
+      name: Project file in a user-writable directory
+      description: >-
+        The project file sits under AppData, Temp, ProgramData, Public or a download
+        directory rather than inside a source tree or a build workspace.
+      source: process_creation
+      field: CommandLine
+      indicates: untrusted_execution_location
+    - id: non_developer_host
+      name: Host with no build history
+      description: >-
+        This host has essentially no MSBuild activity across the baseline window, so a
+        compile occurring here is inconsistent with its role.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        MSBuild was launched by a document handler, archive utility, mail client or script
+        host rather than by an IDE, a build agent or an installer.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: external_egress
+      name: Outbound connection from the build process
+      description: >-
+        The msbuild.exe process connected to an external address outside the known package
+        feeds, which an ordinary local compile does not do.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: possible_payload_retrieval
+
+  contradicting:
+    - id: engineering_asset
+      name: Registered engineering or build host
+      description: >-
+        The host belongs to the engineering or build-server asset group, where MSBuild
+        activity is continuous and expected.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+    - id: ide_or_agent_parent
+      name: IDE or build agent as parent
+      description: >-
+        MSBuild was launched by Visual Studio, a continuous-integration agent or a package
+        restore process, which is its intended invocation path.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: installer_invoked_build
+      name: Installer or .NET tooling invoking MSBuild
+      description: >-
+        The build was triggered by an approved installer or .NET tooling as part of a
+        documented setup or restore step.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - msbuild_execution
+
+    supporting:
+      any:
+        - project_in_writable_path
+        - non_developer_host
+        - delivery_parent
+        - external_egress
+      all:
+        - project_in_writable_path
+        - non_developer_host
+
+    contradicting:
+      any:
+        - engineering_asset
+        - ide_or_agent_parent
+        - installer_invoked_build
+      all: []
+
+  verdict:
+    low_risk_when:
+      - msbuild_execution
+      - engineering_asset
+      - ide_or_agent_parent
+      - installer_invoked_build
+    suspicious_when:
+      - msbuild_execution
+      - non_developer_host
+    high_risk_when:
+      - msbuild_execution
+      - non_developer_host
+      - project_in_writable_path
+      - delivery_parent
+
+  false_positive:
+    - condition: A developer builds a solution on an engineering workstation.
+      explanation: >-
+        MSBuild is the normal .NET build tool and runs constantly on developer machines,
+        which is why the hypothesis is anchored on host role rather than on the invocation
+        itself. Asset group membership removes this class entirely.
+    - condition: A continuous-integration agent runs builds on a build server.
+      explanation: >-
+        Build servers exist to run MSBuild. The parent is a build agent, the volume is
+        high and stable, and the project files sit in workspace directories.
+    - condition: An installer or package restore invokes MSBuild during setup.
+      explanation: >-
+        Some .NET installers and restore operations call MSBuild with temporary project
+        files, producing both the execution and the writable-path evidence. The installer
+        as parent and the estate-wide rollout footprint separate them.
+    - condition: Package restore causes MSBuild to reach a package feed.
+      explanation: >-
+        Restore genuinely makes outbound connections, so egress alone cannot carry the
+        verdict. Known internal and public feeds are excluded, leaving connections to
+        arbitrary destinations as the meaningful case.

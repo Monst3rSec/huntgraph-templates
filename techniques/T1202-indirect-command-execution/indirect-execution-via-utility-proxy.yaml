@@ -1,0 +1,288 @@
+type: detection
+
+id: hg-win-indirect-execution-via-utility-proxy-t1202
+version: 1.0.0
+
+info:
+  name: Command executed indirectly through a utility proxy
+  description: >-
+    Several Windows utilities exist to run something else — forfiles applies a command
+    across matching files, pcalua launches a program under the compatibility assistant,
+    and conhost or explorer can be persuaded to start a process on another's behalf. Using
+    one of them puts an intermediate binary between the launcher and the payload, so
+    process-tree inspection that stops at the immediate parent sees a Microsoft utility
+    rather than the shell or document that really initiated the work. The proxy binaries
+    are few and their legitimate use is narrow, which makes their appearance in a chain
+    with an interpreter an unusually clean observation.
+  severity: medium
+  author: huntgraph
+  tags:
+    - stealth
+    - proxy-execution
+    - lolbin
+    - process-lineage
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1202
+    - https://attack.mitre.org/detectionstrategies/DET0200
+    - https://lolbas-project.github.io/lolbas/Binaries/Forfiles/
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1202
+  sub_techniques: []
+  detection_strategies:
+    - DET0200
+  analytics:
+    - AN0576
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary may launch a payload through a Windows utility whose purpose is to run
+    other programs, inserting a signed intermediate process into the tree so that the true
+    initiator is hidden from lineage-based inspection and from controls that key on
+    parent-child relationships.
+  attacker_behavior:
+    - Uses forfiles with /c to run a command against a trivially matching file pattern.
+    - Launches a payload through pcalua so the compatibility assistant becomes the parent.
+    - Starts a process through conhost or explorer so the originating shell drops out of the tree.
+    - Chains the proxy to a script interpreter or a payload staged in a writable directory.
+  legitimate_behavior:
+    - Administrators use forfiles in maintenance scripts to act on files older than a threshold.
+    - The compatibility assistant genuinely launches older applications through pcalua.
+    - Explorer legitimately starts processes when a user double-clicks a file.
+    - Some installers use these utilities during setup or cleanup steps.
+  risk_indicator:
+    - The proxy immediately launches a script interpreter rather than a file-maintenance command.
+    - The command target sits in a user-writable directory.
+    - The proxy itself was launched by a document handler or archive utility.
+    - The pattern is new for the host across the baseline window.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: forfiles-command-execution
+        name: Forfiles running a command
+        purpose: >-
+          Surface forfiles invocations that carry a /c command, and separate ordinary file
+          maintenance from cases where the command is an interpreter.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^forfiles\.exe$/i
+          | CommandLine=/\/c\s+/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of approved maintenance and housekeeping automation"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - command_line
+
+      - id: proxy-spawns-interpreter
+        name: Proxy utility spawning an interpreter or LOLBin
+        purpose: >-
+          Isolate the chain that matters, where a proxy binary is the direct parent of a
+          script interpreter or another proxy-execution utility.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(forfiles|pcalua|conhost|ieframe|hh)\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin|msbuild)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - process
+
+      - id: pcalua-launching-writable-payload
+        name: Compatibility assistant launching a payload from a writable path
+        purpose: >-
+          Catch pcalua being used as a launcher for content staged in a user-writable
+          directory, which is not what compatibility handling does.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^pcalua\.exe$/i
+          | CommandLine=/-a\s+(?<target>[^\s"]+)/i
+          | target=/\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, target],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: proxy_utility_execution
+      name: Execution routed through a utility proxy
+      description: >-
+        A Windows utility whose purpose is to run other programs was used to launch a
+        command, inserting a signed intermediate process between the initiator and the
+        payload.
+      source: process_creation
+      field: CommandLine
+      indicates: execution_lineage_obfuscation
+
+  supporting:
+    - id: interpreter_child
+      name: Interpreter launched by the proxy
+      description: >-
+        The proxy's child is a script interpreter or another proxy-execution binary rather
+        than a file-maintenance command, which is the shape of payload execution rather
+        than of housekeeping.
+      source: process_creation
+      field: FileName
+      indicates: execution_chain_progression
+    - id: writable_target
+      name: Command target in a user-writable directory
+      description: >-
+        The program the proxy launches sits under AppData, Temp, ProgramData, Public or a
+        download directory rather than in an installation path.
+      source: process_creation
+      field: ImageFileName
+      indicates: untrusted_execution_location
+    - id: delivery_grandparent
+      name: Delivery-style process above the proxy
+      description: >-
+        The proxy itself was launched by a document handler, archive utility, mail client
+        or browser, which is the lineage the proxy is being used to obscure.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: rare_for_host
+      name: Chain unprecedented for this host
+      description: >-
+        This proxy and child combination has not been seen on the host during the baseline
+        window, unlike the small stable set produced by maintenance scripts.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: maintenance_automation
+      name: Approved maintenance automation
+      description: >-
+        The invocation belongs to a sanctioned housekeeping job that uses forfiles to act
+        on aged files, with a stable command line and schedule.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: scheduled_automation_job
+    - id: genuine_compatibility_launch
+      name: Genuine compatibility assistant launch
+      description: >-
+        pcalua is launching an installed legacy application from its installation
+        directory, which is exactly the compatibility assistant's purpose.
+      source: process_creation
+      field: ImageFileName
+      indicates: operating_system_behaviour
+    - id: recurring_estate_pattern
+      name: Recurring pattern across the estate
+      description: >-
+        The same chain occurs regularly on many hosts, matching deployed tooling rather
+        than an intrusion step.
+      source: baseline
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - proxy_utility_execution
+
+    supporting:
+      any:
+        - interpreter_child
+        - writable_target
+        - delivery_grandparent
+        - rare_for_host
+      all:
+        - interpreter_child
+        - delivery_grandparent
+
+    contradicting:
+      any:
+        - maintenance_automation
+        - genuine_compatibility_launch
+        - recurring_estate_pattern
+      all: []
+
+  verdict:
+    low_risk_when:
+      - proxy_utility_execution
+      - maintenance_automation
+      - genuine_compatibility_launch
+      - recurring_estate_pattern
+    suspicious_when:
+      - proxy_utility_execution
+      - rare_for_host
+    high_risk_when:
+      - proxy_utility_execution
+      - interpreter_child
+      - writable_target
+      - delivery_grandparent
+
+  false_positive:
+    - condition: A maintenance script uses forfiles to delete files older than a threshold.
+      explanation: >-
+        This is forfiles' designed use and it appears in many housekeeping jobs. The
+        command it runs is a delete or move rather than an interpreter, and the same line
+        recurs on a schedule.
+    - condition: The compatibility assistant launches an older installed application.
+      explanation: >-
+        pcalua exists to do this, and it will appear as the parent of legacy software. The
+        launched program sits in an installation directory rather than a writable one.
+    - condition: Explorer starts a process when a user double-clicks a file.
+      explanation: >-
+        Explorer is the parent of most interactive launches, which is why it is not
+        treated as a proxy on its own; only chains through the narrower utilities are
+        matched.
+    - condition: An installer uses forfiles or pcalua during a setup or cleanup step.
+      explanation: >-
+        Some packages use these utilities for file handling during installation. The
+        parent is the installer and the activity appears across every host receiving the
+        package in the same window.

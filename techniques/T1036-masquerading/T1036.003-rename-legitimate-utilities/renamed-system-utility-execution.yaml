@@ -1,0 +1,305 @@
+type: detection
+
+id: hg-win-renamed-system-utility-execution-t1036-003
+version: 1.0.0
+
+info:
+  name: System utility executing under a renamed binary
+  description: >-
+    The inverse of naming a payload after a Windows binary is renaming a Windows binary so
+    it stops looking like itself. Copying powershell.exe to update.exe defeats every
+    control and every analyst habit that keys on the process name, while the binary keeps
+    its Microsoft signature and its full capability. The rename cannot hide the internal
+    identity of the file, so the durable observation is the disagreement between the name
+    on disk and what the binary actually is — expressed through its original filename
+    metadata, its hash, or a command line whose arguments only make sense for the tool it
+    really is.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - masquerading
+    - lolbin
+    - renamed-binary
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1036/003
+    - https://attack.mitre.org/detectionstrategies/DET0005
+    - https://attack.mitre.org/techniques/T1036
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1036
+  sub_techniques:
+    - T1036.003
+  detection_strategies:
+    - DET0005
+  analytics:
+    - AN0012
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Command Execution
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary may copy a signed system utility to a new name so that controls and
+    analysts keying on the process name do not recognise it, retaining the tool's full
+    capability and its Microsoft signature while presenting as unremarkable software.
+  attacker_behavior:
+    - Copies powershell.exe, certutil.exe, rundll32.exe or a similar utility to an innocuous name.
+    - Runs the renamed copy from a user-writable directory with the original tool's arguments.
+    - Chooses a name resembling an updater, installer or helper so it survives casual review.
+    - Deletes the renamed copy after use so only the execution record remains.
+  legitimate_behavior:
+    - Application bundles ship a renamed copy of a runtime or helper they depend on.
+    - Portable toolchains rename interpreters to avoid clashing with a system install.
+    - Some vendor installers copy a system utility under a product-specific name.
+    - Developers rename build tools in test harnesses.
+  risk_indicator:
+    - The command line carries arguments only meaningful to a different, well-known utility.
+    - The binary runs from a user-writable directory rather than an installation path.
+    - The name and hash pairing is unique to one host in the estate.
+    - The parent process is a document handler, archive tool or script host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - SHA256HashData
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: powershell-arguments-wrong-name
+        name: PowerShell arguments passed to a differently named binary
+        purpose: >-
+          Catch a renamed PowerShell by the arguments only PowerShell accepts, which the
+          adversary cannot change without losing the functionality they renamed it for.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/-(nop|noprofile|noni|noninteractive|w\s+hidden|windowstyle\s+hidden|enc|encodedcommand|ex(ec)?\s+bypass)\b/i
+          | FileName!=/^(powershell|pwsh|powershell_ise)\.exe$/i
+          | FileName!=/^(cmd|conhost|explorer)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine, SHA256HashData], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ImageFileName of application bundles that ship a renamed PowerShell host"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - process
+            - command_line
+            - organization
+
+      - id: certutil-arguments-wrong-name
+        name: Certutil or bitsadmin arguments under another name
+        purpose: >-
+          Extend the same reasoning to the download and decode utilities, whose flag sets
+          are equally distinctive and equally useful to an operator.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/-urlcache\b|-decode(hex)?\b|-encode\b|\/transfer\s+|setnotifycmdline/i
+          | FileName!=/^(certutil|bitsadmin|certreq)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine, SHA256HashData], limit=3)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - process
+            - command_line
+
+      - id: utility-copied-to-new-name
+        name: System utility copied to a different name
+        purpose: >-
+          Observe the rename itself, which happens once and is a cleaner signal than the
+          resulting executions when the renamed copy is later deleted.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(copy|xcopy|robocopy|move|Copy-Item)\b/i
+          | CommandLine=/\\(powershell|pwsh|certutil|bitsadmin|rundll32|regsvr32|mshta|wmic|msbuild|cscript|wscript)\.exe\b/i
+          | CommandLine=/\\(?!(powershell|pwsh|certutil|bitsadmin|rundll32|regsvr32|mshta|wmic|msbuild|cscript|wscript)\.exe)[^\\\s"]+\.exe\s*("|$)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=copies), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Approved packaging tooling that bundles renamed runtimes"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+
+evidence:
+  required:
+    - id: identity_name_mismatch
+      name: Binary behaving as a utility it is not named after
+      description: >-
+        A process accepts a command-line flag set that belongs unambiguously to a specific
+        Windows utility while carrying a different file name, or a system utility is
+        copied to a new name, so the name on disk contradicts the binary's real identity.
+      source: process_creation
+      field: CommandLine
+      indicates: process_masquerading
+
+  supporting:
+    - id: user_writable_location
+      name: Renamed binary in a user-writable directory
+      description: >-
+        The executable runs from AppData, Temp, ProgramData, Public or a user profile
+        rather than from an installation directory where a bundled runtime would sit.
+      source: process_creation
+      field: ImageFileName
+      indicates: untrusted_execution_location
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        The renamed binary was launched by a document handler, archive utility, mail
+        client, browser or script host rather than by an installer or a service.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: recently_copied
+      name: Binary written to the host shortly before execution
+      description: >-
+        The executable was created at that path shortly before it ran, which distinguishes
+        an on-the-fly rename from a runtime shipped inside an application bundle.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: unique_name_hash_pair
+      name: Name and hash pairing unique in the estate
+      description: >-
+        The combination of file name and hash appears on one or very few hosts, whereas a
+        bundled renamed runtime is uniform wherever the application is installed.
+      source: baseline
+      field: SHA256HashData
+      indicates: unusual_binary_in_environment
+
+  contradicting:
+    - id: bundled_runtime
+      name: Renamed runtime inside an application bundle
+      description: >-
+        The binary resides in a vendor installation directory alongside the application
+        that ships it under that name.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: fleetwide_pairing
+      name: Same name and hash across the estate
+      description: >-
+        The identical name and hash pairing is present on a large share of hosts, which is
+        a deployed package rather than a local rename.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+    - id: installer_parent
+      name: Installer or packaging tool as parent
+      description: >-
+        The copy or execution was performed by an approved installer or packaging tool
+        during a recorded maintenance window.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - identity_name_mismatch
+
+    supporting:
+      any:
+        - user_writable_location
+        - delivery_parent
+        - recently_copied
+        - unique_name_hash_pair
+      all:
+        - user_writable_location
+        - unique_name_hash_pair
+
+    contradicting:
+      any:
+        - bundled_runtime
+        - fleetwide_pairing
+        - installer_parent
+      all: []
+
+  verdict:
+    low_risk_when:
+      - identity_name_mismatch
+      - bundled_runtime
+      - fleetwide_pairing
+      - installer_parent
+    suspicious_when:
+      - identity_name_mismatch
+      - unique_name_hash_pair
+    high_risk_when:
+      - identity_name_mismatch
+      - user_writable_location
+      - recently_copied
+      - delivery_parent
+
+  false_positive:
+    - condition: An application bundle ships a renamed copy of a scripting runtime.
+      explanation: >-
+        Several products embed a renamed PowerShell or script host so their own process
+        appears in the tree rather than a generic interpreter. The binary lives in the
+        product's installation directory and the name and hash pairing is identical
+        everywhere the product is deployed.
+    - condition: A portable toolchain renames an interpreter to avoid clashing with a system install.
+      explanation: >-
+        Engineering environments do this deliberately. It clusters on developer
+        workstations under the developer's account and persists over long periods rather
+        than appearing immediately before use.
+    - condition: A vendor installer copies a system utility under a product-specific name.
+      explanation: >-
+        This produces both the rename evidence and the recent-write evidence together. The
+        installer is the parent process and the same copy appears on every host receiving
+        the package.
+    - condition: A wrapper script legitimately passes PowerShell flags to a launcher executable.
+      explanation: >-
+        Some launchers forward arguments to an interpreter they invoke internally, so the
+        flags appear on a process not named powershell.exe. These launchers are installed
+        software with a stable path and a fleet-wide hash.

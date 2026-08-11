@@ -1,0 +1,281 @@
+type: detection
+
+id: hg-win-xsl-transform-script-execution-t1220
+version: 1.0.0
+
+info:
+  name: Script executed through an XSL stylesheet transform
+  description: >-
+    XSL stylesheets can embed script, and the Windows components that apply them will run
+    it. That gives an adversary arbitrary execution through wmic.exe or msxsl.exe with no
+    scripting host in the tree and, in the wmic case, no additional file on the system.
+    Genuine XSL formatting in an enterprise is confined to a handful of reporting and
+    integration workflows, so the combination of a transform being applied and the
+    stylesheet coming from a writable directory or a URL is a narrow, durable signal that
+    does not depend on the payload's contents.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - proxy-execution
+    - lolbin
+    - xsl
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1220
+    - https://attack.mitre.org/detectionstrategies/DET0205
+    - https://lolbas-project.github.io/lolbas/Binaries/Wmic/
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1220
+  sub_techniques: []
+  detection_strategies:
+    - DET0205
+  analytics:
+    - AN0581
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Module Load
+
+hypothesis:
+  statement: >-
+    An adversary may execute script embedded in an XSL stylesheet by asking wmic.exe or
+    msxsl.exe to apply that stylesheet as an output format, obtaining execution inside a
+    signed Windows binary without a recognisable scripting host appearing in the process
+    tree.
+  attacker_behavior:
+    - "Invokes wmic with a /format: argument pointing at a local or remote .xsl file containing script."
+    - Uses msxsl.exe against a benign XML document and a scripted stylesheet.
+    - Hosts the stylesheet on a remote server so nothing but the command line touches the host.
+    - Launches the transform from a document handler shortly after a user opens a lure.
+  legitimate_behavior:
+    - Administrators use wmic with the supplied htable and csv format stylesheets for reporting.
+    - Integration tooling applies XSL transforms to convert XML between internal formats.
+    - Older reporting solutions ship their own stylesheets alongside the application.
+  risk_indicator:
+    - The stylesheet is a URL or sits in a user-writable directory rather than System32.
+    - The format argument names a stylesheet that is not one of the supplied Windows ones.
+    - msxsl.exe is present at all, since it does not ship with Windows.
+    - The transforming process spawns an interpreter or connects outbound.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: wmic-format-untrusted-stylesheet
+        name: Wmic applying a stylesheet that is not a supplied one
+        purpose: >-
+          Surface transforms whose stylesheet is a URL or a writable path, excluding the
+          htable and csv formats that legitimate reporting relies on.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^wmic\.exe$/i
+          | CommandLine=/\/format\s*:\s*(?<stylesheet>[^\s"]+)/i
+          | stylesheet!=/^(htable|hform|csv|table|list|rawxml|xml|mof|value)(\.xsl)?$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, stylesheet],
+                    function=[count(as=transforms), collect([CommandLine], limit=5)])
+          | sort(transforms, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "stylesheet paths belonging to an approved reporting or integration product"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: msxsl-execution
+        name: msxsl.exe executing a transform
+        purpose: >-
+          Flag any use of msxsl.exe, which is not a Windows component and must have been
+          brought to the host deliberately.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^msxsl\.exe$/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "ImageFileName under an approved integration product directory"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: transform-spawns-interpreter
+        name: Transform process spawning an interpreter
+        purpose: >-
+          Identify the follow-on execution that confirms the stylesheet carried script
+          rather than formatting instructions.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(wmic|msxsl)\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd|wscript|cscript|rundll32|regsvr32|mshta|certutil)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - process
+
+evidence:
+  required:
+    - id: untrusted_stylesheet_transform
+      name: Transform applied with a non-standard stylesheet
+      description: >-
+        A transform is invoked with a stylesheet that is not one of the formats Windows
+        supplies, or msxsl.exe is used at all, meaning arbitrary stylesheet content is
+        being applied by a trusted binary.
+      source: process_creation
+      field: CommandLine
+      indicates: proxy_execution_of_untrusted_module
+
+  supporting:
+    - id: remote_or_writable_stylesheet
+      name: Stylesheet from a URL or a writable directory
+      description: >-
+        The stylesheet is retrieved over the network or read from AppData, Temp,
+        ProgramData or a user profile rather than from an installation directory.
+      source: process_creation
+      field: CommandLine
+      indicates: untrusted_execution_location
+    - id: interpreter_child
+      name: Interpreter spawned by the transform
+      description: >-
+        The transforming process created a command interpreter or proxy-execution binary,
+        confirming the stylesheet carried executable script.
+      source: process_creation
+      field: FileName
+      indicates: execution_chain_progression
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        The transform was launched by a document handler, archive utility, mail client or
+        browser rather than by an administrator shell or a reporting job.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: unprecedented_transform
+      name: Transform unprecedented in the estate
+      description: >-
+        No comparable transform has been observed during the baseline window, unlike the
+        small fixed set of stylesheets a reporting workflow reuses.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: supplied_format_stylesheet
+      name: Windows-supplied output format
+      description: >-
+        The format argument names one of the stylesheets Windows ships for wmic output,
+        which is ordinary reporting rather than script execution.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_administrative_action
+    - id: integration_product_path
+      name: Stylesheet inside an approved product
+      description: >-
+        The stylesheet resolves to the installation directory of a documented reporting or
+        integration product that applies transforms by design.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: recurring_reporting_job
+      name: Recurring scheduled reporting
+      description: >-
+        The same transform recurs on a stable schedule across multiple hosts, matching a
+        deployed reporting job rather than an intrusion step.
+      source: baseline
+      field: ComputerName
+      indicates: scheduled_automation_job
+
+  risk_logic:
+    required:
+      - untrusted_stylesheet_transform
+
+    supporting:
+      any:
+        - remote_or_writable_stylesheet
+        - interpreter_child
+        - delivery_parent
+        - unprecedented_transform
+      all:
+        - remote_or_writable_stylesheet
+        - interpreter_child
+
+    contradicting:
+      any:
+        - supplied_format_stylesheet
+        - integration_product_path
+        - recurring_reporting_job
+      all: []
+
+  verdict:
+    low_risk_when:
+      - untrusted_stylesheet_transform
+      - supplied_format_stylesheet
+      - integration_product_path
+      - recurring_reporting_job
+    suspicious_when:
+      - untrusted_stylesheet_transform
+      - unprecedented_transform
+    high_risk_when:
+      - untrusted_stylesheet_transform
+      - remote_or_writable_stylesheet
+      - interpreter_child
+      - delivery_parent
+
+  false_positive:
+    - condition: An administrator formats wmic output using the supplied htable stylesheet.
+      explanation: >-
+        Formatted wmic output is ordinary reporting, and the supplied stylesheets are the
+        overwhelming majority of all /format usage. They are excluded by name rather than
+        left to triage, since including them would drown the hunt.
+    - condition: An integration product applies XSL transforms to convert XML between formats.
+      explanation: >-
+        Transformation is what XSL is for, and some middleware does it constantly. The
+        stylesheet lives in the product's installation directory and the same transform
+        repeats predictably.
+    - condition: A legacy reporting solution ships msxsl.exe alongside its own stylesheets.
+      explanation: >-
+        A small number of older products bundle msxsl.exe, which would otherwise be a
+        strong signal by itself. The binary sits in a vendor directory with a hash that is
+        uniform across every host running the product.

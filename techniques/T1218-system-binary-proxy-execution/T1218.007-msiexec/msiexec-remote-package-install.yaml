@@ -1,0 +1,298 @@
+type: detection
+
+id: hg-win-msiexec-remote-package-install-t1218-007
+version: 1.0.0
+
+info:
+  name: Msiexec installing a package from a remote or writable location
+  description: >-
+    msiexec.exe will install a package straight from a URL, and an MSI can carry custom
+    actions that execute arbitrary code during installation. Together that is a signed
+    Microsoft binary fetching and running attacker content with no separate downloader in
+    the process tree. Because software distribution in most estates flows from a known set
+    of internal servers and cached paths, the source of the package is the discriminator
+    that holds: an install pulling from an arbitrary external URL or from a user's own
+    directory is not how managed software arrives.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - proxy-execution
+    - lolbin
+    - msiexec
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1218/007
+    - https://attack.mitre.org/detectionstrategies/DET0158
+    - https://lolbas-project.github.io/lolbas/Binaries/Msiexec/
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1218
+  sub_techniques:
+    - T1218.007
+  detection_strategies:
+    - DET0158
+  analytics:
+    - AN0445
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+    - Module Load
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may use msiexec.exe to install a package retrieved from an external URL
+    or staged in a user-writable directory, so that a trusted installer performs the
+    download and executes the package's custom actions on their behalf.
+  attacker_behavior:
+    - Passes an http or https URL directly to msiexec with /i and a quiet flag.
+    - Installs an MSI staged in AppData, Temp or a download directory.
+    - Relies on custom actions inside the package to run a payload during installation.
+    - Suppresses the interface with /qn or /quiet so the install is invisible to the user.
+  legitimate_behavior:
+    - Software distribution installs MSIs from internal servers and local caches constantly.
+    - Users with local administrator rights install downloaded vendor software themselves.
+    - Application updaters fetch and apply MSI packages from vendor endpoints.
+    - Repair and reinstall operations reference cached packages under Windows Installer.
+  risk_indicator:
+    - The package source is an external URL rather than an internal distribution point.
+    - The package sits in a user profile directory rather than a managed cache.
+    - The parent process is a document handler, archive tool or script host.
+    - The install is silent and the package has never been seen in the estate.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: msiexec-remote-package
+        name: Msiexec installing from a URL
+        purpose: >-
+          Surface the remote-install form, where msiexec performs both the retrieval and
+          the execution and no downloader appears in the tree.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^msiexec\.exe$/i
+          | CommandLine=/(?<package_url>https?\s*:?\s*(\[:\])?\/\/[^\s"']+)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, package_url],
+                    function=[count(as=installs), collect([CommandLine], limit=3)])
+          | sort(installs, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "package_url on the internal distribution points and approved vendor update endpoints"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - domain
+            - organization
+
+      - id: msiexec-writable-package
+        name: Msiexec installing a package from a user-writable path
+        purpose: >-
+          Catch packages staged outside the managed installer cache, which is where a
+          dropped MSI would sit.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^msiexec\.exe$/i
+          | CommandLine=/(?<package_path>[A-Za-z]:\\[^",]+\.msi)/i
+          | package_path=/\\(AppData|Temp|Users|Public|Downloads)\\/i
+          | package_path!=/\\Windows\\Installer\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, package_path],
+                    function=[count(as=installs), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude:
+            - "package_path under approved software-distribution staging directories"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: silent-install-from-delivery-parent
+        name: Silent install launched by a delivery application
+        purpose: >-
+          Combine interface suppression with a parent that implies a user opened content,
+          which is the phishing-to-install shape rather than managed distribution.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^msiexec\.exe$/i
+          | CommandLine=/\/(qn|quiet|qb|passive)\b/i
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|acrord32|acrobat|chrome|msedge|firefox|7zfm|winrar|wscript|cscript|powershell|pwsh)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=installs), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: untrusted_package_source
+      name: Package sourced from a URL or a writable directory
+      description: >-
+        The msiexec command line references a package retrieved from an external URL or
+        located in a user-writable directory outside the managed installer cache.
+      source: process_creation
+      field: CommandLine
+      indicates: proxy_execution_of_untrusted_module
+
+  supporting:
+    - id: silent_install
+      name: Installation interface suppressed
+      description: >-
+        The install runs with a quiet or passive flag, so a user at the keyboard sees no
+        prompt and no progress for software arriving on their machine.
+      source: process_creation
+      field: CommandLine
+      indicates: execution_concealment
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        msiexec was launched by a document handler, archive utility, mail client, browser
+        or script host rather than by the distribution agent or an updater service.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: package_recently_written
+      name: Package written to the host shortly before install
+      description: >-
+        The MSI was created on the host shortly before the install, indicating it arrived
+        as part of this activity rather than through managed distribution.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: unseen_package
+      name: Package unknown to the estate
+      description: >-
+        This package path or source has not been observed during the baseline window,
+        unlike distributed software which appears across many hosts.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: distribution_agent_parent
+      name: Software distribution agent as parent
+      description: >-
+        The install was initiated by the approved distribution, patching or updater agent,
+        which installs MSIs as its core function.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: internal_package_source
+      name: Package from an internal distribution point
+      description: >-
+        The package source resolves to an internal distribution server or the managed
+        Windows Installer cache.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_enterprise_activity
+    - id: fleetwide_install
+      name: Same package installed across the estate
+      description: >-
+        The identical package appears on many hosts within one window, which is a
+        distribution wave rather than a targeted install.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - untrusted_package_source
+
+    supporting:
+      any:
+        - silent_install
+        - delivery_parent
+        - package_recently_written
+        - unseen_package
+      all:
+        - silent_install
+        - delivery_parent
+
+    contradicting:
+      any:
+        - distribution_agent_parent
+        - internal_package_source
+        - fleetwide_install
+      all: []
+
+  verdict:
+    low_risk_when:
+      - untrusted_package_source
+      - distribution_agent_parent
+      - internal_package_source
+      - fleetwide_install
+    suspicious_when:
+      - untrusted_package_source
+      - unseen_package
+    high_risk_when:
+      - untrusted_package_source
+      - silent_install
+      - delivery_parent
+      - package_recently_written
+
+  false_positive:
+    - condition: A software distribution agent installs an MSI silently on every managed host.
+      explanation: >-
+        Silent installation is the normal mode for managed distribution, so the
+        concealment evidence appears constantly. The parent agent and the estate-wide
+        footprint are the discriminators.
+    - condition: A user with local administrator rights installs downloaded software.
+      explanation: >-
+        A package in the Downloads folder installed from a browser reproduces both the
+        writable-path and the delivery-parent evidence. This is self-service software
+        installation, which is a policy question rather than an intrusion, and it usually
+        involves a recognisable vendor package.
+    - condition: An application updater fetches and applies an MSI from the vendor endpoint.
+      explanation: >-
+        Updaters install remote packages by design. The URL belongs to a known vendor
+        endpoint and the same install recurs across every host running the product.
+    - condition: A repair operation reinstalls from the cached package under Windows Installer.
+      explanation: >-
+        Repair references the managed cache rather than a user directory, which is
+        excluded explicitly so that routine self-healing does not populate the hunt.
