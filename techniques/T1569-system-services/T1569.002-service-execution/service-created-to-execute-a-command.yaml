@@ -1,0 +1,291 @@
+type: detection
+
+id: hg-win-service-created-to-execute-a-command-t1569-002
+version: 1.0.0
+
+info:
+  name: Service created and started to execute a command
+  description: >-
+    Creating a service purely to run something once is the mechanism behind most remote
+    execution utilities: the service is registered, started, and often deleted within
+    seconds, and the payload inherits SYSTEM without any interactive logon. The
+    distinguishing feature is not the service but its lifetime and its shape — a real
+    service is installed to persist and points at a product binary, while an execution
+    vehicle points at cmd or PowerShell and disappears almost immediately.
+  severity: high
+  author: huntgraph
+  tags:
+    - execution
+    - service-execution
+    - remote-execution
+    - system-account
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1569/002
+    - https://attack.mitre.org/detectionstrategies/DET0421
+    - https://attack.mitre.org/techniques/T1569
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1569
+  sub_techniques:
+    - T1569.002
+  detection_strategies:
+    - DET0421
+  analytics:
+    - AN1185
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Service Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An adversary may register and start a service whose only purpose is to execute a
+    command as SYSTEM, then remove it, obtaining privileged execution without an
+    interactive logon and without leaving a persistent service behind.
+  attacker_behavior:
+    - Creates a service whose binary path is an interpreter with an inline command.
+    - Starts the service immediately and deletes it once the command has run.
+    - Uses a randomly generated or short service name that will not be recognised.
+    - Performs the sequence against a remote host as part of lateral movement.
+  legitimate_behavior:
+    - Installers register services for the products they deploy.
+    - Management platforms use service creation as a remote-execution transport.
+    - Administrators create services for internally developed applications.
+    - Diagnostic tooling occasionally installs a temporary service.
+  risk_indicator:
+    - The service binary is an interpreter carrying an inline command.
+    - The service is created, started and deleted within a short window.
+    - The service name is randomly generated rather than descriptive.
+    - The sequence is issued against a remote host from a workstation.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: service-binary-is-interpreter
+        name: Service registered with an interpreter as its binary
+        purpose: >-
+          Surface services whose image is a shell rather than a product binary, which is
+          execution rather than installation.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(sc(\.exe)?\s+.*\bcreate\b|New-Service)/i
+          | CommandLine=/(cmd(\.exe)?\s*\/c|powershell|pwsh|-enc\b|-EncodedCommand|rundll32|regsvr32|mshta)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=registrations), collect([CommandLine], limit=5)])
+          | sort(registrations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the management platform using service execution as a transport"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: create-start-delete-sequence
+        name: Service created, started and deleted in one activity
+        purpose: >-
+          Catch the short lifetime that distinguishes an execution vehicle from a service
+          installed to persist.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(sc(\.exe)?\s+.*\bcreate\b|New-Service)/i
+                | service_created := CommandLine ;
+              CommandLine=/(sc(\.exe)?\s+.*\bdelete\b|Remove-Service)/i
+                | service_deleted := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([service_created, service_deleted, ParentBaseFileName]),
+                              count(as=events)])
+          | service_created=/.+/ and service_deleted=/.+/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: remote-service-operation
+        name: Service operation issued against a remote host
+        purpose: >-
+          Identify the lateral-movement form, where the service is created on another
+          machine to run a command there.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(sc|psexec|paexec|psexesvc)\.exe$/i
+          | CommandLine=/\\\\\\\\[^\s"\\]+\s+(create|start|delete)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=operations), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of approved management servers and jump hosts"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - organization
+
+evidence:
+  required:
+    - id: service_used_for_execution
+      name: Service registered to run a command
+      description: >-
+        A service was created whose binary is an interpreter carrying an inline command,
+        or a service was created and deleted in the same activity, indicating it existed to
+        execute rather than to persist.
+      source: process_creation
+      field: CommandLine
+      indicates: privileged_execution_vehicle
+
+  supporting:
+    - id: interpreter_binary
+      name: Service binary is an interpreter
+      description: >-
+        The registered image is cmd, PowerShell or a proxy-execution binary rather than a
+        product executable, which packaged software never uses.
+      source: process_creation
+      field: CommandLine
+      indicates: dynamic_code_execution
+    - id: short_lifetime
+      name: Service deleted shortly after creation
+      description: >-
+        The service was removed in the same activity as it was created, which is an
+        execution vehicle being cleaned up rather than a service being installed.
+      source: process_creation
+      field: CommandLine
+      indicates: deliberate_evasion
+    - id: remote_target
+      name: Operation directed at a remote host
+      description: >-
+        The service was created or started on another machine, which converts privileged
+        execution into lateral movement.
+      source: process_creation
+      field: CommandLine
+      indicates: lateral_movement_attempt
+    - id: workstation_origin
+      name: Issued from a workstation
+      description: >-
+        The source is an ordinary workstation rather than a management system whose role
+        includes remote service operations.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: installer_service
+      name: Installer registering a product service
+      description: >-
+        An approved installer created the service for software it deploys, with a product
+        binary as the image.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: management_transport
+      name: Management platform using service execution
+      description: >-
+        The activity belongs to an approved management platform that uses service creation
+        as a documented remote-execution transport.
+      source: process_creation
+      field: UserName
+      indicates: legitimate_enterprise_activity
+    - id: approved_admin_source
+      name: Approved management server or jump host
+      description: >-
+        The operation originates from a designated administration system where remote
+        service management is expected.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - service_used_for_execution
+
+    supporting:
+      any:
+        - interpreter_binary
+        - short_lifetime
+        - remote_target
+        - workstation_origin
+      all:
+        - interpreter_binary
+        - short_lifetime
+
+    contradicting:
+      any:
+        - installer_service
+        - management_transport
+        - approved_admin_source
+      all: []
+
+  verdict:
+    low_risk_when:
+      - service_used_for_execution
+      - installer_service
+      - management_transport
+      - approved_admin_source
+    suspicious_when:
+      - service_used_for_execution
+      - workstation_origin
+    high_risk_when:
+      - service_used_for_execution
+      - interpreter_binary
+      - short_lifetime
+      - remote_target
+
+  false_positive:
+    - condition: A management platform uses service creation as a remote-execution transport.
+      explanation: >-
+        Several platforms create a temporary service, run their payload and remove it,
+        which reproduces the create-and-delete evidence exactly. The service account and
+        the regular cadence against a known target set are the discriminators.
+    - condition: An installer registers a service for the product it deploys.
+      explanation: >-
+        Service registration during installation is routine, but the image is a product
+        binary rather than an interpreter and the service persists afterwards.
+    - condition: An administrator creates a service for an internally developed application.
+      explanation: >-
+        In-house services are installed deliberately and remain in place. They are created
+        interactively with a descriptive name and usually a change record.
+    - condition: Diagnostic tooling installs a temporary service during troubleshooting.
+      explanation: >-
+        Some support utilities install a short-lived service to collect data, matching the
+        short-lifetime evidence. These are recognisable tools run by a named engineer
+        against a single host.

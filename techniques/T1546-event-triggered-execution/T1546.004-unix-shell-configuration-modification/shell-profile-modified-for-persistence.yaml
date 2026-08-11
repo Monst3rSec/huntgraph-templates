@@ -1,0 +1,293 @@
+type: detection
+
+id: hg-lin-shell-profile-modified-for-persistence-t1546-004
+version: 1.0.0
+
+info:
+  name: Shell startup file modified to run a payload
+  description: >-
+    Every interactive shell reads its startup files, so a line appended to .bashrc,
+    .profile or /etc/profile.d runs whenever the user logs in — no scheduler, no service,
+    no privilege beyond write access to the user's own home. It is quiet because these
+    files are long, rarely read end to end, and legitimately edited by users and by
+    provisioning alike. The observation that holds is a startup file being appended to
+    programmatically, particularly by an account that does not own it or by a process that
+    is not a shell.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - shell-profile
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1546/004
+    - https://attack.mitre.org/detectionstrategies/DET0020
+    - https://attack.mitre.org/techniques/T1546
+
+mitre:
+  tactics:
+    - TA0004
+    - TA0003
+  techniques:
+    - T1546
+  sub_techniques:
+    - T1546.004
+  detection_strategies:
+    - DET0020
+  analytics:
+    - AN0059
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+    - auditd:EXECVE
+  data_components:
+    - File Modification
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may append a command to a shell startup file so that their payload runs
+    each time a shell is opened, obtaining persistence that requires no privilege beyond
+    write access to a home directory and that survives reboot.
+  attacker_behavior:
+    - Appends a command to .bashrc, .bash_profile, .profile, .zshrc or an /etc/profile.d file.
+    - Uses a redirect, tee or sed rather than an editor so the change is unattended.
+    - Hides the addition far down a long file or disguises it as an environment setting.
+    - Points the added line at a payload in a temporary or hidden directory.
+  legitimate_behavior:
+    - Users customise their own shell environment continuously.
+    - Provisioning and configuration management write profile scripts during host build.
+    - Package installation drops files into /etc/profile.d for environment setup.
+    - Development tooling appends path and completion lines during installation.
+  risk_indicator:
+    - The file is written by an account that does not own it.
+    - The added line invokes a network fetch or a payload in a temporary directory.
+    - The writing process is a web service account or a non-shell process.
+    - The change does not appear on comparable hosts.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: startup-file-appended
+        name: Shell startup file appended programmatically
+        purpose: >-
+          Surface unattended edits to startup files, which is how persistence is installed
+          rather than how a user customises their own environment.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\.bashrc|\.bash_profile|\.bash_login|\.profile|\.zshrc|\.zprofile|\/etc\/profile|\/etc\/bash\.bashrc|\/etc\/profile\.d\/)/
+          | CommandLine=/(>>|>|tee\b|sed\s+-i|printf\b|echo\b)/i
+          | groupBy([ComputerName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the configuration-management agent and package manager"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: startup-file-with-fetch
+        name: Startup file edit embedding a network fetch
+        purpose: >-
+          Isolate additions that retrieve and run remote content, which re-establishes the
+          payload on every login regardless of local cleanup.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\.bashrc|\.profile|\.zshrc|\/etc\/profile\.d\/)/
+          | CommandLine=/(curl|wget|nc\b|base64|python|perl|\/tmp\/|\/dev\/shm\/|\/var\/tmp\/)/i
+          | groupBy([ComputerName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: profile-d-file-created
+        name: File created under /etc/profile.d
+        purpose: >-
+          Cover the system-wide route, where a drop-in affects every user on the host
+          rather than one account.
+        query: |
+          #event_simpleName=NewScriptWritten
+          | TargetFileName=/^\/etc\/profile\.d\//
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of the package manager and configuration-management agent"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+evidence:
+  required:
+    - id: startup_file_modified
+      name: Shell startup file modified programmatically
+      description: >-
+        A shell startup file was appended to or created by a redirect, tee or sed rather
+        than through an editor, so a command will run whenever a shell is opened.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_established
+
+  supporting:
+    - id: fetch_or_temp_payload
+      name: Added line fetches remote content or runs from a temporary path
+      description: >-
+        The addition retrieves content over the network or invokes a payload under /tmp,
+        /dev/shm or /var/tmp, which no environment customisation requires.
+      source: process_creation
+      field: CommandLine
+      indicates: possible_payload_retrieval
+    - id: system_wide_scope
+      name: Change affects every user on the host
+      description: >-
+        The modification targets /etc/profile, /etc/bash.bashrc or a /etc/profile.d
+        drop-in, so it executes for every account rather than one.
+      source: file_creation
+      field: TargetFileName
+      indicates: broad_persistence_scope
+    - id: nonshell_writer
+      name: Written by a service account or non-shell process
+      description: >-
+        The writing process is a web service, application account or script rather than an
+        interactive shell belonging to the file's owner.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: rare_in_fleet
+      name: Change absent from comparable hosts
+      description: >-
+        The same modification does not appear on peer systems during the baseline window,
+        unlike environment configuration deployed by packages or provisioning.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: package_environment_setup
+      name: Written by package management
+      description: >-
+        The file was created by the package manager while installing software that sets up
+        environment variables or shell completion.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_enterprise_activity
+    - id: config_management_profile
+      name: Deployed by configuration management
+      description: >-
+        The profile change was written by the approved configuration-management agent as
+        part of a governed environment definition.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: software_deployment_wave
+    - id: fleetwide_change
+      name: Same change across comparable hosts
+      description: >-
+        The identical modification is present on peer systems throughout the baseline
+        window, which is managed configuration rather than targeted persistence.
+      source: baseline
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - startup_file_modified
+
+    supporting:
+      any:
+        - fetch_or_temp_payload
+        - system_wide_scope
+        - nonshell_writer
+        - rare_in_fleet
+      all:
+        - fetch_or_temp_payload
+        - nonshell_writer
+
+    contradicting:
+      any:
+        - package_environment_setup
+        - config_management_profile
+        - fleetwide_change
+      all: []
+
+  verdict:
+    low_risk_when:
+      - startup_file_modified
+      - package_environment_setup
+      - config_management_profile
+      - fleetwide_change
+    suspicious_when:
+      - startup_file_modified
+      - rare_in_fleet
+    high_risk_when:
+      - startup_file_modified
+      - fetch_or_temp_payload
+      - nonshell_writer
+      - system_wide_scope
+
+  false_positive:
+    - condition: A user customises their own shell environment.
+      explanation: >-
+        Appending path and alias lines to a personal .bashrc is routine and is often done
+        with a redirect rather than an editor, matching the required evidence. The writing
+        process is the user's own interactive shell and the change stays in their home
+        directory.
+    - condition: Development tooling appends path and completion lines during installation.
+      explanation: >-
+        Language version managers and shell frameworks modify startup files as part of
+        setup. These are recognisable installers running under the user's own account.
+    - condition: Package installation drops a file into /etc/profile.d.
+      explanation: >-
+        Environment setup for system-wide software is exactly what that directory is for,
+        which reproduces the system-wide evidence. The package manager is the writing
+        process and the file appears fleet-wide.
+    - condition: Provisioning writes profile scripts during host build.
+      explanation: >-
+        Build automation configures shell environments deliberately. It occurs during host
+        provisioning and produces identical files across every machine built from the same
+        image.

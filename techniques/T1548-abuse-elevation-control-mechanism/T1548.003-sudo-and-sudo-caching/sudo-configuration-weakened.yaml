@@ -1,0 +1,293 @@
+type: detection
+
+id: hg-lin-sudo-configuration-weakened-t1548-003
+version: 1.0.0
+
+info:
+  name: Sudo configuration weakened to grant passwordless root
+  description: >-
+    Sudo decides who becomes root and what they must prove to do it. Adding a NOPASSWD
+    rule, widening a rule to ALL, or lengthening the credential cache converts a
+    compromised user account into durable root access that needs no password and leaves no
+    obviously malicious artefact — the change is a line in a configuration file that
+    administrators edit legitimately. In a managed estate sudoers is owned by configuration
+    management, so a local edit is a deviation from the intended configuration as much as
+    it is an escalation.
+  severity: critical
+  author: huntgraph
+  tags:
+    - privilege-escalation
+    - sudo
+    - configuration-tampering
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1548/003
+    - https://attack.mitre.org/detectionstrategies/DET0052
+    - https://attack.mitre.org/techniques/T1548
+
+mitre:
+  tactics:
+    - TA0004
+  techniques:
+    - T1548
+  sub_techniques:
+    - T1548.003
+  detection_strategies:
+    - DET0052
+  analytics:
+    - AN0142
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+  data_components:
+    - File Modification
+    - Process Metadata
+
+hypothesis:
+  statement: >-
+    An adversary holding a non-root account may modify the sudo configuration to grant
+    themselves passwordless or unrestricted root, converting a single compromised user
+    into durable privileged access that persists across sessions and reboots.
+  attacker_behavior:
+    - Appends a NOPASSWD rule for their account or group to sudoers or a drop-in file.
+    - Widens an existing rule so the account may run any command as any user.
+    - Extends the sudo timestamp timeout so a cached credential remains valid far longer.
+    - Writes the change with a shell redirect rather than through visudo.
+  legitimate_behavior:
+    - Configuration management distributes sudoers rules across a fleet.
+    - Administrators grant sudo rights during onboarding or a role change.
+    - Package installation adds drop-in rules for service accounts.
+    - Automation accounts are legitimately granted passwordless sudo for specific commands.
+  risk_indicator:
+    - The rule grants ALL commands rather than a specific command set.
+    - The change is written by a shell redirect rather than through visudo.
+    - The beneficiary is a user account rather than an automation or service identity.
+    - The change is local rather than delivered by configuration management.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: nopasswd-rule-written
+        name: Passwordless sudo rule written
+        purpose: >-
+          Surface the specific grant that removes the password requirement, which is the
+          change that makes a stolen account durably privileged.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/NOPASSWD/i
+          | CommandLine=/(sudoers|\/etc\/sudoers\.d\/|>>|>|tee\b|sed\s+-i|echo\b|printf\b)/i
+          | groupBy([ComputerName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the configuration-management agent"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: sudoers-edited-outside-visudo
+        name: Sudoers written without visudo
+        purpose: >-
+          Catch direct edits, since the supported path is visudo and a redirect into
+          sudoers is how the file is modified programmatically.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\/etc\/sudoers(\.d\/[^\s]*)?)/
+          | CommandLine=/(>>|>|tee\b|sed\s+-i|cp\b|mv\b|cat\b|echo\b|printf\b)/i
+          | CommandLine!=/visudo/i
+          | groupBy([ComputerName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of the package manager adding service-account drop-ins"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: sudoers-dropin-created
+        name: Drop-in file created under sudoers.d
+        purpose: >-
+          Cover the filesystem route, where a new drop-in file grants rights without the
+          main sudoers file being touched at all.
+        query: |
+          #event_simpleName=NewScriptWritten
+          | TargetFileName=/^\/etc\/sudoers\.d\//
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of the package manager and configuration-management agent"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+evidence:
+  required:
+    - id: sudo_rule_weakened
+      name: Sudo configuration modified to grant privilege
+      description: >-
+        A sudo rule was written or a drop-in file created that grants elevated rights,
+        changing who may become root and what they must prove to do it.
+      source: process_creation
+      field: CommandLine
+      indicates: elevation_control_bypass
+
+  supporting:
+    - id: passwordless_grant
+      name: Rule grants passwordless elevation
+      description: >-
+        The rule includes NOPASSWD, so the beneficiary can become root without presenting a
+        credential the adversary may not have.
+      source: process_creation
+      field: CommandLine
+      indicates: durable_privileged_access
+    - id: unrestricted_scope
+      name: Rule grants all commands
+      description: >-
+        The rule permits any command as any user rather than a specific command set, which
+        is general-purpose root rather than a delegated task.
+      source: process_creation
+      field: CommandLine
+      indicates: high_impact_privilege_grant
+    - id: written_outside_visudo
+      name: Written by redirect rather than visudo
+      description: >-
+        The change was made with a shell redirect, tee or sed rather than through visudo,
+        which is how the file is edited programmatically rather than by an administrator.
+      source: process_creation
+      field: CommandLine
+      indicates: abnormal_execution_chain
+    - id: local_deviation
+      name: Local change against a managed baseline
+      description: >-
+        Sudo configuration in this estate is otherwise owned by configuration management,
+        so a locally issued change is a deviation as well as an escalation.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: config_management_change
+      name: Delivered by configuration management
+      description: >-
+        The rule was written by the approved configuration-management agent as part of a
+        governed access definition.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: package_dropin
+      name: Drop-in added by package management
+      description: >-
+        The file was created by the package manager while installing software that requires
+        a service account to run specific commands.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_enterprise_activity
+    - id: recorded_access_grant
+      name: Recorded access grant
+      description: >-
+        A change or access-request record covers this sudo grant, naming the beneficiary,
+        the approver and the scope.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - sudo_rule_weakened
+
+    supporting:
+      any:
+        - passwordless_grant
+        - unrestricted_scope
+        - written_outside_visudo
+        - local_deviation
+      all:
+        - passwordless_grant
+        - written_outside_visudo
+
+    contradicting:
+      any:
+        - config_management_change
+        - package_dropin
+        - recorded_access_grant
+      all: []
+
+  verdict:
+    low_risk_when:
+      - sudo_rule_weakened
+      - config_management_change
+      - package_dropin
+      - recorded_access_grant
+    suspicious_when:
+      - sudo_rule_weakened
+      - local_deviation
+    high_risk_when:
+      - sudo_rule_weakened
+      - passwordless_grant
+      - unrestricted_scope
+      - written_outside_visudo
+
+  false_positive:
+    - condition: Configuration management distributes sudoers rules across a fleet.
+      explanation: >-
+        Managed access is written programmatically, often including NOPASSWD for automation
+        accounts, which reproduces the strongest supporting evidence. The agent as the
+        writing process and the fleet-wide pattern are the discriminators.
+    - condition: Package installation adds a drop-in rule for a service account.
+      explanation: >-
+        Software that needs a specific privileged command ships a drop-in. The package
+        manager is the writing process and the rule is scoped to named commands.
+    - condition: An administrator grants sudo rights during onboarding.
+      explanation: >-
+        Access changes are legitimate work and may be done at a shell. They are tied to a
+        named administrator with an access request and usually go through visudo.
+    - condition: Automation is granted passwordless sudo for specific commands.
+      explanation: >-
+        Unattended automation genuinely requires NOPASSWD, which is why command scope
+        rather than the flag alone carries the second escalation.
