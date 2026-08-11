@@ -1,0 +1,298 @@
+type: detection
+
+id: hg-win-source-compiled-on-the-endpoint-t1027-004
+version: 1.0.0
+
+info:
+  name: Source code compiled on the endpoint after delivery
+  description: >-
+    Delivering source instead of a binary defeats everything that inspects executables:
+    what arrives is text, and the executable only exists after a compiler on the victim
+    machine produces it. The compilers needed ship with Windows as part of the .NET
+    framework, so nothing has to be installed. On an engineering host compilation is
+    constant and meaningless; on a finance or HR endpoint a compiler running at all is the
+    finding, which makes host role the primary discriminator rather than anything in the
+    command.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - obfuscation
+    - compile-after-delivery
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1027/004
+    - https://attack.mitre.org/detectionstrategies/DET0501
+    - https://attack.mitre.org/techniques/T1027
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1027
+  sub_techniques:
+    - T1027.004
+  detection_strategies:
+    - DET0501
+  analytics:
+    - AN1381
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may deliver source code rather than a compiled payload and build it on the
+    victim host using compilers the operating system already provides, so that no
+    executable ever crosses the network or mail for inspection.
+  attacker_behavior:
+    - Invokes csc.exe, vbc.exe or jsc.exe against source staged in a writable directory.
+    - Compiles from a document handler or script host shortly after delivery.
+    - Runs the resulting executable from the same directory it was built in.
+    - Uses the framework compilers rather than installing a toolchain.
+  legitimate_behavior:
+    - Developers compile continuously on engineering workstations.
+    - Build agents invoke compilers as their core function.
+    - Some applications compile generated code at runtime, including XML serialisers.
+    - Installers occasionally build components during setup.
+  risk_indicator:
+    - The host has no development or build role.
+    - The compiler is invoked by a document handler, archive tool or script host.
+    - Source and output both sit in a temporary or user-writable directory.
+    - The compiled output is executed shortly after being produced.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: compiler-on-non-developer-host
+        name: Framework compiler running on a host that never builds
+        purpose: >-
+          Use host role as the discriminator, since a compiler on an endpoint with no build
+          history is more telling than any argument it was given.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(csc|vbc|jsc|ilasm|cvtres)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=compilations), collect([CommandLine], limit=3)])
+          | compilations <= 5
+        filters:
+          include: []
+          exclude:
+            - "ComputerName in the engineering and build-server asset groups"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: compiler-from-delivery-parent
+        name: Compiler invoked by a document handler or script host
+        purpose: >-
+          Catch compilation immediately following delivery, where the parent implies a
+          user opened content rather than an engineer building software.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(csc|vbc|jsc|ilasm)\.exe$/i
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|acrord32|chrome|msedge|firefox|7zfm|winrar|wscript|cscript|mshta|powershell|pwsh)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=compilations), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: build-then-run-in-writable-path
+        name: Output built and executed in a writable directory
+        purpose: >-
+          Join compilation to execution in the same location, which is the delivery
+          sequence rather than a build pipeline writing to an artefact store.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten|ProcessRollup2)$/
+          | case {
+              #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+                | TargetFileName=/\\(AppData|Temp|ProgramData|Users\\Public|Downloads)\\/i
+                | built_file := TargetFileName ;
+              #event_simpleName=ProcessRollup2
+                | ImageFileName=/\\(AppData|Temp|ProgramData|Users\\Public|Downloads)\\/i ;
+            }
+          | groupBy([ComputerName],
+                    function=[collect([built_file, ImageFileName, ParentBaseFileName, UserName]),
+                              count(as=events)])
+          | built_file=/.+/ and ImageFileName=/.+/
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of build agents writing into workspace directories"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+
+evidence:
+  required:
+    - id: compiler_invoked
+      name: Framework compiler executed
+      description: >-
+        A compiler shipped with the operating system was run, producing an executable on the
+        host that never had to cross the network as a binary.
+      source: process_creation
+      field: FileName
+      indicates: local_payload_construction
+
+  supporting:
+    - id: non_developer_host
+      name: Host with no build history
+      description: >-
+        This host shows essentially no compiler activity across the baseline window, so a
+        build occurring here is inconsistent with its role.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: delivery_parent
+      name: Compiler launched by a delivery application
+      description: >-
+        The compiler was invoked by a document handler, archive utility, browser or script
+        host rather than by an IDE or a build agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: writable_output
+      name: Output written into a writable directory
+      description: >-
+        The compiled executable was produced in a temporary or user-writable directory
+        rather than in a build workspace or an installation path.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: output_executed
+      name: Compiled output executed
+      description: >-
+        A process started from the path the compiler produced, confirming the build existed
+        to run rather than to be inspected.
+      source: process_creation
+      field: ImageFileName
+      indicates: execution_chain_progression
+
+  contradicting:
+    - id: engineering_asset
+      name: Registered engineering or build host
+      description: >-
+        The host belongs to an engineering or build asset group where compilation is
+        continuous and expected.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+    - id: build_agent_parent
+      name: Build agent or IDE as parent
+      description: >-
+        The compiler was invoked by a continuous-integration agent or a development
+        environment, which is its intended use.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: runtime_code_generation
+      name: Application generating code at runtime
+      description: >-
+        The compilation belongs to a framework feature that builds serialisers or generated
+        classes at runtime, which occurs on servers running that application.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_application_component
+
+  risk_logic:
+    required:
+      - compiler_invoked
+
+    supporting:
+      any:
+        - non_developer_host
+        - delivery_parent
+        - writable_output
+        - output_executed
+      all:
+        - non_developer_host
+        - delivery_parent
+
+    contradicting:
+      any:
+        - engineering_asset
+        - build_agent_parent
+        - runtime_code_generation
+      all: []
+
+  verdict:
+    low_risk_when:
+      - compiler_invoked
+      - engineering_asset
+      - build_agent_parent
+      - runtime_code_generation
+    suspicious_when:
+      - compiler_invoked
+      - non_developer_host
+    high_risk_when:
+      - compiler_invoked
+      - non_developer_host
+      - delivery_parent
+      - output_executed
+
+  false_positive:
+    - condition: A developer compiles code on an engineering workstation.
+      explanation: >-
+        Compilation is the normal activity of a development host, which is why the
+        hypothesis is anchored on host role rather than on the compiler running. Asset group
+        membership removes this class entirely.
+    - condition: A build agent invokes compilers as its core function.
+      explanation: >-
+        Build servers compile continuously at high volume. The parent is a build agent and
+        output goes to workspace directories rather than user paths.
+    - condition: An application compiles generated code at runtime.
+      explanation: >-
+        The .NET framework builds XML serialisers and other generated classes on demand,
+        producing compiler executions on application servers with temporary output paths.
+        These recur with a stable shape tied to the application starting.
+    - condition: An installer builds a component during setup.
+      explanation: >-
+        Some products compile configuration-specific components at install time. The
+        installer is the parent and the activity occurs once per host during a rollout.

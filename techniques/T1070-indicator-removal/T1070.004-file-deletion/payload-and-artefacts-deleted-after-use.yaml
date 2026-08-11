@@ -1,0 +1,290 @@
+type: detection
+
+id: hg-win-payload-and-artefacts-deleted-after-use-t1070-004
+version: 1.0.0
+
+info:
+  name: Payload and working artefacts deleted after use
+  description: >-
+    Deleting the tool after it has run is the cheapest cleanup available and it works: the
+    file is gone before anyone looks, and a hash-based hunt finds nothing. File deletion is
+    also the single most common event on any endpoint, so this can only be hunted as a
+    sequence — something ran from a writable directory, and then that same path was
+    removed. Secure-deletion utilities and volume shadow copy removal are narrower and
+    carry more weight on their own, because neither has a routine equivalent.
+  severity: medium
+  author: huntgraph
+  tags:
+    - stealth
+    - anti-forensics
+    - indicator-removal
+    - file-deletion
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1070/004
+    - https://attack.mitre.org/detectionstrategies/DET0140
+    - https://attack.mitre.org/techniques/T1070
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1070
+  sub_techniques:
+    - T1070.004
+  detection_strategies:
+    - DET0140
+  analytics:
+    - AN0392
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:PowerShell
+  data_components:
+    - Command Execution
+    - File Access
+    - File Deletion
+
+hypothesis:
+  statement: >-
+    An adversary may delete the payload and working files they used once those files have
+    served their purpose, removing the artefacts an investigator would recover and
+    defeating any hunt that depends on the file still existing.
+  attacker_behavior:
+    - Deletes the executable it just ran from the directory it ran in.
+    - Uses a secure-deletion utility so the content cannot be recovered.
+    - Removes volume shadow copies so previous versions cannot be restored either.
+    - Deletes staged output and archives after exfiltration.
+  legitimate_behavior:
+    - Installers and updaters remove their temporary files after completing.
+    - Cleanup and disk-hygiene tooling deletes temporary content on a schedule.
+    - Build systems clear workspaces between runs.
+    - Users delete downloads and working files routinely.
+  risk_indicator:
+    - The deleted path is the one a process ran from moments earlier.
+    - A secure-deletion utility is used rather than an ordinary delete.
+    - Volume shadow copies are removed in the same activity.
+    - The deleting process is a script host or a remote-execution channel.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: secure-deletion-utility
+        name: Secure deletion utility invoked
+        purpose: >-
+          Surface deletion that is designed to defeat recovery, which has no routine
+          administrative equivalent on an endpoint.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(sdelete|cipher(\.exe)?\s+\/w|shred\b|srm\b|Remove-Item\s+.*-Force\s+.*-Recurse.*\\Temp)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved secure-decommissioning tooling on retirement workflows"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: shadow-copies-removed
+        name: Volume shadow copies deleted
+        purpose: >-
+          Catch removal of the mechanism that would otherwise allow deleted content and
+          previous versions to be recovered.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(vssadmin\s+.*delete\s+shadows|wmic\s+shadowcopy\s+delete|Win32_ShadowCopy.*Delete|Delete-ShadowCopy|bcdedit\s+.*recoveryenabled\s+no|wbadmin\s+delete\s+catalog)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: run-then-delete-same-path
+        name: Executable run from a writable path and then deleted
+        purpose: >-
+          Join execution to removal of the same location, which is the cleanup sequence
+          rather than ordinary file hygiene.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              ImageFileName=/\\(AppData|Temp|ProgramData|Users\\Public|Downloads)\\/i
+                | ran_from := ImageFileName ;
+              CommandLine=/\b(del|erase|Remove-Item|rd\s+\/s|rmdir\s+\/s)\b/i
+                | CommandLine=/\\(AppData|Temp|ProgramData|Users\\Public|Downloads)\\/i
+                | delete_command := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([ran_from, delete_command, ParentBaseFileName]),
+                              count(as=events)])
+          | ran_from=/.+/ and delete_command=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Installers and updaters cleaning their own temporary directories"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - path
+
+evidence:
+  required:
+    - id: artefact_deleted
+      name: Working artefact or recovery mechanism removed
+      description: >-
+        Files were deleted from a location a process had just executed from, a
+        secure-deletion utility was used, or volume shadow copies were removed, each of
+        which destroys what an investigation would otherwise recover.
+      source: process_creation
+      field: CommandLine
+      indicates: evidence_destruction
+
+  supporting:
+    - id: secure_deletion
+      name: Deletion designed to defeat recovery
+      description: >-
+        A secure-deletion utility or overwrite option was used rather than an ordinary
+        delete, which is intent to prevent recovery rather than to free space.
+      source: process_creation
+      field: CommandLine
+      indicates: deliberate_evasion
+    - id: shadow_copies_removed
+      name: Shadow copies deleted
+      description: >-
+        Volume shadow copies were removed, eliminating the previous-version mechanism that
+        would allow deleted content to be restored.
+      source: process_creation
+      field: CommandLine
+      indicates: recovery_capability_destroyed
+    - id: deleted_execution_path
+      name: Deleted path matches a recent execution
+      description: >-
+        The removed location is where a process ran from shortly beforehand, which is
+        cleanup of a payload rather than routine temporary-file hygiene.
+      source: process_creation
+      field: ImageFileName
+      indicates: anti_forensic_sequence
+    - id: scripted_actor
+      name: Deletion issued by a script host or remote channel
+      description: >-
+        The deletion was performed by an interpreter or through a remote-execution channel
+        rather than by an installer or a cleanup agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+
+  contradicting:
+    - id: installer_cleanup
+      name: Installer removing its own temporary files
+      description: >-
+        The deletion was performed by an installer or updater clearing the working
+        directory it created during setup.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: disk_hygiene_tooling
+      name: Scheduled cleanup tooling
+      description: >-
+        The deletion belongs to disk-hygiene or workspace-cleanup automation that removes
+        temporary content on a fixed schedule.
+      source: baseline
+      field: CommandLine
+      indicates: scheduled_automation_job
+    - id: recorded_decommission
+      name: Recorded decommissioning or wipe
+      description: >-
+        A change record covers secure deletion as part of decommissioning a host or
+        sanitising storage.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - artefact_deleted
+
+    supporting:
+      any:
+        - secure_deletion
+        - shadow_copies_removed
+        - deleted_execution_path
+        - scripted_actor
+      all:
+        - deleted_execution_path
+        - scripted_actor
+
+    contradicting:
+      any:
+        - installer_cleanup
+        - disk_hygiene_tooling
+        - recorded_decommission
+      all: []
+
+  verdict:
+    low_risk_when:
+      - artefact_deleted
+      - installer_cleanup
+      - disk_hygiene_tooling
+      - recorded_decommission
+    suspicious_when:
+      - artefact_deleted
+      - deleted_execution_path
+    high_risk_when:
+      - artefact_deleted
+      - secure_deletion
+      - shadow_copies_removed
+      - scripted_actor
+
+  false_positive:
+    - condition: An installer removes its temporary files after completing.
+      explanation: >-
+        Cleanup after setup is correct behaviour and often deletes the directory an
+        installer just executed from, reproducing the sequence evidence. The installer as
+        the acting process is the discriminator.
+    - condition: Scheduled disk-hygiene tooling clears temporary content.
+      explanation: >-
+        Cleanup jobs delete large volumes of temporary files, including paths where things
+        recently ran. These recur on a fixed cadence with a stable command line.
+    - condition: A build system clears its workspace between runs.
+      explanation: >-
+        Workspace cleanup removes executables the build itself produced and ran. This is
+        confined to build hosts under a build agent.
+    - condition: An administrator securely wipes a decommissioned machine.
+      explanation: >-
+        Secure deletion is correct during decommissioning and is the strongest supporting
+        item here. A change record and the host's retirement state separate it.
