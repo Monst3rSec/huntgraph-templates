@@ -1,0 +1,293 @@
+type: detection
+
+id: hg-win-vnc-server-installed-for-remote-control-t1021-005
+version: 1.0.0
+
+info:
+  name: VNC server installed or started for remote control
+  description: >-
+    A remote control server gives an adversary the victim's screen and keyboard, which is
+    more useful than a shell when the goal is to use an application as the user rather than
+    to run commands. It is also legitimate software, so it will not be blocked and often
+    will not be questioned. What makes it observable is that it must listen: a server
+    appears on a host that had none, usually installed moments earlier, and then accepts a
+    connection from somewhere the host has no history of being administered from.
+  severity: high
+  author: huntgraph
+  tags:
+    - lateral-movement
+    - remote-control
+    - vnc
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1021/005
+    - https://attack.mitre.org/detectionstrategies/DET0178
+    - https://attack.mitre.org/techniques/T1021
+
+mitre:
+  tactics:
+    - TA0008
+  techniques:
+    - T1021
+  sub_techniques:
+    - T1021.005
+  detection_strategies:
+    - DET0178
+  analytics:
+    - AN0504
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Logon Session Creation
+    - Network Traffic Flow
+
+hypothesis:
+  statement: >-
+    An adversary may install or start a remote control server on a compromised host so they
+    can operate the user's session directly, using legitimate software that endpoint
+    controls permit and that provides screen and keyboard access rather than a shell.
+  attacker_behavior:
+    - Installs a VNC server or starts a portable one that needs no installation.
+    - Configures it to listen without a visible tray icon or notification.
+    - Adds a firewall exception so the listener is reachable.
+    - Connects from a host that has never administered this machine.
+  legitimate_behavior:
+    - Support teams use remote control products to assist users.
+    - Some estates deploy VNC as their standard remote assistance tool.
+    - Engineers run VNC to reach lab and test systems.
+    - Virtualisation consoles embed VNC-derived components.
+  risk_indicator:
+    - The server binary runs from a user-writable directory rather than an installation path.
+    - The server was written to the host shortly before it started.
+    - A firewall exception was created for it in the same activity.
+    - The host has no history of running remote control software.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: vnc-server-started
+        name: Remote control server started
+        purpose: >-
+          Surface remote control listeners running, which on a host with no such history is
+          the starting point regardless of which product it is.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(winvnc|winvnc4|tvnserver|uvnc_service|vncserver|x11vnc|tightvnc|ultravnc|realvnc)\w*\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=starts), collect([CommandLine], limit=5)])
+          | sort(starts, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Estates where VNC is the standard remote assistance product"
+            - "ComputerName in the engineering and lab asset groups"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: server-from-writable-path
+        name: Remote control server running from a writable directory
+        purpose: >-
+          Separate a deployed support product from a portable server dropped onto the host
+          for this purpose.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/(vnc|tvnserver|x11vnc|dwagent|meshagent)\w*\.exe$/i
+          | ImageFileName=/\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\/i
+          | ImageFileName!=/\\Program Files( \(x86\))?\\/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=starts), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: listener-firewall-exception
+        name: Firewall exception created for a remote control port
+        purpose: >-
+          Catch the step that makes the listener reachable, which is required for the
+          server to be useful from outside the host.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(netsh\s+advfirewall\s+firewall\s+add\s+rule|New-NetFirewallRule)/i
+          | CommandLine=/(localport\s*=\s*(59[0-9][0-9])|-LocalPort\s+59[0-9][0-9]|vnc)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=rules), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Managed policy distributing remote assistance firewall configuration"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+evidence:
+  required:
+    - id: remote_control_server_running
+      name: Remote control server started on the host
+      description: >-
+        A VNC or comparable remote control server was started, giving screen and keyboard
+        access to whoever connects to it.
+      source: process_creation
+      field: FileName
+      indicates: remote_interactive_access
+
+  supporting:
+    - id: writable_server_path
+      name: Server running from a user-writable directory
+      description: >-
+        The server binary sits under AppData, Temp, ProgramData or a user profile rather
+        than in an installation directory, which is a portable server rather than deployed
+        software.
+      source: process_creation
+      field: ImageFileName
+      indicates: untrusted_execution_location
+    - id: server_recently_written
+      name: Server written shortly before starting
+      description: >-
+        The binary arrived on the host shortly before it ran, indicating capability being
+        added rather than existing software being used.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: firewall_exception_added
+      name: Firewall exception created for the listener
+      description: >-
+        An inbound rule was created covering the remote control port, which is required for
+        the server to be reachable and is not something deployed software needs at runtime.
+      source: process_creation
+      field: CommandLine
+      indicates: access_path_creation
+    - id: no_remote_control_history
+      name: Host has no remote control history
+      description: >-
+        No comparable software has run on this host during the baseline window, unlike
+        estates where a remote assistance product is deployed.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: standard_support_product
+      name: Standard remote assistance product
+      description: >-
+        The software is the estate's sanctioned remote assistance tool, deployed and used
+        by the support function.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_enterprise_activity
+    - id: engineering_or_lab_host
+      name: Engineering or lab system
+      description: >-
+        The host belongs to an asset group where remote control of test systems is routine.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+    - id: recorded_support_session
+      name: Recorded support session
+      description: >-
+        An incident record covers an engineer establishing remote control to assist the
+        user of this machine.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - remote_control_server_running
+
+    supporting:
+      any:
+        - writable_server_path
+        - server_recently_written
+        - firewall_exception_added
+        - no_remote_control_history
+      all:
+        - writable_server_path
+        - server_recently_written
+
+    contradicting:
+      any:
+        - standard_support_product
+        - engineering_or_lab_host
+        - recorded_support_session
+      all: []
+
+  verdict:
+    low_risk_when:
+      - remote_control_server_running
+      - standard_support_product
+      - engineering_or_lab_host
+      - recorded_support_session
+    suspicious_when:
+      - remote_control_server_running
+      - no_remote_control_history
+    high_risk_when:
+      - remote_control_server_running
+      - writable_server_path
+      - server_recently_written
+      - firewall_exception_added
+
+  false_positive:
+    - condition: A support team uses a remote control product to assist users.
+      explanation: >-
+        Remote assistance is a normal support function and its server component runs on
+        every assisted machine. The product is deployed software in an installation
+        directory with an incident record behind each session.
+    - condition: An estate deploys VNC as its standard remote assistance tool.
+      explanation: >-
+        Where this is the chosen product, servers run everywhere and firewall exceptions are
+        distributed by policy. The estate-wide footprint is the discriminator.
+    - condition: An engineer runs VNC to reach a lab system.
+      explanation: >-
+        Test estates commonly use portable VNC servers from user directories, reproducing
+        the strongest supporting evidence. Asset group membership separates them.
+    - condition: A virtualisation console embeds a VNC-derived component.
+      explanation: >-
+        Some hypervisor consoles use VNC internally for guest display. These run from the
+        virtualisation product's installation path on hosts running that platform.

@@ -1,0 +1,315 @@
+type: detection
+
+id: hg-win-payload-compressed-to-evade-inspection-t1027-015
+version: 1.0.0
+
+info:
+  name: Payload compressed to evade content inspection
+  description: >-
+    Compression hides a payload from anything that inspects file contents without unpacking
+    them, which includes a good deal of mail and gateway inspection. Archives are also
+    entirely ordinary, so the archive itself proves nothing whatsoever. The behaviour worth
+    hunting is the pairing at either end of the chain: an archive arriving and an
+    executable emerging from it in the same directory, or a payload being compressed on the
+    host after collection and before it leaves.
+  severity: medium
+  author: huntgraph
+  tags:
+    - stealth
+    - obfuscation
+    - compression
+    - archive
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1027/015
+    - https://attack.mitre.org/detectionstrategies/DET0281
+    - https://attack.mitre.org/techniques/T1027
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1027
+  sub_techniques:
+    - T1027.015
+  detection_strategies:
+    - DET0281
+  analytics:
+    - AN0782
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary may compress a payload so its contents are opaque to inspection in
+    transit, or compress collected data before moving it off the host, in both cases using
+    archive formats that are entirely ordinary in isolation.
+  attacker_behavior:
+    - Delivers a payload inside an archive so gateway inspection sees compressed bytes.
+    - Extracts an executable from the archive into the same directory and runs it.
+    - Applies a password to the archive so inspection cannot unpack it at all.
+    - Compresses collected files on the host before transferring them.
+  legitimate_behavior:
+    - Users exchange archives constantly for ordinary file transfer.
+    - Software is distributed as compressed packages.
+    - Backup and log rotation produce archives continuously.
+    - Build pipelines package artefacts as archives.
+  risk_indicator:
+    - An executable emerges from an archive in a download directory and then runs.
+    - The archive is password protected, preventing inspection entirely.
+    - Collected files are compressed shortly before an outbound transfer.
+    - The archiving process is a script host rather than a user or a backup agent.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: password-protected-archive
+        name: Password-protected archive created or extracted
+        purpose: >-
+          Isolate archives that inspection cannot open at all, which is a deliberate choice
+          rather than a convenience.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(7z|7za|winrar|rar|zip|tar)\w*\.exe$/i
+          | CommandLine=/(-p[^\s]|\s-hp|password=|--password)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Backup products that encrypt their own archives by policy"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: executable-extracted-then-run
+        name: Executable extracted into a download directory and run
+        purpose: >-
+          Join extraction to execution in the same delivery location, which is the receiving
+          end of a compressed payload.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten|ProcessRollup2)$/
+          | case {
+              #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+                | TargetFileName=/\\(Downloads|AppData\\Local\\Temp|Users\\Public)\\/i
+                | extracted_file := TargetFileName ;
+              #event_simpleName=ProcessRollup2
+                | ImageFileName=/\\(Downloads|AppData\\Local\\Temp|Users\\Public)\\/i
+                | ParentBaseFileName=/^(7zfm|7zg|winrar|winzip|peazip|explorer)\.exe$/i ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([extracted_file, ImageFileName, ParentBaseFileName]),
+                              count(as=events)])
+          | extracted_file=/.+/ and ImageFileName=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Approved self-service installers distributed as archives"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - path
+
+      - id: collection-compressed-by-script
+        name: Files compressed by a script before transfer
+        purpose: >-
+          Catch the sending end, where collected content is packaged by automation rather
+          than by a user or a backup agent.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(Compress-Archive|7z\s+a|rar\s+a|tar\s+-c|makecab)\b/i
+          | ParentBaseFileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|w3wp|wsmprovhost|WmiPrvSE)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Backup, log rotation and build packaging automation"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - command_line
+            - organization
+
+evidence:
+  required:
+    - id: compression_in_payload_chain
+      name: Compression used at a delivery or collection point
+      description: >-
+        An archive was created or extracted in a delivery directory, or files were
+        compressed by a script, placing compression at one end of a payload or collection
+        chain rather than in ordinary file exchange.
+      source: process_creation
+      field: CommandLine
+      indicates: inspection_evasion
+
+  supporting:
+    - id: password_protected
+      name: Archive protected by a password
+      description: >-
+        A password was applied, which prevents inspection from unpacking the archive at all
+        rather than merely compressing its contents.
+      source: process_creation
+      field: CommandLine
+      indicates: deliberate_evasion
+    - id: extracted_then_executed
+      name: Extracted executable run from the same directory
+      description: >-
+        An executable emerged from an archive in a delivery directory and then ran, which
+        is the receiving end of a compressed payload.
+      source: process_creation
+      field: ImageFileName
+      indicates: user_execution_foothold
+    - id: script_host_archiver
+      name: Compression performed by a script host
+      description: >-
+        The archiving was done by an interpreter, web service or remote-execution channel
+        rather than by a user, a backup agent or a build pipeline.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: rare_for_host
+      name: Pattern unprecedented for this host
+      description: >-
+        No comparable archiving or extraction pattern appears for this host and user during
+        the baseline window.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+    - id: executable_extracted
+      name: Executable written into a delivery directory by extraction
+      description: >-
+        An executable appeared in a download or temporary directory as the product of an
+        archive being unpacked, which is the payload emerging from its carrier.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+
+  contradicting:
+    - id: backup_or_rotation
+      name: Backup or log rotation
+      description: >-
+        The archiving belongs to a backup product or log rotation process that compresses
+        content continuously by design.
+      source: process_creation
+      field: FileName
+      indicates: legitimate_application_component
+    - id: build_packaging
+      name: Build packaging
+      description: >-
+        The compression is part of a build pipeline packaging artefacts on an engineering
+        host.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+    - id: ordinary_file_exchange
+      name: Ordinary user file exchange
+      description: >-
+        The archive was created or opened interactively by a user handling documents, which
+        is the overwhelming majority of archive activity.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - compression_in_payload_chain
+
+    supporting:
+      any:
+        - password_protected
+        - extracted_then_executed
+        - script_host_archiver
+        - rare_for_host
+        - executable_extracted
+      all:
+        - extracted_then_executed
+        - executable_extracted
+
+    contradicting:
+      any:
+        - backup_or_rotation
+        - build_packaging
+        - ordinary_file_exchange
+      all: []
+
+  verdict:
+    low_risk_when:
+      - compression_in_payload_chain
+      - backup_or_rotation
+      - build_packaging
+      - ordinary_file_exchange
+    suspicious_when:
+      - compression_in_payload_chain
+      - rare_for_host
+    high_risk_when:
+      - compression_in_payload_chain
+      - password_protected
+      - extracted_then_executed
+      - script_host_archiver
+
+  false_positive:
+    - condition: Users exchange archives for ordinary file transfer.
+      explanation: >-
+        Archives are among the most common file types in any estate, which is why the
+        archive alone is not the required evidence. Interactive handling of documents is
+        the dominant case.
+    - condition: Software is distributed as a compressed package.
+      explanation: >-
+        Extracting an installer from an archive and running it reproduces the strongest
+        supporting evidence exactly. Recognisable vendor software and estate-wide presence
+        are the discriminators.
+    - condition: Backup and log rotation produce archives continuously.
+      explanation: >-
+        These run at volume on a fixed schedule from approved agents, sometimes with
+        encryption applied by policy.
+    - condition: A build pipeline packages artefacts.
+      explanation: >-
+        Packaging is a normal build step and occurs on engineering hosts under build
+        agents with an unchanging command shape.
