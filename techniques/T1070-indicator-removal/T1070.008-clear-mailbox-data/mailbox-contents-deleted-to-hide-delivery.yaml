@@ -1,0 +1,285 @@
+type: detection
+
+id: hg-win-mailbox-contents-deleted-to-hide-delivery-t1070-008
+version: 1.0.0
+
+info:
+  name: Mailbox contents deleted to hide delivery or misuse
+  description: >-
+    The mailbox is where a phishing chain begins and where an operator using a compromised
+    account leaves traces. Deleting the lure hides how access was obtained; deleting sent
+    items hides what the account was used for; deleting bounce notifications hides that
+    mail was sent at all. All of it can be done through the mail client's own scripting
+    interface without touching the server administratively, which is why it belongs on the
+    endpoint rather than only in the mail platform's audit trail.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - anti-forensics
+    - indicator-removal
+    - mailbox
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1070/008
+    - https://attack.mitre.org/detectionstrategies/DET0266
+    - https://attack.mitre.org/techniques/T1070
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1070
+  sub_techniques:
+    - T1070.008
+  detection_strategies:
+    - DET0266
+  analytics:
+    - AN0737
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:PowerShell
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Command Execution
+    - Application Log Content
+    - File Deletion
+
+hypothesis:
+  statement: >-
+    An adversary may delete mail items from a compromised mailbox to remove the lure that
+    gained them access, the messages sent from the account, or the notifications that would
+    reveal that sending occurred, doing so through scripting rather than through the mail
+    platform's administrative interface.
+  attacker_behavior:
+    - Deletes items through the mail client's scripting interface or a COM automation object.
+    - Removes sent items and bounce notifications after using the account to send.
+    - Empties the deleted items folder so the removal is not itself recoverable.
+    - Creates a rule that moves incoming replies straight to a folder the user never opens.
+  legitimate_behavior:
+    - Users delete mail constantly and empty their deleted items.
+    - Retention and archiving tooling removes mail by policy.
+    - Mailbox migration and repair tooling deletes and rewrites items.
+    - Administrators clear mailboxes during offboarding.
+  risk_indicator:
+    - Deletion is performed through scripting rather than by a user clicking.
+    - Sent items or bounce notifications are targeted specifically.
+    - The activity follows a suspicious logon or an outbound sending burst.
+    - A rule is created that hides replies at the same time.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: mailbox-scripted-deletion
+        name: Mail items deleted through scripting
+        purpose: >-
+          Surface programmatic mailbox manipulation, which is how items are removed at
+          scale without a user clicking through them.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Outlook\.Application|MAPI|Search-Mailbox|Remove-MailboxExportRequest|Get-Inbox|Items\.Remove|DeleteItem|Folders\(\s*\d)/i
+          | CommandLine=/(Delete|Remove|Empty)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved retention, archiving and migration tooling"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: sent-items-or-notifications-targeted
+        name: Sent items or delivery notifications targeted
+        purpose: >-
+          Isolate deletion aimed at the folders that record what an account sent, which
+          users rarely clear deliberately.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Sent Items|SentItems|Undeliverable|Delivery Status|Non-Delivery|Deleted Items)/i
+          | CommandLine=/(Delete|Remove|Empty|Move)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: hiding-rule-created
+        name: Rule created to divert incoming mail
+        purpose: >-
+          Catch the companion behaviour, where replies and warnings are routed away from
+          the user rather than deleted after arrival.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(New-InboxRule|Rules\.Create|MoveToFolder|MarkAsRead.*Rule|Set-InboxRule)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Managed mail policy deploying organisational rules"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+evidence:
+  required:
+    - id: scripted_mailbox_change
+      name: Mailbox items deleted or diverted through scripting
+      description: >-
+        Mail items were removed, or a rule was created to divert them, through a scripting
+        or automation interface rather than by a user working in the client.
+      source: process_creation
+      field: CommandLine
+      indicates: evidence_destruction
+
+  supporting:
+    - id: sending_record_targeted
+      name: Sent items or delivery notifications targeted
+      description: >-
+        The deletion aims at sent items or non-delivery notifications, which record what
+        the account sent and which users rarely clear on purpose.
+      source: process_creation
+      field: CommandLine
+      indicates: targeted_evidence_destruction
+    - id: hiding_rule
+      name: Rule created to divert replies
+      description: >-
+        A rule was created that moves or marks incoming mail so replies and warnings do not
+        reach the user, which conceals ongoing misuse rather than past misuse.
+      source: process_creation
+      field: CommandLine
+      indicates: deliberate_evasion
+    - id: script_host_actor
+      name: Performed by a script host or delivery application
+      description: >-
+        The manipulation was driven by an interpreter or a document handler rather than by
+        the mail client under interactive use or by retention tooling.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: rare_for_user
+      name: Unprecedented for this user
+      description: >-
+        This user has not manipulated their mailbox programmatically during the baseline
+        window, unlike accounts covered by automated retention.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: retention_tooling
+      name: Retention or archiving product
+      description: >-
+        The deletion belongs to an approved retention, archiving or compliance product that
+        removes mail by policy.
+      source: process_creation
+      field: FileName
+      indicates: legitimate_enterprise_activity
+    - id: migration_or_repair
+      name: Mailbox migration or repair
+      description: >-
+        The activity belongs to a recorded mailbox migration or repair operation that
+        rewrites items as part of its function.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: managed_mail_policy
+      name: Managed mail rule deployment
+      description: >-
+        The rule was created by organisational mail policy rather than locally, and appears
+        across a defined user population.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - scripted_mailbox_change
+
+    supporting:
+      any:
+        - sending_record_targeted
+        - hiding_rule
+        - script_host_actor
+        - rare_for_user
+      all:
+        - sending_record_targeted
+        - script_host_actor
+
+    contradicting:
+      any:
+        - retention_tooling
+        - migration_or_repair
+        - managed_mail_policy
+      all: []
+
+  verdict:
+    low_risk_when:
+      - scripted_mailbox_change
+      - retention_tooling
+      - migration_or_repair
+      - managed_mail_policy
+    suspicious_when:
+      - scripted_mailbox_change
+      - rare_for_user
+    high_risk_when:
+      - scripted_mailbox_change
+      - sending_record_targeted
+      - hiding_rule
+      - script_host_actor
+
+  false_positive:
+    - condition: Retention or archiving tooling removes mail by policy.
+      explanation: >-
+        Compliance products delete and move mail continuously and programmatically, which
+        reproduces the required evidence. They run as recognisable products across a defined
+        population.
+    - condition: A user deletes mail and empties their deleted items.
+      explanation: >-
+        Ordinary mailbox hygiene is constant, which is why the required evidence is scripted
+        manipulation rather than deletion. Interactive clicking does not produce these
+        command lines.
+    - condition: Mailbox migration or repair rewrites items.
+      explanation: >-
+        Migration tooling deletes and recreates items at scale. These are planned operations
+        with change records and dedicated service accounts.
+    - condition: Organisational mail policy deploys inbox rules.
+      explanation: >-
+        Managed rules are created programmatically for many users at once, matching the
+        rule-creation evidence. They appear across a population rather than for one account.
