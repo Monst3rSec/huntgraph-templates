@@ -1,0 +1,297 @@
+type: detection
+
+id: hg-win-executable-content-planted-on-a-network-share-t1080
+version: 1.0.0
+
+info:
+  name: Executable content planted on a network share
+  description: >-
+    Shared drives are trusted by the people who use them, which makes them an efficient way
+    to spread without touching another machine directly. An adversary writes a shortcut, a
+    script or a macro-bearing document into a departmental share and waits: colleagues open
+    it because it appeared where their work lives. The spread is user-driven, so there is
+    no lateral authentication to observe — the observable is the write itself, and the
+    shape of what was written relative to what that share normally holds.
+  severity: high
+  author: huntgraph
+  tags:
+    - lateral-movement
+    - shared-content
+    - user-driven-spread
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1080
+    - https://attack.mitre.org/detectionstrategies/DET0471
+    - https://attack.mitre.org/techniques/T1204
+
+mitre:
+  tactics:
+    - TA0008
+  techniques:
+    - T1080
+  sub_techniques: []
+  detection_strategies:
+    - DET0471
+  analytics:
+    - AN1298
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - File Creation
+    - Network Share Access
+
+hypothesis:
+  statement: >-
+    An adversary may write executable or shortcut content into a shared directory that
+    colleagues use routinely, spreading through the trust those users place in the share
+    rather than through any direct connection to their machines.
+  attacker_behavior:
+    - Writes a shortcut, script or executable into a departmental or project share.
+    - Replaces or shadows an existing document with a macro-bearing version of the same name.
+    - Names the file to match the surrounding content so it does not look out of place.
+    - Writes to many shared directories in one pass to widen the reach.
+  legitimate_behavior:
+    - Users save documents and occasionally tools into shared project directories.
+    - Software distribution stages installers on shares for self-service installation.
+    - Backup and sync clients write into shared locations continuously.
+    - Build outputs are published to shares for distribution.
+  risk_indicator:
+    - The written content is a shortcut or script rather than a document.
+    - The writing account does not normally write to that share.
+    - Many shared directories receive similar content in a short period.
+    - The file shadows an existing document name with an executable extension.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: file_creation
+      event_types:
+        - NewExecutableWritten
+        - NewScriptWritten
+        - PeFileWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: executable-written-to-share
+        name: Executable or script written to a network path
+        purpose: >-
+          Surface content arriving on shared storage that users will open, which is where
+          the spread originates.
+        query: |
+          #event_simpleName=/^(NewExecutableWritten|NewScriptWritten|PeFileWritten)$/
+          | TargetFileName=/^\\\\\\\\[^\\\\]+\\\\/
+          | TargetFileName=/\.(lnk|exe|scr|js|jse|vbs|vbe|wsf|hta|bat|cmd|ps1|dll)$/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Share paths used for software distribution and build publication"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: many-shares-written-in-one-pass
+        name: Similar content written across many shared directories
+        purpose: >-
+          Identify a single actor seeding numerous locations, which is the reach an
+          adversary wants and which a user saving one file does not produce.
+        query: |
+          #event_simpleName=/^(NewExecutableWritten|NewScriptWritten|PeFileWritten)$/
+          | TargetFileName=/^\\\\\\\\[^\\\\]+\\\\/
+          | TargetFileName=/\.(lnk|exe|scr|js|vbs|hta|bat|cmd|ps1)$/i
+          | share_dir := replace("\\\\\\\\[^\\\\\\\\]+$", with="", field=TargetFileName)
+          | groupBy([ComputerName, SHA256HashData],
+                    function=[count(share_dir, distinct=true, as=distinct_shares),
+                              collect([TargetFileName], limit=20)])
+          | distinct_shares >= 3
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: execution-from-share
+        name: Content executed from a network path
+        purpose: >-
+          Observe the spread taking effect, where another user opens the planted file and
+          it runs from the share.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\\\\\\\\[^\s"\\]+\\\\[^",]+\.(lnk|js|jse|vbs|vbe|wsf|hta|bat|cmd|ps1|exe|scr)/i
+          | ParentBaseFileName=/^(explorer|winword|excel|powerpnt|outlook)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Share paths hosting approved self-service installers"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - path
+
+evidence:
+  required:
+    - id: executable_planted_on_share
+      name: Executable or shortcut content written to a share
+      description: >-
+        A shortcut, script or executable was written into a network share, placing runnable
+        content where users trust what they find.
+      source: file_creation
+      field: TargetFileName
+      indicates: user_driven_spread
+
+  supporting:
+    - id: multiple_shares_seeded
+      name: Same content written across several shares
+      description: >-
+        The identical file was written into three or more distinct shared directories,
+        which is deliberate seeding rather than a user saving their work.
+      source: file_creation
+      field: SHA256HashData
+      indicates: estate_wide_impact
+    - id: executed_by_another_user
+      name: Content executed from the share by a user
+      description: >-
+        A process started from the share path under an interactive parent, confirming the
+        planted content reached and ran for someone.
+      source: process_creation
+      field: CommandLine
+      indicates: execution_chain_progression
+    - id: shortcut_or_script_type
+      name: Content is a shortcut or script
+      description: >-
+        The written file is a shortcut or script rather than a document, which is not what
+        collaborative shares normally accumulate.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: unusual_writer_for_share
+      name: Writer unusual for that share
+      description: >-
+        This host has not written comparable content to that share during the baseline
+        window, unlike the population that maintains it.
+      source: baseline
+      field: TargetFileName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: distribution_share
+      name: Software distribution or build share
+      description: >-
+        The path is a documented distribution or build-publication share where executables
+        are expected to appear.
+      source: file_creation
+      field: TargetFileName
+      indicates: legitimate_enterprise_activity
+    - id: sync_or_backup_client
+      name: Sync or backup client writing
+      description: >-
+        The write was performed by an approved synchronisation or backup client that
+        replicates content into shared locations.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_application_component
+    - id: routine_publisher
+      name: Established publisher for that share
+      description: >-
+        This host and path pairing recurs throughout the baseline window, which is a
+        maintained share rather than a seeded one.
+      source: baseline
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - executable_planted_on_share
+
+    supporting:
+      any:
+        - multiple_shares_seeded
+        - executed_by_another_user
+        - shortcut_or_script_type
+        - unusual_writer_for_share
+      all:
+        - multiple_shares_seeded
+        - shortcut_or_script_type
+
+    contradicting:
+      any:
+        - distribution_share
+        - sync_or_backup_client
+        - routine_publisher
+      all: []
+
+  verdict:
+    low_risk_when:
+      - executable_planted_on_share
+      - distribution_share
+      - sync_or_backup_client
+      - routine_publisher
+    suspicious_when:
+      - executable_planted_on_share
+      - unusual_writer_for_share
+    high_risk_when:
+      - executable_planted_on_share
+      - multiple_shares_seeded
+      - shortcut_or_script_type
+      - executed_by_another_user
+
+  false_positive:
+    - condition: Software distribution stages installers on a share for self-service.
+      explanation: >-
+        Executables on shares are expected where self-service installation is offered. The
+        path is a documented distribution share and the same content appears there
+        routinely.
+    - condition: A build pipeline publishes outputs to a share.
+      explanation: >-
+        Build publication writes executables to shared storage continuously, sometimes
+        across several directories. The writing process is a build agent and the paths are
+        stable.
+    - condition: A user saves a tool or script into a project share.
+      explanation: >-
+        People do share utilities with colleagues, which produces the required evidence.
+        This is a single file in one directory rather than the same content seeded across
+        several.
+    - condition: A sync client replicates content into a shared location.
+      explanation: >-
+        Synchronisation writes whatever the user has, including scripts and shortcuts. The
+        acting process is an approved client operating continuously.

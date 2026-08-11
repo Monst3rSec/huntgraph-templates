@@ -1,0 +1,284 @@
+type: detection
+
+id: hg-win-rdp-session-hijacked-via-tscon-t1563-002
+version: 1.0.0
+
+info:
+  name: Disconnected remote desktop session hijacked
+  description: >-
+    A disconnected remote desktop session keeps its logon alive, and a SYSTEM-level caller
+    can attach that session to their own console without supplying the owner's password.
+    The result is a fully authenticated interactive session as another user — often an
+    administrator who locked their screen and walked away — with no credential theft, no
+    authentication event that looks wrong, and nothing for a password reset to remediate.
+    The mechanism is narrow enough that its use is close to self-evidently interesting.
+  severity: critical
+  author: huntgraph
+  tags:
+    - lateral-movement
+    - session-hijacking
+    - remote-desktop
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1563/002
+    - https://attack.mitre.org/detectionstrategies/DET0588
+    - https://attack.mitre.org/techniques/T1563
+
+mitre:
+  tactics:
+    - TA0008
+  techniques:
+    - T1563
+  sub_techniques:
+    - T1563.002
+  detection_strategies:
+    - DET0588
+  analytics:
+    - AN1620
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:System
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Logon Session Creation
+    - Service Creation
+
+hypothesis:
+  statement: >-
+    An adversary holding SYSTEM privilege may attach another user's disconnected remote
+    desktop session to their own, assuming that user's fully authenticated interactive
+    session without needing their password and without generating an authentication event
+    that appears anomalous.
+  attacker_behavior:
+    - Enumerates sessions with query user or qwinsta to find disconnected ones.
+    - Runs tscon against another session identifier to attach it to their own console.
+    - Creates a service that runs tscon so the operation executes as SYSTEM.
+    - Targets sessions belonging to administrators rather than ordinary users.
+  legitimate_behavior:
+    - Administrators query sessions while diagnosing terminal server capacity or hung sessions.
+    - Session management tooling disconnects and reconnects sessions during maintenance.
+    - Users reconnect to their own disconnected session, which is the intended feature.
+    - Remote support products manage sessions programmatically.
+  risk_indicator:
+    - tscon is invoked against a session identifier that does not belong to the caller.
+    - A service is created whose command line contains tscon.
+    - Session enumeration immediately precedes the attach.
+    - The activity occurs on a server holding administrator sessions.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: tscon-session-attach
+        name: Session attached with tscon
+        purpose: >-
+          Surface the mechanism directly, since attaching another session is the technique
+          itself rather than a precursor to it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\btscon(\.exe)?\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=attaches), collect([CommandLine], limit=5)])
+          | sort(attaches, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Session management products that reconnect sessions during maintenance"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+            - organization
+
+      - id: service-created-running-tscon
+        name: Service created to run tscon as SYSTEM
+        purpose: >-
+          Catch the privilege route, where a service is registered purely so the attach
+          runs with the rights the technique requires.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(sc(\.exe)?\s+.*\bcreate\b|New-Service)/i
+          | CommandLine=/tscon/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=registrations), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: session-enumeration-then-attach
+        name: Session enumeration followed by an attach
+        purpose: >-
+          Join reconnaissance to the operation, which distinguishes hijacking from an
+          administrator checking session state.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(query\s+user|quser|qwinsta|query\s+session)/i
+                | session_enum := CommandLine ;
+              CommandLine=/\btscon\b/i
+                | session_attach := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([session_enum, session_attach, ParentBaseFileName]),
+                              count(as=events)])
+          | session_enum=/.+/ and session_attach=/.+/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: session_attached
+      name: Remote desktop session attached to another console
+      description: >-
+        tscon was invoked to attach a terminal session, which transfers an existing
+        authenticated session to the caller without any credential being supplied.
+      source: process_creation
+      field: CommandLine
+      indicates: session_hijacking
+
+  supporting:
+    - id: system_privilege_route
+      name: Service created to run the attach as SYSTEM
+      description: >-
+        A service was registered whose command line contains tscon, which exists only to
+        obtain the SYSTEM context the operation requires.
+      source: process_creation
+      field: CommandLine
+      indicates: privilege_escalation_attempt
+    - id: enumeration_preceded
+      name: Session enumeration immediately before
+      description: >-
+        Sessions were listed shortly before the attach, which is an operator identifying a
+        target rather than an administrator reconnecting to their own session.
+      source: process_creation
+      field: CommandLine
+      indicates: hands_on_keyboard_activity
+    - id: scripted_context
+      name: Issued from a script host or remote channel
+      description: >-
+        The attach was issued by an interpreter or a remote-execution channel rather than
+        from an interactive administrative console.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: unprecedented_use
+      name: No comparable use in the baseline
+      description: >-
+        tscon has not been used on this host during the baseline window, which is the
+        normal state outside terminal-server administration.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: session_management_product
+      name: Approved session management product
+      description: >-
+        The operation was performed by a sanctioned session management or remote support
+        product that reconnects sessions as part of its documented behaviour.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: terminal_server_administration
+      name: Terminal server administration host
+      description: >-
+        The host is a terminal or session-broker server where session management is
+        routine operational work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: recorded_maintenance
+      name: Recorded session maintenance
+      description: >-
+        A change or incident record covers reconnecting or clearing sessions during
+        maintenance of a session host.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - session_attached
+
+    supporting:
+      any:
+        - system_privilege_route
+        - enumeration_preceded
+        - scripted_context
+        - unprecedented_use
+      all:
+        - system_privilege_route
+        - enumeration_preceded
+
+    contradicting:
+      any:
+        - session_management_product
+        - terminal_server_administration
+        - recorded_maintenance
+      all: []
+
+  verdict:
+    low_risk_when:
+      - session_attached
+      - session_management_product
+      - terminal_server_administration
+      - recorded_maintenance
+    suspicious_when:
+      - session_attached
+      - unprecedented_use
+    high_risk_when:
+      - session_attached
+      - system_privilege_route
+      - enumeration_preceded
+      - scripted_context
+
+  false_positive:
+    - condition: An administrator queries and reconnects sessions on a terminal server.
+      explanation: >-
+        Session management is routine on session hosts, and reconnecting a hung session is
+        a normal remedy. The host role is the discriminator, which is why it is
+        contradicting evidence rather than a filter.
+    - condition: A session management product reconnects sessions during maintenance.
+      explanation: >-
+        Products that manage session hosts invoke these mechanisms programmatically, which
+        reproduces the required and scripted evidence. The acting product is recognisable
+        and its behaviour is uniform.
+    - condition: A user reconnects to their own disconnected session.
+      explanation: >-
+        This is the feature working as designed, and it does not involve attaching another
+        user's session, which is why the target session identity matters rather than the
+        reconnect itself.
