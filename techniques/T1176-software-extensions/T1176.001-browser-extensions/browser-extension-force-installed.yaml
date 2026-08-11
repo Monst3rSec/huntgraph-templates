@@ -1,0 +1,297 @@
+type: detection
+
+id: hg-win-browser-extension-force-installed-t1176-001
+version: 1.0.0
+
+info:
+  name: Browser extension force-installed outside the user's choice
+  description: >-
+    A browser extension sits inside the application through which most work now happens. It
+    can read and rewrite pages, capture form submissions including credentials, and reach
+    the network under the browser's own identity, all without any process appearing on the
+    endpoint. Extensions are also installable by policy, which is what makes this
+    attractive: an adversary who can write the force-install registry values installs
+    silently on every profile, and the user is not asked and cannot remove it.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - browser-extension
+    - policy-abuse
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1176/001
+    - https://attack.mitre.org/detectionstrategies/DET0044
+    - https://attack.mitre.org/techniques/T1176
+
+mitre:
+  tactics:
+    - TA0003
+  techniques:
+    - T1176
+  sub_techniques:
+    - T1176.001
+  detection_strategies:
+    - DET0044
+  analytics:
+    - AN0123
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+    - File Creation
+    - Windows Registry Key Modification
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may install a browser extension through the force-install policy values or
+    by loading an unpacked extension directory, obtaining persistence inside the browser
+    that can read pages and capture credentials without any process running on the host.
+  attacker_behavior:
+    - Writes an extension identifier into the browser's force-install policy values.
+    - Loads an unpacked extension from a directory using a browser command-line switch.
+    - Points the install source at an update endpoint the organisation does not operate.
+    - Uses the extension to capture form data or to proxy traffic rather than to run code locally.
+  legitimate_behavior:
+    - Enterprises force-install approved extensions through managed policy.
+    - Security and productivity products install their own browser components.
+    - Developers load unpacked extensions while building them.
+    - Users install extensions themselves from the vendor store.
+  risk_indicator:
+    - The policy values are written locally rather than arriving through managed policy.
+    - The update endpoint is not the vendor store or a known internal source.
+    - An unpacked extension is loaded from a user-writable directory.
+    - The extension identifier appears on few hosts rather than across the estate.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: force-install-policy-written
+        name: Extension force-install policy written locally
+        purpose: >-
+          Surface local writes to the values that install extensions silently, which in a
+          managed estate should only ever arrive through policy.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(ExtensionInstallForcelist|ExtensionSettings|ExtensionInstallSources|Extensions\\\\Install)/i
+          | CommandLine=/(reg(\.exe)?\s+add|Set-ItemProperty|New-ItemProperty|New-Item)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Managed policy distributing approved extension configuration"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: unpacked-extension-loaded
+        name: Unpacked extension loaded from a directory
+        purpose: >-
+          Catch the developer-mode route, which installs an extension with no store
+          involvement and no policy value at all.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(chrome|msedge|brave|opera|vivaldi)\.exe$/i
+          | CommandLine=/--load-extension=|--disable-extensions-except=/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=loads), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "ComputerName in the engineering asset group where extension development is expected"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: extension-files-written-outside-store
+        name: Extension manifest written into a user-writable directory
+        purpose: >-
+          Observe extension content arriving on disk outside the browser's managed profile
+          path, which is how an unpacked payload is staged.
+        query: |
+          #event_simpleName=NewScriptWritten
+          | TargetFileName=/manifest\.json$/i
+          | TargetFileName=/\\(AppData|Temp|ProgramData|Users\\Public|Downloads)\\/i
+          | TargetFileName!=/\\(Extensions|Default\\Extensions)\\/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: extension_installed_outside_choice
+      name: Extension installed by policy value or unpacked load
+      description: >-
+        Browser extension force-install values were written, or an unpacked extension was
+        loaded from a directory, installing code inside the browser without the user
+        choosing it.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_established
+
+  supporting:
+    - id: local_policy_write
+      name: Policy written locally rather than by managed policy
+      description: >-
+        The force-install values were set by a local command rather than arriving through
+        the management platform that owns browser configuration.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: unpacked_from_writable_path
+      name: Extension loaded from a user-writable directory
+      description: >-
+        The extension directory sits under AppData, Temp, ProgramData or a user profile
+        rather than inside the browser's managed extension store.
+      source: file_creation
+      field: TargetFileName
+      indicates: untrusted_execution_location
+    - id: unknown_update_source
+      name: Install source is not the vendor store
+      description: >-
+        The configured update endpoint is neither the vendor store nor a documented
+        internal source, so the extension is served by an unknown party.
+      source: process_creation
+      field: CommandLine
+      indicates: possible_payload_retrieval
+    - id: rare_extension
+      name: Extension rare across the estate
+      description: >-
+        The extension identifier appears on very few hosts during the baseline window,
+        unlike approved extensions distributed to a managed population.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: managed_extension_policy
+      name: Distributed by managed policy
+      description: >-
+        The extension arrived through Group Policy or the browser management platform as
+        part of an approved configuration.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: vendor_product_component
+      name: Vendor product installing its own extension
+      description: >-
+        The extension belongs to an approved security or productivity product that installs
+        a browser component as part of setup.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_application_component
+    - id: engineering_host
+      name: Engineering host loading a development extension
+      description: >-
+        The host belongs to an engineering asset group where loading unpacked extensions is
+        routine development work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - extension_installed_outside_choice
+
+    supporting:
+      any:
+        - local_policy_write
+        - unpacked_from_writable_path
+        - unknown_update_source
+        - rare_extension
+      all:
+        - local_policy_write
+        - unknown_update_source
+
+    contradicting:
+      any:
+        - managed_extension_policy
+        - vendor_product_component
+        - engineering_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - extension_installed_outside_choice
+      - managed_extension_policy
+      - vendor_product_component
+      - engineering_host
+    suspicious_when:
+      - extension_installed_outside_choice
+      - rare_extension
+    high_risk_when:
+      - extension_installed_outside_choice
+      - local_policy_write
+      - unpacked_from_writable_path
+      - unknown_update_source
+
+  false_positive:
+    - condition: An enterprise force-installs approved extensions through policy.
+      explanation: >-
+        Managed extension deployment writes exactly these values, which is why the origin
+        rather than the value carries the escalation. Policy-delivered configuration
+        appears identically across the estate.
+    - condition: A security or productivity product installs its own browser component.
+      explanation: >-
+        Several products ship browser extensions and install them during setup. The
+        installer is the writing process and the extension is present wherever the product
+        is deployed.
+    - condition: A developer loads an unpacked extension while building it.
+      explanation: >-
+        Extension development requires exactly this switch and a directory under the user's
+        profile, reproducing the strongest supporting evidence. Asset group membership is
+        the discriminator.
+    - condition: A user installs an extension from the vendor store.
+      explanation: >-
+        Self-service installation writes into the browser's own extension directory rather
+        than setting force-install values, which is why the policy path is what the hunt
+        matches.

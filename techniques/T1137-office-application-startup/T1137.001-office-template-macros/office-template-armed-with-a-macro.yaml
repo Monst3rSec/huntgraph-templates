@@ -1,0 +1,301 @@
+type: detection
+
+id: hg-win-office-template-armed-with-a-macro-t1137-001
+version: 1.0.0
+
+info:
+  name: Office base template armed with a macro
+  description: >-
+    Word loads Normal.dotm and Excel loads its startup workbooks every time the application
+    opens, regardless of which document the user asked for. Writing macro code into one of
+    those templates therefore produces persistence that triggers on ordinary work, needs no
+    autostart entry, and re-arms every document the user creates afterwards. It is
+    particularly durable because the template is a legitimate file that already exists —
+    nothing new appears for an autoruns review to notice.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - office-template
+    - macro
+    - user-triggered
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1137/001
+    - https://attack.mitre.org/detectionstrategies/DET0519
+    - https://attack.mitre.org/techniques/T1137
+
+mitre:
+  tactics:
+    - TA0003
+  techniques:
+    - T1137
+  sub_techniques:
+    - T1137.001
+  detection_strategies:
+    - DET0519
+  analytics:
+    - AN1436
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Command Execution
+    - File Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An adversary may write macro code into an Office base template or startup directory so
+    that it executes every time the application launches, obtaining persistence that
+    triggers on the user's ordinary work and leaves no new autostart entry behind.
+  attacker_behavior:
+    - Writes or replaces Normal.dotm, or drops a template into the Word or Excel startup path.
+    - Enables macros through the trust settings so the template runs without a prompt.
+    - Uses the template to launch an interpreter whenever the application starts.
+    - Modifies an existing template rather than adding a file, so nothing new appears.
+  legitimate_behavior:
+    - Word rewrites Normal.dotm whenever a user changes styles or preferences.
+    - Enterprises deploy branded templates and add-ins to startup directories.
+    - Macro-enabled business templates are a normal part of finance and reporting work.
+    - Template management products distribute and update templates centrally.
+  risk_indicator:
+    - The template is written by a process other than the Office application itself.
+    - Macro security settings are relaxed in the same activity.
+    - The Office application spawns an interpreter shortly after starting.
+    - The change appears on few hosts rather than across a managed population.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+        - PeFileWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: template-written-by-non-office-process
+        name: Office template written by something other than Office
+        purpose: >-
+          Separate the application maintaining its own template, which happens constantly,
+          from another process writing into it.
+        query: |
+          #event_simpleName=/^(NewScriptWritten|PeFileWritten)$/
+          | TargetFileName=/\\(Normal\.dotm|PERSONAL\.XLSB|.*\.(dotm|xlam|xlsm|xlt[mx]|ppa[mx]))$/i
+          | TargetFileName=/\\(Templates|XLSTART|STARTUP|AddIns|Roaming\\Microsoft)\\/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of the Office applications themselves and approved template-management tooling"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: macro-trust-settings-relaxed
+        name: Macro security or trusted access relaxed
+        purpose: >-
+          Catch the configuration change that lets a planted template run without
+          prompting, which is required for the persistence to be reliable.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(VBAWarnings|AccessVBOM|DisableAllActiveX|TrustedLocations|MacroRuntimeScanScope)/i
+          | CommandLine=/(reg(\.exe)?\s+add|Set-ItemProperty|New-ItemProperty)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Managed policy distributing Office macro configuration"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: office-spawns-interpreter-at-startup
+        name: Office application spawning an interpreter
+        purpose: >-
+          Observe the template executing, where the application becomes the parent of
+          something no document handling requires.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook)\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32|certutil)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Documented business macros that invoke scripting"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - parent_process
+            - process
+
+evidence:
+  required:
+    - id: template_modified
+      name: Office template or startup item written externally
+      description: >-
+        A base template or startup-directory file was written by a process other than the
+        Office application that owns it, placing code where the application will load it on
+        every launch.
+      source: file_creation
+      field: TargetFileName
+      indicates: persistence_established
+
+  supporting:
+    - id: macro_trust_relaxed
+      name: Macro security settings relaxed
+      description: >-
+        Macro warnings were disabled, the VBA object model was opened, or a trusted
+        location was added, which lets the planted template run without prompting.
+      source: process_creation
+      field: CommandLine
+      indicates: defensive_control_avoidance
+    - id: office_spawned_interpreter
+      name: Office application spawned an interpreter
+      description: >-
+        The application became the parent of a script interpreter or proxy-execution
+        binary, which is the template executing rather than merely existing.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: execution_chain_progression
+    - id: script_host_writer
+      name: Written by a script host or delivery application
+      description: >-
+        The template was written by an interpreter, archive utility or mail client rather
+        than by Office or a template-management product.
+      source: file_creation
+      field: ContextProcessId
+      indicates: abnormal_execution_chain
+    - id: rare_in_estate
+      name: Change confined to few hosts
+      description: >-
+        The template modification appears on very few machines during the baseline window,
+        unlike branded templates distributed to a managed population.
+      source: baseline
+      field: TargetFileName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: office_self_maintenance
+      name: Office maintaining its own template
+      description: >-
+        The writing process is the Office application itself, which rewrites Normal.dotm
+        whenever a user changes styles or preferences.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_application_component
+    - id: managed_template_deployment
+      name: Managed template distribution
+      description: >-
+        The template was deployed by an approved template-management product or policy and
+        appears across a defined population.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+    - id: documented_business_macro
+      name: Documented business macro workflow
+      description: >-
+        The macro-enabled template belongs to a known finance or reporting workflow whose
+        macros invoke scripting by design.
+      source: asset_inventory
+      field: UserName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - template_modified
+
+    supporting:
+      any:
+        - macro_trust_relaxed
+        - office_spawned_interpreter
+        - script_host_writer
+        - rare_in_estate
+      all:
+        - macro_trust_relaxed
+        - office_spawned_interpreter
+
+    contradicting:
+      any:
+        - office_self_maintenance
+        - managed_template_deployment
+        - documented_business_macro
+      all: []
+
+  verdict:
+    low_risk_when:
+      - template_modified
+      - office_self_maintenance
+      - managed_template_deployment
+      - documented_business_macro
+    suspicious_when:
+      - template_modified
+      - rare_in_estate
+    high_risk_when:
+      - template_modified
+      - macro_trust_relaxed
+      - office_spawned_interpreter
+      - script_host_writer
+
+  false_positive:
+    - condition: Word rewrites Normal.dotm when a user changes styles.
+      explanation: >-
+        The base template is rewritten constantly during ordinary use, which is why the
+        writing process rather than the write carries the required evidence. Office writing
+        its own template is the overwhelming majority case.
+    - condition: An enterprise deploys branded templates to startup directories.
+      explanation: >-
+        Managed template distribution writes exactly these paths, sometimes programmatically.
+        The files appear across a defined population rather than on isolated hosts.
+    - condition: A finance or reporting workflow uses macro-enabled templates.
+      explanation: >-
+        Legitimate macros do spawn scripting, particularly in reporting teams, which
+        reproduces the execution evidence. These recur for the same users over long periods.
+    - condition: Managed policy configures Office macro settings.
+      explanation: >-
+        Enterprises set macro warning levels and trusted locations centrally, which matches
+        the trust-relaxation evidence. It arrives through policy rather than an interactive
+        command line.
