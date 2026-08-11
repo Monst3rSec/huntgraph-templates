@@ -1,0 +1,305 @@
+type: detection
+
+id: hg-win-container-file-used-to-strip-mark-of-the-web-t1553-005
+version: 1.0.0
+
+info:
+  name: Container file used to deliver a payload without mark-of-the-web
+  description: >-
+    Windows tags downloaded files with a zone marker, and Office and SmartScreen use it to
+    decide how cautious to be. The marker does not always survive extraction: certain
+    container formats — ISO, IMG, VHD and some archive tools — deliver their contents
+    without it, so a macro document that would have opened in Protected View opens
+    normally instead. The delivery shape is distinctive because these formats have almost
+    no legitimate use in ordinary correspondence, and mounting one to open a single
+    document is not how anyone works.
+  severity: high
+  author: huntgraph
+  tags:
+    - defense-impairment
+    - mark-of-the-web
+    - phishing-payload
+    - container-delivery
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1553/005
+    - https://attack.mitre.org/detectionstrategies/DET0257
+    - https://attack.mitre.org/techniques/T1553
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1553
+  sub_techniques:
+    - T1553.005
+  detection_strategies:
+    - DET0257
+  analytics:
+    - AN0712
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - File Creation
+    - File Access
+    - File Metadata
+
+hypothesis:
+  statement: >-
+    An adversary may deliver a payload inside a disk image or archive format that does not
+    propagate the zone marker to extracted contents, so the payload executes without
+    Protected View, SmartScreen or macro blocking treating it as downloaded content.
+  attacker_behavior:
+    - Sends an ISO, IMG or VHD containing a document, shortcut or executable.
+    - Relies on the user mounting the image and opening its contents directly.
+    - Uses an archive utility that does not propagate the marker on extraction.
+    - Places a shortcut inside the container that launches an interpreter.
+  legitimate_behavior:
+    - Software vendors distribute installation media as ISO images.
+    - Engineering and virtualisation workflows use disk images routinely.
+    - Backup products create and mount VHD files.
+    - Users extract archives with third-party tools constantly.
+  risk_indicator:
+    - The container was written to a download or mail directory before being opened.
+    - The content executed from the mounted volume is a shortcut, script or interpreter.
+    - The container is small enough to hold a lure rather than installation media.
+    - The host has no engineering or virtualisation role.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewExecutableWritten
+        - NewScriptWritten
+        - PeFileWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: container-written-to-delivery-path
+        name: Disk image written to a download or mail directory
+        purpose: >-
+          Catch the container at delivery, which precedes the user mounting it and gives
+          the earliest opportunity to respond.
+        query: |
+          #event_simpleName=/^(NewExecutableWritten|NewScriptWritten|PeFileWritten)$/
+          | TargetFileName=/\.(iso|img|vhd|vhdx|udf)$/i
+          | TargetFileName=/\\(Downloads|AppData|Temp|Users\\Public|INetCache|Content\.Outlook)\\/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName in the engineering and virtualisation asset groups"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - path
+            - organization
+
+      - id: execution-from-mounted-volume
+        name: Interpreter or shortcut executed from a mounted volume
+        purpose: >-
+          Observe the payload running out of the container, which is where the missing zone
+          marker actually changes the outcome.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32|msiexec)\.exe$/i
+          | CommandLine=/[D-Z]:\\[^",]+\.(lnk|js|jse|vbs|vbe|wsf|hta|bat|cmd|ps1|dll|exe)/i
+          | ParentBaseFileName=/^(explorer|winword|excel|powerpnt|outlook)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Removable-media workflows approved for the affected user population"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: office-child-without-protected-view
+        name: Document application spawning execution after container delivery
+        purpose: >-
+          Identify the outcome the bypass is for, where a document that should have opened
+          in Protected View instead spawns an execution chain.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(winword|excel|powerpnt|onenote|msaccess)\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32|certutil)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Documented business macros that invoke scripting"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - parent_process
+            - process
+
+evidence:
+  required:
+    - id: container_delivery
+      name: Container file delivered or executed from
+      description: >-
+        A disk image or comparable container was written into a delivery directory, or
+        content was executed from a mounted volume, which is how a payload arrives without
+        the zone marker its download would otherwise carry.
+      source: file_creation
+      field: TargetFileName
+      indicates: trust_control_subversion
+
+  supporting:
+    - id: interpreter_from_volume
+      name: Interpreter or shortcut run from the mounted volume
+      description: >-
+        The content executed from the container is a shortcut, script or interpreter rather
+        than installation media, which is the payload shape rather than a software
+        distribution.
+      source: process_creation
+      field: CommandLine
+      indicates: user_execution_foothold
+    - id: document_spawned_chain
+      name: Document application spawned an execution chain
+      description: >-
+        An Office application became the parent of an interpreter, which is the outcome the
+        marker bypass exists to enable.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: execution_chain_progression
+    - id: delivery_directory
+      name: Container written to a download or mail directory
+      description: >-
+        The container arrived in Downloads, a browser cache or the Outlook attachment
+        directory rather than being staged by a distribution process.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: rare_for_user
+      name: Container use unprecedented for this user
+      description: >-
+        This user and host have not handled disk images during the baseline window, unlike
+        engineering populations where they are routine.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: engineering_asset
+      name: Engineering or virtualisation host
+      description: >-
+        The host belongs to an asset group where disk images are handled as routine work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+    - id: vendor_installation_media
+      name: Vendor installation media
+      description: >-
+        The container is recognised installation media distributed through an approved
+        channel, and the content executed from it is an installer.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_enterprise_activity
+    - id: backup_product_image
+      name: Backup product image file
+      description: >-
+        The image was created and mounted by an approved backup product as part of its
+        normal operation.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_application_component
+
+  risk_logic:
+    required:
+      - container_delivery
+
+    supporting:
+      any:
+        - interpreter_from_volume
+        - document_spawned_chain
+        - delivery_directory
+        - rare_for_user
+      all:
+        - interpreter_from_volume
+        - delivery_directory
+
+    contradicting:
+      any:
+        - engineering_asset
+        - vendor_installation_media
+        - backup_product_image
+      all: []
+
+  verdict:
+    low_risk_when:
+      - container_delivery
+      - engineering_asset
+      - vendor_installation_media
+      - backup_product_image
+    suspicious_when:
+      - container_delivery
+      - rare_for_user
+    high_risk_when:
+      - container_delivery
+      - interpreter_from_volume
+      - document_spawned_chain
+      - delivery_directory
+
+  false_positive:
+    - condition: A vendor distributes installation media as an ISO image.
+      explanation: >-
+        Software distribution genuinely uses disk images, and users do download and mount
+        them. The content executed is a recognisable installer rather than a shortcut or
+        script, and the image is large enough to be media.
+    - condition: Engineering or virtualisation work uses disk images routinely.
+      explanation: >-
+        Building and testing systems involves images constantly, which reproduces the
+        required evidence on those hosts. Asset group membership is the discriminator.
+    - condition: A backup product creates and mounts VHD files.
+      explanation: >-
+        Image-based backup writes and mounts virtual disks as its normal operation. The
+        acting process is an approved backup client with a fixed schedule.
+    - condition: A user extracts an archive with a third-party tool.
+      explanation: >-
+        Some archive utilities do not propagate the zone marker, so ordinary extraction can
+        produce unmarked files. The escalation depends on what runs afterwards rather than
+        on extraction itself.

@@ -1,0 +1,284 @@
+type: detection
+
+id: hg-win-domain-account-created-from-an-endpoint-t1136-002
+version: 1.0.0
+
+info:
+  name: Domain account created from an endpoint
+  description: >-
+    A domain account created by an adversary is worth more than a local one: it works
+    everywhere, it blends into an identity population of thousands, and it survives the
+    rebuild of whichever machine was originally compromised. Account creation is a
+    perfectly normal event, which is why the question is never whether one was made but
+    where the instruction came from. Joiner processes run through an identity platform;
+    an intrusion runs `net user /add /domain` from whatever shell it already has.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - account-creation
+    - active-directory
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1136/002
+    - https://attack.mitre.org/detectionstrategies/DET0003
+    - https://attack.mitre.org/techniques/T1136
+
+mitre:
+  tactics:
+    - TA0003
+  techniques:
+    - T1136
+  sub_techniques:
+    - T1136.002
+  detection_strategies:
+    - DET0003
+  analytics:
+    - AN0006
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - User Account Creation
+
+hypothesis:
+  statement: >-
+    An adversary may create a domain account from a compromised endpoint, establishing an
+    identity that authenticates across the whole estate and survives the remediation of the
+    machine and credential originally used to gain access.
+  attacker_behavior:
+    - Runs net user with the domain switch, or the directory cmdlets, from an endpoint shell.
+    - Names the account to resemble a service or support identity so it survives a review.
+    - Adds the new account to a privileged or remote-access group immediately afterwards.
+    - Issues the command through a remote-execution channel rather than at a console.
+  legitimate_behavior:
+    - Identity management platforms create accounts as part of joiner workflows.
+    - Directory administrators create accounts during onboarding.
+    - Application installers create domain service accounts during deployment.
+    - Automation provisions accounts for new systems or services.
+  risk_indicator:
+    - The creation is issued from a workstation or a server that is not an identity system.
+    - The creating process is a script host, a web service or a remote-execution channel.
+    - A privileged group addition follows in the same session.
+    - The acting account has no history of directory administration.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: domain-account-created
+        name: Domain account created from a command line
+        purpose: >-
+          Surface account creation issued from an endpoint, which in a managed estate should
+          be the identity platform's job rather than a shell's.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(net(\.exe)?\s+user\s+[^\s]+\s+[^\s]+\s+\/add\s+\/domain|net1\s+user\s+.*\/add\s+\/domain|New-ADUser|dsadd\s+user)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=creations), collect([CommandLine], limit=5)])
+          | sort(creations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of the identity management platform hosts"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: creation-from-scripted-parent
+        name: Account creation issued by a script host or service
+        purpose: >-
+          Isolate creations whose parent implies automation the identity platform does not
+          own, such as a web service or an interpreter reached remotely.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(net(\.exe)?\s+user\s+.*\/add\s+\/domain|New-ADUser|dsadd\s+user)/i
+          | ParentBaseFileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|w3wp|wsmprovhost|WmiPrvSE|winrshost)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=creations), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: create-then-add-to-group
+        name: Domain account created and granted membership
+        purpose: >-
+          Join creation to the group addition that makes the account useful, which is the
+          pairing that indicates access establishment rather than routine provisioning.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(net(\.exe)?\s+user\s+.*\/add\s+\/domain|New-ADUser|dsadd\s+user)/i
+                | account_created := CommandLine ;
+              CommandLine=/(net(\.exe)?\s+group\s+.*\/add\s+\/domain|Add-ADGroupMember|net(\.exe)?\s+localgroup\s+.*\/add)/i
+                | group_added := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([account_created, group_added, ParentBaseFileName]),
+                              count(as=events)])
+          | account_created=/.+/ and group_added=/.+/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: domain_account_created
+      name: Domain account created from an endpoint
+      description: >-
+        A directory account was created through a command line on an endpoint, establishing
+        an identity that authenticates across the estate.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_established
+
+  supporting:
+    - id: scripted_or_remote_parent
+      name: Created by a script host, web service or remote channel
+      description: >-
+        The creation was issued by an interpreter, a web server process or a
+        remote-execution channel rather than through the identity platform.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: group_membership_followed
+      name: Privileged group membership granted afterwards
+      description: >-
+        The new account was added to a privileged or remote-access group in the same
+        activity, which is what turns a directory object into usable access.
+      source: process_creation
+      field: CommandLine
+      indicates: privilege_escalation_attempt
+    - id: non_identity_host
+      name: Issued from a host with no identity role
+      description: >-
+        The creating host is a workstation or an ordinary server rather than an identity
+        management or directory administration system.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: unusual_administrator
+      name: Actor without directory administration history
+      description: >-
+        The account issuing the creation has no history of directory administration during
+        the baseline window.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: identity_platform_creation
+      name: Created through the identity platform
+      description: >-
+        The account was created by the approved identity management system as part of a
+        joiner or access-request workflow.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: installer_service_account
+      name: Installer creating a domain service account
+      description: >-
+        An approved installer created a directory service account required by the product
+        it deploys.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: recorded_onboarding
+      name: Recorded onboarding or provisioning
+      description: >-
+        A change or access-request record covers the creation, naming the person, the
+        approver and the purpose.
+      source: change_management
+      field: UserName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - domain_account_created
+
+    supporting:
+      any:
+        - scripted_or_remote_parent
+        - group_membership_followed
+        - non_identity_host
+        - unusual_administrator
+      all:
+        - scripted_or_remote_parent
+        - group_membership_followed
+
+    contradicting:
+      any:
+        - identity_platform_creation
+        - installer_service_account
+        - recorded_onboarding
+      all: []
+
+  verdict:
+    low_risk_when:
+      - domain_account_created
+      - identity_platform_creation
+      - installer_service_account
+      - recorded_onboarding
+    suspicious_when:
+      - domain_account_created
+      - non_identity_host
+    high_risk_when:
+      - domain_account_created
+      - scripted_or_remote_parent
+      - group_membership_followed
+      - unusual_administrator
+
+  false_positive:
+    - condition: An identity management platform creates accounts during onboarding.
+      explanation: >-
+        Joiner workflows create accounts continuously, which is why the originating process
+        and host rather than the creation itself carry the escalation.
+    - condition: A directory administrator creates an account at a command line.
+      explanation: >-
+        Administrators do use net user and the directory cmdlets, particularly for service
+        identities. They work from administration hosts under accounts with a long history
+        of such changes.
+    - condition: An installer creates a domain service account during deployment.
+      explanation: >-
+        Products requiring a directory identity create one at install time and often grant
+        it group membership immediately, reproducing the strongest supporting evidence. The
+        installer as parent is the discriminator.
+    - condition: Automation provisions accounts for new systems.
+      explanation: >-
+        Provisioning pipelines create service accounts programmatically, which matches the
+        scripted-parent evidence. These run under a known automation identity on a
+        predictable cadence.
