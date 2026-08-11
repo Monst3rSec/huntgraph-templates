@@ -1,0 +1,274 @@
+type: detection
+
+id: hg-win-at-command-used-to-schedule-execution-t1053-002
+version: 1.0.0
+
+info:
+  name: Legacy at command used to schedule execution
+  description: >-
+    The at command is the deprecated predecessor to schtasks, superseded for years and
+    absent from any modern administrative workflow. It still functions, it still creates
+    tasks that run as SYSTEM, and the tasks it creates land in a different place from the
+    ones a modern review inspects. That combination is what keeps it in use: an operator
+    gets a scheduled payload while an administrator checking the task library the usual way
+    may not see it. Because nothing legitimate uses it any more, its execution is close to
+    self-evidently worth investigating.
+  severity: high
+  author: huntgraph
+  tags:
+    - execution
+    - persistence
+    - privilege-escalation
+    - scheduled-task
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1053/002
+    - https://attack.mitre.org/detectionstrategies/DET0333
+    - https://attack.mitre.org/techniques/T1053
+
+mitre:
+  tactics:
+    - TA0002
+    - TA0003
+    - TA0004
+  techniques:
+    - T1053
+  sub_techniques:
+    - T1053.002
+  detection_strategies:
+    - DET0333
+  analytics:
+    - AN0943
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Scheduled Job Creation
+
+hypothesis:
+  statement: >-
+    An adversary may use the deprecated at command to schedule execution, obtaining a task
+    that runs with SYSTEM privilege through a mechanism no current administrative workflow
+    uses and which a modern task review may overlook.
+  attacker_behavior:
+    - Runs at.exe with a time and a command to schedule execution.
+    - Schedules an interpreter or a payload in a user-writable directory.
+    - Uses the legacy path specifically because it is inspected less often than schtasks.
+    - Issues the command against a remote host as part of lateral movement.
+  legitimate_behavior:
+    - Very old scripts and runbooks occasionally still call at.
+    - Legacy applications may schedule work through the deprecated interface.
+    - An administrator familiar with older Windows may use it out of habit.
+  risk_indicator:
+    - The scheduled command is an interpreter or a program in a writable directory.
+    - The invocation is issued by a script host or a remote-execution channel.
+    - The command targets a remote host.
+    - No comparable use appears anywhere in the estate.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: at-command-invoked
+        name: Legacy at command executed
+        purpose: >-
+          Surface any use of the deprecated scheduler, which is rare enough that the
+          invocation itself is the starting point.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^at\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=invocations), collect([CommandLine], limit=5)])
+          | sort(invocations, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: at-scheduling-interpreter
+        name: At scheduling an interpreter or writable payload
+        purpose: >-
+          Isolate the invocations whose scheduled command is an interpreter or a program
+          outside the installation trees.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^at\.exe$/i
+          | CommandLine=/(powershell|pwsh|cmd\.exe|wscript|cscript|mshta|rundll32|regsvr32|\\AppData\\|\\Temp\\|\\ProgramData\\|\\Users\\)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=invocations), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: at-targeting-remote-host
+        name: At issued against a remote host
+        purpose: >-
+          Catch the lateral-movement use, where the legacy scheduler creates a task on
+          another machine.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^at\.exe$/i
+          | CommandLine=/\\\\\\\\[^\s"\\]+/
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=invocations), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of approved management servers and jump hosts"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: at_command_used
+      name: Deprecated scheduler invoked
+      description: >-
+        The legacy at command was executed, creating a scheduled task through a mechanism
+        no current administrative workflow uses and which modern task review may overlook.
+      source: process_creation
+      field: FileName
+      indicates: legacy_mechanism_abuse
+
+  supporting:
+    - id: interpreter_or_writable_payload
+      name: Scheduled command is an interpreter or writable payload
+      description: >-
+        The command being scheduled is a script interpreter or a program in a user-writable
+        directory rather than an installed maintenance utility.
+      source: process_creation
+      field: CommandLine
+      indicates: dynamic_code_execution
+    - id: remote_target
+      name: Task created on a remote host
+      description: >-
+        The invocation names a remote machine, which turns scheduled execution into lateral
+        movement.
+      source: process_creation
+      field: CommandLine
+      indicates: lateral_movement_attempt
+    - id: scripted_parent
+      name: Issued by a script host or remote channel
+      description: >-
+        The command was issued by an interpreter or a remote-execution channel rather than
+        by an interactive administrative session.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: unused_in_estate
+      name: No comparable use in the estate
+      description: >-
+        The legacy scheduler has not been used elsewhere during the baseline window, which
+        is expected given it has been superseded for years.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: legacy_runbook
+      name: Legacy runbook or application
+      description: >-
+        An old script, runbook or application still schedules work through the deprecated
+        interface and does so consistently over time.
+      source: baseline
+      field: CommandLine
+      indicates: legitimate_enterprise_activity
+    - id: administrator_habit
+      name: Interactive administrative use
+      description: >-
+        A named administrator invoked it interactively from an administration host, which
+        happens where older Windows practice persists.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: recorded_change
+      name: Recorded scheduling change
+      description: >-
+        A change record covers the creation of this scheduled work, naming the host, the
+        command and the purpose.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - at_command_used
+
+    supporting:
+      any:
+        - interpreter_or_writable_payload
+        - remote_target
+        - scripted_parent
+        - unused_in_estate
+      all:
+        - interpreter_or_writable_payload
+        - scripted_parent
+
+    contradicting:
+      any:
+        - legacy_runbook
+        - administrator_habit
+        - recorded_change
+      all: []
+
+  verdict:
+    low_risk_when:
+      - at_command_used
+      - legacy_runbook
+      - administrator_habit
+      - recorded_change
+    suspicious_when:
+      - at_command_used
+      - unused_in_estate
+    high_risk_when:
+      - at_command_used
+      - interpreter_or_writable_payload
+      - remote_target
+      - scripted_parent
+
+  false_positive:
+    - condition: An old runbook or application still schedules work through at.
+      explanation: >-
+        Legacy tooling occasionally survives long past its deprecation. Such use recurs
+        with a stable command over long periods rather than appearing once.
+    - condition: An administrator uses at out of habit.
+      explanation: >-
+        Engineers familiar with older Windows sometimes reach for it. This is interactive,
+        from an administration host, and schedules an ordinary maintenance command.
+    - condition: A vendor product schedules work through the deprecated interface.
+      explanation: >-
+        A small number of older products still call it during installation or operation.
+        These appear across every host running the product with an unchanging command.

@@ -144,17 +144,24 @@ def targets(atk: Attack, tactic: str) -> tuple[list, list]:
     return in_scope, out_scope
 
 
-def blocking_components(atk: Attack, technique) -> set[str]:
+def blocking_components(atk: Attack, technique, platform: str | None = None) -> set[str]:
     """Components an endpoint analytic needs that this repo cannot collect.
 
-    Returns an empty set when at least one Windows, Linux or macOS analytic is
-    fully served by collectable components — that technique is workable.
+    Returns an empty set when at least one analytic is fully served by
+    collectable components — that technique is workable.
+
+    `platform` narrows the question to one operating system. This matters:
+    without it a technique counts as reachable when *any* endpoint analytic is
+    clean, which can be the Linux one while the Windows analytic still needs
+    Module Load. Selecting a Windows target off the unfiltered list therefore
+    risks citing an analytic the query cannot serve.
     """
+    wanted = {platform} if platform else ENDPOINT_PLATFORMS
     needed = set()
     saw_endpoint_analytic = False
     for ds in atk.detection_strategies(technique):
         for a in ds["analytics"]:
-            if not set(a["platforms"]) & ENDPOINT_PLATFORMS:
+            if not set(a["platforms"]) & wanted:
                 continue
             saw_endpoint_analytic = True
             components = {
@@ -182,7 +189,7 @@ def report_blocked(atk: Attack, covered: dict, args) -> int:
             if tid in covered or tid in seen:
                 continue
             seen.add(tid)
-            missing = blocking_components(atk, t)
+            missing = blocking_components(atk, t, args.platform)
             if missing:
                 rows.append({"id": tid, "name": t["name"], "missing": sorted(missing)})
     rows.sort(key=lambda r: r["id"])
@@ -213,6 +220,8 @@ def main() -> int:
     ap.add_argument("--remaining", action="store_true", help="list uncovered targets only")
     ap.add_argument("--blocked", action="store_true",
                     help="list uncovered targets blocked on telemetry this repo cannot collect")
+    ap.add_argument("--platform", choices=sorted(ENDPOINT_PLATFORMS),
+                    help="with --blocked, judge reachability for one platform only")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 

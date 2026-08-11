@@ -1,0 +1,288 @@
+type: detection
+
+id: hg-win-logon-script-registered-in-the-user-hive-t1037-001
+version: 1.0.0
+
+info:
+  name: Logon script registered through the user environment key
+  description: >-
+    Windows will run a script named in the UserInitMprLogonScript value every time the user
+    logs on. The key is per-user, writable without any privilege, and almost entirely
+    unused by legitimate software, which makes it a quiet corner of the registry compared
+    with the Run keys everyone inspects. Persistence placed here triggers on ordinary logon
+    and does not appear in the startup folder or in the autostart locations most reviews
+    cover.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - logon-script
+    - registry
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1037/001
+    - https://attack.mitre.org/detectionstrategies/DET0072
+    - https://attack.mitre.org/techniques/T1037
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1037
+  sub_techniques:
+    - T1037.001
+  detection_strategies:
+    - DET0072
+  analytics:
+    - AN0199
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:System
+  data_components:
+    - Process Creation
+    - File Access
+    - Script Execution
+
+hypothesis:
+  statement: >-
+    An adversary may register a script or executable in the user environment logon-script
+    value so that it runs at every logon, obtaining persistence in a registry location
+    that requires no privilege and that most autostart reviews do not cover.
+  attacker_behavior:
+    - Writes UserInitMprLogonScript under the user environment key pointing at a payload.
+    - Points the value at a script or interpreter in a user-writable directory.
+    - Relies on the key being outside the Run locations that autoruns review focuses on.
+    - Writes the payload and the value within the same activity.
+  legitimate_behavior:
+    - Some legacy environments deploy logon scripts through this mechanism.
+    - Profile management products configure logon-time actions.
+    - Administrators occasionally set it for a targeted user workflow.
+  risk_indicator:
+    - The value points at a user-writable directory rather than a share or installation path.
+    - The registration was made by a script host or delivery application.
+    - The payload was written shortly before the value was set.
+    - The key is otherwise unused across the estate.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+        - PeFileWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: logon-script-value-written
+        name: Logon script value registered
+        purpose: >-
+          Surface writes to the specific value Windows runs at logon, which almost nothing
+          legitimate sets.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/UserInitMprLogonScript|Environment\\\\UserInitMprLogonScript/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=registrations), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: logon-value-pointing-to-writable-path
+        name: Logon script value pointing at a user-writable path
+        purpose: >-
+          Isolate registrations whose target sits where any unprivileged process could have
+          placed it, as opposed to a managed script share.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/UserInitMprLogonScript/i
+          | CommandLine=/(?<script_target>[A-Za-z]:\\[^",]+\.(exe|dll|ps1|vbs|js|bat|cmd|scr))/i
+          | script_target=/\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, script_target],
+                    function=[count(as=registrations), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: payload-written-then-registered
+        name: Payload written then registered for logon
+        purpose: >-
+          Join the drop to the registration, which distinguishes a payload installing
+          itself from an administrator configuring an existing script.
+        query: |
+          #event_simpleName=/^(NewScriptWritten|PeFileWritten|ProcessRollup2)$/
+          | case {
+              #event_simpleName=/^(NewScriptWritten|PeFileWritten)$/
+                | TargetFileName=/\\(AppData|Temp|ProgramData|Users|Public)\\/i
+                | dropped_payload := TargetFileName ;
+              #event_simpleName=ProcessRollup2
+                | CommandLine=/UserInitMprLogonScript/i
+                | logon_registration := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([dropped_payload, logon_registration, ParentBaseFileName]),
+                              count(as=events)])
+          | dropped_payload=/.+/ and logon_registration=/.+/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+
+evidence:
+  required:
+    - id: logon_script_registered
+      name: Logon script value written
+      description: >-
+        The user environment logon-script value was set, causing the named program to run
+        at every logon for that account.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_established
+
+  supporting:
+    - id: writable_target
+      name: Value points at a user-writable path
+      description: >-
+        The registered program sits under AppData, Temp, ProgramData or a user profile
+        rather than on a managed script share or in an installation directory.
+      source: process_creation
+      field: CommandLine
+      indicates: untrusted_execution_location
+    - id: payload_recently_written
+      name: Target written shortly before registration
+      description: >-
+        The program the value names was created on the host shortly before the value was
+        set, which is self-installation rather than configuration.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: script_host_creator
+      name: Registered by a script host or delivery application
+      description: >-
+        The write was performed by an interpreter, document handler or archive utility
+        rather than by profile-management tooling.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: key_unused_in_estate
+      name: Key otherwise unused across the estate
+      description: >-
+        No comparable use of this value appears elsewhere during the baseline window, which
+        is the normal state outside legacy logon-script environments.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: legacy_logon_environment
+      name: Legacy logon-script environment
+      description: >-
+        The estate deploys logon scripts through this mechanism and the value is set
+        consistently across a user population.
+      source: baseline
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: profile_management_product
+      name: Profile management product
+      description: >-
+        The value was written by an approved profile or desktop management product that
+        configures logon-time actions by design.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_application_component
+    - id: recorded_configuration
+      name: Recorded administrative configuration
+      description: >-
+        A change record covers setting a logon action for a specific user workflow.
+      source: change_management
+      field: UserName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - logon_script_registered
+
+    supporting:
+      any:
+        - writable_target
+        - payload_recently_written
+        - script_host_creator
+        - key_unused_in_estate
+      all:
+        - writable_target
+        - script_host_creator
+
+    contradicting:
+      any:
+        - legacy_logon_environment
+        - profile_management_product
+        - recorded_configuration
+      all: []
+
+  verdict:
+    low_risk_when:
+      - logon_script_registered
+      - legacy_logon_environment
+      - profile_management_product
+      - recorded_configuration
+    suspicious_when:
+      - logon_script_registered
+      - key_unused_in_estate
+    high_risk_when:
+      - logon_script_registered
+      - writable_target
+      - payload_recently_written
+      - script_host_creator
+
+  false_positive:
+    - condition: A legacy environment deploys logon scripts through this value.
+      explanation: >-
+        Some estates still use this mechanism, in which case the value is set consistently
+        across a user population and points at a managed script share rather than a user
+        directory.
+    - condition: A profile management product configures logon-time actions.
+      explanation: >-
+        Desktop and profile management tools write logon actions as part of their function.
+        The acting process is a recognisable product present across the estate.
+    - condition: An administrator sets a logon action for a specific workflow.
+      explanation: >-
+        Targeted logon configuration happens occasionally and is legitimate. It is
+        interactive, tied to a named administrator, and usually has a change record.
