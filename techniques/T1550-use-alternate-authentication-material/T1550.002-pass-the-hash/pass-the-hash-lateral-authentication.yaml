@@ -1,0 +1,301 @@
+type: detection
+
+id: hg-win-pass-the-hash-lateral-authentication-t1550-002
+version: 1.0.0
+
+info:
+  name: Lateral authentication using a stolen password hash
+  description: >-
+    Pass-the-hash removes the need to crack anything: the hash is the credential as far as
+    NTLM is concerned, so an adversary who has dumped one can authenticate as that account
+    directly. Nothing about the resulting logon looks unusual in isolation, which is why
+    this cannot be hunted at the authentication event alone. What is observable on the
+    endpoint is the tooling that injects the hash into a logon session, and the execution
+    that follows it — a process running under an account that never logged on
+    interactively to that machine.
+  severity: critical
+  author: huntgraph
+  tags:
+    - lateral-movement
+    - credential-reuse
+    - pass-the-hash
+    - ntlm
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1550/002
+    - https://attack.mitre.org/detectionstrategies/DET0409
+    - https://attack.mitre.org/techniques/T1550
+
+mitre:
+  tactics:
+    - TA0008
+  techniques:
+    - T1550
+  sub_techniques:
+    - T1550.002
+  detection_strategies:
+    - DET0409
+  analytics:
+    - AN1144
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Logon Session Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary holding a stolen NTLM hash may inject it into a logon session and
+    authenticate to remote systems as that account, moving laterally without ever
+    recovering or needing the plaintext password.
+  attacker_behavior:
+    - Runs credential-injection tooling that creates a logon session from a supplied hash.
+    - Spawns a process under the injected session to act as the impersonated account.
+    - Authenticates to remote hosts over SMB or WMI using the injected credential.
+    - Targets accounts whose local hash is shared across many hosts from a common image.
+  legitimate_behavior:
+    - Administrators use runas with alternate credentials for routine work.
+    - Management platforms authenticate to hosts under service accounts.
+    - Security teams test credential hygiene during authorised assessments.
+    - Some legacy applications authenticate with stored credentials.
+  risk_indicator:
+    - Credential-injection tooling is present in the command line.
+    - A process runs under an account with no interactive logon history on that host.
+    - The activity is followed by administrative-share or WMI access to other hosts.
+    - The source host is a workstation rather than a management system.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: credential-injection-tooling
+        name: Credential-injection tooling invoked
+        purpose: >-
+          Surface the mechanisms that create a logon session from supplied credential
+          material, which is the step that has no legitimate counterpart.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(sekurlsa::pth|pth\s+\/user|Invoke-Mimikatz|\/ntlm\s*:|\/aes256\s*:|Invoke-SMBExec|Invoke-WMIExec|-Hash\s+[A-Fa-f0-9]{32})/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: alternate-credential-launch
+        name: Process launched with explicit alternate credentials
+        purpose: >-
+          Cover the broader pattern of running as another account, so that tooling variants
+          not matched by name are still surfaced through their effect.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(runas(\.exe)?\s+.*\/user\s*:|-Credential\b|New-PSSession\s+.*-Credential|\/netonly)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of approved jump hosts and administrative workstations"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+            - organization
+
+      - id: injected-session-reaches-remote-hosts
+        name: Outbound administrative connections following credential injection
+        purpose: >-
+          Join the injection to its purpose, since a stolen hash is only useful once it is
+          presented to another machine.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | CommandLine=/(sekurlsa::pth|\/ntlm\s*:|-Hash\s+[A-Fa-f0-9]{32}|runas.*\/netonly)/i
+                | injection_host := ComputerName ;
+              #event_simpleName=NetworkConnectIP4
+                | RemotePort=/^(445|135|5985|5986)$/ ;
+            }
+          | groupBy([ComputerName],
+                    function=[collect([CommandLine, UserName, RemoteAddressIP4, RemotePort]),
+                              count(RemoteAddressIP4, distinct=true, as=distinct_targets)])
+          | injection_host=/.+/
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of management infrastructure that reaches many hosts by design"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - remote_address
+
+evidence:
+  required:
+    - id: credential_injection
+      name: Alternate credential material injected or presented
+      description: >-
+        Tooling was invoked that creates a logon session from a supplied hash, or a process
+        was launched with explicit alternate credentials, allowing action as another
+        account without that account logging on.
+      source: process_creation
+      field: CommandLine
+      indicates: credential_reuse
+
+  supporting:
+    - id: injection_tooling
+      name: Known credential-injection syntax present
+      description: >-
+        The command line carries hash-injection syntax rather than ordinary alternate
+        credential use, which has no administrative equivalent.
+      source: process_creation
+      field: CommandLine
+      indicates: credential_material_capture
+    - id: remote_admin_fanout
+      name: Administrative connections to several hosts
+      description: >-
+        The host reached multiple remote systems on administrative ports after the
+        injection, which is the purpose of a stolen hash.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: lateral_movement_attempt
+    - id: workstation_origin
+      name: Activity originating from a workstation
+      description: >-
+        The source is an ordinary workstation rather than a management system whose role
+        includes authenticating widely.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: unusual_account_context
+      name: Account without history on this host
+      description: >-
+        The account being used has no interactive or administrative history on this machine
+        during the baseline window.
+      source: baseline
+      field: UserName
+      indicates: credential_reuse
+
+  contradicting:
+    - id: admin_workstation
+      name: Approved administrative workstation
+      description: >-
+        The source is a designated jump host or administrative workstation where running as
+        alternate credentials is routine.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: management_service_account
+      name: Management platform service account
+      description: >-
+        The activity runs under the service account of an approved platform that
+        authenticates to hosts as a documented part of its operation.
+      source: process_creation
+      field: UserName
+      indicates: legitimate_enterprise_activity
+    - id: recorded_assessment
+      name: Recorded security assessment
+      description: >-
+        An engagement record covers a credential-hygiene assessment reproducing this
+        technique, naming the operator and the window.
+      source: change_management
+      field: UserName
+      indicates: authorised_security_testing
+
+  risk_logic:
+    required:
+      - credential_injection
+
+    supporting:
+      any:
+        - injection_tooling
+        - remote_admin_fanout
+        - workstation_origin
+        - unusual_account_context
+      all:
+        - injection_tooling
+        - remote_admin_fanout
+
+    contradicting:
+      any:
+        - admin_workstation
+        - management_service_account
+        - recorded_assessment
+      all: []
+
+  verdict:
+    low_risk_when:
+      - credential_injection
+      - admin_workstation
+      - management_service_account
+      - recorded_assessment
+    suspicious_when:
+      - credential_injection
+      - workstation_origin
+    high_risk_when:
+      - credential_injection
+      - injection_tooling
+      - remote_admin_fanout
+      - unusual_account_context
+
+  false_positive:
+    - condition: An administrator uses runas with alternate credentials.
+      explanation: >-
+        Running a tool as a privileged account is ordinary administration and produces the
+        required evidence. It originates from an administrative workstation under an
+        account with a long history of such use.
+    - condition: A management platform authenticates to hosts under a service account.
+      explanation: >-
+        Platforms that manage endpoints authenticate widely and reach many hosts on
+        administrative ports, reproducing the fan-out evidence. The service account and the
+        stable target set are the discriminators.
+    - condition: A security team tests credential hygiene during an assessment.
+      explanation: >-
+        Assessments reproduce hash injection exactly, including the tooling syntax. Only the
+        engagement record distinguishes them from an intrusion.
+    - condition: A legacy application authenticates with stored credentials.
+      explanation: >-
+        Older software sometimes passes explicit credentials to reach a resource. This runs
+        from the application's own process with an unchanging target and account.

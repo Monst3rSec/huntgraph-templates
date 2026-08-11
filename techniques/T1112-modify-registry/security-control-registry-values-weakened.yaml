@@ -1,0 +1,290 @@
+type: detection
+
+id: hg-win-security-control-registry-values-weakened-t1112
+version: 1.0.0
+
+info:
+  name: Security control settings weakened in the registry
+  description: >-
+    The registry is where Windows keeps the settings that decide whether protection is on.
+    Turning off real-time scanning, adding a scan exclusion, disabling script logging or
+    relaxing user account control are all single value writes, and each one quietly removes
+    a control that would otherwise have observed or blocked what comes next. Modifying the
+    registry in general is far too common to hunt; modifying the specific values that
+    govern protection is not, and in a managed estate those values are supposed to be
+    policy-controlled anyway.
+  severity: high
+  author: huntgraph
+  tags:
+    - defense-impairment
+    - persistence
+    - registry
+    - security-controls
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1112
+    - https://attack.mitre.org/detectionstrategies/DET0280
+    - https://attack.mitre.org/techniques/T1562
+
+mitre:
+  tactics:
+    - TA0112
+    - TA0003
+  techniques:
+    - T1112
+  sub_techniques: []
+  detection_strategies:
+    - DET0280
+  analytics:
+    - AN0781
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An adversary may write to the specific registry values that govern endpoint protection,
+    logging and elevation prompts, disabling or narrowing the controls that would otherwise
+    record or prevent their subsequent activity.
+  attacker_behavior:
+    - Disables real-time monitoring or behaviour monitoring for the endpoint protection product.
+    - Adds a path or process exclusion covering the directory a payload runs from.
+    - Turns off script block logging, module logging or transcription.
+    - Relaxes user account control so elevation proceeds without a prompt.
+  legitimate_behavior:
+    - Security teams add exclusions for line-of-business applications that misbehave under scanning.
+    - Managed policy distributes protection settings across the estate.
+    - Provisioning configures these values during host build.
+    - Support staff temporarily disable scanning while diagnosing a performance issue.
+  risk_indicator:
+    - The value written governs protection, logging or elevation rather than ordinary configuration.
+    - An exclusion covers a user-writable directory rather than an application path.
+    - The change is made locally rather than delivered through policy.
+    - The acting process is a script host or a remote-execution channel.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: protection-disabled
+        name: Endpoint protection settings disabled
+        purpose: >-
+          Surface writes to the values that switch scanning and behaviour monitoring off,
+          which is the most direct reduction of endpoint defence.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(DisableRealtimeMonitoring|DisableBehaviorMonitoring|DisableAntiSpyware|DisableScriptScanning|DisableIOAVProtection|TamperProtection)/i
+          | CommandLine=/(reg(\.exe)?\s+add|Set-ItemProperty|New-ItemProperty|Set-MpPreference)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Managed policy distributing protection configuration"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: exclusion-for-writable-path
+        name: Scan exclusion covering a user-writable directory
+        purpose: >-
+          Isolate exclusions that carve out exactly the directories a payload would run
+          from, which is narrower and more telling than exclusions generally.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Exclusions\\\\(Paths|Processes|Extensions)|Add-MpPreference\s+.*-Exclusion)/i
+          | CommandLine=/(?<excluded_path>[A-Za-z]:\\[^",]+|\\\\[^",]+)/i
+          | excluded_path=/\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, excluded_path],
+                    function=[count(as=changes), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude:
+            - "Documented exclusions for line-of-business applications"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: script-logging-or-uac-weakened
+        name: Script logging or elevation prompting disabled
+        purpose: >-
+          Cover the settings that reduce visibility and friction rather than protection,
+          which are often changed in the same session.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(EnableScriptBlockLogging|EnableModuleLogging|EnableTranscripting|ConsentPromptBehaviorAdmin|EnableLUA|LocalAccountTokenFilterPolicy|FilterAdministratorToken)/i
+          | CommandLine=/(reg(\.exe)?\s+add|Set-ItemProperty|New-ItemProperty)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Managed policy distributing logging and elevation configuration"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+evidence:
+  required:
+    - id: security_value_written
+      name: Protection, logging or elevation value modified
+      description: >-
+        A registry write targeted a value that governs endpoint protection, script logging
+        or elevation prompting, reducing a control rather than changing ordinary
+        configuration.
+      source: process_creation
+      field: CommandLine
+      indicates: defensive_control_degradation
+
+  supporting:
+    - id: writable_path_exclusion
+      name: Exclusion covering a user-writable directory
+      description: >-
+        The exclusion added covers AppData, Temp, ProgramData or a user profile, which is
+        where a payload would run rather than where an application is installed.
+      source: process_creation
+      field: CommandLine
+      indicates: targeted_control_gap
+    - id: script_host_actor
+      name: Change made by a script host or remote channel
+      description: >-
+        The modification was issued by an interpreter or a remote-execution channel rather
+        than by policy processing or a management agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: local_deviation
+      name: Local change against a managed baseline
+      description: >-
+        These values are otherwise governed by policy in this estate, so a locally issued
+        change is a deviation as well as a weakening.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: multiple_controls_touched
+      name: Several controls weakened together
+      description: >-
+        More than one protection, logging or elevation value was changed on the host in the
+        same period, which is preparation rather than a single tuning decision.
+      source: baseline
+      field: CommandLine
+      indicates: deliberate_evasion
+
+  contradicting:
+    - id: managed_policy_change
+      name: Delivered through managed policy
+      description: >-
+        The configuration arrived through Group Policy or the security platform as part of
+        a governed standard.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: documented_exclusion
+      name: Documented application exclusion
+      description: >-
+        The exclusion matches a recorded exception for a line-of-business application that
+        the security team has approved.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: provisioning_context
+      name: Host being provisioned
+      description: >-
+        The host is in a build state where protection and logging values are configured
+        deliberately before the machine enters service.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - security_value_written
+
+    supporting:
+      any:
+        - writable_path_exclusion
+        - script_host_actor
+        - local_deviation
+        - multiple_controls_touched
+      all:
+        - writable_path_exclusion
+        - script_host_actor
+
+    contradicting:
+      any:
+        - managed_policy_change
+        - documented_exclusion
+        - provisioning_context
+      all: []
+
+  verdict:
+    low_risk_when:
+      - security_value_written
+      - managed_policy_change
+      - documented_exclusion
+      - provisioning_context
+    suspicious_when:
+      - security_value_written
+      - local_deviation
+    high_risk_when:
+      - security_value_written
+      - writable_path_exclusion
+      - script_host_actor
+      - multiple_controls_touched
+
+  false_positive:
+    - condition: A security team adds an exclusion for a line-of-business application.
+      explanation: >-
+        Exclusions are a normal operational concession, occasionally covering a working
+        directory under ProgramData. The difference is a recorded exception and an
+        application-specific path rather than a whole user-writable tree.
+    - condition: Managed policy distributes protection settings across the estate.
+      explanation: >-
+        Governed configuration writes these values on every host, which is why the
+        originating process rather than the value itself carries the escalation.
+    - condition: Provisioning configures protection and logging during host build.
+      explanation: >-
+        Build automation sets these values before a machine enters service, sometimes
+        disabling controls temporarily during imaging. Host build state is the
+        discriminator.
+    - condition: Support staff disable scanning while diagnosing a performance issue.
+      explanation: >-
+        Temporarily turning off real-time monitoring to isolate a performance fault is
+        common support practice. It is interactive, short-lived and usually attached to an
+        incident record.

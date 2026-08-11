@@ -1,0 +1,287 @@
+type: detection
+
+id: hg-win-event-log-service-disabled-or-channel-silenced-t1685-001
+version: 1.0.0
+
+info:
+  name: Event logging disabled or a channel silenced
+  description: >-
+    Clearing logs destroys what has already happened; disabling logging prevents what
+    happens next from being recorded at all, which is the more valuable outcome for an
+    operator who intends to stay. The mechanisms are varied — stopping the service,
+    disabling a channel, breaking the audit policy, patching the logging provider — but
+    they share a property that makes them worth hunting: they are configuration changes on
+    a running production host, where logging is supposed to be governed by policy and
+    nobody has a routine reason to reduce it.
+  severity: high
+  author: huntgraph
+  tags:
+    - defense-impairment
+    - anti-forensics
+    - event-log
+    - audit-policy
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1685/001
+    - https://attack.mitre.org/detectionstrategies/DET0187
+    - https://attack.mitre.org/techniques/T1685
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1685
+  sub_techniques:
+    - T1685.001
+  detection_strategies:
+    - DET0187
+  analytics:
+    - AN0535
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:System
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Windows Registry Key Modification
+    - Service Metadata
+
+hypothesis:
+  statement: >-
+    An adversary may stop the event log service, disable a logging channel or weaken the
+    audit policy so that their subsequent activity is never recorded, removing the evidence
+    of an intrusion before it is created rather than after.
+  attacker_behavior:
+    - Stops or disables the event log service, or sets its start type to disabled.
+    - Disables a specific channel such as PowerShell operational or Sysmon through wevtutil.
+    - Turns off audit subcategories with auditpol so relevant events stop being generated.
+    - Reduces a channel's maximum size so records roll over almost immediately.
+  legitimate_behavior:
+    - Performance tuning occasionally disables verbose channels on constrained systems.
+    - Logging configuration is adjusted during troubleshooting of a noisy source.
+    - Provisioning sets channel sizes and audit policy during host build.
+    - Management platforms push logging configuration across the estate.
+  risk_indicator:
+    - The Security, PowerShell or Sysmon channel is targeted rather than an application channel.
+    - The change is made locally rather than arriving through policy.
+    - The acting process is a script host or a remote-execution channel.
+    - Other suspicious activity precedes or follows on the same host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: log-service-stopped-or-disabled
+        name: Event log service stopped or set to disabled
+        purpose: >-
+          Surface interference with the service itself, which silences every channel at
+          once and is the bluntest form of the technique.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(net(\.exe)?\s+stop\s+.*eventlog|Stop-Service\s+.*eventlog|sc(\.exe)?\s+.*config\s+eventlog.*start\s*=\s*disabled|Set-Service\s+.*EventLog.*-StartupType\s+Disabled)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: security-channel-disabled
+        name: Security or telemetry channel disabled
+        purpose: >-
+          Isolate targeting of the channels that carry authentication, execution and
+          endpoint telemetry, as distinct from a noisy application channel.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/wevtutil(\.exe)?\s+(sl|set-log)/i
+          | CommandLine=/(security|system|powershell|sysmon|windows defender|terminalservices|scriptblock)/i
+          | CommandLine=/(\/e\s*:\s*false|\/enabled\s*:\s*false|\/ms\s*:\s*\d{1,6}\b)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Managed logging configuration pushed across server collections"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: audit-policy-weakened
+        name: Audit policy subcategories turned off
+        purpose: >-
+          Catch suppression at the source, where events stop being generated rather than
+          being discarded after the fact.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/auditpol(\.exe)?\s+.*\/set/i
+          | CommandLine=/(\/success\s*:\s*disable|\/failure\s*:\s*disable)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Provisioning automation that sets audit policy during host build"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+evidence:
+  required:
+    - id: logging_reduced
+      name: Logging stopped, disabled or weakened
+      description: >-
+        The event log service was stopped or disabled, a channel was turned off or shrunk,
+        or audit subcategories were disabled, so activity that would have been recorded no
+        longer is.
+      source: process_creation
+      field: CommandLine
+      indicates: defensive_control_degradation
+
+  supporting:
+    - id: security_channel_targeted
+      name: Security or telemetry channel targeted
+      description: >-
+        The affected channel or audit subcategory carries authentication, execution or
+        endpoint telemetry rather than application noise, so the change removes exactly the
+        record an investigation would use.
+      source: process_creation
+      field: CommandLine
+      indicates: targeted_evidence_destruction
+    - id: script_host_actor
+      name: Change made by a script host or remote channel
+      description: >-
+        The modification was issued by an interpreter or through a remote-execution channel
+        rather than by provisioning or a management agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: local_deviation
+      name: Local change against a managed baseline
+      description: >-
+        Logging configuration in this estate is otherwise governed by policy, so a locally
+        issued reduction is a deviation as well as a weakening.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: unprecedented_change
+      name: No comparable change in the baseline
+      description: >-
+        This host has not had its logging configuration reduced during the baseline window,
+        which is the expected state for a production system.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: managed_policy_change
+      name: Delivered through managed policy
+      description: >-
+        The configuration arrived through Group Policy or the management platform as part
+        of a governed logging standard.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: provisioning_context
+      name: Host being provisioned
+      description: >-
+        The host is in a build state where channel sizes and audit policy are configured
+        deliberately.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: recorded_tuning
+      name: Recorded performance or noise tuning
+      description: >-
+        A change record covers disabling or resizing a channel to address a documented
+        performance or noise problem.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - logging_reduced
+
+    supporting:
+      any:
+        - security_channel_targeted
+        - script_host_actor
+        - local_deviation
+        - unprecedented_change
+      all:
+        - security_channel_targeted
+        - script_host_actor
+
+    contradicting:
+      any:
+        - managed_policy_change
+        - provisioning_context
+        - recorded_tuning
+      all: []
+
+  verdict:
+    low_risk_when:
+      - logging_reduced
+      - managed_policy_change
+      - provisioning_context
+      - recorded_tuning
+    suspicious_when:
+      - logging_reduced
+      - unprecedented_change
+    high_risk_when:
+      - logging_reduced
+      - security_channel_targeted
+      - script_host_actor
+      - local_deviation
+
+  false_positive:
+    - condition: An administrator disables a verbose channel to address a performance problem.
+      explanation: >-
+        Noisy channels genuinely cause disk and forwarding pressure, and turning one down
+        is reasonable. It targets the offending application channel rather than Security or
+        PowerShell, and normally has a change record.
+    - condition: Provisioning sets channel sizes and audit policy during host build.
+      explanation: >-
+        Build processes configure logging deliberately, including disabling subcategories
+        that the standard does not require. Host build state is the discriminator.
+    - condition: A management platform pushes a logging standard across the estate.
+      explanation: >-
+        Governed logging configuration changes many hosts at once, sometimes reducing
+        channels. It arrives through policy processing rather than an interactive shell.
+    - condition: Troubleshooting temporarily stops the event log service.
+      explanation: >-
+        Restarting the logging service occurs during diagnosis of log-forwarding faults.
+        This is short-lived, interactive, and usually accompanied by an incident record.
