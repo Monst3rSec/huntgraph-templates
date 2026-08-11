@@ -1,0 +1,293 @@
+type: detection
+
+id: hg-lin-systemd-unit-installed-for-untrusted-binary-t1543-002
+version: 1.0.0
+
+info:
+  name: Systemd unit installed for an untrusted binary
+  description: >-
+    A systemd unit is the Linux equivalent of a Windows service and carries the same
+    appeal: it starts at boot, runs as root unless told otherwise, and restarts if it
+    dies. Packages install units constantly, so the unit itself is unremarkable. What is
+    remarkable is a unit whose ExecStart points into /tmp, /dev/shm or a home directory,
+    or one written by a web service account rather than by the package manager — because
+    packaged software never lives in those places and never installs itself that way.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - systemd
+    - service
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1543/002
+    - https://attack.mitre.org/detectionstrategies/DET0253
+    - https://attack.mitre.org/techniques/T1543
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1543
+  sub_techniques:
+    - T1543.002
+  detection_strategies:
+    - DET0253
+  analytics:
+    - AN0701
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+    - linux:osquery
+  data_components:
+    - Process Creation
+    - File Creation
+    - Service Creation
+
+hypothesis:
+  statement: >-
+    An adversary may install a systemd unit whose executable lives in a writable directory,
+    obtaining persistence that starts at boot, runs with root privilege and restarts
+    automatically after termination.
+  attacker_behavior:
+    - Writes a unit file into a systemd directory with ExecStart pointing at a payload.
+    - Places the payload in /tmp, /dev/shm, /var/tmp or a home directory.
+    - Enables and starts the unit immediately so it does not wait for a reboot.
+    - Names the unit after a plausible system component so it survives a listing.
+  legitimate_behavior:
+    - Package installation writes unit files for the software it deploys.
+    - Configuration management deploys units across a fleet.
+    - Administrators write units for internally developed services.
+    - Container and orchestration tooling generates transient units.
+  risk_indicator:
+    - The unit's executable path is a temporary or world-writable directory.
+    - The unit was written by a web service account or an interactive shell.
+    - The unit is enabled and started in the same activity as it is written.
+    - The unit does not appear on comparable hosts.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: unit-file-written
+        name: Unit file written into a systemd directory
+        purpose: >-
+          Surface unit installation outside the package manager, which is how persistence
+          arrives rather than how software is deployed.
+        query: |
+          #event_simpleName=NewScriptWritten
+          | TargetFileName=/^\/(etc\/systemd\/system|lib\/systemd\/system|usr\/lib\/systemd\/system|run\/systemd\/system|home\/[^\/]+\/\.config\/systemd\/user)\/.*\.service$/
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of the package manager and configuration-management agent"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: unit-enabled-and-started
+        name: Unit enabled and started immediately
+        purpose: >-
+          Catch installation followed straight away by activation, which is persistence
+          being brought into service rather than staged for the next boot.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/systemctl\s+(daemon-reload|enable|start|--now)/i
+          | groupBy([ComputerName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=commands), collect([CommandLine], limit=5)])
+          | sort(commands, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the package manager and configuration-management agent"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: service-running-from-writable-path
+        name: Service process executing from a writable directory
+        purpose: >-
+          Observe the outcome, where a systemd-parented process runs from a location no
+          packaged service occupies.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^systemd$/i
+          | ImageFileName=/^\/(tmp|dev\/shm|var\/tmp|home)\//
+          | groupBy([ComputerName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: untrusted_unit_installed
+      name: Systemd unit installed or running from an untrusted location
+      description: >-
+        A unit file was written outside package management, or a systemd-parented process
+        is executing from a temporary or world-writable directory, which packaged services
+        never do.
+      source: file_creation
+      field: TargetFileName
+      indicates: persistence_established
+
+  supporting:
+    - id: writable_exec_path
+      name: Service executable in a writable directory
+      description: >-
+        The running service image sits under /tmp, /dev/shm, /var/tmp or a home directory
+        rather than in a system binary path.
+      source: process_creation
+      field: ImageFileName
+      indicates: untrusted_execution_location
+    - id: immediate_activation
+      name: Unit enabled and started immediately
+      description: >-
+        The unit was reloaded, enabled and started in the same activity as it was written,
+        bringing the persistence into service without waiting for a reboot.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_activated
+    - id: nonpackage_writer
+      name: Written outside package management
+      description: >-
+        The unit file was created by a web service account, an interactive shell or a
+        script rather than by the package manager or configuration management.
+      source: file_creation
+      field: ContextProcessId
+      indicates: abnormal_execution_chain
+    - id: rare_in_fleet
+      name: Unit absent from comparable hosts
+      description: >-
+        The same unit does not appear on peer systems during the baseline window, unlike
+        services deployed by packages or configuration management.
+      source: baseline
+      field: TargetFileName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: package_installed_unit
+      name: Installed by package management
+      description: >-
+        The unit was written by the package manager as part of installing or updating
+        system software.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_enterprise_activity
+    - id: config_management_unit
+      name: Deployed by configuration management
+      description: >-
+        The unit was written by the approved configuration-management agent as part of a
+        governed service definition.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: software_deployment_wave
+    - id: fleetwide_unit
+      name: Same unit across comparable hosts
+      description: >-
+        The identical unit is present on peer systems throughout the baseline window, which
+        is managed software rather than targeted persistence.
+      source: baseline
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - untrusted_unit_installed
+
+    supporting:
+      any:
+        - writable_exec_path
+        - immediate_activation
+        - nonpackage_writer
+        - rare_in_fleet
+      all:
+        - writable_exec_path
+        - nonpackage_writer
+
+    contradicting:
+      any:
+        - package_installed_unit
+        - config_management_unit
+        - fleetwide_unit
+      all: []
+
+  verdict:
+    low_risk_when:
+      - untrusted_unit_installed
+      - package_installed_unit
+      - config_management_unit
+      - fleetwide_unit
+    suspicious_when:
+      - untrusted_unit_installed
+      - rare_in_fleet
+    high_risk_when:
+      - untrusted_unit_installed
+      - writable_exec_path
+      - immediate_activation
+      - nonpackage_writer
+
+  false_positive:
+    - condition: Package installation writes a unit file for the software it deploys.
+      explanation: >-
+        Installing a service is what package management does, and it reloads and enables
+        units immediately afterwards, reproducing the activation evidence. The package
+        manager as the writing process is the discriminator.
+    - condition: Configuration management deploys units across a fleet.
+      explanation: >-
+        Managed service definitions are written programmatically outside the package
+        manager, which matches the non-package evidence. They appear identically across
+        many hosts.
+    - condition: An administrator writes a unit for an internally developed service.
+      explanation: >-
+        In-house services sometimes run from /opt or a home directory, reproducing the
+        writable-path evidence. These persist unchanged over long periods and usually have
+        a change record.
+    - condition: Container or orchestration tooling generates transient units.
+      explanation: >-
+        Some runtimes create units under /run/systemd for scopes and slices. These are
+        machine-generated, short-lived and created by the runtime's own process.

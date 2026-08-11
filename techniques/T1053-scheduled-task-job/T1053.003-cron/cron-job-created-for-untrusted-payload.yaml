@@ -1,0 +1,296 @@
+type: detection
+
+id: hg-lin-cron-job-created-for-untrusted-payload-t1053-003
+version: 1.0.0
+
+info:
+  name: Cron job created to run an untrusted payload
+  description: >-
+    Cron is the default persistence on Linux because it needs no privilege beyond the
+    user's own, survives reboot, and is invisible to anyone who does not think to look at
+    a crontab. It is also heavily used legitimately, so the schedule itself proves nothing.
+    The discriminator is the command: a maintenance job runs a packaged binary or a script
+    from an administered directory, while persistence runs an interpreter, a payload in a
+    world-writable path, or a command with a network fetch embedded in it.
+  severity: high
+  author: huntgraph
+  tags:
+    - execution
+    - persistence
+    - privilege-escalation
+    - cron
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1053/003
+    - https://attack.mitre.org/detectionstrategies/DET0290
+    - https://attack.mitre.org/techniques/T1053
+
+mitre:
+  tactics:
+    - TA0002
+    - TA0003
+    - TA0004
+  techniques:
+    - T1053
+  sub_techniques:
+    - T1053.003
+  detection_strategies:
+    - DET0290
+  analytics:
+    - AN0805
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+  data_components:
+    - Process Creation
+    - File Modification
+
+hypothesis:
+  statement: >-
+    An adversary may create a cron entry that runs a payload from a writable directory or
+    fetches and executes remote content on a schedule, obtaining execution that repeats
+    indefinitely and survives reboot without requiring elevated privilege.
+  attacker_behavior:
+    - Edits a user crontab or writes a file into a cron directory to schedule a payload.
+    - Schedules a shell one-liner that retrieves and pipes remote content into an interpreter.
+    - Points the job at a binary in /tmp, /dev/shm, /var/tmp or a home directory.
+    - Uses a short repeating interval so the job re-establishes access quickly after cleanup.
+  legitimate_behavior:
+    - System packages install cron entries for maintenance and rotation.
+    - Administrators schedule backup, monitoring and housekeeping scripts.
+    - Configuration management deploys cron entries across a fleet.
+    - Applications schedule their own periodic jobs during installation.
+  risk_indicator:
+    - The scheduled command runs from a world-writable or temporary directory.
+    - The command embeds a network fetch piped into a shell.
+    - The entry was created by a web service account or an interactive shell rather than a package.
+    - The same entry does not appear on comparable hosts.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: crontab-edited-noninteractively
+        name: Crontab modified non-interactively
+        purpose: >-
+          Surface programmatic crontab changes, which is how persistence is installed, as
+          distinct from an administrator opening an editor.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\bcrontab\b/i
+          | CommandLine=/(-\s*$|\/tmp\/|\/dev\/shm\/|\/var\/tmp\/|echo\s|printf\s|cat\s)/i
+          | groupBy([ComputerName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=edits), collect([CommandLine], limit=5)])
+          | sort(edits, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the configuration-management agent"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: cron-file-written
+        name: File written into a cron directory
+        purpose: >-
+          Catch the filesystem route, where a drop-in file schedules the job without any
+          crontab command being run.
+        query: |
+          #event_simpleName=NewScriptWritten
+          | TargetFileName=/^\/(etc\/(cron\.(d|daily|hourly|weekly|monthly)|crontab)|var\/spool\/cron)\//
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of the package manager and configuration-management agent"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: cron-spawns-fetch-and-execute
+        name: Cron running a fetch-and-execute command
+        purpose: >-
+          Observe the job in operation, where the scheduled command retrieves remote
+          content and pipes it into a shell.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(cron|crond|anacron)$/i
+          | CommandLine=/(curl|wget|nc|ncat|python|perl|base64)\b/i
+          | CommandLine=/(\|\s*(sh|bash|zsh|python)|https?:\/\/|-o\s+\/tmp\/)/i
+          | groupBy([ComputerName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Approved monitoring jobs that fetch configuration over HTTP"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+
+evidence:
+  required:
+    - id: cron_entry_untrusted
+      name: Cron entry created or running an untrusted command
+      description: >-
+        A cron entry was written or executed whose command runs from a writable directory,
+        fetches remote content, or was installed programmatically rather than by a package.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_established
+
+  supporting:
+    - id: writable_payload_path
+      name: Scheduled command in a temporary or writable directory
+      description: >-
+        The job runs a binary or script from /tmp, /dev/shm, /var/tmp or a home directory
+        rather than from an administered location.
+      source: process_creation
+      field: CommandLine
+      indicates: untrusted_execution_location
+    - id: fetch_and_execute
+      name: Scheduled command retrieves and executes remote content
+      description: >-
+        The cron command downloads content and pipes it into an interpreter, which
+        re-establishes the payload on every run regardless of local cleanup.
+      source: process_creation
+      field: CommandLine
+      indicates: possible_payload_retrieval
+    - id: nonpackage_writer
+      name: Entry written outside package management
+      description: >-
+        The cron file was created by a web service account, an interactive shell or a
+        script rather than by the package manager or configuration management.
+      source: file_creation
+      field: ContextProcessId
+      indicates: abnormal_execution_chain
+    - id: rare_in_fleet
+      name: Entry absent from comparable hosts
+      description: >-
+        The same job does not appear on peer systems during the baseline window, unlike
+        maintenance scheduled by packages or configuration management.
+      source: baseline
+      field: TargetFileName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: package_installed_job
+      name: Installed by package management
+      description: >-
+        The cron entry was created by the package manager as part of installing or updating
+        system software.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_enterprise_activity
+    - id: config_management_job
+      name: Deployed by configuration management
+      description: >-
+        The entry was written by the approved configuration-management agent and appears
+        identically across the fleet.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: software_deployment_wave
+    - id: fleetwide_job
+      name: Same job across comparable hosts
+      description: >-
+        The identical entry is present on peer systems throughout the baseline window,
+        which is a managed schedule rather than targeted persistence.
+      source: baseline
+      field: ComputerName
+      indicates: scheduled_automation_job
+
+  risk_logic:
+    required:
+      - cron_entry_untrusted
+
+    supporting:
+      any:
+        - writable_payload_path
+        - fetch_and_execute
+        - nonpackage_writer
+        - rare_in_fleet
+      all:
+        - writable_payload_path
+        - nonpackage_writer
+
+    contradicting:
+      any:
+        - package_installed_job
+        - config_management_job
+        - fleetwide_job
+      all: []
+
+  verdict:
+    low_risk_when:
+      - cron_entry_untrusted
+      - package_installed_job
+      - config_management_job
+      - fleetwide_job
+    suspicious_when:
+      - cron_entry_untrusted
+      - rare_in_fleet
+    high_risk_when:
+      - cron_entry_untrusted
+      - writable_payload_path
+      - fetch_and_execute
+      - nonpackage_writer
+
+  false_positive:
+    - condition: A package installs a cron entry for maintenance or log rotation.
+      explanation: >-
+        System packages schedule housekeeping constantly, writing directly into cron
+        directories. The package manager is the writing process and the entry appears on
+        every host running that package.
+    - condition: Configuration management deploys cron entries across a fleet.
+      explanation: >-
+        Managed schedules are written programmatically, which reproduces the
+        non-interactive evidence. They appear simultaneously across many hosts with an
+        identical definition.
+    - condition: An administrator schedules a backup or monitoring script.
+      explanation: >-
+        Operational scheduling is the normal use of cron and sometimes points at scripts in
+        a home directory. These persist unchanged over long periods rather than appearing
+        alongside other suspicious activity.
+    - condition: A monitoring job fetches its configuration over HTTP on a schedule.
+      explanation: >-
+        Some agents refresh configuration periodically, reproducing the fetch evidence. The
+        destination is a fixed internal endpoint and the job is present fleet-wide.
