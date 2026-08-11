@@ -1,0 +1,291 @@
+type: detection
+
+id: hg-win-powershell-profile-modified-for-persistence-t1546-013
+version: 1.0.0
+
+info:
+  name: PowerShell profile modified to run a payload
+  description: >-
+    Every PowerShell session executes its profile scripts before anything the user typed,
+    which makes a profile the Windows equivalent of a shell startup file: append a line and
+    it runs whenever anyone opens PowerShell. It is a particularly good hiding place
+    because the people most likely to open PowerShell are administrators, so the payload
+    tends to run in privileged sessions. Profiles are also rarely inspected — most users
+    do not know they have one — which is why programmatic modification is worth watching
+    even though the file is legitimately editable.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - powershell-profile
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1546/013
+    - https://attack.mitre.org/detectionstrategies/DET0451
+    - https://attack.mitre.org/techniques/T1546
+
+mitre:
+  tactics:
+    - TA0004
+    - TA0003
+  techniques:
+    - T1546
+  sub_techniques:
+    - T1546.013
+  detection_strategies:
+    - DET0451
+  analytics:
+    - AN1245
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:PowerShell
+  data_components:
+    - Process Creation
+    - Command Execution
+    - File Creation
+    - File Modification
+
+hypothesis:
+  statement: >-
+    An adversary may append a command to a PowerShell profile so that their payload runs at
+    the start of every PowerShell session, obtaining persistence that executes
+    disproportionately often in administrative contexts.
+  attacker_behavior:
+    - Appends a command to a user or all-users PowerShell profile with a redirect or Add-Content.
+    - Writes to the all-users profile so the payload runs for every account on the host.
+    - Points the added line at a payload in a writable directory or at a remote fetch.
+    - Creates the profile and its directory where none existed before.
+  legitimate_behavior:
+    - Administrators and developers customise their own profiles with functions and aliases.
+    - Module installers append import lines during setup.
+    - Configuration management deploys standard profiles across a fleet.
+    - Shell frameworks and completion tooling modify profiles when installed.
+  risk_indicator:
+    - The profile written belongs to a different account, or is the all-users profile.
+    - The added line fetches remote content or references a temporary directory.
+    - The writing process is a script host reached remotely rather than an interactive session.
+    - The host had no profile before this write.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: profile-written-programmatically
+        name: PowerShell profile appended by a command
+        purpose: >-
+          Surface unattended profile edits, which is how persistence is installed rather
+          than how a user curates their own shell.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Microsoft\.PowerShell_profile\.ps1|profile\.ps1|\$PROFILE)/i
+          | CommandLine=/(Add-Content|Set-Content|Out-File|>>|>|New-Item|Copy-Item|tee\b)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the configuration-management agent"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: profile-file-created
+        name: Profile script written to disk
+        purpose: >-
+          Catch the file itself arriving, including the all-users profile, which affects
+          every account rather than one.
+        query: |
+          #event_simpleName=NewScriptWritten
+          | TargetFileName=/(Microsoft\.PowerShell_profile\.ps1|profile\.ps1)$/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of module installers and configuration-management agents"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: profile-edit-with-fetch
+        name: Profile edit embedding a remote fetch
+        purpose: >-
+          Isolate additions that retrieve and run remote content, which re-establishes the
+          payload on every session regardless of local cleanup.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(profile\.ps1|\$PROFILE)/i
+          | CommandLine=/(DownloadString|Invoke-WebRequest|Invoke-RestMethod|\biex\b|Invoke-Expression|FromBase64String|\\AppData\\|\\Temp\\)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: profile_modified
+      name: PowerShell profile created or appended programmatically
+      description: >-
+        A PowerShell profile script was written or appended to by a command rather than
+        through an editor, so a command will run at the start of every session.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_established
+
+  supporting:
+    - id: all_users_scope
+      name: All-users profile targeted
+      description: >-
+        The profile written applies to every account on the host rather than to one user,
+        widening the persistence to anyone who opens PowerShell.
+      source: file_creation
+      field: TargetFileName
+      indicates: broad_persistence_scope
+    - id: fetch_or_temp_payload
+      name: Added line fetches remote content or uses a temporary path
+      description: >-
+        The addition retrieves content over the network or references a writable directory,
+        which profile customisation does not require.
+      source: process_creation
+      field: CommandLine
+      indicates: possible_payload_retrieval
+    - id: remote_or_service_writer
+      name: Written by a remote channel or service context
+      description: >-
+        The writing process was reached remotely or runs as a service rather than being an
+        interactive session belonging to the profile's owner.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: first_profile_on_host
+      name: No profile previously present
+      description: >-
+        The host had no PowerShell profile during the baseline window, so its sudden
+        appearance is not a user refining an existing setup.
+      source: baseline
+      field: TargetFileName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: module_installer
+      name: Module or framework installer
+      description: >-
+        The profile was modified by a module installer or shell framework that appends
+        import and completion lines as part of its setup.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_application_component
+    - id: config_management_profile
+      name: Deployed by configuration management
+      description: >-
+        The profile was written by the approved configuration-management agent as part of a
+        standard shell environment.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: software_deployment_wave
+    - id: owner_interactive_edit
+      name: Owner editing their own profile interactively
+      description: >-
+        The profile belongs to the user performing the edit and the session is interactive,
+        which is ordinary shell customisation.
+      source: process_creation
+      field: UserName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - profile_modified
+
+    supporting:
+      any:
+        - all_users_scope
+        - fetch_or_temp_payload
+        - remote_or_service_writer
+        - first_profile_on_host
+      all:
+        - fetch_or_temp_payload
+        - remote_or_service_writer
+
+    contradicting:
+      any:
+        - module_installer
+        - config_management_profile
+        - owner_interactive_edit
+      all: []
+
+  verdict:
+    low_risk_when:
+      - profile_modified
+      - module_installer
+      - config_management_profile
+      - owner_interactive_edit
+    suspicious_when:
+      - profile_modified
+      - first_profile_on_host
+    high_risk_when:
+      - profile_modified
+      - all_users_scope
+      - fetch_or_temp_payload
+      - remote_or_service_writer
+
+  false_positive:
+    - condition: A developer or administrator customises their own profile.
+      explanation: >-
+        Adding functions and aliases is the profile's purpose, and it is often done with
+        Add-Content rather than an editor. The file belongs to the person editing it and
+        the session is interactive.
+    - condition: A module installer appends an import line during setup.
+      explanation: >-
+        Many PowerShell modules and shell frameworks modify the profile so their commands
+        are available in new sessions. The installer is the writing process and the change
+        appears wherever the module is installed.
+    - condition: Configuration management deploys a standard profile.
+      explanation: >-
+        Managed shell environments write profiles programmatically, including the all-users
+        profile, which reproduces the strongest supporting evidence. The agent and the
+        fleet-wide pattern are the discriminators.

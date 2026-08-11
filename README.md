@@ -151,16 +151,40 @@ iterations; the corpus is re-validated in full each time so drift cannot accumul
 
 ### Status
 
-| Iteration | Tactic | Scope | State |
-|---|---|---|---|
-| 1 | Stealth (TA0005) | batch S1 — 6 sub-techniques, 8 hypotheses | complete, 8/8 valid |
-| 2 | Stealth (TA0005) | batches S2+ — remaining 142 techniques | not started |
-| 3 | Defense Impairment (TA0112) | full tactic | not started |
-| 4 | Credential Access (TA0006) | full tactic | not started |
+Run `python3 tools/coverage.py --priority 1` for the current figure — it is computed
+from the corpus, never from this table.
 
-Batch S1 covers T1218.011, T1027.010, T1036.005, T1574.001, T1564.003 and T1070.006 —
-chosen to exercise process, file, network and correlation telemetry rather than to cover
-the tactic.
+Priority 1 is Execution, Persistence, Privilege Escalation, Stealth, Defense
+Impairment, Credential Access and Lateral Movement: **315 unique in-scope leaf
+targets**. Priority 2 (Discovery, Collection, Command and Control, Exfiltration) is
+declared but not yet worked.
+
+### The reachable remainder is smaller than the remaining count
+
+```bash
+python3 tools/coverage.py --priority 1 --blocked
+```
+
+**97 of the uncovered Priority 1 targets — around 40% — cannot be given an honest
+hypothesis with the telemetry this repo targets.** Their MITRE analytics rest entirely
+on data components the CrowdStrike process, file and network events cannot supply:
+
+| Missing component | Techniques it would unblock |
+|---|---|
+| Module Load | 50 |
+| Process Access | 38 |
+| OS API Execution | 26 |
+| Process Modification | 13 |
+| Driver Load | 5 |
+
+The whole T1055 process-injection family sits behind the first three, as do
+T1620 Reflective Code Loading, T1129 Shared Modules and T1622 Debugger Evasion.
+
+This is deliberate, not an omission. A command-line approximation of DLL injection
+detects nothing while looking like coverage, which is the failure mode the contract
+exists to prevent. Confirming the NG-SIEM schema for module loads and process handle
+access is worth more than several batches of authoring: it converts the single largest
+block of remaining work from impossible to routine.
 
 ## Contributing
 
