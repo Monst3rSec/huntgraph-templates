@@ -1,0 +1,288 @@
+type: detection
+
+id: hg-win-share-connections-removed-after-access-t1070-005
+version: 1.0.0
+
+info:
+  name: Network share connections removed after access
+  description: >-
+    Mapped connections persist in a user's session and show, in a listing anyone can run,
+    exactly which remote systems were reached. An operator who has finished collecting from
+    a file server therefore disconnects: the mapping disappears, the listing is clean, and
+    an investigator asking what this account touched has one less answer. The removal is a
+    small, ordinary-looking command, which is why it is only meaningful next to what
+    preceded it — a share was mounted, something was read from it, and then the mapping was
+    taken away.
+  severity: medium
+  author: huntgraph
+  tags:
+    - stealth
+    - anti-forensics
+    - indicator-removal
+    - network-share
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1070/005
+    - https://attack.mitre.org/detectionstrategies/DET0103
+    - https://attack.mitre.org/techniques/T1070
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1070
+  sub_techniques:
+    - T1070.005
+  detection_strategies:
+    - DET0103
+  analytics:
+    - AN0286
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Command Execution
+    - Logon Session Creation
+
+hypothesis:
+  statement: >-
+    An adversary may remove the network share connections they created once collection or
+    lateral movement is complete, erasing the record of which remote systems the session
+    reached from anything that enumerates active mappings.
+  attacker_behavior:
+    - Deletes mapped connections with net use after finishing with a share.
+    - Removes all mappings at once rather than a specific one.
+    - Disconnects shortly after mounting and reading from the same remote host.
+    - Pairs the removal with deletion of the files copied from the share.
+  legitimate_behavior:
+    - Logon and logoff scripts map and unmap drives as a matter of routine.
+    - Users disconnect drives they no longer need.
+    - Profile management tooling cleans up mappings at session end.
+    - Administrators tidy stale mappings during troubleshooting.
+  risk_indicator:
+    - The removal follows a mapping and access of the same host within a short period.
+    - All mappings are deleted at once rather than one being tidied.
+    - The command is issued by a script host or a remote-execution channel.
+    - The same session shows file copying from the share beforehand.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: mapping-removed
+        name: Share mapping deleted
+        purpose: >-
+          Surface removal of mapped connections, capturing whether a specific mapping or
+          all of them were taken away.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(net(\.exe)?\s+use\s+.*\/(delete|d)\b|net1\s+use\s+.*\/delete|Remove-PSDrive|Remove-SmbMapping)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=removals), collect([CommandLine], limit=5)])
+          | sort(removals, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Logon and logoff scripts that map and unmap drives routinely"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: map-then-remove-sequence
+        name: Share mapped and then removed in the same session
+        purpose: >-
+          Join the mount to the disconnect, which is the sequence that indicates cleanup
+          after use rather than tidying a stale mapping.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(net(\.exe)?\s+use\s+[a-z]:\s*\\\\|New-PSDrive|New-SmbMapping)/i
+                | share_mapped := CommandLine ;
+              CommandLine=/(net(\.exe)?\s+use\s+.*\/(delete|d)\b|Remove-PSDrive|Remove-SmbMapping)/i
+                | share_removed := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([share_mapped, share_removed, ParentBaseFileName]),
+                              count(as=events)])
+          | share_mapped=/.+/ and share_removed=/.+/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: all-mappings-removed
+        name: All mappings removed at once
+        purpose: >-
+          Isolate wholesale removal, which erases the record of every remote system reached
+          rather than tidying one connection.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/net(\.exe)?\s+use\s+\*\s*\/(delete|d)\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=removals), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Logoff scripts that clear all mappings at session end"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+evidence:
+  required:
+    - id: mapping_removed
+      name: Share connection removed
+      description: >-
+        A mapped network connection was deleted, removing it from the listing that would
+        otherwise show which remote systems this session reached.
+      source: process_creation
+      field: CommandLine
+      indicates: evidence_destruction
+
+  supporting:
+    - id: mapped_then_removed
+      name: Share mapped and removed in the same activity
+      description: >-
+        The same session created the mapping shortly before deleting it, which is cleanup
+        after use rather than removal of a stale connection.
+      source: process_creation
+      field: CommandLine
+      indicates: anti_forensic_sequence
+    - id: wholesale_removal
+      name: All mappings removed at once
+      description: >-
+        Every mapping was deleted rather than a specific one, which erases the record of
+        all remote systems reached rather than tidying a single connection.
+      source: process_creation
+      field: CommandLine
+      indicates: deliberate_evasion
+    - id: scripted_actor
+      name: Issued by a script host or remote channel
+      description: >-
+        The removal was performed by an interpreter or a remote-execution channel rather
+        than by a logon script or an interactive user.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: rare_for_user
+      name: Unprecedented for this account
+      description: >-
+        This account has not removed mappings in this pattern during the baseline window,
+        unlike users whose logon scripts do so every session.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: logon_logoff_script
+      name: Logon or logoff script managing drives
+      description: >-
+        The mapping and removal belong to the session scripts that map drives at logon and
+        clear them at logoff.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: scheduled_automation_job
+    - id: profile_management
+      name: Profile management cleanup
+      description: >-
+        An approved profile or desktop management product cleared mappings as part of
+        session teardown.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_application_component
+    - id: routine_for_user
+      name: Routine behaviour for this account
+      description: >-
+        This account maps and unmaps drives regularly throughout the baseline window, which
+        reads as normal working practice.
+      source: baseline
+      field: UserName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - mapping_removed
+
+    supporting:
+      any:
+        - mapped_then_removed
+        - wholesale_removal
+        - scripted_actor
+        - rare_for_user
+      all:
+        - mapped_then_removed
+        - scripted_actor
+
+    contradicting:
+      any:
+        - logon_logoff_script
+        - profile_management
+        - routine_for_user
+      all: []
+
+  verdict:
+    low_risk_when:
+      - mapping_removed
+      - logon_logoff_script
+      - profile_management
+      - routine_for_user
+    suspicious_when:
+      - mapping_removed
+      - rare_for_user
+    high_risk_when:
+      - mapping_removed
+      - mapped_then_removed
+      - wholesale_removal
+      - scripted_actor
+
+  false_positive:
+    - condition: A logoff script clears all mappings at session end.
+      explanation: >-
+        Clearing drives at logoff is standard session management and reproduces the
+        wholesale-removal evidence exactly. It runs from the logon mechanism for every user
+        on a predictable cadence.
+    - condition: A user disconnects a drive they no longer need.
+      explanation: >-
+        Manual tidying is ordinary and interactive. It removes one mapping rather than all,
+        and is not preceded by mounting and reading in the same short window.
+    - condition: Profile management tooling cleans up mappings.
+      explanation: >-
+        Desktop management products clear mappings during teardown. The acting process is a
+        recognisable product present across the estate.
+    - condition: An administrator tidies stale mappings while troubleshooting.
+      explanation: >-
+        Removing broken mappings is a normal support step. It is interactive, tied to a
+        named engineer, and usually accompanies an incident record.

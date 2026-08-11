@@ -1,0 +1,294 @@
+type: detection
+
+id: hg-win-shortcut-disguised-by-borrowed-icon-t1027-012
+version: 1.0.0
+
+info:
+  name: Shortcut disguised with a borrowed document icon
+  description: >-
+    A shortcut file carries both the command it runs and the icon it displays, and the two
+    need not have anything to do with each other. Pointing the icon at a PDF reader or an
+    Office application while the target is an interpreter produces a file that looks like a
+    document in every folder view, including inside an archive. The user sees the icon they
+    expect, and the extension is hidden by default. What the shortcut actually runs is
+    still recorded in its command, which is where the disguise fails.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - obfuscation
+    - shortcut
+    - user-deception
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1027/012
+    - https://attack.mitre.org/detectionstrategies/DET0405
+    - https://attack.mitre.org/techniques/T1027
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1027
+  sub_techniques:
+    - T1027.012
+  detection_strategies:
+    - DET0405
+  analytics:
+    - AN1134
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Metadata
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may deliver a shortcut whose icon is borrowed from a document application
+    while its target is an interpreter, so the file presents as a document in every folder
+    view and the user opens it expecting to read something.
+  attacker_behavior:
+    - Sets the shortcut icon to a document or PDF application while targeting an interpreter.
+    - Embeds the payload command in the shortcut arguments rather than in a separate file.
+    - Delivers the shortcut inside an archive so the icon survives to the user.
+    - Relies on extension hiding so the .lnk suffix is never shown.
+  legitimate_behavior:
+    - Installers create shortcuts to their applications with matching icons.
+    - Users create shortcuts to documents and folders routinely.
+    - Management tooling deploys shortcuts to line-of-business applications.
+    - Some launchers create shortcuts that invoke a script wrapper by design.
+  risk_indicator:
+    - A shortcut launches an interpreter rather than an application.
+    - The shortcut was written into a download or extraction directory.
+    - The launched command contains a remote fetch or encoded content.
+    - The shortcut arrived through an archive or mail client.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+        - PeFileWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: shortcut-launching-interpreter
+        name: Interpreter launched by a shortcut from a delivery directory
+        purpose: >-
+          Surface the execution the disguise produces, where a file the user took for a
+          document starts an interpreter instead.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32|curl)\.exe$/i
+          | ParentBaseFileName=/^explorer\.exe$/i
+          | CommandLine=/(DownloadString|Invoke-WebRequest|Invoke-RestMethod|\biex\b|FromBase64String|-enc\b|http)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: shortcut-written-to-delivery-path
+        name: Shortcut written into a download or extraction directory
+        purpose: >-
+          Catch the shortcut at delivery, before the user opens it, which is the earliest
+          point of intervention.
+        query: |
+          #event_simpleName=/^(NewScriptWritten|PeFileWritten)$/
+          | TargetFileName=/\.lnk$/i
+          | TargetFileName=/\\(Downloads|AppData\\Local\\Temp|INetCache|Content\.Outlook|Users\\Public)\\/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of installers creating application shortcuts"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: shortcut-from-archive-parent
+        name: Interpreter launched from an archive extraction context
+        purpose: >-
+          Establish the delivery route, which confirms the disguised shortcut reached the
+          user through a channel they acted on.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(7zfm|7zg|winrar|winzip|peazip|outlook|thunderbird)\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: shortcut_launched_interpreter
+      name: Shortcut execution starting an interpreter
+      description: >-
+        A shortcut in a delivery directory, or an explorer-parented launch, started a script
+        interpreter carrying a remote fetch or encoded content rather than opening an
+        application.
+      source: process_creation
+      field: CommandLine
+      indicates: user_facing_deception
+
+  supporting:
+    - id: delivery_directory
+      name: Shortcut written into a delivery directory
+      description: >-
+        The shortcut arrived in Downloads, a browser cache or the mail attachment directory
+        rather than being created by an installer.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: archive_or_mail_parent
+      name: Archive tool or mail client as parent
+      description: >-
+        The execution was parented by an archive utility or mail client, establishing that
+        the shortcut arrived through a delivery channel.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: remote_or_encoded_command
+      name: Command carries a fetch or encoded content
+      description: >-
+        The launched command retrieves remote content or carries an encoded block, which no
+        shortcut to a document requires.
+      source: process_creation
+      field: CommandLine
+      indicates: possible_payload_retrieval
+    - id: rare_for_user
+      name: Unprecedented for this user
+      description: >-
+        This user has not launched comparable commands through explorer during the baseline
+        window, unlike administrators who use shortcuts to scripts routinely.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: installer_shortcut
+      name: Shortcut created by an installer
+      description: >-
+        The shortcut was created by an approved installer for the application it points at,
+        with a matching icon by design.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_enterprise_activity
+    - id: managed_shortcut
+      name: Managed shortcut deployment
+      description: >-
+        The shortcut was deployed by management tooling across a host collection as part of
+        a governed desktop configuration.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+    - id: script_launcher_by_design
+      name: Launcher that wraps a script by design
+      description: >-
+        The shortcut belongs to an approved application whose launcher invokes a script
+        wrapper as part of its normal startup.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_application_component
+
+  risk_logic:
+    required:
+      - shortcut_launched_interpreter
+
+    supporting:
+      any:
+        - delivery_directory
+        - archive_or_mail_parent
+        - remote_or_encoded_command
+        - rare_for_user
+      all:
+        - delivery_directory
+        - remote_or_encoded_command
+
+    contradicting:
+      any:
+        - installer_shortcut
+        - managed_shortcut
+        - script_launcher_by_design
+      all: []
+
+  verdict:
+    low_risk_when:
+      - shortcut_launched_interpreter
+      - installer_shortcut
+      - managed_shortcut
+      - script_launcher_by_design
+    suspicious_when:
+      - shortcut_launched_interpreter
+      - rare_for_user
+    high_risk_when:
+      - shortcut_launched_interpreter
+      - delivery_directory
+      - archive_or_mail_parent
+      - remote_or_encoded_command
+
+  false_positive:
+    - condition: An installer creates a shortcut to the application it deploys.
+      explanation: >-
+        Shortcut creation with a matching icon is part of nearly every installation. These
+        point at application executables rather than interpreters and are written by the
+        installer.
+    - condition: A user creates a shortcut to a document or folder.
+      explanation: >-
+        Self-made shortcuts are routine and appear in profile directories. They open
+        documents rather than launching interpreters with remote fetches.
+    - condition: Management tooling deploys shortcuts to line-of-business applications.
+      explanation: >-
+        Managed desktops receive shortcuts from policy, sometimes into user directories.
+        These appear identically across a host collection.
+    - condition: An application launcher wraps a script by design.
+      explanation: >-
+        A few products ship shortcuts that call a script wrapper before starting the
+        application. These reference the product's own installation path rather than a
+        remote fetch.
