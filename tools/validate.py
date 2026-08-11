@@ -153,6 +153,24 @@ def check_mitre(doc, atk: Attack, rep: Report) -> None:
             rep.error("L2", "sub-technique %s declared without parent %s in mitre.techniques"
                       % (sid, parent))
 
+    # a hypothesis must be pitched at a leaf. Parents that decompose into
+    # sub-techniques are covered through those, because a hypothesis at the
+    # parent is too broad to produce an explainable verdict — and it silently
+    # fails to count toward coverage, which is how this was first noticed.
+    if not m["sub_techniques"]:
+        for tid in m["techniques"]:
+            children = sorted(
+                aid for aid in atk.by_attack_id
+                if aid.startswith(tid + ".")
+                and atk.by_attack_id[aid]["type"] == "attack-pattern"
+                and not atk.by_attack_id[aid].get("revoked")
+                and not atk.by_attack_id[aid].get("x_mitre_deprecated")
+            )
+            if children:
+                rep.error("L2", "%s decomposes into sub-techniques (%s); pitch the "
+                                "hypothesis at the specific one it describes"
+                          % (tid, ", ".join(children)))
+
     # detection strategies must actually detect a declared technique
     valid_ds = {}
     for tid, obj in live.items():

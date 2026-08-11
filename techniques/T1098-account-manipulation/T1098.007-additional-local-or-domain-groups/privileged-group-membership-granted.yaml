@@ -1,0 +1,292 @@
+type: detection
+
+id: hg-win-privileged-group-membership-granted-t1098-007
+version: 1.0.0
+
+info:
+  name: Existing account granted privileged group membership
+  description: >-
+    Adding an account an adversary already controls to a privileged group is quieter than
+    creating a new one: no account appears that was not there yesterday, and the change
+    hides among the genuine membership churn that every directory experiences. It also
+    survives the obvious remediation, since resetting a password does not remove group
+    membership. The question triage has to answer is not whether membership changed but
+    whether this change came through the process that is supposed to make it — an identity
+    workflow — or from a shell on an endpoint.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - account-manipulation
+    - group-membership
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1098/007
+    - https://attack.mitre.org/detectionstrategies/DET0310
+    - https://attack.mitre.org/techniques/T1098
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1098
+  sub_techniques:
+    - T1098.007
+  detection_strategies:
+    - DET0310
+  analytics:
+    - AN0865
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+  data_components:
+    - User Account Modification
+
+hypothesis:
+  statement: >-
+    An adversary may add an account they already control to a privileged or remote-access
+    group, retaining elevated access without creating a new account and surviving a
+    password reset aimed at the compromised identity.
+  attacker_behavior:
+    - Adds an account to Domain Admins, Enterprise Admins or a local Administrators group.
+    - Grants remote-access group membership so the account can log in interactively.
+    - Re-enables a dormant account and grants it privilege in the same session.
+    - Makes the change from an endpoint shell rather than through an identity workflow.
+  legitimate_behavior:
+    - Identity management workflows grant group membership as part of joiner and mover processes.
+    - Administrators add accounts to groups during onboarding or a role change.
+    - Provisioning automation seeds local administrator membership during host build.
+    - Application installers add service accounts to the groups their products need.
+  risk_indicator:
+    - The change is made from an endpoint shell rather than an identity platform.
+    - The target group is highly privileged or grants remote interactive access.
+    - A dormant or service account is the beneficiary.
+    - The account making the change has no history of directory administration.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: domain-privileged-group-add
+        name: Account added to a highly privileged domain group
+        purpose: >-
+          Surface membership changes to the groups that confer estate-wide control, where
+          any addition deserves attention regardless of who made it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(net(\.exe)?\s+group|Add-ADGroupMember|net1\s+group|dsmod\s+group)/i
+          | CommandLine=/(domain admins|enterprise admins|schema admins|account operators|backup operators|domain controllers|group policy creator)/i
+          | CommandLine=/(\/add|-Members)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of the identity management platform hosts"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: local-admin-or-remote-group-add
+        name: Account added to a local administrative or remote-access group
+        purpose: >-
+          Cover the endpoint-scoped equivalent, which is how footholds are consolidated on
+          individual machines.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(net(\.exe)?\s+localgroup|Add-LocalGroupMember|net1\s+localgroup)/i
+          | CommandLine=/(administrators|remote desktop users|remote management users|distributed com users)/i
+          | CommandLine=/(\/add|-Member)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Provisioning automation that seeds administrative membership at host build"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: account-enabled-then-elevated
+        name: Dormant account re-enabled and granted privilege
+        purpose: >-
+          Catch the reuse of an existing but unused identity, which avoids creating
+          anything new while producing a fully privileged account.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(net(\.exe)?\s+user\s+.*\/active\s*:\s*yes|Enable-ADAccount|Enable-LocalUser|Set-ADUser\s+.*-Enabled\s+\$true)/i
+                | account_enabled := CommandLine ;
+              CommandLine=/((net(\.exe)?\s+(local)?group|Add-(AD|Local)GroupMember).*(admin|remote))/i
+                | group_added := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([account_enabled, group_added, ParentBaseFileName]),
+                              count(as=events)])
+          | account_enabled=/.+/ and group_added=/.+/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: privileged_membership_change
+      name: Account added to a privileged or remote-access group
+      description: >-
+        Group membership was granted that confers administrative rights or interactive
+        remote access, extending what the beneficiary account can do.
+      source: process_creation
+      field: CommandLine
+      indicates: privilege_escalation_attempt
+
+  supporting:
+    - id: endpoint_shell_origin
+      name: Change made from an endpoint shell
+      description: >-
+        The modification was issued from a command shell or script host on an endpoint
+        rather than through the identity management platform that owns this process.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: highly_privileged_group
+      name: Target group confers estate-wide control
+      description: >-
+        The group granted is one of the domain-wide administrative groups rather than a
+        team or application group, so the change affects the whole environment.
+      source: process_creation
+      field: CommandLine
+      indicates: high_impact_privilege_grant
+    - id: dormant_account_revived
+      name: Dormant account enabled alongside the grant
+      description: >-
+        An account was re-enabled in the same activity as the membership change, which is
+        the reuse of an unused identity rather than a role change for an active person.
+      source: process_creation
+      field: CommandLine
+      indicates: credential_reuse
+    - id: unusual_administrator
+      name: Actor without directory administration history
+      description: >-
+        The account making the change has no history of directory or group administration
+        during the baseline window.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: identity_platform_change
+      name: Change originating from the identity platform
+      description: >-
+        The membership change was made by the approved identity management system as part
+        of a joiner, mover or access-request workflow.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: provisioning_seed
+      name: Provisioning seeding administrative membership
+      description: >-
+        The change occurred during host build, where local administrative membership is
+        configured deliberately.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: recorded_access_request
+      name: Recorded access request
+      description: >-
+        A change or access-request record covers this membership grant, naming the
+        beneficiary, the approver and the justification.
+      source: change_management
+      field: UserName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - privileged_membership_change
+
+    supporting:
+      any:
+        - endpoint_shell_origin
+        - highly_privileged_group
+        - dormant_account_revived
+        - unusual_administrator
+      all:
+        - endpoint_shell_origin
+        - highly_privileged_group
+
+    contradicting:
+      any:
+        - identity_platform_change
+        - provisioning_seed
+        - recorded_access_request
+      all: []
+
+  verdict:
+    low_risk_when:
+      - privileged_membership_change
+      - identity_platform_change
+      - provisioning_seed
+      - recorded_access_request
+    suspicious_when:
+      - privileged_membership_change
+      - unusual_administrator
+    high_risk_when:
+      - privileged_membership_change
+      - endpoint_shell_origin
+      - highly_privileged_group
+      - dormant_account_revived
+
+  false_positive:
+    - condition: An identity management workflow grants group membership during onboarding.
+      explanation: >-
+        Joiner and mover processes change membership constantly, which is why the
+        originating process rather than the change itself carries the escalation. These
+        originate from the identity platform against an access request.
+    - condition: An administrator adds an account to a group during a role change.
+      explanation: >-
+        Directory administration is legitimate work and is sometimes done at a command
+        line. It is performed by an account with a long history of such changes and is
+        usually attached to a request record.
+    - condition: Provisioning automation seeds local administrator membership at build.
+      explanation: >-
+        Host build configures local administrative groups deliberately, reproducing the
+        required evidence on every new machine. Build state is the discriminator.
+    - condition: An installer adds a service account to a group its product needs.
+      explanation: >-
+        Products that require specific rights add their service account during setup. The
+        installer is the parent and the change appears on every host running the product.

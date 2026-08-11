@@ -1,0 +1,267 @@
+type: detection
+
+id: hg-win-syncappv-appended-expression-t1216-002
+version: 1.0.0
+
+info:
+  name: SyncAppvPublishingServer carrying an appended PowerShell expression
+  description: >-
+    SyncAppvPublishingServer exists to refresh application virtualisation publishing, and
+    it passes its argument through to PowerShell. A semicolon separates the expected
+    server value from anything else an operator appends, so the signed Microsoft component
+    ends up executing arbitrary script. The technique is narrow and specific: the binary
+    is present on every Windows install whether or not application virtualisation is
+    deployed, so in most estates it should never run at all.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - proxy-execution
+    - lolbin
+    - signed-script
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1216/002
+    - https://attack.mitre.org/detectionstrategies/DET0440
+    - https://lolbas-project.github.io/lolbas/Binaries/Syncappvpublishingserver/
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1216
+  sub_techniques:
+    - T1216.002
+  detection_strategies:
+    - DET0440
+  analytics:
+    - AN1220
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:PowerShell
+  data_components:
+    - Process Creation
+    - Command Execution
+    - Process Access
+
+hypothesis:
+  statement: >-
+    An adversary may append a PowerShell expression to the argument of
+    SyncAppvPublishingServer, so that a signed Microsoft component executes their script
+    while presenting as an application virtualisation refresh.
+  attacker_behavior:
+    - Passes a semicolon followed by an expression to SyncAppvPublishingServer.
+    - Uses the appended expression to download, decode or launch a second stage.
+    - Invokes the component from a delivery application after user interaction.
+    - Relies on the binary being present even where application virtualisation is not deployed.
+  legitimate_behavior:
+    - Application virtualisation publishing genuinely runs the component where deployed.
+    - Administrators trigger a publishing refresh while troubleshooting that platform.
+  risk_indicator:
+    - The argument contains a semicolon or scripting keywords rather than a server value.
+    - Application virtualisation is not deployed anywhere in the estate.
+    - The parent process is a document handler or archive utility.
+    - The invocation is unprecedented for the host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: appended-expression
+        name: Expression appended after the publishing argument
+        purpose: >-
+          Catch the documented syntax, where a semicolon separates the expected value from
+          script the component will execute.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/SyncAppvPublishingServer/i
+          | CommandLine=/;|\biex\b|Invoke-Expression|Start-Process|DownloadString|FromBase64String|New-Object/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: any-invocation-where-not-deployed
+        name: Any invocation in an estate without application virtualisation
+        purpose: >-
+          Where the platform is not deployed the component should never run, so the
+          baseline turns any execution into a finding without needing argument analysis.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/SyncAppvPublishingServer/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Hosts where application virtualisation publishing is genuinely deployed"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - organization
+
+      - id: invocation-from-delivery-parent
+        name: Component invoked by a delivery application
+        purpose: >-
+          Establish the delivery route, which is what places the invocation immediately
+          after a user opened content.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/SyncAppvPublishingServer/i
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|acrord32|acrobat|chrome|msedge|firefox|7zfm|winrar|mshta|wscript|cscript)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: syncappv_invocation
+      name: SyncAppvPublishingServer executed
+      description: >-
+        The application virtualisation publishing component was invoked, which forwards its
+        argument to PowerShell and therefore can execute arbitrary script.
+      source: process_creation
+      field: CommandLine
+      indicates: proxy_execution_of_untrusted_module
+
+  supporting:
+    - id: appended_expression
+      name: Expression appended to the argument
+      description: >-
+        The argument contains a semicolon or scripting constructs rather than a publishing
+        server value, meaning script is being forwarded for execution.
+      source: process_creation
+      field: CommandLine
+      indicates: dynamic_code_execution
+    - id: platform_not_deployed
+      name: Application virtualisation absent from the estate
+      description: >-
+        No application virtualisation publishing activity appears anywhere during the
+        baseline window, so the component has no legitimate reason to run.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        The component was invoked by a document handler, archive utility, mail client or
+        script host rather than by the virtualisation platform.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: rare_for_host
+      name: Invocation unprecedented on this host
+      description: >-
+        This host has not run the component during the baseline window, which is the normal
+        state outside a virtualisation deployment.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: appv_platform_deployed
+      name: Application virtualisation genuinely deployed
+      description: >-
+        The estate runs application virtualisation and the component executes routinely on
+        hosts that participate in publishing.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: publishing_workflow_parent
+      name: Invoked by the virtualisation platform
+      description: >-
+        The component was launched by the application virtualisation client as part of a
+        scheduled or user-triggered publishing refresh.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_application_component
+    - id: administrative_session
+      name: Interactive administrative troubleshooting
+      description: >-
+        A named administrator triggered a publishing refresh while diagnosing the platform,
+        with a corresponding incident record.
+      source: change_management
+      field: UserName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - syncappv_invocation
+
+    supporting:
+      any:
+        - appended_expression
+        - platform_not_deployed
+        - delivery_parent
+        - rare_for_host
+      all:
+        - appended_expression
+        - delivery_parent
+
+    contradicting:
+      any:
+        - appv_platform_deployed
+        - publishing_workflow_parent
+        - administrative_session
+      all: []
+
+  verdict:
+    low_risk_when:
+      - syncappv_invocation
+      - appv_platform_deployed
+      - publishing_workflow_parent
+      - administrative_session
+    suspicious_when:
+      - syncappv_invocation
+      - platform_not_deployed
+    high_risk_when:
+      - syncappv_invocation
+      - appended_expression
+      - delivery_parent
+      - rare_for_host
+
+  false_positive:
+    - condition: Application virtualisation publishing runs the component routinely.
+      explanation: >-
+        On estates where the platform is deployed the component executes as designed. The
+        argument contains a publishing server reference with no appended expression, and
+        activity is confined to hosts running the platform.
+    - condition: An administrator triggers a publishing refresh while troubleshooting.
+      explanation: >-
+        Manual refreshes are reasonable support work on a deployed platform. They are
+        interactive, from an administrative context, and tied to a named user.

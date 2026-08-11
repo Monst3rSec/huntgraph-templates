@@ -1,0 +1,283 @@
+type: detection
+
+id: hg-win-accessibility-binary-replaced-or-debugged-t1546-008
+version: 1.0.0
+
+info:
+  name: Accessibility feature backdoored for pre-logon execution
+  description: >-
+    The accessibility helpers reachable from the logon screen — sticky keys, the on-screen
+    keyboard, the magnifier, the utility manager — run as SYSTEM before anyone has
+    authenticated. Replacing one of those binaries, or attaching a debugger to it through
+    Image File Execution Options, converts a key combination at the logon screen into a
+    SYSTEM shell. It is old, it is well known, and it persists because it survives password
+    resets and needs nothing running to maintain it. Nothing legitimate attaches a debugger
+    to sethc.exe, which makes the registry form close to conclusive.
+  severity: critical
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - accessibility-features
+    - image-file-execution-options
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1546/008
+    - https://attack.mitre.org/detectionstrategies/DET0033
+    - https://attack.mitre.org/techniques/T1546
+
+mitre:
+  tactics:
+    - TA0004
+    - TA0003
+  techniques:
+    - T1546
+  sub_techniques:
+    - T1546.008
+  detection_strategies:
+    - DET0033
+  analytics:
+    - AN0094
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An adversary may replace an accessibility helper binary, or register a debugger for it
+    through Image File Execution Options, so that a key combination at the logon screen
+    launches an attacker-chosen program as SYSTEM before authentication.
+  attacker_behavior:
+    - Sets a Debugger value under Image File Execution Options for sethc.exe, utilman.exe, osk.exe or magnify.exe.
+    - Replaces the accessibility binary in System32 with cmd.exe or another program.
+    - Uses the resulting SYSTEM shell from the logon screen or over remote desktop.
+    - Restores the original binary after use to remove the artefact.
+  legitimate_behavior:
+    - Developers set Image File Execution Options debuggers while diagnosing application startup.
+    - Accessibility software vendors may register their own components.
+    - Servicing operations replace System32 binaries during updates.
+    - Application compatibility tooling uses Image File Execution Options for shims.
+  risk_indicator:
+    - The debugger value targets an accessibility binary specifically.
+    - The registered debugger is a shell or interpreter.
+    - An accessibility binary in System32 is overwritten outside servicing.
+    - The change is made by a script host or a remote-execution channel.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: ifeo-debugger-on-accessibility-binary
+        name: Debugger registered for an accessibility binary
+        purpose: >-
+          Surface the registry form, which is the cleanest signal because no legitimate
+          workflow attaches a debugger to these particular binaries.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/Image File Execution Options/i
+          | CommandLine=/(sethc|utilman|osk|magnify|narrator|displayswitch|atbroker)\.exe/i
+          | CommandLine=/(Debugger|reg(\.exe)?\s+add|Set-ItemProperty|New-ItemProperty)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: accessibility-binary-overwritten
+        name: Accessibility binary written in a system directory
+        purpose: >-
+          Catch outright replacement, which leaves no registry artefact and is therefore
+          invisible to a review that only inspects Image File Execution Options.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+          | TargetFileName=/\\(System32|SysWOW64)\\(sethc|utilman|osk|magnify|narrator|displayswitch|atbroker)\.exe$/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of the Windows servicing stack applying updates"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: accessibility-binary-spawns-shell
+        name: Accessibility binary spawning a shell
+        purpose: >-
+          Observe the backdoor in use, which confirms exploitation rather than only
+          preparation.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(sethc|utilman|osk|magnify|narrator|displayswitch|atbroker)\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh|wscript|cscript|mshta|explorer)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: accessibility_hijack
+      name: Accessibility helper hijacked
+      description: >-
+        A debugger was registered for an accessibility binary, the binary itself was
+        overwritten, or such a binary spawned a shell, any of which converts a logon-screen
+        key combination into SYSTEM execution.
+      source: process_creation
+      field: CommandLine
+      indicates: pre_authentication_backdoor
+
+  supporting:
+    - id: shell_as_debugger
+      name: Registered debugger is a shell
+      description: >-
+        The debugger value points at cmd, PowerShell or another interpreter rather than at
+        a debugging tool, which is the backdoor configuration rather than diagnostics.
+      source: process_creation
+      field: CommandLine
+      indicates: dynamic_code_execution
+    - id: system_binary_overwritten
+      name: System32 accessibility binary overwritten
+      description: >-
+        An accessibility executable in a system directory was rewritten outside the
+        servicing process, meaning the shipped binary no longer runs.
+      source: file_creation
+      field: TargetFileName
+      indicates: system_binary_tampering
+    - id: shell_spawned_from_helper
+      name: Shell spawned by an accessibility binary
+      description: >-
+        An accessibility helper became the parent of an interpreter, which is the backdoor
+        being exercised rather than merely installed.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: hands_on_keyboard_activity
+    - id: script_host_actor
+      name: Change made by a script host or remote channel
+      description: >-
+        The modification was issued by an interpreter or a remote-execution channel rather
+        than by servicing or a development tool.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+
+  contradicting:
+    - id: servicing_update
+      name: Windows servicing applying an update
+      description: >-
+        The binary was replaced by the servicing stack during a patch, which legitimately
+        rewrites System32 executables.
+      source: file_creation
+      field: ContextProcessId
+      indicates: operating_system_behaviour
+    - id: developer_debugging
+      name: Developer debugging application startup
+      description: >-
+        An Image File Execution Options debugger was set on an engineering host as part of
+        diagnosing a program's start-up behaviour.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+    - id: accessibility_product
+      name: Accessibility product registering components
+      description: >-
+        An approved accessibility or compatibility product registered its own components
+        through the same mechanism.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_application_component
+
+  risk_logic:
+    required:
+      - accessibility_hijack
+
+    supporting:
+      any:
+        - shell_as_debugger
+        - system_binary_overwritten
+        - shell_spawned_from_helper
+        - script_host_actor
+      all:
+        - shell_as_debugger
+        - script_host_actor
+
+    contradicting:
+      any:
+        - servicing_update
+        - developer_debugging
+        - accessibility_product
+      all: []
+
+  verdict:
+    low_risk_when:
+      - accessibility_hijack
+      - servicing_update
+      - developer_debugging
+      - accessibility_product
+    suspicious_when:
+      - accessibility_hijack
+      - script_host_actor
+    high_risk_when:
+      - accessibility_hijack
+      - shell_as_debugger
+      - shell_spawned_from_helper
+      - system_binary_overwritten
+
+  false_positive:
+    - condition: Windows servicing replaces an accessibility binary during a patch.
+      explanation: >-
+        Updates legitimately rewrite System32 executables including these. The writing
+        process belongs to the servicing stack and the change appears across the estate in
+        a patch window.
+    - condition: A developer sets an Image File Execution Options debugger while diagnosing startup.
+      explanation: >-
+        The mechanism exists for debugging, so its use is legitimate in principle. It is
+        confined to engineering hosts and targets the application under test rather than an
+        accessibility helper.
+    - condition: An accessibility or compatibility product registers its own components.
+      explanation: >-
+        Assistive technology occasionally hooks these binaries. Such products are installed
+        software present across a defined user population rather than a one-off change.

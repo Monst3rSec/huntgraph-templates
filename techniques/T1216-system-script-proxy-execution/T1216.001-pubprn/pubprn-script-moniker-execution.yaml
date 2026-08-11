@@ -1,0 +1,271 @@
+type: detection
+
+id: hg-win-pubprn-script-moniker-execution-t1216-001
+version: 1.0.0
+
+info:
+  name: PubPrn invoked with a script moniker
+  description: >-
+    pubprn.vbs is a Microsoft-signed script that publishes printers to a directory, and
+    older versions pass their second argument to a COM object without validating it. An
+    operator can therefore supply a `script:` moniker or a URL in place of the expected
+    publication target and have signed Microsoft script run their code. The value is
+    provenance rather than concealment: application control that trusts signed scripts in
+    System32 approves pubprn, and the payload arrives as a parameter.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - proxy-execution
+    - lolbin
+    - signed-script
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1216/001
+    - https://attack.mitre.org/detectionstrategies/DET0528
+    - https://lolbas-project.github.io/lolbas/Scripts/Pubprn/
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1216
+  sub_techniques:
+    - T1216.001
+  detection_strategies:
+    - DET0528
+  analytics:
+    - AN1464
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:PowerShell
+  data_components:
+    - Process Creation
+    - Command Execution
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may pass a script moniker or a remote URL to pubprn.vbs in place of the
+    printer publication target it expects, causing a Microsoft-signed script to execute
+    attacker-supplied code with the trust that its signature confers.
+  attacker_behavior:
+    - Invokes pubprn.vbs with a `script:` or `scriptlet:` moniker as the second argument.
+    - Supplies a remote URL so the executed content is fetched at run time.
+    - Runs the script through cscript or wscript from a delivery application.
+    - Follows the invocation with an interpreter launch or outbound communication.
+  legitimate_behavior:
+    - Printer publishing genuinely uses pubprn.vbs where shared print servers are deployed.
+    - Administrators run it while troubleshooting directory printer publication.
+  risk_indicator:
+    - The second argument is a script moniker or a URL rather than a directory path.
+    - The invoking parent is a document handler, archive tool or another script host.
+    - Printer publishing is not deployed anywhere in the environment.
+    - An interpreter is spawned by the script host immediately afterwards.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: pubprn-script-moniker
+        name: PubPrn invoked with a script moniker or URL
+        purpose: >-
+          Catch the documented abuse directly, where the argument is executable content
+          rather than a publication target.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/pubprn(\.vbs)?/i
+          | CommandLine=/script\s*:|scriptlet\s*:|https?\s*:?\s*(\[:\])?\/\//i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: pubprn-unusual-parent
+        name: PubPrn invoked from a delivery application
+        purpose: >-
+          Use lineage rather than argument shape, so variants that do not match the
+          published syntax are still surfaced.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/pubprn(\.vbs)?/i
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|acrord32|acrobat|chrome|msedge|firefox|7zfm|winrar|mshta|powershell|pwsh)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - parent_process
+            - command_line
+
+      - id: pubprn-spawns-interpreter
+        name: Script host running pubprn spawning an interpreter
+        purpose: >-
+          Confirm the forwarded argument was executable, which separates abuse from a
+          failed or inert invocation.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(cscript|wscript)\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd|mshta|rundll32|regsvr32|certutil|bitsadmin)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Legacy logon scripting that legitimately invokes command-line utilities"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - process
+
+evidence:
+  required:
+    - id: pubprn_untrusted_argument
+      name: PubPrn invoked with executable content or an unusual parent
+      description: >-
+        pubprn.vbs was run with a script moniker or URL in place of its publication target,
+        or was launched by an application unrelated to printer administration.
+      source: process_creation
+      field: CommandLine
+      indicates: proxy_execution_of_untrusted_module
+
+  supporting:
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        The script was invoked by a document handler, archive utility, mail client or
+        another script host rather than by printer administration tooling.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: interpreter_child
+      name: Interpreter spawned by the script host
+      description: >-
+        The script host created a command interpreter or proxy-execution binary,
+        confirming the forwarded argument was executable content.
+      source: process_creation
+      field: FileName
+      indicates: execution_chain_progression
+    - id: printing_not_deployed
+      name: Printer publishing absent from the environment
+      description: >-
+        No shared print-server publication activity appears in the estate during the
+        baseline window, so the script has no legitimate reason to run.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+    - id: rare_for_host
+      name: Invocation unprecedented on this host
+      description: >-
+        This host has not invoked pubprn during the baseline window, unlike systems that
+        participate in printer publication.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: print_workflow_context
+      name: Invoked by printer administration
+      description: >-
+        The script was invoked by the printing subsystem or by an administrator publishing
+        printers, with the directory parameters that workflow supplies.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: print_servers_deployed
+      name: Shared printing deployed in the environment
+      description: >-
+        Shared print servers are in use and the script runs routinely on hosts that
+        participate in publication.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: administrative_session
+      name: Interactive administrative troubleshooting
+      description: >-
+        A named administrator invoked the script interactively while diagnosing printer
+        publication, with a corresponding incident record.
+      source: change_management
+      field: UserName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - pubprn_untrusted_argument
+
+    supporting:
+      any:
+        - delivery_parent
+        - interpreter_child
+        - printing_not_deployed
+        - rare_for_host
+      all:
+        - delivery_parent
+        - interpreter_child
+
+    contradicting:
+      any:
+        - print_workflow_context
+        - print_servers_deployed
+        - administrative_session
+      all: []
+
+  verdict:
+    low_risk_when:
+      - pubprn_untrusted_argument
+      - print_workflow_context
+      - print_servers_deployed
+      - administrative_session
+    suspicious_when:
+      - pubprn_untrusted_argument
+      - printing_not_deployed
+    high_risk_when:
+      - pubprn_untrusted_argument
+      - delivery_parent
+      - interpreter_child
+      - rare_for_host
+
+  false_positive:
+    - condition: Printer publishing genuinely invokes pubprn.vbs in a print-server environment.
+      explanation: >-
+        Where shared printing is deployed the script runs for its intended purpose. Those
+        invocations carry printer and server parameters rather than script monikers, which
+        is why argument shape carries the required evidence.
+    - condition: An administrator troubleshoots printer publication interactively.
+      explanation: >-
+        Running the script by hand while diagnosing publishing is reasonable support work.
+        It is interactive, from an administrative context, and tied to a named user.

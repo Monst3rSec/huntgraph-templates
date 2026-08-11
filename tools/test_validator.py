@@ -51,6 +51,12 @@ def m_orphan_subtechnique(d):
     d["mitre"]["sub_techniques"] = ["T1055.012"]
 
 
+def m_parent_level_hypothesis(d):
+    # T1218 decomposes into sub-techniques, so a hypothesis declaring only the
+    # parent is pitched too broadly to yield an explainable verdict
+    d["mitre"]["sub_techniques"] = []
+
+
 def m_wrong_detection_strategy(d):
     d["mitre"]["detection_strategies"] = ["DET0001"]
 
@@ -141,6 +147,7 @@ CASES = [
     ("L2", "tactic not on the technique", m_wrong_tactic, None),
     ("L2", "technique that does not exist", m_nonexistent_technique, None),
     ("L2", "sub-technique without its parent", m_orphan_subtechnique, None),
+    ("L2", "hypothesis pitched at a decomposing parent", m_parent_level_hypothesis, None),
     ("L2", "detection strategy not mapped to the technique", m_wrong_detection_strategy, None),
     ("L2", "analytic outside the declared strategy", m_analytic_not_in_strategy, None),
     ("L2", "platform not listed on the technique", m_platform_not_on_technique, None),

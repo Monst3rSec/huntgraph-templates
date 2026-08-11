@@ -1,0 +1,282 @@
+type: detection
+
+id: hg-win-root-certificate-installed-t1553-004
+version: 1.0.0
+
+info:
+  name: Certificate installed into a trusted root store
+  description: >-
+    Installing a certificate into the trusted root store changes what the machine believes
+    about everything it verifies afterwards. It lets an adversary intercept TLS without a
+    warning, sign binaries that appear trusted, and defeat controls that key on publisher
+    identity — all from one small change that leaves no running process behind. In a
+    managed estate root trust is distributed by policy and by nothing else, so a local
+    installation is a deviation from the intended configuration as much as it is a
+    technique.
+  severity: high
+  author: huntgraph
+  tags:
+    - defense-impairment
+    - trust-controls
+    - certificate
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1553/004
+    - https://attack.mitre.org/detectionstrategies/DET0056
+    - https://attack.mitre.org/techniques/T1553
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1553
+  sub_techniques:
+    - T1553.004
+  detection_strategies:
+    - DET0056
+  analytics:
+    - AN0153
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Windows Registry Key Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An adversary may install their own certificate into the machine's trusted root store,
+    so that traffic they intercept and code they sign are accepted as legitimate by every
+    control on the host that relies on certificate trust.
+  attacker_behavior:
+    - Adds a certificate to the Root or AuthRoot store through certutil or the PowerShell cmdlets.
+    - Imports a certificate file staged in a user-writable directory.
+    - Performs the installation from a script host rather than through managed policy.
+    - Follows the installation with interception or with execution of newly trusted signed content.
+  legitimate_behavior:
+    - Enterprise certificate authorities are distributed to endpoints by policy.
+    - Inspection proxies and secure web gateways install their own root certificates.
+    - Developers install test certificates on engineering machines.
+    - Some vendor products install a root certificate as part of setup.
+  risk_indicator:
+    - The certificate file is read from a user-writable directory.
+    - The installation is performed by a script host or a document handler.
+    - The change is local rather than delivered through policy.
+    - No comparable installation appears anywhere else in the estate.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: root-store-import
+        name: Certificate added to a trusted root store
+        purpose: >-
+          Surface installations into the stores that govern trust decisions, as distinct
+          from the many other certificate stores that do not.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(certutil(\.exe)?\s+.*-addstore|Import-Certificate|certmgr(\.exe)?\s+.*-add|certoc(\.exe)?\s+.*-store)/i
+          | CommandLine=/\b(root|authroot|trustedpublisher|ca)\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=installs), collect([CommandLine], limit=5)])
+          | sort(installs, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the approved certificate-distribution and proxy agents"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: certificate-from-writable-path
+        name: Certificate imported from a user-writable directory
+        purpose: >-
+          Isolate installations whose source file was staged where any unprivileged process
+          could have written it, rather than delivered by policy.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(addstore|Import-Certificate|certmgr.*-add)/i
+          | CommandLine=/(?<cert_path>[A-Za-z]:\\[^",]+\.(cer|crt|der|p7b|pfx|pem))/i
+          | cert_path=/\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, cert_path],
+                    function=[count(as=installs), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: root-store-registry-write
+        name: Trusted root store written directly in the registry
+        purpose: >-
+          Cover the route that avoids the certificate utilities entirely by writing the
+          store keys directly.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/SystemCertificates\\\\(Root|AuthRoot|TrustedPublisher)\\\\Certificates/i
+          | CommandLine=/(reg(\.exe)?\s+add|Set-ItemProperty|New-Item)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=writes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: root_trust_modified
+      name: Certificate added to a trust-governing store
+      description: >-
+        A certificate was installed into the Root, AuthRoot or TrustedPublisher store,
+        changing what the host accepts as trusted for TLS validation and code signing.
+      source: process_creation
+      field: CommandLine
+      indicates: trust_control_subversion
+
+  supporting:
+    - id: writable_source_file
+      name: Certificate file from a user-writable directory
+      description: >-
+        The certificate being installed was read from AppData, Temp, ProgramData or a user
+        profile rather than delivered through a managed distribution path.
+      source: process_creation
+      field: CommandLine
+      indicates: untrusted_execution_location
+    - id: script_host_actor
+      name: Installed by a script host or delivery application
+      description: >-
+        The installation was performed by an interpreter, document handler or archive
+        utility rather than by a certificate-distribution agent or an installer.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: local_deviation
+      name: Local change against a managed trust baseline
+      description: >-
+        Root trust in this estate is otherwise distributed by policy, so a locally issued
+        installation is a deviation from the intended configuration.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: unique_in_estate
+      name: Certificate not present elsewhere
+      description: >-
+        No comparable installation appears on other hosts during the baseline window,
+        unlike an enterprise authority or inspection proxy certificate.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: policy_distribution
+      name: Distributed by managed policy
+      description: >-
+        The certificate arrived through Group Policy or the certificate-distribution
+        mechanism the organisation operates.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: inspection_proxy
+      name: Inspection proxy or gateway certificate
+      description: >-
+        The certificate belongs to the approved TLS inspection proxy or secure web gateway,
+        which installs its own root by design.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_enterprise_activity
+    - id: engineering_test_certificate
+      name: Test certificate on an engineering host
+      description: >-
+        The host is an engineering system where developers install test certificates as
+        routine work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - root_trust_modified
+
+    supporting:
+      any:
+        - writable_source_file
+        - script_host_actor
+        - local_deviation
+        - unique_in_estate
+      all:
+        - writable_source_file
+        - script_host_actor
+
+    contradicting:
+      any:
+        - policy_distribution
+        - inspection_proxy
+        - engineering_test_certificate
+      all: []
+
+  verdict:
+    low_risk_when:
+      - root_trust_modified
+      - policy_distribution
+      - inspection_proxy
+      - engineering_test_certificate
+    suspicious_when:
+      - root_trust_modified
+      - unique_in_estate
+    high_risk_when:
+      - root_trust_modified
+      - writable_source_file
+      - script_host_actor
+      - local_deviation
+
+  false_positive:
+    - condition: An enterprise certificate authority is distributed to endpoints.
+      explanation: >-
+        Internal authorities must be trusted by every host, so root installations occur
+        legitimately at scale. They arrive through policy and appear identically across the
+        estate.
+    - condition: A TLS inspection proxy installs its own root certificate.
+      explanation: >-
+        Inspection requires the endpoint to trust the proxy, which is precisely the
+        capability an adversary wants. It is distributed by the security platform and is
+        present everywhere the proxy is enforced.
+    - condition: A developer installs a test certificate on an engineering machine.
+      explanation: >-
+        Local development with HTTPS commonly requires trusting a self-signed certificate,
+        often staged in a user directory. This clusters on engineering assets under the
+        developer's own account.
+    - condition: A vendor product installs a root certificate during setup.
+      explanation: >-
+        Some products install their own trust anchor. The installer is the parent process
+        and the certificate appears on every host running the product.
