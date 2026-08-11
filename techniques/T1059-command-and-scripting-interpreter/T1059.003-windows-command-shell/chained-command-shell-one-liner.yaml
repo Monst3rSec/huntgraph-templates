@@ -1,0 +1,294 @@
+type: detection
+
+id: hg-win-chained-command-shell-one-liner-t1059-003
+version: 1.0.0
+
+info:
+  name: Chained command shell one-liner from a delivery application
+  description: >-
+    cmd.exe is the most common thing on a Windows endpoint, so its execution proves
+    nothing. What is unusual is its shape when an operator uses it: several commands
+    chained with ampersands or pipes into a single line, run non-interactively through
+    /c, and launched by something that has no business launching a shell. Scripts and
+    installers use cmd constantly but they do it from installers, schedulers and service
+    hosts, and they tend to run one thing at a time. Density plus lineage is what makes
+    this observable rather than drowned.
+  severity: medium
+  author: huntgraph
+  tags:
+    - execution
+    - command-shell
+    - process-lineage
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1059/003
+    - https://attack.mitre.org/detectionstrategies/DET0202
+    - https://attack.mitre.org/techniques/T1059
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1059
+  sub_techniques:
+    - T1059.003
+  detection_strategies:
+    - DET0202
+  analytics:
+    - AN0578
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+    - Script Execution
+    - Module Load
+
+hypothesis:
+  statement: >-
+    An adversary operating through a delivered payload may run several commands as a
+    single chained cmd.exe one-liner, performing reconnaissance, staging or execution in
+    one non-interactive invocation launched by an application that does not normally spawn
+    a shell.
+  attacker_behavior:
+    - Chains multiple commands with ampersands, double ampersands or pipes in one /c invocation.
+    - Runs reconnaissance and staging steps together to reduce the number of round trips.
+    - Launches the shell from a document handler, archive tool, script host or web service.
+    - Redirects output to a file in a temporary directory for later retrieval.
+  legitimate_behavior:
+    - Installers and packaging scripts invoke cmd with chained steps.
+    - Build and deployment tooling generates long chained command lines.
+    - Login and maintenance scripts run sequences of commands.
+    - Applications shell out for small housekeeping tasks.
+  risk_indicator:
+    - The parent process is a delivery application or a web service rather than an installer.
+    - Several distinct commands are chained in a single invocation.
+    - The chain includes reconnaissance or credential-adjacent commands.
+    - The invocation is unprecedented for the host and user.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: chained-oneliner-from-delivery-parent
+        name: Chained shell invocation from a delivery application
+        purpose: >-
+          Combine command chaining with a parent that has no reason to spawn a shell,
+          which is the shape of operator activity rather than of packaged scripting.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^cmd\.exe$/i
+          | CommandLine=/\s\/c\s/i
+          | CommandLine=/(&&|&|\|\|)/
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|onenote|acrord32|acrobat|chrome|msedge|firefox|7zfm|winrar|wscript|cscript|mshta|w3wp|httpd|java)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Applications documented to shell out for housekeeping tasks"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - parent_process
+            - command_line
+
+      - id: reconnaissance-chain
+        name: Reconnaissance commands chained in one invocation
+        purpose: >-
+          Isolate chains whose contents enumerate the host, user or domain, which is what
+          an operator does on arrival and which packaged scripting has no reason to do.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^cmd\.exe$/i
+          | CommandLine=/(whoami|net\s+user|net\s+group|net\s+localgroup|net\s+view|nltest|systeminfo|ipconfig\s*\/all|tasklist|query\s+user|arp\s+-a)/i
+          | CommandLine=/(&&|&|\|)/
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=10)])
+        filters:
+          include: []
+          exclude:
+            - "Inventory and diagnostic collection scripts run by approved agents"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: output-redirected-to-temp
+        name: Chained shell redirecting output to a temporary file
+        purpose: >-
+          Catch the collection step, where results are written somewhere for later
+          retrieval rather than displayed to an interactive user.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^cmd\.exe$/i
+          | CommandLine=/\s\/c\s/i
+          | CommandLine=/>\s*(?<output_path>[A-Za-z]:\\[^"\s]+|\\\\[^"\s]+)/i
+          | output_path=/\\(AppData|Temp|Windows\\Temp|ProgramData|Users\\Public)\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, output_path],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - path
+
+evidence:
+  required:
+    - id: chained_shell_invocation
+      name: Multiple commands chained in one shell invocation
+      description: >-
+        A non-interactive cmd.exe invocation carries several commands joined by chaining or
+        piping operators, executing a sequence of steps in a single call.
+      source: process_creation
+      field: CommandLine
+      indicates: operator_command_sequence
+
+  supporting:
+    - id: delivery_or_service_parent
+      name: Delivery application or web service as parent
+      description: >-
+        The shell was launched by a document handler, archive tool, script host or web
+        service rather than by an installer, scheduler or service host.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: reconnaissance_content
+      name: Chain contains reconnaissance commands
+      description: >-
+        The chained commands enumerate users, groups, network configuration, sessions or
+        domain trust, which is arrival reconnaissance rather than application housekeeping.
+      source: process_creation
+      field: CommandLine
+      indicates: hands_on_keyboard_activity
+    - id: output_staged
+      name: Output redirected to a temporary path
+      description: >-
+        Results are written to a file in a temporary or user-writable directory, indicating
+        collection for later retrieval rather than interactive use.
+      source: process_creation
+      field: CommandLine
+      indicates: collection_staging
+    - id: rare_invocation
+      name: Invocation unprecedented for host and user
+      description: >-
+        This command shape has not been seen for the host or user during the baseline
+        window, unlike the repeating invocations that scripting produces.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: installer_or_build_parent
+      name: Installer, build or scheduler as parent
+      description: >-
+        The shell was launched by an installer, build agent, scheduler or service host,
+        which generate chained command lines as a matter of course.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: recurring_identical_chain
+      name: Identical chain recurring on a schedule
+      description: >-
+        The same command line repeats on a stable cadence across hosts, matching deployed
+        scripting rather than interactive operation.
+      source: baseline
+      field: CommandLine
+      indicates: scheduled_automation_job
+    - id: approved_collection_script
+      name: Approved diagnostic collection
+      description: >-
+        The invocation belongs to a sanctioned inventory or diagnostic collection script
+        that gathers host information by design.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - chained_shell_invocation
+
+    supporting:
+      any:
+        - delivery_or_service_parent
+        - reconnaissance_content
+        - output_staged
+        - rare_invocation
+      all:
+        - delivery_or_service_parent
+        - reconnaissance_content
+
+    contradicting:
+      any:
+        - installer_or_build_parent
+        - recurring_identical_chain
+        - approved_collection_script
+      all: []
+
+  verdict:
+    low_risk_when:
+      - chained_shell_invocation
+      - installer_or_build_parent
+      - recurring_identical_chain
+      - approved_collection_script
+    suspicious_when:
+      - chained_shell_invocation
+      - rare_invocation
+    high_risk_when:
+      - chained_shell_invocation
+      - delivery_or_service_parent
+      - reconnaissance_content
+      - output_staged
+
+  false_positive:
+    - condition: An installer runs a chained sequence of setup steps through cmd.
+      explanation: >-
+        Packaging scripts routinely chain commands, so chaining alone is meaningless. The
+        parent is an installer and the same chain appears on every host receiving the
+        package.
+    - condition: Build or deployment tooling generates a long chained command line.
+      explanation: >-
+        Generated command lines are often long and heavily chained. These run under build
+        agents on engineering hosts and repeat with every pipeline execution.
+    - condition: An inventory agent collects host information through cmd.
+      explanation: >-
+        Diagnostic collection genuinely runs reconnaissance-shaped commands and redirects
+        output to a file, reproducing two supporting items. The acting agent and the
+        scheduled cadence are the discriminators.
+    - condition: A logon script runs a sequence of maintenance commands.
+      explanation: >-
+        Logon scripting chains commands and runs for many users at similar times. The
+        parent is the logon mechanism rather than a delivery application.

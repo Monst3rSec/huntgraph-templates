@@ -1,0 +1,299 @@
+type: detection
+
+id: hg-win-rdp-session-from-unusual-source-t1021-001
+version: 1.0.0
+
+info:
+  name: Interactive remote desktop session from an unusual source
+  description: >-
+    Remote desktop is how administrators work and how intruders move, and the protocol
+    looks identical either way. What differs is the shape of the graph: administration
+    flows from a small set of jump hosts and admin workstations into servers, on a stable
+    pattern that a month of history makes obvious. Lateral movement flows the wrong way —
+    workstation to workstation, or from a machine whose user has never administered
+    anything. The hypothesis is therefore about edges that are new, not sessions that are
+    suspicious in isolation.
+  severity: high
+  author: huntgraph
+  tags:
+    - lateral-movement
+    - remote-desktop
+    - interactive-session
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1021/001
+    - https://attack.mitre.org/detectionstrategies/DET0327
+    - https://attack.mitre.org/techniques/T1021
+
+mitre:
+  tactics:
+    - TA0008
+  techniques:
+    - T1021
+  sub_techniques:
+    - T1021.001
+  detection_strategies:
+    - DET0327
+  analytics:
+    - AN0931
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Logon Session Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary holding valid credentials may open a remote desktop session to a host the
+    source machine and account have never reached before, moving laterally through an
+    interactive channel that is indistinguishable from administration except by its
+    position in the access graph.
+  attacker_behavior:
+    - Initiates outbound remote desktop from a workstation to another workstation or a server.
+    - Uses an account that has no administrative history against the target.
+    - Enables remote desktop on the target beforehand if it is disabled.
+    - Fans out from one source to several targets in a short period.
+  legitimate_behavior:
+    - Administrators connect to servers from jump hosts and admin workstations continuously.
+    - Support staff connect to user machines to provide assistance.
+    - Developers reach lab and test systems interactively.
+    - Users connect to their own desktop from another machine.
+  risk_indicator:
+    - The source and destination pairing has never been seen during the baseline window.
+    - The direction is workstation to workstation rather than into a server estate.
+    - Remote desktop was enabled on the target shortly beforehand.
+    - One source reaches several distinct targets in a short period.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: outbound-rdp-edges
+        name: Outbound remote desktop connections by source and destination
+        purpose: >-
+          Build the access graph so that new edges stand out against the stable
+          administrative pattern, which is the only reliable discriminator for this
+          protocol.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | RemotePort=3389
+          | groupBy([ComputerName, RemoteAddressIP4],
+                    function=[count(as=sessions), count(RemoteAddressIP4, distinct=true, as=distinct_targets)])
+          | sort(sessions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of approved jump hosts and administrative workstations"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - remote_address
+            - organization
+
+      - id: rdp-client-launched-with-target
+        name: Remote desktop client launched against a target
+        purpose: >-
+          Capture the calling side with the account context, which the network record alone
+          does not carry.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(mstsc|msrdc)\.exe$/i
+          | CommandLine=/\/v\s*:\s*(?<rdp_target>[^\s"']+)|(?<alt_target>[^\s"']+\.rdp)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, rdp_target],
+                    function=[count(as=launches), collect([CommandLine], limit=3)])
+          | sort(launches, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of approved jump hosts and administrative workstations"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - remote_address
+
+      - id: rdp-enabled-on-target
+        name: Remote desktop enabled on a host
+        purpose: >-
+          Catch the preparatory step, where the protocol is turned on so that a session can
+          be established at all.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(fDenyTSConnections|Terminal Server.*fDenyTSConnections|Set-ItemProperty.*fDenyTSConnections|netsh\s+.*remotedesktop.*enable)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Managed policy that enables remote desktop across server collections"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+evidence:
+  required:
+    - id: rdp_session_established
+      name: Remote desktop session initiated
+      description: >-
+        An outbound remote desktop connection was made, or the client was launched against
+        a named target, establishing an interactive session on another host.
+      source: network_connection
+      field: RemotePort
+      indicates: remote_interactive_access
+
+  supporting:
+    - id: new_access_edge
+      name: Source and destination pairing not seen before
+      description: >-
+        This source has never reached this destination during the baseline window, which is
+        what separates lateral movement from the stable administrative access graph.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: lateral_movement_attempt
+    - id: fan_out
+      name: One source reaching several targets
+      description: >-
+        The source opened sessions to multiple distinct destinations in a short period,
+        which is the exploration pattern of an operator rather than of routine support.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: lateral_movement_attempt
+    - id: protocol_enabled_first
+      name: Remote desktop enabled beforehand
+      description: >-
+        The protocol was turned on for the target shortly before the session, indicating
+        the path was created rather than already available.
+      source: process_creation
+      field: CommandLine
+      indicates: access_path_creation
+    - id: unusual_account
+      name: Account without administrative history
+      description: >-
+        The account initiating the session has no history of administering the target
+        during the baseline window.
+      source: baseline
+      field: UserName
+      indicates: credential_reuse
+
+  contradicting:
+    - id: approved_jump_host
+      name: Approved jump host or admin workstation
+      description: >-
+        The source is a designated administrative system from which remote desktop into the
+        estate is expected and continuous.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: support_workflow
+      name: Recorded support session
+      description: >-
+        An incident or support record covers an engineer connecting to a user machine to
+        provide assistance.
+      source: change_management
+      field: UserName
+      indicates: legitimate_enterprise_activity
+    - id: established_edge
+      name: Long-standing access pattern
+      description: >-
+        This source, account and destination combination recurs steadily throughout the
+        baseline window, which is routine rather than novel.
+      source: baseline
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - rdp_session_established
+
+    supporting:
+      any:
+        - new_access_edge
+        - fan_out
+        - protocol_enabled_first
+        - unusual_account
+      all:
+        - new_access_edge
+        - unusual_account
+
+    contradicting:
+      any:
+        - approved_jump_host
+        - support_workflow
+        - established_edge
+      all: []
+
+  verdict:
+    low_risk_when:
+      - rdp_session_established
+      - approved_jump_host
+      - support_workflow
+      - established_edge
+    suspicious_when:
+      - rdp_session_established
+      - new_access_edge
+    high_risk_when:
+      - rdp_session_established
+      - new_access_edge
+      - fan_out
+      - protocol_enabled_first
+
+  false_positive:
+    - condition: An administrator connects to servers from a jump host.
+      explanation: >-
+        This is the overwhelming majority of remote desktop activity in any estate and is
+        indistinguishable at the protocol level. Source asset role removes it, which is why
+        jump hosts are excluded in the queries rather than triaged.
+    - condition: Support staff connect to a user machine to provide assistance.
+      explanation: >-
+        Support connections are genuinely workstation-to-workstation and often to a host the
+        engineer has never reached before, reproducing the strongest supporting evidence.
+        The incident record is the discriminator.
+    - condition: A developer reaches a lab or test system interactively.
+      explanation: >-
+        Engineering access to lab estates is frequent and irregular, so new edges appear
+        routinely. These cluster within the lab address space and under engineering accounts.
+    - condition: A user connects to their own desktop from another machine.
+      explanation: >-
+        Remote access to one's own machine produces a stable edge between two hosts
+        associated with the same person, which the baseline recognises quickly.

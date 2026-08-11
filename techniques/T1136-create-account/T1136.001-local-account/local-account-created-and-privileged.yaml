@@ -1,0 +1,291 @@
+type: detection
+
+id: hg-win-local-account-created-and-privileged-t1136-001
+version: 1.0.0
+
+info:
+  name: Local account created and added to a privileged group
+  description: >-
+    Creating a local account gives an adversary access that does not depend on the
+    credential they stole, survives a password reset on the compromised user, and looks
+    ordinary in an authentication log once it exists. The step that matters is what
+    follows: an account is only useful if it can log in and do something, so creation is
+    almost always followed by a group addition and often by enabling remote access. In a
+    managed estate local accounts are created by imaging and by nothing else, which makes
+    interactive creation on a live endpoint a strong deviation.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - account-creation
+    - privileged-group
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1136/001
+    - https://attack.mitre.org/detectionstrategies/DET0447
+    - https://attack.mitre.org/techniques/T1136
+
+mitre:
+  tactics:
+    - TA0003
+  techniques:
+    - T1136
+  sub_techniques:
+    - T1136.001
+  detection_strategies:
+    - DET0447
+  analytics:
+    - AN1235
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - User Account Creation
+
+hypothesis:
+  statement: >-
+    An adversary may create a local account and grant it privilege, establishing access
+    that is independent of the credential originally used to gain entry and that survives
+    remediation aimed at the compromised user.
+  attacker_behavior:
+    - Creates a local user through net user, PowerShell or WMI on a live endpoint.
+    - Adds the account to Administrators, Remote Desktop Users or Remote Management Users.
+    - Chooses a name resembling a service or support account so it survives a review.
+    - Follows creation with a remote logon using the new account.
+  legitimate_behavior:
+    - Imaging and provisioning create local accounts during host build.
+    - Application installers create local service accounts for their components.
+    - Administrators create a break-glass local account by policy.
+    - Support staff create a temporary account during a recovery scenario.
+  risk_indicator:
+    - The account is added to a privileged or remote-access group immediately after creation.
+    - The creating process is a script host, a web service or a remote-execution channel.
+    - The host is a live production endpoint rather than one being provisioned.
+    - The account name imitates a service or system account.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: local-account-created
+        name: Local account created on an endpoint
+        purpose: >-
+          Surface account creation itself, which in a managed estate should be confined to
+          provisioning and is therefore worth seeing wherever else it happens.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(net(\.exe)?\s+user\s+[^\s]+\s+[^\s]+\s+\/add|New-LocalUser|Win32_UserAccount.*Create|net1\s+user\s+.*\/add)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=creations), collect([CommandLine], limit=5)])
+          | sort(creations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of hosts undergoing imaging or provisioning"
+            - "ParentBaseFileName of approved installers creating service accounts"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: added-to-privileged-group
+        name: Account added to a privileged or remote-access group
+        purpose: >-
+          Isolate the step that makes a new account useful, which is where the intent
+          becomes legible regardless of what the account is called.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(net(\.exe)?\s+localgroup|Add-LocalGroupMember|net1\s+localgroup)/i
+          | CommandLine=/(administrators|remote desktop users|remote management users|backup operators|distributed com users)/i
+          | CommandLine=/(\/add|-Member)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=additions), collect([CommandLine], limit=5)])
+          | sort(additions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Provisioning automation that seeds administrative group membership at build"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: create-then-elevate-sequence
+        name: Account created and elevated on the same host
+        purpose: >-
+          Join creation to elevation, which is the pairing that distinguishes establishing
+          access from a routine account maintenance task.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(net(\.exe)?\s+user\s+.*\/add|New-LocalUser)/i
+                | account_created := CommandLine ;
+              CommandLine=/(net(\.exe)?\s+localgroup|Add-LocalGroupMember)/i
+                | group_added := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([account_created, group_added, ParentBaseFileName]),
+                              count(as=events)])
+          | account_created=/.+/ and group_added=/.+/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: local_account_created
+      name: Local account created
+      description: >-
+        A local user account was created on the endpoint, establishing a credential that
+        is independent of any account already in use.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_established
+
+  supporting:
+    - id: privileged_group_added
+      name: Account granted privilege or remote access
+      description: >-
+        The account was added to Administrators, a remote-access group or another
+        privileged group, which is what makes a new local account operationally useful.
+      source: process_creation
+      field: CommandLine
+      indicates: privilege_escalation_attempt
+    - id: script_or_service_creator
+      name: Created by a script host, web service or remote channel
+      description: >-
+        The creation was performed by an interpreter, a web server process or a
+        remote-execution channel rather than by provisioning or an installer.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: live_production_host
+      name: Host is in live production
+      description: >-
+        The endpoint is a running production system rather than one being imaged or
+        provisioned, where local account creation would be expected.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: rare_for_estate
+      name: Account creation rare across the estate
+      description: >-
+        Local account creation is essentially absent from this host and its peers during
+        the baseline window, which is the normal state under managed identity.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: provisioning_context
+      name: Host being imaged or provisioned
+      description: >-
+        The host is in a build or provisioning state where creating local accounts is a
+        deliberate step.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: installer_service_account
+      name: Installer creating a service account
+      description: >-
+        An approved installer created a local account for the service components it
+        deploys.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: recorded_break_glass
+      name: Recorded break-glass or recovery account
+      description: >-
+        A change or incident record covers the creation of a local account for emergency
+        access or a recovery scenario.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - local_account_created
+
+    supporting:
+      any:
+        - privileged_group_added
+        - script_or_service_creator
+        - live_production_host
+        - rare_for_estate
+      all:
+        - privileged_group_added
+        - script_or_service_creator
+
+    contradicting:
+      any:
+        - provisioning_context
+        - installer_service_account
+        - recorded_break_glass
+      all: []
+
+  verdict:
+    low_risk_when:
+      - local_account_created
+      - provisioning_context
+      - installer_service_account
+      - recorded_break_glass
+    suspicious_when:
+      - local_account_created
+      - live_production_host
+    high_risk_when:
+      - local_account_created
+      - privileged_group_added
+      - script_or_service_creator
+      - live_production_host
+
+  false_positive:
+    - condition: Imaging or provisioning creates local accounts during host build.
+      explanation: >-
+        Build processes create and often elevate local accounts by design, reproducing both
+        the required and the strongest supporting evidence. Host build state is the only
+        reliable discriminator, which is why it is contradicting evidence rather than a
+        query filter alone.
+    - condition: An application installer creates a local service account.
+      explanation: >-
+        Products that run under a dedicated local identity create it at install time. The
+        installer is the parent and the account appears on every host running the product.
+    - condition: An administrator creates a break-glass account by policy.
+      explanation: >-
+        Emergency access accounts are deliberately local and privileged. Their creation is
+        planned, documented and typically performed across a defined set of hosts.
+    - condition: Support staff create a temporary account during recovery.
+      explanation: >-
+        Recovery scenarios sometimes require a new local account with administrative
+        rights. This is interactive work by a named engineer attached to an incident.
