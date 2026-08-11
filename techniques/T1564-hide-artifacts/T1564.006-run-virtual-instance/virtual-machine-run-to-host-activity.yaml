@@ -1,0 +1,279 @@
+type: detection
+
+id: hg-win-virtual-machine-run-to-host-activity-t1564-006
+version: 1.0.0
+
+info:
+  name: Virtual instance run to host activity outside endpoint visibility
+  description: >-
+    A virtual machine on a compromised host is a place the endpoint sensor cannot see
+    inside. Files encrypted from within a guest, tooling run inside it, and traffic
+    originating there are all attributed to the hypervisor process, and the guest's own
+    filesystem is opaque. Ransomware has used this to run its encryption entirely inside a
+    guest with the host's drives mounted. What remains visible is the setup: virtualisation
+    being installed or a guest started on a machine that has no reason to run one.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - hide-artifacts
+    - virtualisation
+    - sensor-evasion
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1564/006
+    - https://attack.mitre.org/detectionstrategies/DET0321
+    - https://attack.mitre.org/techniques/T1564
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1564
+  sub_techniques:
+    - T1564.006
+  detection_strategies:
+    - DET0321
+  analytics:
+    - AN0909
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:System
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Service Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An adversary may install virtualisation and run a guest on a compromised host so that
+    their tooling executes inside an environment the endpoint sensor cannot inspect, with
+    the host's own storage mounted into it.
+  attacker_behavior:
+    - Installs a hypervisor or enables the platform feature on a host that had neither.
+    - Starts a guest headlessly so no window appears to the user.
+    - Mounts host drives or shares into the guest so files can be reached from inside.
+    - Runs encryption or tooling inside the guest where the sensor has no visibility.
+  legitimate_behavior:
+    - Engineers run virtual machines constantly for development and testing.
+    - Some applications ship a lightweight hypervisor for containers or sandboxing.
+    - Virtualisation platforms are deployed on servers by design.
+    - Security products use virtualisation-based protection features.
+  risk_indicator:
+    - Virtualisation is installed on a host with no history of running guests.
+    - A guest is started headlessly rather than through a management interface.
+    - Host storage is attached to the guest at start.
+    - The installation is performed by a script host rather than a deployment agent.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: virtualisation-installed
+        name: Virtualisation installed or enabled on a host
+        purpose: >-
+          Surface the platform arriving on a machine that had none, which is the
+          precondition for everything that follows.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(VBoxManage|vmware(-vdiskmanager|player|workstation)?|qemu-system|Enable-WindowsOptionalFeature\s+.*(Hyper-V|VirtualMachinePlatform)|dism\s+.*Microsoft-Hyper-V)/i
+          | CommandLine=/(install|enable|setup|\/i\b|createvm|-featurename)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName in the engineering, lab and virtualisation-server asset groups"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - organization
+
+      - id: headless-guest-started
+        name: Guest started headlessly
+        purpose: >-
+          Isolate guests launched without a visible window, which is how a virtual machine
+          runs on a user's desktop without the user noticing.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(VBoxManage\s+startvm|VBoxHeadless|qemu-system|vmrun\s+.*start|Start-VM)/i
+          | CommandLine=/(--type\s+headless|-nographic|-display\s+none|nogui|headless)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=starts), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: host-storage-attached
+        name: Host storage attached to a guest
+        purpose: >-
+          Catch the step that gives the guest reach into the host's own files, which is what
+          makes the concealment useful rather than merely isolating.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(VBoxManage\s+(sharedfolder|storageattach)|vmrun\s+.*addSharedFolder|Add-VMHardDiskDrive|-drive\s+file=\\\\\\\\\.\\\\PhysicalDrive)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: guest_environment_used
+      name: Virtualisation installed or a guest started
+      description: >-
+        Virtualisation was installed or enabled, or a guest was started, creating an
+        execution environment the endpoint sensor cannot inspect from the host.
+      source: process_creation
+      field: CommandLine
+      indicates: sensor_visibility_gap
+
+  supporting:
+    - id: headless_start
+      name: Guest started without a visible window
+      description: >-
+        The guest was launched headlessly, so it runs on the user's machine without any
+        window to notice, which no ordinary development use requires.
+      source: process_creation
+      field: CommandLine
+      indicates: execution_concealment
+    - id: host_storage_attached
+      name: Host storage mounted into the guest
+      description: >-
+        Host drives or shared folders were attached to the guest, giving code inside it
+        reach into the host's own files.
+      source: process_creation
+      field: CommandLine
+      indicates: host_reach_from_guest
+    - id: no_virtualisation_history
+      name: Host has no history of running guests
+      description: >-
+        No virtualisation activity appears for this host during the baseline window, so the
+        platform arriving now is inconsistent with its role.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: script_host_installer
+      name: Installed by a script host or remote channel
+      description: >-
+        The installation was performed by an interpreter or a remote-execution channel
+        rather than by a deployment agent or a user running an installer.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+
+  contradicting:
+    - id: engineering_or_lab_host
+      name: Engineering, lab or virtualisation server
+      description: >-
+        The host belongs to an asset group where running guests is routine or is the
+        machine's purpose.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+    - id: product_embedded_hypervisor
+      name: Product shipping a lightweight hypervisor
+      description: >-
+        The virtualisation belongs to an approved product that uses it for containers,
+        sandboxing or protection features.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: managed_deployment
+      name: Managed virtualisation deployment
+      description: >-
+        The platform was installed by the deployment agent across a defined host collection
+        as part of a governed rollout.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - guest_environment_used
+
+    supporting:
+      any:
+        - headless_start
+        - host_storage_attached
+        - no_virtualisation_history
+        - script_host_installer
+      all:
+        - headless_start
+        - host_storage_attached
+
+    contradicting:
+      any:
+        - engineering_or_lab_host
+        - product_embedded_hypervisor
+        - managed_deployment
+      all: []
+
+  verdict:
+    low_risk_when:
+      - guest_environment_used
+      - engineering_or_lab_host
+      - product_embedded_hypervisor
+      - managed_deployment
+    suspicious_when:
+      - guest_environment_used
+      - no_virtualisation_history
+    high_risk_when:
+      - guest_environment_used
+      - headless_start
+      - host_storage_attached
+      - script_host_installer
+
+  false_positive:
+    - condition: An engineer runs virtual machines for development or testing.
+      explanation: >-
+        Virtualisation is a normal engineering tool, including headless guests for
+        automated testing. Asset group membership removes this class, which is why it is
+        contradicting evidence rather than a query filter alone.
+    - condition: A product ships a lightweight hypervisor for containers or sandboxing.
+      explanation: >-
+        Several security and development products enable virtualisation platform features
+        during installation. These are recognisable products deployed across the estate.
+    - condition: Virtualisation is deployed to servers by design.
+      explanation: >-
+        Hypervisor hosts exist to run guests. Their asset role makes the required evidence
+        expected rather than notable.
+    - condition: A security product uses virtualisation-based protection.
+      explanation: >-
+        Platform features are enabled by protection technologies as part of hardening,
+        producing the same installation evidence during a managed rollout.

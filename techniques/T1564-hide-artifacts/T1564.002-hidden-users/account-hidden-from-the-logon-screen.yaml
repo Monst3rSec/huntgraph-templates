@@ -1,0 +1,281 @@
+type: detection
+
+id: hg-win-account-hidden-from-the-logon-screen-t1564-002
+version: 1.0.0
+
+info:
+  name: Account hidden from the logon screen and user listings
+  description: >-
+    Creating an account is one problem for an adversary; the account then appearing on the
+    logon screen and in Settings for the machine's owner is another. A single registry
+    value under the special accounts key removes it from both, leaving the account fully
+    functional and effectively invisible to the person using the computer. Nothing
+    legitimate hides an interactive account this way outside a small number of service
+    identities created by installers, which makes the write itself narrow and meaningful.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - hide-artifacts
+    - hidden-account
+    - registry
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1564/002
+    - https://attack.mitre.org/detectionstrategies/DET0353
+    - https://attack.mitre.org/techniques/T1564
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1564
+  sub_techniques:
+    - T1564.002
+  detection_strategies:
+    - DET0353
+  analytics:
+    - AN1001
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - User Account Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An adversary may hide an account they control from the logon screen and user listings
+    through the special accounts registry key, so the machine's owner has no indication
+    that an additional usable identity exists on their computer.
+  attacker_behavior:
+    - Writes a zero value for the account under the special accounts user list key.
+    - Creates the account and hides it within the same activity.
+    - Chooses a name resembling a service identity so it survives an account audit.
+    - Grants the hidden account administrative or remote-access rights afterwards.
+  legitimate_behavior:
+    - Some installers create hidden service accounts and suppress them from the logon screen.
+    - Imaging and provisioning may hide built-in or staging accounts.
+    - Management tooling hides accounts it creates for its own agents.
+  risk_indicator:
+    - An account is created and hidden in the same activity.
+    - The hiding is performed by a script host rather than an installer.
+    - The hidden account is granted privileged or remote-access group membership.
+    - The change appears on very few hosts rather than across a managed population.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: special-accounts-key-written
+        name: Account suppressed through the special accounts key
+        purpose: >-
+          Surface the specific registry write that removes an account from the logon
+          screen, which has essentially one purpose.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/SpecialAccounts\\\\UserList/i
+          | CommandLine=/(reg(\.exe)?\s+add|Set-ItemProperty|New-ItemProperty|New-Item)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: account-created-then-hidden
+        name: Account created and hidden in the same activity
+        purpose: >-
+          Join creation to suppression, which is the pairing that indicates an identity
+          being established covertly rather than a service account being tidied.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(net(\.exe)?\s+user\s+.*\/add|New-LocalUser|Win32_UserAccount.*Create)/i
+                | account_created := CommandLine ;
+              CommandLine=/SpecialAccounts\\\\UserList/i
+                | account_hidden := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([account_created, account_hidden, ParentBaseFileName]),
+                              count(as=events)])
+          | account_created=/.+/ and account_hidden=/.+/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: hidden-account-granted-rights
+        name: Hidden account granted privileged membership
+        purpose: >-
+          Catch the step that makes a concealed account useful, which distinguishes it from
+          a suppressed service identity that never logs on interactively.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/SpecialAccounts\\\\UserList/i
+                | account_hidden := CommandLine ;
+              CommandLine=/(net(\.exe)?\s+localgroup|Add-LocalGroupMember)/i
+                | CommandLine=/(administrators|remote desktop users|remote management users)/i
+                | rights_granted := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([account_hidden, rights_granted, ParentBaseFileName]),
+                              count(as=events)])
+          | account_hidden=/.+/ and rights_granted=/.+/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: account_suppressed
+      name: Account hidden from the logon screen
+      description: >-
+        A registry value was written under the special accounts key removing an account
+        from the logon screen and user listings while leaving it fully usable.
+      source: process_creation
+      field: CommandLine
+      indicates: artifact_concealment
+
+  supporting:
+    - id: created_and_hidden_together
+      name: Account created and hidden in one activity
+      description: >-
+        The account was created and suppressed in the same session, which is an identity
+        being established covertly rather than an existing service account being tidied.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_established
+    - id: privileged_rights_granted
+      name: Hidden account granted privileged membership
+      description: >-
+        The concealed account was added to an administrative or remote-access group, which
+        makes it operationally useful rather than merely present.
+      source: process_creation
+      field: CommandLine
+      indicates: privilege_escalation_attempt
+    - id: script_host_actor
+      name: Suppression performed by a script host
+      description: >-
+        The registry write was issued by an interpreter or a remote-execution channel rather
+        than by an installer creating its own service identity.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: rare_in_estate
+      name: Change confined to very few hosts
+      description: >-
+        The suppression appears on one or a small number of machines during the baseline
+        window, unlike an agent account hidden across a managed population.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: installer_service_account
+      name: Installer hiding its own service account
+      description: >-
+        An approved installer created and suppressed a service identity its product
+        requires, which some products do by design.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: provisioning_context
+      name: Host being imaged or provisioned
+      description: >-
+        The change occurred during host build, where staging and built-in accounts are
+        sometimes suppressed deliberately.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: fleetwide_suppression
+      name: Same account hidden across the estate
+      description: >-
+        The identical account is suppressed on many hosts, which is a management agent
+        identity rather than a targeted concealment.
+      source: baseline
+      field: CommandLine
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - account_suppressed
+
+    supporting:
+      any:
+        - created_and_hidden_together
+        - privileged_rights_granted
+        - script_host_actor
+        - rare_in_estate
+      all:
+        - created_and_hidden_together
+        - privileged_rights_granted
+
+    contradicting:
+      any:
+        - installer_service_account
+        - provisioning_context
+        - fleetwide_suppression
+      all: []
+
+  verdict:
+    low_risk_when:
+      - account_suppressed
+      - installer_service_account
+      - provisioning_context
+      - fleetwide_suppression
+    suspicious_when:
+      - account_suppressed
+      - rare_in_estate
+    high_risk_when:
+      - account_suppressed
+      - created_and_hidden_together
+      - privileged_rights_granted
+      - script_host_actor
+
+  false_positive:
+    - condition: An installer creates and hides a service account for its product.
+      explanation: >-
+        Some products create a local service identity and suppress it so users are not
+        confused by it at the logon screen. The installer is the acting process and the same
+        account appears wherever the product is deployed.
+    - condition: Imaging or provisioning suppresses a staging account.
+      explanation: >-
+        Build processes sometimes hide built-in or temporary accounts before a machine is
+        issued. Host build state is the discriminator.
+    - condition: Management tooling hides an agent account.
+      explanation: >-
+        Agents that run under a dedicated local identity often suppress it. These appear
+        identically across every managed host.
