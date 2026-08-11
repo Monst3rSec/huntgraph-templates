@@ -1,0 +1,287 @@
+type: detection
+
+id: hg-win-deployment-tool-used-to-push-untrusted-payload-t1072
+version: 1.0.0
+
+info:
+  name: Software deployment tooling used to push an untrusted payload
+  description: >-
+    A deployment platform is the most efficient lateral movement an estate can offer: it
+    already has an agent on every host, it already runs as SYSTEM, and its traffic is
+    expected. An adversary who compromises the console does not need to move laterally at
+    all — they publish. The behaviour is therefore invisible at the network layer and
+    largely invisible on the endpoint, except for one thing: the agent becomes the parent
+    of something that does not resemble a package installation.
+  severity: critical
+  author: huntgraph
+  tags:
+    - execution
+    - lateral-movement
+    - deployment-tooling
+    - supply-path
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1072
+    - https://attack.mitre.org/detectionstrategies/DET0223
+    - https://attack.mitre.org/techniques/T1021
+
+mitre:
+  tactics:
+    - TA0002
+    - TA0008
+  techniques:
+    - T1072
+  sub_techniques: []
+  detection_strategies:
+    - DET0223
+  analytics:
+    - AN0623
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Application
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+    - Application Log Content
+
+hypothesis:
+  statement: >-
+    An adversary with access to a software deployment console may publish a package or
+    script that executes on every targeted endpoint, obtaining simultaneous privileged
+    execution across the estate through a channel that is expected and trusted.
+  attacker_behavior:
+    - Publishes a package whose action is a script or an interpreter rather than an installer.
+    - Targets an unusually broad collection so the payload lands widely at once.
+    - Uses the agent's SYSTEM context to run commands that would otherwise require elevation.
+    - Follows deployment with discovery or credential access executed under the agent.
+  legitimate_behavior:
+    - Deployment platforms install software and run remediation scripts by design.
+    - Patch cycles execute installers across the estate on a schedule.
+    - Configuration baselines run scripts to evaluate and remediate settings.
+    - Administrators push emergency fixes outside the normal window.
+  risk_indicator:
+    - The agent spawns an interpreter carrying an encoded or inline command.
+    - The payload runs from a temporary directory rather than a package cache.
+    - The execution reaches an unusually large host population in a short period.
+    - The deployment falls outside any recorded change window.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: agent-spawns-interpreter
+        name: Deployment agent spawning an interpreter
+        purpose: >-
+          Surface the lineage that distinguishes a published payload from a package
+          installation, since installers do not need a shell.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(ccmexec|CcmExec|TaniumClient|AeXNSAgent|ir_agent|amagent|BESClient|ManageEngine|PatchMgmt)\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Configuration baseline scripts recorded in the deployment platform"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - parent_process
+            - command_line
+            - organization
+
+      - id: agent-runs-encoded-command
+        name: Deployment agent running an encoded or inline command
+        purpose: >-
+          Isolate payloads whose content is concealed or supplied inline, which packaged
+          software does not require.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(ccmexec|CcmExec|TaniumClient|AeXNSAgent|ir_agent|amagent|BESClient)\.exe$/i
+          | CommandLine=/(-enc\b|-EncodedCommand|FromBase64String|DownloadString|Invoke-Expression|\biex\b)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: payload-outside-package-cache
+        name: Agent executing a binary outside its package cache
+        purpose: >-
+          Catch payloads staged somewhere the platform does not normally place content,
+          which separates a published package from an injected one.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(ccmexec|CcmExec|TaniumClient|AeXNSAgent|ir_agent|amagent|BESClient)\.exe$/i
+          | ImageFileName=/\\(AppData|Users|Public|Downloads|Windows\\Temp)\\/i
+          | ImageFileName!=/\\(ccmcache|SoftwareDistribution|Tanium)\\/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+evidence:
+  required:
+    - id: agent_executed_payload
+      name: Deployment agent executing a non-package payload
+      description: >-
+        A software deployment agent spawned an interpreter or executed a binary outside its
+        package cache, which is script execution rather than the software installation the
+        platform exists to perform.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: trusted_channel_abuse
+
+  supporting:
+    - id: concealed_command
+      name: Encoded or inline command supplied
+      description: >-
+        The agent ran an encoded command or an inline download-and-execute construct, which
+        no packaged installation requires.
+      source: process_creation
+      field: CommandLine
+      indicates: command_obfuscation
+    - id: payload_outside_cache
+      name: Payload outside the platform's package cache
+      description: >-
+        The executed image sits in a user-writable or temporary directory rather than in
+        the cache the platform stages content into.
+      source: process_creation
+      field: ImageFileName
+      indicates: untrusted_execution_location
+    - id: broad_simultaneous_reach
+      name: Execution across an unusually broad population
+      description: >-
+        The same execution appears across a far larger host set than the platform's normal
+        deployment pattern in a comparable period.
+      source: baseline
+      field: ComputerName
+      indicates: estate_wide_impact
+    - id: unprecedented_payload
+      name: Payload shape new to the platform
+      description: >-
+        This command shape has not been published through the deployment agent during the
+        baseline window, unlike the recurring baseline and remediation scripts.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: recorded_deployment
+      name: Recorded deployment or patch window
+      description: >-
+        A change record covers this deployment, naming the package, the collection and the
+        approved window.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: known_baseline_script
+      name: Established configuration baseline script
+      description: >-
+        The command matches a configuration baseline or remediation script that the
+        platform has run repeatedly throughout the baseline window.
+      source: baseline
+      field: CommandLine
+      indicates: scheduled_automation_job
+    - id: package_cache_execution
+      name: Payload executing from the package cache
+      description: >-
+        The executed image resides in the platform's own cache directory, which is where
+        legitimately distributed content is staged.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - agent_executed_payload
+
+    supporting:
+      any:
+        - concealed_command
+        - payload_outside_cache
+        - broad_simultaneous_reach
+        - unprecedented_payload
+      all:
+        - concealed_command
+        - unprecedented_payload
+
+    contradicting:
+      any:
+        - recorded_deployment
+        - known_baseline_script
+        - package_cache_execution
+      all: []
+
+  verdict:
+    low_risk_when:
+      - agent_executed_payload
+      - recorded_deployment
+      - known_baseline_script
+      - package_cache_execution
+    suspicious_when:
+      - agent_executed_payload
+      - unprecedented_payload
+    high_risk_when:
+      - agent_executed_payload
+      - concealed_command
+      - payload_outside_cache
+      - broad_simultaneous_reach
+
+  false_positive:
+    - condition: The deployment platform runs a configuration baseline or remediation script.
+      explanation: >-
+        Running scripts across the estate is a core function of these platforms, so the
+        required evidence occurs continuously. The discriminator is whether the command
+        shape is one the platform has run repeatedly before.
+    - condition: A patch cycle executes installers across the estate.
+      explanation: >-
+        Scheduled patching reaches a very large host population at once, which reproduces
+        the breadth evidence. It falls inside a recorded window and executes from the
+        platform's package cache.
+    - condition: An administrator pushes an emergency fix outside the normal window.
+      explanation: >-
+        Out-of-band deployment is legitimate and will look unusual against the baseline. A
+        change record is the discriminator, which is why it is contradicting evidence
+        rather than a filter.
+    - condition: The agent runs a vendor-supplied inventory script.
+      explanation: >-
+        Some platforms ship scripted inventory that runs through an interpreter on every
+        host. These recur on a fixed cadence with an unchanging command line.
