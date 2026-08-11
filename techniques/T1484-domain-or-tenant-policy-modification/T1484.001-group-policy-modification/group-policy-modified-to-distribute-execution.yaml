@@ -1,0 +1,310 @@
+type: detection
+
+id: hg-win-group-policy-modified-to-distribute-execution-t1484-001
+version: 1.0.0
+
+info:
+  name: Group Policy modified to distribute execution or weaken controls
+  description: >-
+    Group Policy is the estate's configuration authority: whatever it says, every joined
+    machine does. An adversary who can edit a linked policy object can add a startup
+    script, a scheduled task or an immediate task and have it run everywhere, or can
+    quietly relax the settings that would otherwise have stopped them. It is the closest
+    thing in a Windows estate to the software deployment console, and it fails the same
+    way — there is no lateral movement to observe, only a configuration change followed by
+    the whole domain complying.
+  severity: critical
+  author: huntgraph
+  tags:
+    - defense-impairment
+    - privilege-escalation
+    - group-policy
+    - active-directory
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1484/001
+    - https://attack.mitre.org/detectionstrategies/DET0305
+    - https://attack.mitre.org/techniques/T1484
+
+mitre:
+  tactics:
+    - TA0112
+    - TA0004
+  techniques:
+    - T1484
+  sub_techniques:
+    - T1484.001
+  detection_strategies:
+    - DET0305
+  analytics:
+    - AN0854
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - File Modification
+    - Active Directory Object Modification
+
+hypothesis:
+  statement: >-
+    An adversary with rights over a Group Policy object may add a script, scheduled task or
+    configuration change to it, causing every machine in the linked scope to execute their
+    payload or to have a protective setting removed.
+  attacker_behavior:
+    - Writes a startup, logon or immediate task into the policy file share.
+    - Adds a scheduled task definition under a policy's Preferences directory.
+    - Relaxes protective settings such as audit policy, firewall or macro handling through policy.
+    - Links or edits a policy affecting a broad scope rather than a single organisational unit.
+  legitimate_behavior:
+    - Administrators edit policies as part of routine configuration management.
+    - Policy management tooling writes into the policy share continuously.
+    - Baseline deployments add scheduled tasks and scripts across the estate by design.
+    - Backup and reporting products read and write policy objects.
+  risk_indicator:
+    - Policy files are written by a process that is not a policy management tool.
+    - A script or immediate task is added rather than a settings change.
+    - The change relaxes a protective control rather than tightening one.
+    - The edit is made from a workstation rather than an administration host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+        - PeFileWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: script-written-into-policy-share
+        name: Script or task written into the policy share
+        purpose: >-
+          Surface executable content arriving in the directory every joined machine reads
+          its configuration from.
+        query: |
+          #event_simpleName=/^(NewScriptWritten|PeFileWritten)$/
+          | TargetFileName=/SYSVOL|\\Policies\\\{[0-9A-Fa-f-]{36}\}/
+          | TargetFileName=/\.(ps1|bat|cmd|vbs|js|exe|dll|xml)$/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of approved policy management and baseline deployment tooling"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: policy-edited-from-command-line
+        name: Policy object edited through scripting
+        purpose: >-
+          Catch programmatic policy edits, which is how a change is made without opening
+          the management console an administrator would use.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(New-GPO|Set-GPRegistryValue|Set-GPLink|New-GPLink|Set-GPPrefRegistryValue|Backup-GPO|Restore-GPO|gpupdate\s+\/force)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of designated directory administration hosts"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: immediate-task-definition
+        name: Scheduled task definition added to policy preferences
+        purpose: >-
+          Isolate the preferences path that distributes tasks, which executes on target
+          machines without any per-host registration being visible.
+        query: |
+          #event_simpleName=/^(NewScriptWritten|PeFileWritten)$/
+          | TargetFileName=/\\(Preferences\\ScheduledTasks|ScheduledTasks\.xml|Machine\\Scripts|User\\Scripts)/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of approved baseline deployment tooling"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+evidence:
+  required:
+    - id: policy_modified
+      name: Group Policy content or object modified
+      description: >-
+        Executable content or a task definition was written into the policy share, or a
+        policy object was edited programmatically, changing what every machine in the
+        linked scope will do.
+      source: file_creation
+      field: TargetFileName
+      indicates: estate_wide_configuration_change
+
+  supporting:
+    - id: executable_content_added
+      name: Script or task added rather than a setting changed
+      description: >-
+        The change introduces a script or scheduled task rather than adjusting a
+        configuration value, which distributes execution rather than configuration.
+      source: file_creation
+      field: TargetFileName
+      indicates: estate_wide_impact
+    - id: non_management_writer
+      name: Written by a process that is not policy tooling
+      description: >-
+        The writing process is an interpreter or an ad hoc tool rather than the policy
+        management console or an approved baseline deployment product.
+      source: file_creation
+      field: ContextProcessId
+      indicates: abnormal_execution_chain
+    - id: workstation_origin
+      name: Edit issued from a workstation
+      description: >-
+        The change was made from an ordinary workstation rather than a designated directory
+        administration host.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: unusual_editor
+      name: Actor without policy administration history
+      description: >-
+        The account making the change has no history of Group Policy administration during
+        the baseline window.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_host
+    - id: programmatic_policy_edit
+      name: Policy edited through scripting rather than the console
+      description: >-
+        The policy object was modified with cmdlets or a script rather than through the
+        management console an administrator would normally use, which is how a change is
+        made without an interactive session.
+      source: process_creation
+      field: CommandLine
+      indicates: abnormal_execution_chain
+
+  contradicting:
+    - id: policy_management_tooling
+      name: Approved policy management tooling
+      description: >-
+        The change was made by the policy management console or an approved baseline
+        deployment product that maintains policy content by design.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_enterprise_activity
+    - id: directory_admin_host
+      name: Designated directory administration host
+      description: >-
+        The edit originates from an administration system where policy management is the
+        expected activity.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: recorded_policy_change
+      name: Recorded policy change
+      description: >-
+        A change record covers this policy modification, naming the object, the scope and
+        the approver.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - policy_modified
+
+    supporting:
+      any:
+        - executable_content_added
+        - non_management_writer
+        - workstation_origin
+        - unusual_editor
+        - programmatic_policy_edit
+      all:
+        - executable_content_added
+        - non_management_writer
+
+    contradicting:
+      any:
+        - policy_management_tooling
+        - directory_admin_host
+        - recorded_policy_change
+      all: []
+
+  verdict:
+    low_risk_when:
+      - policy_modified
+      - policy_management_tooling
+      - directory_admin_host
+      - recorded_policy_change
+    suspicious_when:
+      - policy_modified
+      - unusual_editor
+    high_risk_when:
+      - policy_modified
+      - executable_content_added
+      - non_management_writer
+      - workstation_origin
+
+  false_positive:
+    - condition: An administrator edits a policy as part of routine configuration management.
+      explanation: >-
+        Policy editing is constant in any managed estate, which is why the writing process
+        and the originating host rather than the edit carry the escalation.
+    - condition: Baseline deployment adds scheduled tasks and scripts across the estate.
+      explanation: >-
+        Distributing tasks through policy is a designed capability and reproduces the
+        executable-content evidence exactly. The deployment product is the writing process
+        and the change is covered by a record.
+    - condition: Policy management tooling writes into the policy share continuously.
+      explanation: >-
+        Management consoles rewrite policy files whenever settings change. These writes come
+        from recognisable tooling on administration hosts.
+    - condition: A backup or reporting product reads and writes policy objects.
+      explanation: >-
+        Policy backup and reporting products touch the same paths on a schedule. They run
+        under service accounts with a stable, repeating pattern.

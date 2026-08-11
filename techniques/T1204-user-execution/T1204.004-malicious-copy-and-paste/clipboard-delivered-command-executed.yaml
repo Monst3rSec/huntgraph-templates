@@ -1,0 +1,306 @@
+type: detection
+
+id: hg-win-clipboard-delivered-command-executed-t1204-004
+version: 1.0.0
+
+info:
+  name: Command pasted from a web lure and executed by the user
+  description: >-
+    A page tells the user their browser needs a fix, or that a document will not open until
+    they run a verification step, and helpfully copies the command to their clipboard. The
+    user opens Run or a terminal and pastes. Nothing is downloaded, no attachment is opened,
+    and no control that inspects files has anything to inspect — the user is the delivery
+    mechanism. What remains observable is the shape of what gets pasted: a long obfuscated
+    one-liner appearing in a context that normally sees short, typed commands.
+  severity: high
+  author: huntgraph
+  tags:
+    - execution
+    - user-execution
+    - clipboard
+    - social-engineering
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1204/004
+    - https://attack.mitre.org/detectionstrategies/DET0340
+    - https://attack.mitre.org/techniques/T1204
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1204
+  sub_techniques:
+    - T1204.004
+  detection_strategies:
+    - DET0340
+  analytics:
+    - AN0962
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:PowerShell
+  data_components:
+    - Process Creation
+    - Command Execution
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    A user may be persuaded by a web page or document to paste a supplied command into the
+    Run dialog or a terminal and execute it, delivering a payload with no file transfer and
+    nothing for file-inspecting controls to examine.
+  attacker_behavior:
+    - Presents a fake verification, captcha or repair step that copies a command to the clipboard.
+    - Supplies a long one-liner that fetches and runs remote content in a single command.
+    - Relies on the Run dialog or a terminal, so the parent is explorer rather than a browser.
+    - Obfuscates the command so its purpose is not obvious to a user glancing at it.
+  legitimate_behavior:
+    - Administrators paste commands from documentation and internal runbooks.
+    - Developers copy setup commands from vendor installation instructions.
+    - Support staff paste diagnostic commands supplied in a ticket.
+    - Package managers document installation as a copy-and-run one-liner.
+  risk_indicator:
+    - The command was launched from the Run dialog rather than an existing shell.
+    - It combines a remote fetch with immediate execution.
+    - It is far longer than commands typically launched that way on this host.
+    - The user's session shows browser activity immediately beforehand.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: run-dialog-fetch-and-execute
+        name: Fetch-and-execute launched from the Run dialog
+        purpose: >-
+          Surface the defining shape, where explorer parents an interpreter carrying a
+          remote fetch, which is what pasting into Run produces.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^explorer\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd|mshta|wscript|cscript|curl)\.exe$/i
+          | CommandLine=/(DownloadString|Invoke-WebRequest|Invoke-RestMethod|\biex\b|Invoke-Expression|curl\s|http|FromBase64String|-enc\b)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName in the engineering asset group where setup one-liners are routine"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: unusually-long-run-command
+        name: Unusually long command launched from the Run dialog
+        purpose: >-
+          Use length as the discriminator, since commands typed into Run are short while a
+          pasted lure carries an entire stager.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^explorer\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd|mshta|wscript|cscript)\.exe$/i
+          | command_length := length(CommandLine)
+          | command_length >= 200
+          | groupBy([ComputerName, UserName, FileName],
+                    function=[count(as=executions), max(command_length, as=longest),
+                              collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: pasted-command-egress
+        name: Pasted command reaching an external address
+        purpose: >-
+          Confirm the pasted command acted on the network, which separates a live lure from
+          a harmless command a user happened to paste.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | ParentBaseFileName=/^explorer\.exe$/i
+                | FileName=/^(powershell|pwsh|cmd|mshta|curl)\.exe$/i
+                | pasted_pid := TargetProcessId ;
+              #event_simpleName=NetworkConnectIP4
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/ ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([CommandLine, UserName, RemoteAddressIP4, RemotePort]),
+                              count(as=events)])
+          | pasted_pid = ContextProcessId
+        filters:
+          include: []
+          exclude:
+            - "RemoteAddressIP4 of internal package feeds and approved registries"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: run_dialog_execution
+      name: Interpreter launched directly from the Run dialog
+      description: >-
+        An interpreter was started with explorer as its parent, which is the shape produced
+        by typing or pasting into the Run dialog rather than working in an existing shell.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: user_execution_foothold
+
+  supporting:
+    - id: fetch_and_execute
+      name: Command retrieves and executes remote content
+      description: >-
+        The pasted command combines a network fetch with immediate execution, which is a
+        stager rather than a diagnostic or configuration command.
+      source: process_creation
+      field: CommandLine
+      indicates: possible_payload_retrieval
+    - id: excessive_length
+      name: Command far longer than typical for this context
+      description: >-
+        The command is long enough to carry an entire stager, whereas commands people
+        actually type into Run are short.
+      source: process_creation
+      field: CommandLine
+      indicates: pasted_rather_than_typed
+    - id: external_egress
+      name: Outbound connection from the launched process
+      description: >-
+        The process opened a connection to an external address, confirming the pasted
+        command acted rather than failing inertly.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: active_command_and_control_attempt
+    - id: rare_for_user
+      name: Unprecedented for this user
+      description: >-
+        This user has not launched comparable commands from the Run dialog during the
+        baseline window, unlike administrators who do so regularly.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: engineering_host
+      name: Engineering host where setup one-liners are routine
+      description: >-
+        The host belongs to an engineering asset group where copying installation commands
+        from vendor documentation is normal work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+    - id: internal_feed_destination
+      name: Command targets an internal feed
+      description: >-
+        The fetch targets an internal package feed, script repository or approved registry
+        rather than an arbitrary external host.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_enterprise_activity
+    - id: recorded_support_instruction
+      name: Recorded support instruction
+      description: >-
+        An incident record covers a support engineer supplying this command for the user to
+        run.
+      source: change_management
+      field: UserName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - run_dialog_execution
+
+    supporting:
+      any:
+        - fetch_and_execute
+        - excessive_length
+        - external_egress
+        - rare_for_user
+      all:
+        - fetch_and_execute
+        - external_egress
+
+    contradicting:
+      any:
+        - engineering_host
+        - internal_feed_destination
+        - recorded_support_instruction
+      all: []
+
+  verdict:
+    low_risk_when:
+      - run_dialog_execution
+      - engineering_host
+      - internal_feed_destination
+      - recorded_support_instruction
+    suspicious_when:
+      - run_dialog_execution
+      - rare_for_user
+    high_risk_when:
+      - run_dialog_execution
+      - fetch_and_execute
+      - excessive_length
+      - external_egress
+
+  false_positive:
+    - condition: An administrator pastes a command from an internal runbook.
+      explanation: >-
+        Runbooks are written to be copied, and the Run dialog is a normal place to use them.
+        These target internal endpoints and come from accounts with a history of such
+        commands.
+    - condition: A developer copies a setup command from vendor documentation.
+      explanation: >-
+        Several ecosystems document installation as a copy-and-run one-liner that fetches
+        and executes, which reproduces the required and strongest supporting evidence.
+        Engineering asset membership is the discriminator.
+    - condition: Support staff supply a diagnostic command for a user to paste.
+      explanation: >-
+        Guided troubleshooting frequently involves pasting a command, sometimes a long one.
+        The incident record and the internal destination separate it.
+    - condition: A user pastes a command they wrote themselves earlier.
+      explanation: >-
+        People reuse their own commands via the clipboard routinely. These lack the remote
+        fetch that turns a pasted command into a delivery mechanism.
