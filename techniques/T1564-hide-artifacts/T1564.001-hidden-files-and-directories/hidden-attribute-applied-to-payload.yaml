@@ -1,0 +1,301 @@
+type: detection
+
+id: hg-win-hidden-attribute-applied-to-payload-t1564-001
+version: 1.0.0
+
+info:
+  name: Hidden attribute applied to a dropped file or directory
+  description: >-
+    Marking a file hidden does not defeat forensics, and it is not meant to — it defeats
+    the user and the casual look at a folder. That is enough when the payload lives in a
+    directory the victim opens regularly, or when a staging directory needs to survive
+    someone browsing their own profile. Installers set the attribute on their own
+    components too, so the observation only becomes interesting when what is being hidden
+    was written moments earlier by something that is not an installer, and sits somewhere
+    an application would have no reason to place a hidden folder.
+  severity: medium
+  author: huntgraph
+  tags:
+    - stealth
+    - hide-artifacts
+    - hidden-files
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1564/001
+    - https://attack.mitre.org/detectionstrategies/DET0032
+    - https://attack.mitre.org/techniques/T1564
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1564
+  sub_techniques:
+    - T1564.001
+  detection_strategies:
+    - DET0032
+  analytics:
+    - AN0091
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary may set the hidden or system attribute on a file or directory they have
+    just created, so that the payload and its staging location do not appear when the user
+    or an administrator browses the containing folder.
+  attacker_behavior:
+    - Runs attrib with +h and often +s against a file or directory in a user-writable path.
+    - Sets the attribute through PowerShell on a file written moments earlier.
+    - Hides an entire staging directory rather than an individual file.
+    - Combines the hidden and system attributes so the item is suppressed even with hidden files shown.
+  legitimate_behavior:
+    - Installers hide their own support directories and configuration files.
+    - Backup, sync and version-control clients create hidden metadata folders.
+    - Scripts hide working directories to keep a user's profile tidy.
+    - Some applications mark cache directories hidden by design.
+  risk_indicator:
+    - The hidden item was written shortly before the attribute was applied.
+    - Both the hidden and system attributes are set, which suppresses the item more aggressively.
+    - The item is an executable or script rather than a configuration or metadata file.
+    - The acting process is a script host or a document handler rather than an installer.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: attrib-hidden-system
+        name: Hidden and system attributes applied together
+        purpose: >-
+          Surface the aggressive form, where an item is suppressed even for a user who has
+          enabled showing hidden files, which ordinary tidiness does not require.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^attrib\.exe$/i
+          | CommandLine=/\+h/i
+          | CommandLine=/\+s/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of approved installers and profile-management tooling"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - command_line
+
+      - id: hidden-attribute-in-writable-path
+        name: Hidden attribute set on an item in a user-writable directory
+        purpose: >-
+          Restrict to locations where a hidden executable or staging directory has no
+          legitimate reason to exist, rather than to application data directories.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/attrib(\.exe)?\s+.*\+h|Set-ItemProperty\s+.*-Name\s+Attributes.*Hidden|\.Attributes\s*=.*Hidden/i
+          | CommandLine=/(?<hidden_target>[A-Za-z]:\\[^",]+)/i
+          | hidden_target=/\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName, hidden_target],
+                    function=[count(as=events), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude:
+            - "hidden_target under known application metadata directories"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+            - command_line
+
+      - id: write-then-hide-sequence
+        name: Executable written then hidden on the same host
+        purpose: >-
+          Join the drop to the concealment, which distinguishes a payload being hidden
+          from an installer marking its own long-lived support folder.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten|NewScriptWritten|ProcessRollup2)$/
+          | case {
+              #event_simpleName=/^(PeFileWritten|NewExecutableWritten|NewScriptWritten)$/
+                | TargetFileName=/\\(AppData|Temp|ProgramData|Users|Public)\\/i
+                | dropped_file := TargetFileName ;
+              #event_simpleName=ProcessRollup2
+                | CommandLine=/attrib(\.exe)?\s+.*\+h/i
+                | hide_command := CommandLine ;
+            }
+          | groupBy([ComputerName],
+                    function=[collect([dropped_file, hide_command, UserName, ParentBaseFileName]),
+                              count(as=events)])
+          | dropped_file=/.+/ and hide_command=/.+/
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of approved installers"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+
+evidence:
+  required:
+    - id: hidden_attribute_set
+      name: Hidden attribute applied to a file or directory
+      description: >-
+        A command sets the hidden attribute, alone or together with the system attribute,
+        on a file or directory so that it does not appear in ordinary folder listings.
+      source: process_creation
+      field: CommandLine
+      indicates: artifact_concealment
+
+  supporting:
+    - id: system_attribute_too
+      name: System attribute set alongside hidden
+      description: >-
+        The system attribute is applied as well, which suppresses the item even for users
+        who have chosen to display hidden files and is rarely needed for tidiness.
+      source: process_creation
+      field: CommandLine
+      indicates: deliberate_evasion
+    - id: recently_written_target
+      name: Target written shortly before being hidden
+      description: >-
+        The hidden item was created on the host shortly before the attribute was applied,
+        which is a drop-then-conceal sequence rather than maintenance of an existing
+        component.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: script_host_actor
+      name: Script host applying the attribute
+      description: >-
+        The attribute was set by PowerShell, cmd or a script host rather than by an
+        installer or a profile-management tool.
+      source: process_creation
+      field: FileName
+      indicates: non_standard_automation
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        The acting process was launched by a document handler, archive utility, mail
+        client or browser rather than by setup or maintenance tooling.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+
+  contradicting:
+    - id: installer_actor
+      name: Installer hiding its own components
+      description: >-
+        An approved installer or updater applied the attribute to its own support
+        directory or configuration files during setup.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: known_metadata_directory
+      name: Known application metadata directory
+      description: >-
+        The hidden item is a metadata or cache directory belonging to an approved backup,
+        sync or version-control client, which creates hidden folders by design.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_application_component
+    - id: fleetwide_pattern
+      name: Same concealment across the estate
+      description: >-
+        The identical path and attribute pattern appears across many hosts, matching
+        deployed software rather than a targeted drop.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - hidden_attribute_set
+
+    supporting:
+      any:
+        - system_attribute_too
+        - recently_written_target
+        - script_host_actor
+        - delivery_parent
+      all:
+        - recently_written_target
+        - script_host_actor
+
+    contradicting:
+      any:
+        - installer_actor
+        - known_metadata_directory
+        - fleetwide_pattern
+      all: []
+
+  verdict:
+    low_risk_when:
+      - hidden_attribute_set
+      - installer_actor
+      - known_metadata_directory
+      - fleetwide_pattern
+    suspicious_when:
+      - hidden_attribute_set
+      - system_attribute_too
+    high_risk_when:
+      - hidden_attribute_set
+      - system_attribute_too
+      - recently_written_target
+      - delivery_parent
+
+  false_positive:
+    - condition: An installer hides its own support directory during setup.
+      explanation: >-
+        Hiding configuration and support folders is normal packaging practice, and it
+        happens immediately after those files are written, reproducing the sequence
+        evidence. The installer as the acting process and the rollout footprint separate it.
+    - condition: A sync or version-control client creates a hidden metadata directory.
+      explanation: >-
+        Hidden metadata folders are fundamental to how these clients work. They recur for
+        every user of the product and sit at predictable paths.
+    - condition: A logon or profile script hides a working directory.
+      explanation: >-
+        Keeping a user's profile tidy is a reasonable administrative goal. These run under
+        the logon mechanism on a fixed schedule with an unchanging command line.

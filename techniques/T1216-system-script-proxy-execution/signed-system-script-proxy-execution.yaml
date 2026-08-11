@@ -1,0 +1,281 @@
+type: detection
+
+id: hg-win-signed-system-script-proxy-execution-t1216
+version: 1.0.0
+
+info:
+  name: Signed system script used to proxy execution
+  description: >-
+    Windows ships a number of signed scripts whose arguments are passed to an interpreter
+    or a COM object with insufficient validation, so an operator can supply their own
+    target and have a Microsoft-signed script run it. The value to an adversary is not
+    stealth of the payload but provenance of the launcher: application control policies
+    that trust the system script directory approve the script, and the payload arrives as
+    a parameter. The scripts involved are few, they live in fixed locations, and outside
+    their narrow purposes they are effectively never invoked, which makes the observation
+    both cheap and specific.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - proxy-execution
+    - lolbin
+    - signed-script
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1216
+    - https://attack.mitre.org/detectionstrategies/DET0466
+    - https://lolbas-project.github.io/lolbas/Scripts/Pubprn/
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1216
+  sub_techniques: []
+  detection_strategies:
+    - DET0466
+  analytics:
+    - AN1288
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:PowerShell
+  data_components:
+    - Process Creation
+    - Command Execution
+    - Module Load
+
+hypothesis:
+  statement: >-
+    An adversary may pass a payload reference to a Microsoft-signed system script that
+    forwards its arguments to an interpreter or COM object, obtaining execution that
+    inherits the script's trusted provenance and satisfies policies which allow signed
+    scripts from system directories.
+  attacker_behavior:
+    - Invokes pubprn.vbs with a script moniker in place of the expected printer target.
+    - Uses SyncAppvPublishingServer with an appended PowerShell expression.
+    - References a signed system script from a script host rather than from its owning workflow.
+    - Follows the invocation with an interpreter launch or outbound communication.
+  legitimate_behavior:
+    - Printer publishing genuinely uses pubprn.vbs in environments with shared print servers.
+    - Application virtualisation publishing uses SyncAppvPublishingServer where that platform is deployed.
+    - Administrators occasionally run these scripts while troubleshooting the features they belong to.
+  risk_indicator:
+    - The argument supplied is a script moniker or an expression rather than the expected target.
+    - The invoking parent is a document handler, archive tool or script host.
+    - The feature the script belongs to is not deployed in the environment at all.
+    - An interpreter is spawned by the script host immediately afterwards.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: pubprn-script-moniker
+        name: Pubprn invoked with a script moniker
+        purpose: >-
+          Catch the documented abuse directly, where the second parameter is a script or
+          scriptlet moniker rather than a printer publication target.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/pubprn(\.vbs)?/i
+          | CommandLine=/script\s*:|scriptlet\s*:|https?\s*:?\s*(\[:\])?\/\//i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: syncappv-expression
+        name: SyncAppvPublishingServer carrying an appended expression
+        purpose: >-
+          Surface the application-virtualisation variant, where a semicolon separates the
+          expected argument from an appended PowerShell expression.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/SyncAppvPublishingServer/i
+          | CommandLine=/;|\biex\b|Invoke-Expression|Start-Process|DownloadString/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Hosts where application virtualisation publishing is genuinely deployed"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: system-script-unusual-parent
+        name: Signed system script invoked from an unexpected parent
+        purpose: >-
+          Widen coverage to the script set generally, using lineage rather than argument
+          shape so that variants not yet published are still surfaced.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(pubprn|syncappvpublishingserver|winrm|slmgr|manage-bde|cl_invocation|cl_mutexverifiers)\.(vbs|ps1)/i
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|acrord32|acrobat|chrome|msedge|firefox|7zfm|winrar|mshta|wscript|cscript)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - parent_process
+            - command_line
+
+evidence:
+  required:
+    - id: signed_script_proxy
+      name: Signed system script invoked with an execution argument
+      description: >-
+        A Microsoft-signed system script is invoked with a script moniker, a URL or an
+        appended expression in place of the parameter its own workflow expects, so the
+        script forwards attacker-supplied content to an interpreter.
+      source: process_creation
+      field: CommandLine
+      indicates: proxy_execution_of_untrusted_module
+
+  supporting:
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        The script was invoked by a document handler, archive utility, mail client,
+        browser or another script host rather than by the feature it belongs to.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: interpreter_child
+      name: Interpreter spawned by the script host
+      description: >-
+        The script host created a command interpreter or proxy-execution binary,
+        confirming the forwarded argument was executable content.
+      source: process_creation
+      field: FileName
+      indicates: execution_chain_progression
+    - id: feature_not_deployed
+      name: Owning feature absent from the environment
+      description: >-
+        The workflow the script belongs to has no footprint in the estate during the
+        baseline window, so there is no legitimate reason for the script to run at all.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+    - id: rare_for_host
+      name: Invocation unprecedented on this host
+      description: >-
+        This host has not invoked the script during the baseline window, unlike systems
+        that participate in the relevant publishing workflow.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: owning_workflow_context
+      name: Invoked by its own workflow
+      description: >-
+        The script was invoked by the printing or application-virtualisation component it
+        belongs to, with the parameters that workflow supplies.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: feature_deployed_here
+      name: Owning feature deployed in the environment
+      description: >-
+        The relevant publishing feature is genuinely deployed and the script runs
+        routinely on hosts that participate in it.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: administrative_session
+      name: Interactive administrative troubleshooting
+      description: >-
+        A named administrator invoked the script interactively while working on the
+        feature it belongs to, with a corresponding incident or change record.
+      source: change_management
+      field: UserName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - signed_script_proxy
+
+    supporting:
+      any:
+        - delivery_parent
+        - interpreter_child
+        - feature_not_deployed
+        - rare_for_host
+      all:
+        - delivery_parent
+        - interpreter_child
+
+    contradicting:
+      any:
+        - owning_workflow_context
+        - feature_deployed_here
+        - administrative_session
+      all: []
+
+  verdict:
+    low_risk_when:
+      - signed_script_proxy
+      - owning_workflow_context
+      - feature_deployed_here
+      - administrative_session
+    suspicious_when:
+      - signed_script_proxy
+      - feature_not_deployed
+    high_risk_when:
+      - signed_script_proxy
+      - delivery_parent
+      - interpreter_child
+      - rare_for_host
+
+  false_positive:
+    - condition: Printer publishing genuinely invokes pubprn.vbs in a print-server environment.
+      explanation: >-
+        Where shared printing is deployed the script does run for its intended purpose.
+        Those invocations carry printer and server parameters rather than script monikers,
+        which is why the argument shape carries the required evidence.
+    - condition: Application virtualisation publishing runs SyncAppvPublishingServer routinely.
+      explanation: >-
+        On estates where that platform is deployed the script executes as designed. The
+        argument contains a publishing server reference and no appended expression, and the
+        activity is confined to hosts running the platform.
+    - condition: An administrator troubleshoots printing or publishing interactively.
+      explanation: >-
+        Running these scripts by hand while diagnosing the feature is reasonable support
+        work. It is interactive, from an administrative console, and tied to a named user
+        with a ticket.

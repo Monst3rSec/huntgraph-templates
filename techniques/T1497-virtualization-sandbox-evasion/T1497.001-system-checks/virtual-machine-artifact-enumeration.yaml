@@ -1,0 +1,292 @@
+type: detection
+
+id: hg-win-virtual-machine-artifact-enumeration-t1497-001
+version: 1.0.0
+
+info:
+  name: Virtual machine and sandbox artefacts enumerated before execution
+  description: >-
+    Malware that wants to avoid analysis asks the host whether it is a virtual machine
+    before doing anything interesting: the system manufacturer, the disk model, the
+    presence of guest-agent services, the processor count. On a physical endpoint that
+    line of questioning has no purpose — an application that needs hardware facts asks for
+    one of them, not for the specific set that distinguishes a hypervisor guest. The
+    combination and the timing are the signal, and unusually for an evasion technique the
+    check itself is loud, since it must run before the payload commits to anything.
+  severity: medium
+  author: huntgraph
+  tags:
+    - stealth
+    - discovery
+    - sandbox-evasion
+    - anti-analysis
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1497/001
+    - https://attack.mitre.org/detectionstrategies/DET0168
+    - https://attack.mitre.org/techniques/T1497
+
+mitre:
+  tactics:
+    - TA0005
+    - TA0007
+  techniques:
+    - T1497
+  sub_techniques:
+    - T1497.001
+  detection_strategies:
+    - DET0168
+  analytics:
+    - AN0478
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Module Load
+
+hypothesis:
+  statement: >-
+    An adversary may query system, disk and firmware identifiers characteristic of
+    virtualisation before executing a payload, so that the sample stays inert inside an
+    analysis sandbox and only behaves maliciously on a real victim endpoint.
+  attacker_behavior:
+    - Queries computer system model and manufacturer looking for hypervisor vendor strings.
+    - Enumerates disk drive models, BIOS serials or firmware tables for virtualisation markers.
+    - Checks for guest-agent services and drivers belonging to virtualisation platforms.
+    - Runs several such checks in quick succession from a single script before any payload activity.
+  legitimate_behavior:
+    - Asset inventory and licensing tools collect hardware identifiers on a schedule.
+    - Support scripts gather system information while diagnosing a fault.
+    - Deployment tooling checks whether a host is virtual before applying a configuration.
+    - Monitoring agents report hardware attributes as part of normal telemetry.
+  risk_indicator:
+    - Several distinct virtualisation indicators are queried together in one command.
+    - The querying process is a script host launched by a document or archive.
+    - The checks are followed immediately by a payload write or an interpreter launch.
+    - The pattern is new for the host rather than part of a recurring inventory cycle.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: hardware-identity-queries
+        name: Virtualisation identifiers queried through WMI or CIM
+        purpose: >-
+          Surface the classic identity questions, then rank by how many distinct
+          indicators a single command asks for, since breadth is what separates evasion
+          from inventory.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Win32_ComputerSystem|Win32_BIOS|Win32_DiskDrive|Win32_VideoController|Win32_Fan|Win32_CacheMemory|MSAcpi_ThermalZoneTemperature)/i
+          | CommandLine=/(Model|Manufacturer|SerialNumber|Caption|NumberOfCores|NumberOfLogicalProcessors)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=queries), collect([CommandLine], limit=5)])
+          | sort(queries, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the asset-inventory, licensing and monitoring agents"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - command_line
+
+      - id: hypervisor-vendor-strings
+        name: Hypervisor vendor strings referenced directly
+        purpose: >-
+          Catch commands that name virtualisation vendors explicitly, which inventory
+          tooling collects values for but rarely searches by name.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(vmware|virtualbox|vbox|qemu|xen|parallels|hyper-?v|kvm|innotek|sandbox|cuckoo)/i
+          | FileName=/^(powershell|pwsh|cmd|wmic|wscript|cscript|reg)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=checks), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Virtualisation management tooling on hosts that administer hypervisors"
+            - "ComputerName of hosts that are themselves virtual, where guest-agent checks are expected"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: checks-then-interpreter
+        name: System checks followed by an interpreter launch
+        purpose: >-
+          Join the reconnaissance to what follows it, which is the difference between a
+          sample deciding whether to detonate and a tool collecting inventory.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(wmic|cscript|wscript)\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd|rundll32|regsvr32|mshta)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - process
+
+evidence:
+  required:
+    - id: virtualisation_probe
+      name: Virtualisation indicators queried
+      description: >-
+        A command queries system, BIOS, disk or device identifiers of the kind used to
+        distinguish a hypervisor guest from physical hardware, or references virtualisation
+        vendor names directly.
+      source: process_creation
+      field: CommandLine
+      indicates: environment_fingerprinting
+
+  supporting:
+    - id: multiple_indicators
+      name: Several distinct indicators queried together
+      description: >-
+        The command asks for more than one class of virtualisation marker at once, which
+        is characteristic of a decision procedure rather than of collecting a single
+        hardware fact.
+      source: process_creation
+      field: CommandLine
+      indicates: deliberate_evasion
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        The querying process was launched by a document handler, archive utility, mail
+        client or browser rather than by an inventory or monitoring agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: interpreter_followup
+      name: Interpreter launched after the checks
+      description: >-
+        The checking process spawned a command interpreter or proxy-execution binary,
+        which is the payload proceeding after the environment passed its test.
+      source: process_creation
+      field: FileName
+      indicates: execution_chain_progression
+    - id: rare_for_host
+      name: Checks unprecedented on this host
+      description: >-
+        No comparable enumeration has been seen on this host during the baseline window,
+        unlike inventory collection which recurs on a predictable cycle.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: inventory_agent
+      name: Asset inventory or licensing agent
+      description: >-
+        The approved inventory, licensing or monitoring agent performed the query as part
+        of its scheduled hardware collection.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: recurring_collection
+      name: Recurring collection cycle
+      description: >-
+        The same query recurs on a stable schedule across many hosts, which is inventory
+        rather than a one-off decision procedure.
+      source: baseline
+      field: ComputerName
+      indicates: scheduled_automation_job
+    - id: virtualisation_admin_host
+      name: Host administers virtualisation
+      description: >-
+        The host is a virtualisation management or engineering system where querying
+        hypervisor attributes is routine work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - virtualisation_probe
+
+    supporting:
+      any:
+        - multiple_indicators
+        - delivery_parent
+        - interpreter_followup
+        - rare_for_host
+      all:
+        - multiple_indicators
+        - interpreter_followup
+
+    contradicting:
+      any:
+        - inventory_agent
+        - recurring_collection
+        - virtualisation_admin_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - virtualisation_probe
+      - inventory_agent
+      - recurring_collection
+      - virtualisation_admin_host
+    suspicious_when:
+      - virtualisation_probe
+      - multiple_indicators
+    high_risk_when:
+      - virtualisation_probe
+      - multiple_indicators
+      - delivery_parent
+      - interpreter_followup
+
+  false_positive:
+    - condition: An asset inventory agent collects hardware identifiers on every host.
+      explanation: >-
+        Inventory tooling queries exactly these classes, often several in one pass, so it
+        reproduces the strongest supporting evidence. It runs on a schedule from a known
+        agent and appears identically across the estate.
+    - condition: A support script gathers system information while diagnosing a fault.
+      explanation: >-
+        Troubleshooting scripts commonly dump system, BIOS and disk details together. These
+        are interactive, tied to a named engineer and usually accompany an incident record.
+    - condition: Deployment tooling checks whether a host is virtual before applying configuration.
+      explanation: >-
+        Branching on physical versus virtual is a legitimate deployment concern, and such
+        scripts do name hypervisor vendors explicitly. They run from the deployment agent
+        during build windows.
+    - condition: A virtual host queries its own guest-agent services.
+      explanation: >-
+        On a virtual machine, guest tooling reporting on itself is unremarkable and would
+        otherwise generate volume proportional to how virtualised the estate is. Host
+        virtualisation status is therefore treated as context rather than as a finding.
