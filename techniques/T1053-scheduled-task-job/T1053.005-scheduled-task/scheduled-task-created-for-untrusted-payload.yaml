@@ -1,0 +1,305 @@
+type: detection
+
+id: hg-win-scheduled-task-created-for-untrusted-payload-t1053-005
+version: 1.0.0
+
+info:
+  name: Scheduled task created to run an untrusted payload
+  description: >-
+    A scheduled task gives an adversary execution, persistence and often privilege in one
+    object, which is why it appears in nearly every intrusion that lasts more than an
+    afternoon. Task creation is also constant background noise in a managed estate, so
+    the hypothesis cannot rest on a task being made. What separates the two is the action:
+    deployed software schedules its own installed binaries, while an intrusion schedules
+    an interpreter or something sitting in a directory the user can write to, and often
+    asks for SYSTEM while doing it.
+  severity: high
+  author: huntgraph
+  tags:
+    - execution
+    - persistence
+    - privilege-escalation
+    - scheduled-task
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1053/005
+    - https://attack.mitre.org/detectionstrategies/DET0441
+    - https://attack.mitre.org/techniques/T1053
+
+mitre:
+  tactics:
+    - TA0002
+    - TA0003
+    - TA0004
+  techniques:
+    - T1053
+  sub_techniques:
+    - T1053.005
+  detection_strategies:
+    - DET0441
+  analytics:
+    - AN1221
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Scheduled Job Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary may create a scheduled task whose action is an interpreter or a payload in
+    a user-writable directory, obtaining execution that repeats on a trigger, survives
+    reboot and can be made to run as SYSTEM.
+  attacker_behavior:
+    - Creates a task through schtasks or the PowerShell cmdlets with an interpreter as the action.
+    - Requests SYSTEM through the highest run level or an explicit system account.
+    - Triggers the task at logon, at startup or on a short repeating interval.
+    - Registers the task on a remote host as part of lateral movement.
+  legitimate_behavior:
+    - Installed software registers update and maintenance tasks during setup.
+    - Management platforms deploy scheduled jobs across the estate.
+    - Administrators create maintenance tasks that legitimately run scripts.
+    - Windows itself registers a large number of platform tasks.
+  risk_indicator:
+    - The task action is an interpreter or a program in a user-writable directory.
+    - The task requests SYSTEM or the highest available privilege.
+    - The creating process is a script host or a document handler.
+    - The task is registered against a remote host from a workstation.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: task-action-writable-payload
+        name: Task created with an action in a user-writable directory
+        purpose: >-
+          Surface tasks whose action lies outside the installation trees, which is the
+          contrast between deployed software and staged persistence.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(schtasks(\.exe)?\s+.*\/create|Register-ScheduledTask|New-ScheduledTaskAction)/i
+          | CommandLine=/(?<task_action>[A-Za-z]:\\[^",]+\.(exe|dll|ps1|vbs|js|bat|cmd|scr))/i
+          | task_action=/\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\/i
+          | task_action!=/\\Program Files( \(x86\))?\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, task_action],
+                    function=[count(as=registrations), collect([CommandLine], limit=3)])
+          | sort(registrations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "task_action under approved updater and deployment staging directories"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: task-elevated-interpreter
+        name: Task running an interpreter with elevated privilege
+        purpose: >-
+          Isolate tasks that combine an interpreter action with a request for SYSTEM,
+          which is the persistence-plus-elevation shape.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(schtasks(\.exe)?\s+.*\/create|Register-ScheduledTask)/i
+          | CommandLine=/(powershell|pwsh|cmd\.exe|wscript|cscript|mshta|rundll32|regsvr32)/i
+          | CommandLine=/(\/rl\s+highest|\/ru\s+(system|"?nt authority)|-RunLevel\s+Highest|ServiceAccount)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=registrations), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the configuration-management agent"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: remote-task-registration
+        name: Task registered against a remote host
+        purpose: >-
+          Catch the lateral-movement use, where a task is created on another machine to
+          run a payload there.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/schtasks(\.exe)?\s+.*\/create/i
+          | CommandLine=/\/s\s+[^\s"']+/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=registrations), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of approved management servers and jump hosts"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - organization
+
+evidence:
+  required:
+    - id: task_untrusted_action
+      name: Scheduled task with an untrusted action
+      description: >-
+        A scheduled task was created whose action is a script interpreter or a program in a
+        user-writable directory, rather than an installed application binary.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_established
+
+  supporting:
+    - id: elevated_run_level
+      name: Task requests SYSTEM or highest privilege
+      description: >-
+        The task is registered to run as SYSTEM or at the highest available run level,
+        which grants the action more privilege than the creating user holds interactively.
+      source: process_creation
+      field: CommandLine
+      indicates: privilege_escalation_attempt
+    - id: script_host_creator
+      name: Created by a script host or delivery application
+      description: >-
+        The registration was performed by an interpreter, document handler or archive
+        utility rather than by an installer or management agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: action_recently_written
+      name: Action program written shortly before registration
+      description: >-
+        The program the task will run was created on the host shortly before the task was
+        registered, which is self-installation rather than software setup.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: rare_task
+      name: Task rare across the estate
+      description: >-
+        This task action appears on very few hosts during the baseline window, unlike
+        update and maintenance tasks belonging to deployed products.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: installer_registered
+      name: Registered by an approved installer
+      description: >-
+        The task was created by an approved installer or updater as part of deploying its
+        own product.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: management_platform_job
+      name: Managed job deployed across the estate
+      description: >-
+        The task was deployed by the configuration-management platform and appears
+        identically across a collection of hosts.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+    - id: recorded_admin_task
+      name: Recorded administrative task
+      description: >-
+        A change record covers an administrator creating a maintenance task, naming the
+        host, the schedule and the purpose.
+      source: change_management
+      field: UserName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - task_untrusted_action
+
+    supporting:
+      any:
+        - elevated_run_level
+        - script_host_creator
+        - action_recently_written
+        - rare_task
+      all:
+        - elevated_run_level
+        - script_host_creator
+
+    contradicting:
+      any:
+        - installer_registered
+        - management_platform_job
+        - recorded_admin_task
+      all: []
+
+  verdict:
+    low_risk_when:
+      - task_untrusted_action
+      - installer_registered
+      - management_platform_job
+      - recorded_admin_task
+    suspicious_when:
+      - task_untrusted_action
+      - rare_task
+    high_risk_when:
+      - task_untrusted_action
+      - elevated_run_level
+      - script_host_creator
+      - action_recently_written
+
+  false_positive:
+    - condition: An installer registers an update task during setup.
+      explanation: >-
+        Update tasks are ubiquitous and some vendors stage their updater under ProgramData,
+        producing the required evidence. The installer as parent and the estate-wide
+        presence are the discriminators.
+    - condition: A management platform deploys a scheduled job that runs PowerShell.
+      explanation: >-
+        Managed jobs commonly run interpreters at high privilege, reproducing the strongest
+        supporting evidence. They appear simultaneously across a host collection with an
+        identical definition.
+    - condition: An administrator creates a maintenance task that runs a script.
+      explanation: >-
+        Scheduled maintenance scripting is ordinary administration. It is an interactive
+        registration by a named administrator, usually with a change record.
+    - condition: Windows registers platform tasks during servicing.
+      explanation: >-
+        The operating system creates many tasks, but their actions are binaries under the
+        Windows tree, which is why the required evidence needs an untrusted action rather
+        than a task registration alone.

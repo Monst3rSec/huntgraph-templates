@@ -1,0 +1,298 @@
+type: detection
+
+id: hg-win-document-spawning-execution-chain-t1204-002
+version: 1.0.0
+
+info:
+  name: Document application spawning an execution chain
+  description: >-
+    Most intrusions still begin with someone opening a file they were sent. Whatever the
+    lure — a macro, an embedded object, an exploit — the moment it works, a document
+    application becomes the parent of something that is not a document application. That
+    relationship is the earliest reliable point at which the intrusion becomes visible,
+    it precedes every later technique, and unlike the lure's contents it does not change
+    between campaigns. Word does not launch PowerShell as part of editing a document, and
+    no amount of obfuscation inside the file changes that.
+  severity: high
+  author: huntgraph
+  tags:
+    - execution
+    - user-execution
+    - phishing-payload
+    - process-lineage
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1204/002
+    - https://attack.mitre.org/detectionstrategies/DET0294
+    - https://attack.mitre.org/techniques/T1204
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1204
+  sub_techniques:
+    - T1204.002
+  detection_strategies:
+    - DET0294
+  analytics:
+    - AN0819
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - File Metadata
+
+hypothesis:
+  statement: >-
+    A user may be induced to open a delivered file whose content executes on opening,
+    causing the document, archive or mail application to spawn an interpreter or a
+    downloader and establishing the first foothold of an intrusion.
+  attacker_behavior:
+    - Delivers a document whose macro or embedded object launches an interpreter on open.
+    - Sends an archive whose extracted contents the user runs directly from the extraction directory.
+    - Uses a shortcut file that appears to be a document but executes a command.
+    - Follows the initial spawn with a download or a second interpreter in the same chain.
+  legitimate_behavior:
+    - Business documents with legitimate macros call scripting for data refresh or reporting.
+    - Some applications spawn helper utilities for printing, conversion or repair.
+    - Add-ins and templates launch supporting processes as part of normal operation.
+    - Users open installers extracted from archives as part of sanctioned self-service software.
+  risk_indicator:
+    - The child is a general-purpose interpreter rather than a documented helper.
+    - The file was written to the host shortly before it was opened.
+    - The chain continues into a download or a second interpreter.
+    - The parent and child pairing is rare for the host and the user.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: document-parent-interpreter-child
+        name: Document application spawning an interpreter
+        purpose: >-
+          Capture the foundational lineage, which marks the transition from a user opening
+          a file to code running on their behalf.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|onenote|msaccess|visio|acrord32|acrobat|wordpad)\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin|msbuild|installutil|curl)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Documented business macros that invoke scripting for data refresh"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - parent_process
+            - process
+
+      - id: archive-extracted-payload-run
+        name: Executable run directly from an archive extraction directory
+        purpose: >-
+          Cover the archive delivery route, where the archive tool is the parent and the
+          payload runs from a temporary extraction path.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(7zfm|7zg|winrar|winzip|explorer|peazip)\.exe$/i
+          | CommandLine=/(?<payload_path>[A-Za-z]:\\[^",]+\.(exe|scr|js|jse|vbs|vbe|wsf|hta|bat|cmd|ps1|lnk))/i
+          | payload_path=/\\(AppData|Temp|Downloads|Users\\Public)\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, payload_path],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude:
+            - "Self-service software installers approved for user installation"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - path
+
+      - id: chain-continues-past-first-child
+        name: Execution chain continuing beyond the first interpreter
+        purpose: >-
+          Identify chains that progress into a second stage, which distinguishes a
+          successful foothold from a single benign helper invocation.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(wscript|cscript|mshta|powershell|pwsh|cmd)\.exe$/i
+          | FileName=/^(powershell|pwsh|rundll32|regsvr32|certutil|bitsadmin|curl|msiexec)\.exe$/i
+          | CommandLine=/(https?\s*:?\s*(\[:\])?\/\/|DownloadString|Invoke-WebRequest|-urlcache|\/transfer)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: document_spawned_interpreter
+      name: Document or archive application spawning an execution process
+      description: >-
+        A document handler, mail client or archive utility created an interpreter,
+        downloader or proxy-execution binary, which ordinary document handling does not do.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: user_execution_foothold
+
+  supporting:
+    - id: chain_progression
+      name: Chain continues into a second stage
+      description: >-
+        The spawned process itself launched a downloader or another interpreter with a
+        remote reference, showing the foothold progressed rather than terminating.
+      source: process_creation
+      field: CommandLine
+      indicates: execution_chain_progression
+    - id: file_recently_delivered
+      name: File written to the host shortly before opening
+      description: >-
+        The opened file arrived on the host shortly before execution, consistent with
+        delivery followed immediately by the user acting on it.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: writable_payload_path
+      name: Payload run from a delivery directory
+      description: >-
+        The executed file sits in a download, extraction or temporary directory rather
+        than in an installed location.
+      source: process_creation
+      field: CommandLine
+      indicates: untrusted_execution_location
+    - id: rare_pairing
+      name: Parent and child pairing rare for this user
+      description: >-
+        This document application has not spawned this process for the user or host during
+        the baseline window, unlike a business macro that runs routinely.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: documented_macro
+      name: Documented business macro
+      description: >-
+        The spawning document belongs to a known business workflow whose macros invoke
+        scripting for data refresh or reporting.
+      source: asset_inventory
+      field: UserName
+      indicates: legitimate_enterprise_activity
+    - id: application_helper
+      name: Application helper utility
+      description: >-
+        The child process is a documented helper the application invokes for printing,
+        conversion or repair rather than a general-purpose interpreter.
+      source: process_creation
+      field: FileName
+      indicates: legitimate_application_component
+    - id: recurring_for_user
+      name: Recurring pattern for this user
+      description: >-
+        The same parent and child pairing recurs regularly for this user across the
+        baseline window, which reads as a routine workflow.
+      source: baseline
+      field: UserName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - document_spawned_interpreter
+
+    supporting:
+      any:
+        - chain_progression
+        - file_recently_delivered
+        - writable_payload_path
+        - rare_pairing
+      all:
+        - chain_progression
+        - rare_pairing
+
+    contradicting:
+      any:
+        - documented_macro
+        - application_helper
+        - recurring_for_user
+      all: []
+
+  verdict:
+    low_risk_when:
+      - document_spawned_interpreter
+      - documented_macro
+      - application_helper
+      - recurring_for_user
+    suspicious_when:
+      - document_spawned_interpreter
+      - rare_pairing
+    high_risk_when:
+      - document_spawned_interpreter
+      - chain_progression
+      - file_recently_delivered
+      - writable_payload_path
+
+  false_positive:
+    - condition: A business spreadsheet runs a macro that invokes scripting for a data refresh.
+      explanation: >-
+        Legitimate macros do spawn interpreters, and in finance and reporting teams they do
+        so daily. The pairing recurs for the same users over long periods, which is what
+        the baseline exposes.
+    - condition: A document application spawns a helper for printing or conversion.
+      explanation: >-
+        Applications call specific utilities for their own functions. The child is a named
+        helper rather than a general shell, which is why the child identity matters.
+    - condition: A user extracts and runs an approved installer from an archive.
+      explanation: >-
+        Self-service software installation looks structurally identical to archive-delivered
+        malware. The payload is a recognisable vendor installer and appears across many
+        users rather than on one host.
+    - condition: An add-in or template launches a supporting process on document open.
+      explanation: >-
+        Deployed add-ins can start helper processes for every document a user opens. These
+        appear across the whole population using that add-in with an unchanging shape.

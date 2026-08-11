@@ -1,0 +1,298 @@
+type: detection
+
+id: hg-win-service-created-for-untrusted-binary-t1543-003
+version: 1.0.0
+
+info:
+  name: Windows service created for an untrusted binary
+  description: >-
+    A service starts automatically, runs as SYSTEM and restarts if it dies, which makes it
+    the most durable persistence Windows offers and the reason service creation appears in
+    so many intrusions. Software installs services legitimately and constantly, so the
+    event alone is noise. The signal is the image path: a packaged product points its
+    service at a binary under Program Files or the Windows tree, while an intrusion points
+    it at a temporary directory, a user profile, or straight at an interpreter with an
+    encoded argument.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - windows-service
+    - system-account
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1543/003
+    - https://attack.mitre.org/detectionstrategies/DET0552
+    - https://attack.mitre.org/techniques/T1543
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1543
+  sub_techniques:
+    - T1543.003
+  detection_strategies:
+    - DET0552
+  analytics:
+    - AN1527
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Service Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An adversary may create or reconfigure a Windows service so that it launches a binary
+    they control, obtaining persistence that starts automatically, runs with SYSTEM
+    privilege and recovers from termination.
+  attacker_behavior:
+    - Creates a service whose image path is an executable in a temporary or user-writable directory.
+    - Points a service directly at an interpreter with an encoded or obfuscated argument.
+    - Reconfigures an existing service's binary path rather than creating a new one.
+    - Names the service after a Windows or vendor component to survive a review of the service list.
+  legitimate_behavior:
+    - Installers create services for the products they deploy.
+    - Management and security agents register their own services.
+    - Administrators install services for internally developed applications.
+    - Driver and hardware packages register kernel services during setup.
+  risk_indicator:
+    - The service image path is a temporary or user-writable directory.
+    - The service runs an interpreter rather than a service binary.
+    - An existing service's binary path is modified rather than a new service being added.
+    - The creating process is a script host or a remote-execution channel.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: service-image-writable-path
+        name: Service created with an image in a writable directory
+        purpose: >-
+          Surface service registrations whose binary sits outside the installation and
+          system trees, which no packaged product does.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(sc(\.exe)?\s+.*\bcreate\b|New-Service|sc(\.exe)?\s+.*\bconfig\b.*binpath)/i
+          | CommandLine=/(?<service_image>[A-Za-z]:\\[^",]+\.(exe|dll|bat|cmd|ps1))/i
+          | service_image=/\\(AppData|Temp|Windows\\Temp|ProgramData|Users|Public|PerfLogs|Downloads)\\/i
+          | service_image!=/\\Program Files( \(x86\))?\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, service_image],
+                    function=[count(as=registrations), collect([CommandLine], limit=3)])
+          | sort(registrations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "service_image under approved agent and deployment staging directories"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: service-runs-interpreter
+        name: Service configured to run an interpreter
+        purpose: >-
+          Isolate services whose image is a script interpreter or proxy-execution binary,
+          which packaged software never requires.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(sc(\.exe)?\s+.*\bcreate\b|New-Service|sc(\.exe)?\s+.*\bconfig\b.*binpath)/i
+          | CommandLine=/(powershell|pwsh|cmd\.exe\s*\/c|wscript|cscript|mshta|rundll32|regsvr32|-enc\b|FromBase64String)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=registrations), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: existing-service-repointed
+        name: Existing service binary path modified
+        purpose: >-
+          Catch reconfiguration rather than creation, which leaves the service list looking
+          unchanged and is therefore easy to miss in a review.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(sc(\.exe)?\s+.*\bconfig\b.*binpath|Set-Service|reg(\.exe)?\s+add.*\\\\Services\\\\.*ImagePath)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of approved installers performing upgrade reconfiguration"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+evidence:
+  required:
+    - id: service_untrusted_image
+      name: Service pointing at an untrusted image
+      description: >-
+        A service was created or reconfigured so that its image path is a program in a
+        temporary or user-writable directory, or an interpreter, rather than an installed
+        service binary.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_established
+
+  supporting:
+    - id: interpreter_service
+      name: Service image is an interpreter
+      description: >-
+        The service launches a script interpreter or proxy-execution binary, often with an
+        encoded argument, which no packaged product does.
+      source: process_creation
+      field: CommandLine
+      indicates: dynamic_code_execution
+    - id: image_recently_written
+      name: Service binary written shortly before registration
+      description: >-
+        The executable was created on the host shortly before the service was registered,
+        which is staging rather than installation.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: script_host_creator
+      name: Created by a script host or remote-execution channel
+      description: >-
+        The registration was issued by an interpreter or a remote-execution channel rather
+        than by an installer or management agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: existing_service_repointed
+      name: Existing service repointed rather than created
+      description: >-
+        An established service's binary path was changed, which preserves the appearance of
+        the service list while altering what actually runs.
+      source: process_creation
+      field: CommandLine
+      indicates: deliberate_evasion
+
+  contradicting:
+    - id: installer_service
+      name: Installer registering its own service
+      description: >-
+        An approved installer or updater created the service for a product it deploys.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: agent_service_path
+      name: Image inside an approved agent directory
+      description: >-
+        The service binary resolves to an installation directory belonging to an approved
+        management, security or backup agent.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_application_component
+    - id: fleetwide_service
+      name: Same service across the estate
+      description: >-
+        The identical service and image path appear on many hosts within one window, which
+        is a deployment wave rather than targeted persistence.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - service_untrusted_image
+
+    supporting:
+      any:
+        - interpreter_service
+        - image_recently_written
+        - script_host_creator
+        - existing_service_repointed
+      all:
+        - interpreter_service
+        - script_host_creator
+
+    contradicting:
+      any:
+        - installer_service
+        - agent_service_path
+        - fleetwide_service
+      all: []
+
+  verdict:
+    low_risk_when:
+      - service_untrusted_image
+      - installer_service
+      - agent_service_path
+      - fleetwide_service
+    suspicious_when:
+      - service_untrusted_image
+      - existing_service_repointed
+    high_risk_when:
+      - service_untrusted_image
+      - interpreter_service
+      - image_recently_written
+      - script_host_creator
+
+  false_positive:
+    - condition: An installer creates a service for the product it deploys.
+      explanation: >-
+        Service creation is routine during installation and some vendors stage the binary
+        under ProgramData first, producing both the required and the staging evidence. The
+        installer as parent and the fleet-wide footprint separate it.
+    - condition: A management or security agent registers its own service.
+      explanation: >-
+        Agents install services on every managed host. The image sits in the agent's
+        installation directory and the registration appears identically across the estate.
+    - condition: An administrator installs a service for an internally developed application.
+      explanation: >-
+        In-house services are sometimes run from non-standard paths, which reproduces the
+        required evidence legitimately. These are interactive installations with a change
+        record and a stable path thereafter.
+    - condition: An upgrade reconfigures an existing service's binary path.
+      explanation: >-
+        Product upgrades legitimately repoint services at new binaries. The change is made
+        by the installer during a maintenance window and the new path stays inside the
+        product's installation directory.

@@ -1,0 +1,293 @@
+type: detection
+
+id: hg-win-vbscript-host-executing-delivered-script-t1059-005
+version: 1.0.0
+
+info:
+  name: Windows script host executing a delivered VBScript
+  description: >-
+    VBScript persists in intrusions long after it stopped being used to build anything,
+    because wscript.exe and cscript.exe are present on every Windows install and a .vbs
+    file attracts less suspicion than an executable. Enterprises do still run legacy VBScript
+    for logon and maintenance work, but that script lives in a fixed location — a
+    NETLOGON share, a policy path, an application directory. A .vbs executing out of a
+    download or extraction directory has arrived rather than been deployed, and that
+    difference is what the hunt is built on.
+  severity: high
+  author: huntgraph
+  tags:
+    - execution
+    - vbscript
+    - script-host
+    - phishing-payload
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1059/005
+    - https://attack.mitre.org/detectionstrategies/DET0076
+    - https://attack.mitre.org/techniques/T1059
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1059
+  sub_techniques:
+    - T1059.005
+  detection_strategies:
+    - DET0076
+  analytics:
+    - AN0209
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Module Load
+
+hypothesis:
+  statement: >-
+    An adversary may deliver a VBScript file and have the Windows script host execute it
+    from a download or extraction directory, obtaining execution through a built-in
+    interpreter without deploying any binary of their own.
+  attacker_behavior:
+    - Executes a .vbs or .vbe file staged in a Downloads, Temp or AppData directory.
+    - Launches the script from an archive utility, browser or mail client after user interaction.
+    - Uses the script to create objects that download, decode or launch a second stage.
+    - Suppresses output or the window so the execution passes unnoticed.
+  legitimate_behavior:
+    - Legacy logon and maintenance scripts run from NETLOGON or policy paths.
+    - Line-of-business applications ship VBScript components in their installation directories.
+    - Administrators run diagnostic scripts during troubleshooting.
+    - Some installers execute VBScript during setup.
+  risk_indicator:
+    - The script runs from a delivery directory rather than a share or installation path.
+    - The parent process is an archive tool, browser or mail client.
+    - The script host spawns a downloader or another interpreter.
+    - The script file was written to the host shortly before it ran.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: script-from-delivery-directory
+        name: Script host running a file from a delivery directory
+        purpose: >-
+          Separate scripts that arrived on the host from the legacy scripting that lives in
+          shares and installation directories.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(wscript|cscript)\.exe$/i
+          | CommandLine=/(?<script_path>[A-Za-z]:\\[^",]+\.(vbs|vbe|wsf|wsh))/i
+          | script_path=/\\(AppData|Temp|Downloads|Users\\Public)\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, script_path],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "script_path under approved installer working directories"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - path
+
+      - id: script-host-delivery-parent
+        name: Script host launched by an archive tool, browser or mail client
+        purpose: >-
+          Establish the delivery route, which is what turns a script execution into a
+          user-opened payload.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(wscript|cscript)\.exe$/i
+          | ParentBaseFileName=/^(7zfm|7zg|winrar|winzip|explorer|chrome|msedge|firefox|outlook|thunderbird|winword|excel)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - parent_process
+
+      - id: script-host-spawns-stage-two
+        name: Script host spawning a downloader or interpreter
+        purpose: >-
+          Identify the chain progressing past the script, which confirms the payload did
+          something rather than failing quietly.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(wscript|cscript)\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd|rundll32|regsvr32|mshta|certutil|bitsadmin|curl|msiexec)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Legacy logon scripting that legitimately invokes command-line utilities"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - process
+
+evidence:
+  required:
+    - id: script_from_delivery_path
+      name: Script executed from a delivery directory
+      description: >-
+        The Windows script host executed a VBScript or WSF file located in a download,
+        extraction or temporary directory rather than in a share or installation path.
+      source: process_creation
+      field: CommandLine
+      indicates: user_execution_foothold
+
+  supporting:
+    - id: delivery_parent
+      name: Archive tool, browser or mail client as parent
+      description: >-
+        The script host was launched by a delivery application, establishing that the
+        script arrived through a channel a user acted on.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: stage_two_spawned
+      name: Downloader or interpreter spawned by the script
+      description: >-
+        The script host created a downloader, interpreter or proxy-execution binary,
+        showing the script progressed into a second stage.
+      source: process_creation
+      field: FileName
+      indicates: execution_chain_progression
+    - id: script_recently_written
+      name: Script written shortly before execution
+      description: >-
+        The script file was created on the host shortly before it ran, consistent with
+        delivery followed immediately by execution.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: rare_for_user
+      name: Script execution rare for this user
+      description: >-
+        This user and host have not run comparable scripts during the baseline window,
+        unlike populations covered by legacy logon scripting.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: logon_script_path
+      name: Script from a logon or policy share
+      description: >-
+        The script resides on a NETLOGON share, a policy path or an application
+        installation directory, which is where deployed scripting lives.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_enterprise_activity
+    - id: installer_context
+      name: Executed by an installer during setup
+      description: >-
+        The script was run by an approved installer as part of a product's setup routine.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: recurring_for_population
+      name: Recurring across a user population
+      description: >-
+        The same script runs for many users on a predictable cadence, which is deployed
+        scripting rather than a delivered payload.
+      source: baseline
+      field: ComputerName
+      indicates: scheduled_automation_job
+
+  risk_logic:
+    required:
+      - script_from_delivery_path
+
+    supporting:
+      any:
+        - delivery_parent
+        - stage_two_spawned
+        - script_recently_written
+        - rare_for_user
+      all:
+        - delivery_parent
+        - stage_two_spawned
+
+    contradicting:
+      any:
+        - logon_script_path
+        - installer_context
+        - recurring_for_population
+      all: []
+
+  verdict:
+    low_risk_when:
+      - script_from_delivery_path
+      - logon_script_path
+      - installer_context
+      - recurring_for_population
+    suspicious_when:
+      - script_from_delivery_path
+      - rare_for_user
+    high_risk_when:
+      - script_from_delivery_path
+      - delivery_parent
+      - stage_two_spawned
+      - script_recently_written
+
+  false_positive:
+    - condition: A legacy logon script runs from a NETLOGON share.
+      explanation: >-
+        Many estates still run VBScript at logon. It executes from a share path rather than
+        a delivery directory, which is why the location carries the required evidence.
+    - condition: An installer executes VBScript during setup.
+      explanation: >-
+        Setup routines sometimes run scripts from a temporary working directory, matching
+        both the required and staging evidence. The installer as parent and the rollout
+        window separate it.
+    - condition: An administrator runs a diagnostic script during troubleshooting.
+      explanation: >-
+        Support scripts are often downloaded and run from a working folder. The activity is
+        interactive under a named engineer and usually attached to an incident record.
+    - condition: A line-of-business application invokes its own VBScript component.
+      explanation: >-
+        Older applications ship scripting they call at runtime. These run from the
+        application's installation directory with the application as the parent process.
