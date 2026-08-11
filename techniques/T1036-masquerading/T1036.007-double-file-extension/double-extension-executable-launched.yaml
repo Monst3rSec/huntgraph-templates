@@ -1,0 +1,281 @@
+type: detection
+
+id: hg-win-double-extension-executable-launched-t1036-007
+version: 1.0.0
+
+info:
+  name: Executable with a document-style double extension launched
+  description: >-
+    Windows hides known file extensions by default, so a file named report.pdf.exe is
+    presented to the user as report.pdf, complete with whatever icon the author chose. The
+    deception targets the person rather than the machine, which is why it survives despite
+    being trivially detectable — the file's real extension is right there in the telemetry
+    even though it is not on the user's screen. Nothing legitimate is named this way, so
+    the required evidence is close to conclusive on its own and triage is mostly about
+    what the file did after it ran.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - masquerading
+    - phishing-payload
+    - user-deception
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1036/007
+    - https://attack.mitre.org/detectionstrategies/DET0366
+    - https://attack.mitre.org/techniques/T1036
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1036
+  sub_techniques:
+    - T1036.007
+  detection_strategies:
+    - DET0366
+  analytics:
+    - AN1033
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary may give an executable a document-style double extension so that Windows
+    extension hiding presents it to the user as a harmless document, causing them to open
+    a payload believing they are opening a file they were expecting.
+  attacker_behavior:
+    - Names a payload with a document extension followed by an executable one, such as .pdf.exe.
+    - Sets an icon matching the impersonated document type so the disguise survives a glance.
+    - Delivers the file inside an archive, since archive tools preserve the full name until extraction.
+    - Relies on the user launching it from a download or extraction directory.
+  legitimate_behavior:
+    - Installers and archives occasionally contain files with compound names by accident.
+    - Some build outputs carry version strings that resemble a second extension.
+    - Documentation tooling may produce files whose names contain dots before the real extension.
+  risk_indicator:
+    - The name pairs a document extension with an executable or script extension.
+    - The file runs from a download, extraction or temporary directory.
+    - The parent process is an archive tool, browser or mail client.
+    - The file was written to the host shortly before it ran.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - SHA256HashData
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: double-extension-execution
+        name: Process started from a double-extension file
+        purpose: >-
+          Surface executions whose image name pairs a document extension with an
+          executable one, which is the disguise itself rather than a consequence of it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/\.(pdf|doc|docx|xls|xlsx|ppt|pptx|txt|rtf|jpg|jpeg|png|gif|csv|zip|rar|htm|html)\.(exe|scr|com|pif|bat|cmd|js|jse|vbs|vbe|wsf|hta|lnk|ps1)$/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine, SHA256HashData], limit=3)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: double-extension-written
+        name: Double-extension file written to the host
+        purpose: >-
+          Catch the payload at delivery rather than at execution, so the file is visible
+          even if the user never opens it or opens it after the hunt window.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten|NewScriptWritten)$/
+          | TargetFileName=/\.(pdf|doc|docx|xls|xlsx|ppt|pptx|txt|rtf|jpg|jpeg|png|gif|csv|zip|rar|htm|html)\.(exe|scr|com|pif|bat|cmd|js|jse|vbs|vbe|wsf|hta|lnk|ps1)$/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: double-extension-from-archive-or-browser
+        name: Double-extension file launched by an archive tool or browser
+        purpose: >-
+          Establish the delivery route, which is what turns a suspicious file name into a
+          confirmed user-opened payload.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/\.[a-z]{2,4}\.(exe|scr|com|pif|js|vbs|hta|bat|cmd|ps1)$/i
+          | ParentBaseFileName=/^(7zfm|winrar|winzip|explorer|chrome|msedge|firefox|outlook|thunderbird)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: document_style_double_extension
+      name: Document extension followed by an executable extension
+      description: >-
+        The file name pairs a document, image or archive extension with an executable or
+        script extension, so Windows extension hiding presents it to the user as the
+        harmless type.
+      source: process_creation
+      field: FileName
+      indicates: user_facing_deception
+
+  supporting:
+    - id: delivery_parent
+      name: Archive tool, browser or mail client as parent
+      description: >-
+        The file was launched by an archive utility, browser, mail client or explorer,
+        establishing that it arrived through a delivery channel and was opened by a user.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: user_writable_location
+      name: File in a download or temporary directory
+      description: >-
+        The image runs from a download, extraction or temporary directory rather than from
+        an installed location.
+      source: process_creation
+      field: ImageFileName
+      indicates: untrusted_execution_location
+    - id: recently_written
+      name: File written shortly before execution
+      description: >-
+        The file was created on the host shortly before it ran, consistent with delivery
+        followed immediately by the user opening it.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: unique_hash
+      name: Hash unique in the estate
+      description: >-
+        The image hash appears on one or very few hosts, which is inconsistent with any
+        distributed file that merely has an unfortunate name.
+      source: baseline
+      field: SHA256HashData
+      indicates: unusual_binary_in_environment
+
+  contradicting:
+    - id: version_string_name
+      name: Name segment is a version rather than an extension
+      description: >-
+        The segment preceding the real extension is a version or build string rather than
+        a document type, so the name only superficially resembles a double extension.
+      source: process_creation
+      field: FileName
+      indicates: legitimate_application_component
+    - id: vendor_installation_path
+      name: File inside a vendor installation directory
+      description: >-
+        The image resides in an installation directory belonging to approved software,
+        rather than in a delivery or temporary location.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: fleetwide_presence
+      name: Same file across the estate
+      description: >-
+        The identical name and hash appear on many hosts, which is a distributed component
+        rather than a targeted lure.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - document_style_double_extension
+
+    supporting:
+      any:
+        - delivery_parent
+        - user_writable_location
+        - recently_written
+        - unique_hash
+      all:
+        - delivery_parent
+        - user_writable_location
+
+    contradicting:
+      any:
+        - version_string_name
+        - vendor_installation_path
+        - fleetwide_presence
+      all: []
+
+  verdict:
+    low_risk_when:
+      - document_style_double_extension
+      - version_string_name
+      - vendor_installation_path
+      - fleetwide_presence
+    suspicious_when:
+      - document_style_double_extension
+      - unique_hash
+    high_risk_when:
+      - document_style_double_extension
+      - delivery_parent
+      - user_writable_location
+      - recently_written
+
+  false_positive:
+    - condition: A build output carries a version string that resembles a second extension.
+      explanation: >-
+        Names such as tool.1.2.exe contain dots before the real extension. The preceding
+        segment is numeric or a build identifier rather than a document type, which is why
+        the required evidence matches document extensions specifically rather than any dot.
+    - condition: An installer bundles a file whose name contains a document-like segment.
+      explanation: >-
+        Compound names occasionally occur in packaged software. Such files sit in
+        installation directories and appear identically across every host running the
+        product.
+    - condition: A user deliberately renames a file for their own organisation.
+      explanation: >-
+        Occasionally someone appends an extension by hand while tidying files. This
+        produces a single low-volume case tied to one named user, with no delivery parent
+        and no recent write from an external source.

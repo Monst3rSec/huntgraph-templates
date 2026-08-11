@@ -1,0 +1,303 @@
+type: detection
+
+id: hg-win-cor-profiler-environment-hijack-t1574-012
+version: 1.0.0
+
+info:
+  name: COR_PROFILER used to load a DLL into .NET processes
+  description: >-
+    The .NET profiling API loads an arbitrary DLL into any managed process that starts
+    with profiling enabled, before the application's own code runs. Setting COR_ENABLE_
+    PROFILING and COR_PROFILER_PATH — as environment variables, in the registry, or in an
+    application configuration — therefore gives an adversary execution inside every .NET
+    process on the host, with persistence and privilege inherited from whatever starts
+    next. Genuine profiling happens on developer machines and on servers running an APM
+    product, and in both cases the profiler DLL belongs to a recognisable vendor path.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - execution
+    - persistence
+    - dotnet
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1574/012
+    - https://attack.mitre.org/detectionstrategies/DET0479
+    - https://attack.mitre.org/techniques/T1574
+
+mitre:
+  tactics:
+    - TA0005
+    - TA0002
+  techniques:
+    - T1574
+  sub_techniques:
+    - T1574.012
+  detection_strategies:
+    - DET0479
+  analytics:
+    - AN1319
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+    - File Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An adversary may enable the .NET profiler and point it at a DLL they control, so that
+    the common language runtime loads their code into managed processes as those processes
+    start, granting execution and persistence without modifying any application binary.
+  attacker_behavior:
+    - Sets COR_ENABLE_PROFILING and COR_PROFILER_PATH through the environment or the registry.
+    - Points COR_PROFILER_PATH at a DLL staged in a user-writable directory.
+    - Applies the settings machine-wide so every managed process loads the profiler.
+    - Registers an arbitrary profiler CLSID that does not correspond to any installed product.
+  legitimate_behavior:
+    - Application performance monitoring agents install a profiler by design on servers.
+    - Developers enable profiling while diagnosing performance in a local application.
+    - Code coverage tooling attaches a profiler during test runs.
+    - Some diagnostic and tracing products use the profiling API for instrumentation.
+  risk_indicator:
+    - The profiler DLL path lies outside a recognised APM or tooling installation.
+    - The variables are set persistently rather than for a single process launch.
+    - The DLL was written to the host shortly before the settings were applied.
+    - No APM or profiling product is deployed on the host at all.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: profiler-variables-set
+        name: Profiling environment variables configured
+        purpose: >-
+          Surface the settings being applied through any of the routes that persist them,
+          capturing the profiler path so it can be judged against known tooling.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/COR_ENABLE_PROFILING|COR_PROFILER(_PATH)?/i
+          | CommandLine=/(setx|reg(\.exe)?\s+add|Set-ItemProperty|New-ItemProperty|\[Environment\]::SetEnvironmentVariable)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the approved application performance monitoring installer"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: profiler-path-writable-dll
+        name: Profiler path pointing at a user-writable DLL
+        purpose: >-
+          Isolate the cases where the DLL the runtime will load sits somewhere any
+          unprivileged process could have written it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/COR_PROFILER_PATH/i
+          | CommandLine=/(?<profiler_dll>[A-Za-z]:\\[^",]+\.dll)/i
+          | profiler_dll=/\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\/i
+          | profiler_dll!=/\\Program Files( \(x86\))?\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, profiler_dll],
+                    function=[count(as=events), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: profiler-dll-written-then-enabled
+        name: DLL written and profiling enabled on the same host
+        purpose: >-
+          Join the drop to the configuration, separating a payload being installed as a
+          profiler from an APM agent that has been present for months.
+        query: |
+          #event_simpleName=/^(PeFileWritten|ProcessRollup2)$/
+          | case {
+              #event_simpleName=PeFileWritten
+                | TargetFileName=/\.dll$/i
+                | TargetFileName=/\\(AppData|Temp|ProgramData|Users|Public)\\/i
+                | staged_dll := TargetFileName ;
+              #event_simpleName=ProcessRollup2
+                | CommandLine=/COR_ENABLE_PROFILING|COR_PROFILER/i
+                | profiler_command := CommandLine ;
+            }
+          | groupBy([ComputerName],
+                    function=[collect([staged_dll, profiler_command, UserName, ParentBaseFileName]),
+                              count(as=events)])
+          | staged_dll=/.+/ and profiler_command=/.+/
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of the approved monitoring agent installer"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+
+evidence:
+  required:
+    - id: profiler_configured
+      name: .NET profiling enabled with a specified DLL
+      description: >-
+        Profiling environment variables were set with a profiler path, causing the common
+        language runtime to load that DLL into managed processes as they start.
+      source: process_creation
+      field: CommandLine
+      indicates: hijacked_execution_flow
+
+  supporting:
+    - id: writable_profiler_dll
+      name: Profiler DLL in a user-writable directory
+      description: >-
+        The DLL the runtime is directed to load sits under AppData, Temp, ProgramData,
+        Public or a user profile rather than inside a monitoring product's installation.
+      source: process_creation
+      field: CommandLine
+      indicates: untrusted_execution_location
+    - id: dll_recently_written
+      name: Profiler DLL written shortly before configuration
+      description: >-
+        The DLL was created on the host shortly before profiling was enabled, which is
+        installation of a payload rather than configuration of existing tooling.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: persistent_scope
+      name: Settings applied persistently or machine-wide
+      description: >-
+        The variables were written to the registry or set at machine scope rather than for
+        a single process launch, so every managed process that starts will load the DLL.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_established
+    - id: no_profiling_product
+      name: No profiling product deployed here
+      description: >-
+        The estate shows no application performance monitoring or profiling product on
+        this host during the baseline window, so profiling has no legitimate purpose.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: apm_agent_installation
+      name: Approved monitoring agent installing its profiler
+      description: >-
+        The configuration was applied by an approved application performance monitoring or
+        tracing product, which installs a profiler as its documented mechanism.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: vendor_profiler_path
+      name: Profiler DLL inside a vendor installation
+      description: >-
+        The profiler DLL resolves to the installation directory of a recognised monitoring,
+        tracing or code-coverage product.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_application_component
+    - id: engineering_asset
+      name: Registered engineering host
+      description: >-
+        The host belongs to the engineering asset group, where developers enable profiling
+        and coverage tooling as routine work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - profiler_configured
+
+    supporting:
+      any:
+        - writable_profiler_dll
+        - dll_recently_written
+        - persistent_scope
+        - no_profiling_product
+      all:
+        - writable_profiler_dll
+        - persistent_scope
+
+    contradicting:
+      any:
+        - apm_agent_installation
+        - vendor_profiler_path
+        - engineering_asset
+      all: []
+
+  verdict:
+    low_risk_when:
+      - profiler_configured
+      - apm_agent_installation
+      - vendor_profiler_path
+      - engineering_asset
+    suspicious_when:
+      - profiler_configured
+      - no_profiling_product
+    high_risk_when:
+      - profiler_configured
+      - writable_profiler_dll
+      - dll_recently_written
+      - persistent_scope
+
+  false_positive:
+    - condition: An application performance monitoring agent installs its profiler machine-wide.
+      explanation: >-
+        This is precisely how APM products instrument .NET applications, and they set the
+        variables persistently at machine scope. The DLL belongs to the product's
+        installation directory and the same configuration appears on every instrumented
+        server.
+    - condition: A developer enables profiling while diagnosing application performance.
+      explanation: >-
+        Profiling is a normal development activity. It is usually scoped to a single
+        process launch rather than persisted, and occurs on engineering hosts.
+    - condition: Code coverage tooling attaches a profiler during a test run.
+      explanation: >-
+        Coverage instrumentation uses the same API. These runs occur on build servers,
+        reference the coverage product's own DLL, and repeat with every pipeline execution.
+    - condition: A diagnostic product uses the profiling API for tracing.
+      explanation: >-
+        Several tracing and debugging products instrument through profilers. They install
+        into vendor directories and are present on hosts where that product is deployed.

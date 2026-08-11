@@ -1,0 +1,298 @@
+type: detection
+
+id: hg-win-scheduled-task-or-service-masquerading-as-system-t1036-004
+version: 1.0.0
+
+info:
+  name: Scheduled task or service named to resemble a system component
+  description: >-
+    Persistence has to live somewhere an administrator will see it, so adversaries name
+    the task or service after something that belongs there — a Windows update helper, a
+    telemetry job, a driver service. The name is the whole defence, and it works because
+    reviewing a task list means reading names rather than tracing each one to its binary.
+    The observation that survives is the mismatch: a task or service whose name claims to
+    be a Microsoft component while the program it runs sits in a user-writable directory
+    or is an interpreter rather than a service binary.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - masquerading
+    - persistence-review
+    - scheduled-task
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1036/004
+    - https://attack.mitre.org/detectionstrategies/DET0117
+    - https://attack.mitre.org/techniques/T1036
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1036
+  sub_techniques:
+    - T1036.004
+  detection_strategies:
+    - DET0117
+  analytics:
+    - AN0324
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:System
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Scheduled Job Creation
+    - Service Creation
+
+hypothesis:
+  statement: >-
+    An adversary may create a scheduled task or service whose name imitates a Windows or
+    vendor component, so that an administrator reviewing persistence reads the name as
+    legitimate and does not trace it to the program it actually runs.
+  attacker_behavior:
+    - Creates a task or service named after Windows Update, telemetry, defender or a driver component.
+    - Points the task action or service binary path at an interpreter or a user-writable executable.
+    - Registers the task under a Microsoft-looking folder path so it blends into the task tree.
+    - Schedules it at logon or on a short repeating interval to maintain access.
+  legitimate_behavior:
+    - Windows itself registers a large number of tasks with exactly these names.
+    - Vendor software creates update and telemetry tasks named after the product.
+    - Management tooling registers its own scheduled jobs across the estate.
+    - Administrators create maintenance tasks with descriptive operational names.
+  risk_indicator:
+    - The task action or service binary lives in a user-writable directory.
+    - The action is a script interpreter rather than a service or updater binary.
+    - The name imitates a Microsoft component but the binary is not under the Windows tree.
+    - The task exists on very few hosts despite claiming to be a platform component.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: system-named-task-writable-action
+        name: System-sounding task whose action is in a writable directory
+        purpose: >-
+          Surface task registrations that borrow a platform name while pointing at a
+          program any unprivileged process could have written.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/schtasks(\.exe)?\s+.*\/create|Register-ScheduledTask|New-ScheduledTask/i
+          | CommandLine=/(windows\s*update|microsoft|defender|telemetry|onedrive|edgeupdate|googleupdate|adobe|driver|health|servicing|maintenance)/i
+          | CommandLine=/(?<action_path>[A-Za-z]:\\[^",]+\.(exe|dll|ps1|vbs|js|bat|cmd))/i
+          | action_path=/\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\/i
+          | action_path!=/\\Program Files( \(x86\))?\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, action_path],
+                    function=[count(as=registrations), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude:
+            - "action_path under approved vendor updater directories"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: system-named-service-writable-binary
+        name: System-sounding service whose binary is in a writable directory
+        purpose: >-
+          Apply the same reasoning to service creation, where the display name is what an
+          administrator reviews and the binary path is what actually runs.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/sc(\.exe)?\s+.*\bcreate\b|New-Service|Set-Service\s+.*-BinaryPathName/i
+          | CommandLine=/(?<binary_path>[A-Za-z]:\\[^",]+\.(exe|dll|ps1|bat|cmd))/i
+          | binary_path=/\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\/i
+          | binary_path!=/\\Program Files( \(x86\))?\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, binary_path],
+                    function=[count(as=registrations), collect([CommandLine], limit=3)])
+          | sort(registrations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "binary_path under approved management-agent directories"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: task-action-is-interpreter
+        name: Task or service action is a script interpreter
+        purpose: >-
+          Catch persistence whose action is an interpreter regardless of where it lives,
+          since a genuine platform component runs a service binary rather than a shell.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/schtasks(\.exe)?\s+.*\/create|Register-ScheduledTask|sc(\.exe)?\s+.*\bcreate\b|New-Service/i
+          | CommandLine=/(powershell|pwsh|cmd\.exe|wscript|cscript|mshta|rundll32|regsvr32)/i
+          | CommandLine=/(windows|microsoft|defender|telemetry|update|servicing|health)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=registrations), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the configuration-management agent"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+evidence:
+  required:
+    - id: platform_name_untrusted_action
+      name: Platform-sounding persistence with an untrusted action
+      description: >-
+        A scheduled task or service borrows a Windows or vendor component name while the
+        program it runs is a script interpreter or sits in a user-writable directory,
+        contradicting what the name claims.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_masquerading
+
+  supporting:
+    - id: interpreter_action
+      name: Action is a script interpreter
+      description: >-
+        The task action or service binary is an interpreter or proxy-execution utility
+        rather than a service executable, which no genuine platform component uses.
+      source: process_creation
+      field: CommandLine
+      indicates: dynamic_code_execution
+    - id: writable_action_path
+      name: Action program in a user-writable directory
+      description: >-
+        The program the persistence runs sits under AppData, Temp, ProgramData, Public or
+        a user profile rather than under the Windows or Program Files trees.
+      source: process_creation
+      field: CommandLine
+      indicates: untrusted_execution_location
+    - id: rare_in_estate
+      name: Persistence rare despite a platform name
+      description: >-
+        The task or service exists on very few hosts during the baseline window, which
+        contradicts a name claiming to be a platform or deployed-product component.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: script_host_creator
+      name: Registered by a script host or delivery application
+      description: >-
+        The registration was performed by a script interpreter, document handler or archive
+        utility rather than by an installer or management agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+
+  contradicting:
+    - id: vendor_updater_registration
+      name: Vendor updater registering its own task
+      description: >-
+        The registration was performed by an approved vendor installer or updater creating
+        the update task its product documents.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: management_agent_registration
+      name: Management agent registering a job
+      description: >-
+        The approved configuration-management or monitoring agent created the task or
+        service as part of its normal operation.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: fleetwide_registration
+      name: Same persistence across the estate
+      description: >-
+        The identical task or service is registered across many hosts within one window,
+        which is a deployment wave rather than a targeted persistence step.
+      source: baseline
+      field: CommandLine
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - platform_name_untrusted_action
+
+    supporting:
+      any:
+        - interpreter_action
+        - writable_action_path
+        - rare_in_estate
+        - script_host_creator
+      all:
+        - interpreter_action
+        - writable_action_path
+
+    contradicting:
+      any:
+        - vendor_updater_registration
+        - management_agent_registration
+        - fleetwide_registration
+      all: []
+
+  verdict:
+    low_risk_when:
+      - platform_name_untrusted_action
+      - vendor_updater_registration
+      - management_agent_registration
+      - fleetwide_registration
+    suspicious_when:
+      - platform_name_untrusted_action
+      - rare_in_estate
+    high_risk_when:
+      - platform_name_untrusted_action
+      - interpreter_action
+      - writable_action_path
+      - script_host_creator
+
+  false_positive:
+    - condition: A vendor updater registers an update task named after its product.
+      explanation: >-
+        Update tasks with product names are ubiquitous, and some vendors stage their
+        updater under ProgramData, reproducing the writable-path evidence. The installer as
+        parent and the estate-wide presence separate them.
+    - condition: Management tooling registers scheduled jobs across the estate.
+      explanation: >-
+        Configuration-management platforms create tasks that run interpreters by design,
+        which reproduces the strongest supporting evidence. The registering agent and the
+        fleet-wide footprint are the discriminators.
+    - condition: An administrator creates a maintenance task with an operational name.
+      explanation: >-
+        Names such as "Windows Maintenance Cleanup" are natural for administrative jobs
+        and often run PowerShell. These are interactive registrations by a named
+        administrator, usually with a change record.
+    - condition: Windows itself registers platform tasks during servicing.
+      explanation: >-
+        The operating system creates many tasks with exactly these names, which is why the
+        required evidence needs the action to be untrusted rather than the name alone.

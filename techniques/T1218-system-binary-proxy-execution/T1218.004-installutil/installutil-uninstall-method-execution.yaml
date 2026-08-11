@@ -1,0 +1,296 @@
+type: detection
+
+id: hg-win-installutil-uninstall-method-execution-t1218-004
+version: 1.0.0
+
+info:
+  name: InstallUtil executing assembly installer methods
+  description: >-
+    InstallUtil runs the installer class of a .NET assembly, and it will do so before the
+    assembly's main entry point is ever reached. An adversary places their code in the
+    Install or Uninstall method, so a payload executes inside a signed Microsoft utility
+    that application control policies routinely permit as developer tooling. The
+    /logfile= and /LogToConsole=false combination that suppresses its output is close to a
+    signature of the abuse, because a genuine installation has no reason to hide what it
+    installed.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - proxy-execution
+    - lolbin
+    - dotnet
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1218/004
+    - https://attack.mitre.org/detectionstrategies/DET0138
+    - https://lolbas-project.github.io/lolbas/Binaries/Installutil/
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1218
+  sub_techniques:
+    - T1218.004
+  detection_strategies:
+    - DET0138
+  analytics:
+    - AN0388
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:PowerShell
+  data_components:
+    - Process Creation
+    - Command Execution
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary may invoke InstallUtil against an assembly whose installer methods carry
+    the payload, so that attacker code executes inside a signed Microsoft utility that
+    policy permits, without the assembly's normal entry point ever running.
+  attacker_behavior:
+    - Runs InstallUtil with /logfile= and /LogToConsole=false to suppress its output entirely.
+    - Targets an assembly staged in AppData, Temp, ProgramData or a user profile directory.
+    - Places the payload in the Install or Uninstall method so it runs during installation.
+    - Invokes InstallUtil on an endpoint with no development or .NET service role.
+  legitimate_behavior:
+    - Developers install and uninstall .NET services during local testing.
+    - Deployment scripts register Windows services implemented as .NET assemblies.
+    - Some vendor installers call InstallUtil to register their service components.
+    - Build pipelines exercise installer classes as part of integration testing.
+  risk_indicator:
+    - Logging is suppressed with an empty logfile argument and console output disabled.
+    - The target assembly sits in a user-writable directory.
+    - The host has no history of .NET service installation.
+    - The parent process is a document handler, archive tool or script host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: installutil-logging-suppressed
+        name: InstallUtil run with its logging disabled
+        purpose: >-
+          Surface the flag combination that suppresses all record of what was installed,
+          which a genuine service registration has no reason to use.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^installutil\.exe$/i
+          | CommandLine=/\/logfile\s*=\s*(\s|$|")/i
+          | CommandLine=/\/LogToConsole\s*=\s*false/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: installutil-writable-assembly
+        name: InstallUtil targeting an assembly in a writable directory
+        purpose: >-
+          Catch assemblies staged outside installation trees, which is where a dropped
+          payload would sit rather than a service being registered.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^installutil\.exe$/i
+          | CommandLine=/(?<assembly_path>[A-Za-z]:\\[^",]+\.(exe|dll))/i
+          | assembly_path=/\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\/i
+          | assembly_path!=/\\Program Files( \(x86\))?\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, assembly_path],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "assembly_path under approved deployment staging directories"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: installutil-on-non-developer-host
+        name: InstallUtil on a host that never registers services
+        purpose: >-
+          Use the estate as the discriminator, since InstallUtil appearing on an endpoint
+          with no .NET service history is more telling than any single argument.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^installutil\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+          | executions <= 3
+        filters:
+          include: []
+          exclude:
+            - "ComputerName in the engineering, build-server and application-server asset groups"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - organization
+
+evidence:
+  required:
+    - id: installutil_assembly_execution
+      name: InstallUtil invoked against an assembly
+      description: >-
+        InstallUtil was run against a .NET assembly, meaning its installer methods execute
+        inside a signed Microsoft utility before the assembly's own entry point.
+      source: process_creation
+      field: CommandLine
+      indicates: proxy_execution_of_untrusted_module
+
+  supporting:
+    - id: logging_suppressed
+      name: Installation logging disabled
+      description: >-
+        The invocation supplies an empty logfile argument and disables console output,
+        removing the record that a genuine installation would produce.
+      source: process_creation
+      field: CommandLine
+      indicates: execution_concealment
+    - id: writable_assembly_path
+      name: Assembly in a user-writable directory
+      description: >-
+        The target assembly sits under AppData, Temp, ProgramData, Public or a user
+        profile rather than in an installation directory.
+      source: process_creation
+      field: CommandLine
+      indicates: untrusted_execution_location
+    - id: assembly_recently_written
+      name: Assembly written shortly before invocation
+      description: >-
+        The assembly was created on the host shortly before InstallUtil ran, indicating
+        staging rather than registration of installed software.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: non_developer_host
+      name: Host with no service-installation history
+      description: >-
+        This host shows essentially no InstallUtil activity across the baseline window, so
+        a .NET installer class executing here is inconsistent with its role.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: engineering_or_app_server
+      name: Registered engineering or application server
+      description: >-
+        The host belongs to an engineering, build or application-server asset group where
+        .NET service registration is routine.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+    - id: installer_parent
+      name: Installer or deployment agent as parent
+      description: >-
+        InstallUtil was invoked by an approved installer or deployment agent registering a
+        product's own service components.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: fleetwide_registration
+      name: Same registration across the estate
+      description: >-
+        The identical assembly and command line appear across many hosts within one
+        window, which is a deployment wave rather than a targeted execution.
+      source: baseline
+      field: CommandLine
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - installutil_assembly_execution
+
+    supporting:
+      any:
+        - logging_suppressed
+        - writable_assembly_path
+        - assembly_recently_written
+        - non_developer_host
+      all:
+        - logging_suppressed
+        - writable_assembly_path
+
+    contradicting:
+      any:
+        - engineering_or_app_server
+        - installer_parent
+        - fleetwide_registration
+      all: []
+
+  verdict:
+    low_risk_when:
+      - installutil_assembly_execution
+      - engineering_or_app_server
+      - installer_parent
+      - fleetwide_registration
+    suspicious_when:
+      - installutil_assembly_execution
+      - non_developer_host
+    high_risk_when:
+      - installutil_assembly_execution
+      - logging_suppressed
+      - writable_assembly_path
+      - assembly_recently_written
+
+  false_positive:
+    - condition: A developer installs or uninstalls a .NET service while testing locally.
+      explanation: >-
+        This is InstallUtil's intended use and it is common on engineering hosts. The
+        assembly usually sits in a build output directory and the host has a long history
+        of similar activity.
+    - condition: A deployment script registers a Windows service implemented in .NET.
+      explanation: >-
+        Service registration during deployment is legitimate and may stage the assembly
+        temporarily, reproducing the writable-path evidence. The deployment agent as parent
+        and the estate-wide pattern separate it.
+    - condition: A vendor installer calls InstallUtil to register its own components.
+      explanation: >-
+        Some products register services this way during setup. The invocation appears once
+        per host during a rollout window with the installer as the parent process.
+    - condition: A build pipeline exercises installer classes during integration testing.
+      explanation: >-
+        Test suites that verify installation behaviour will invoke InstallUtil repeatedly.
+        These run on build servers under a build agent with high, stable volume.

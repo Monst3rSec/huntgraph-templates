@@ -1,0 +1,301 @@
+type: detection
+
+id: hg-win-chm-file-executing-script-t1218-001
+version: 1.0.0
+
+info:
+  name: Compiled HTML help file spawning script execution
+  description: >-
+    A .chm file is a compiled bundle of HTML, and hh.exe renders it with a scripting
+    engine attached. An adversary can therefore embed a shortcut object that runs a command
+    when the help topic loads, turning a document that users open without hesitation into
+    an execution vector. Help files are still delivered legitimately with software, so the
+    file itself is not the signal — the signal is hh.exe becoming the parent of a command
+    interpreter, which no genuine help topic needs to do.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - proxy-execution
+    - lolbin
+    - chm
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1218/001
+    - https://attack.mitre.org/detectionstrategies/DET0342
+    - https://lolbas-project.github.io/lolbas/Binaries/Hh/
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1218
+  sub_techniques:
+    - T1218.001
+  detection_strategies:
+    - DET0342
+  analytics:
+    - AN0968
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may embed a command in a compiled HTML help file so that opening it
+    causes hh.exe to execute script, obtaining code execution through a file type users
+    open freely and which arrives past controls that focus on executables.
+  attacker_behavior:
+    - Delivers a .chm containing a shortcut object that runs a command when a topic loads.
+    - Opens the file from a download or extraction directory after user interaction.
+    - Uses hh.exe to launch an interpreter or a proxy-execution binary as a child process.
+    - Relies on the help file arriving inside an archive so it reaches the user intact.
+  legitimate_behavior:
+    - Installed applications ship .chm help files that users open from the Help menu.
+    - Older line-of-business software relies on compiled help as its only documentation.
+    - Support staff open vendor help files while troubleshooting.
+  risk_indicator:
+    - hh.exe is the parent of a command interpreter or proxy-execution binary.
+    - The help file runs from a download, temporary or extraction directory.
+    - The file was written to the host shortly before it was opened.
+    - The hh.exe process makes an outbound connection.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+        - PeFileWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: hh-spawns-interpreter
+        name: Help viewer spawning a command interpreter
+        purpose: >-
+          Surface the lineage that no legitimate help topic produces, which is the
+          strongest single observation for this technique.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^hh\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin|msiexec)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: chm-opened-from-writable-path
+        name: Help file opened from a download or temporary directory
+        purpose: >-
+          Separate vendor documentation opened from an installation directory from a help
+          file that arrived through a delivery channel.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^hh\.exe$/i
+          | CommandLine=/(?<chm_path>[A-Za-z]:\\[^",]+\.chm)/i
+          | chm_path=/\\(AppData|Temp|Users|Public|Downloads)\\/i
+          | chm_path!=/\\Program Files( \(x86\))?\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, chm_path],
+                    function=[count(as=opens), collect([CommandLine], limit=3)])
+          | sort(opens, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: hh-network-egress
+        name: Help viewer connecting outbound
+        purpose: >-
+          Confirm network activity from the viewer itself, which a locally rendered help
+          topic has no reason to produce.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | FileName=/^hh\.exe$/i
+                | hh_pid := TargetProcessId ;
+              #event_simpleName=NetworkConnectIP4
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/ ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([CommandLine, ParentBaseFileName, RemoteAddressIP4, RemotePort]),
+                              count(as=events)])
+          | hh_pid = ContextProcessId
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: chm_execution_behaviour
+      name: Help viewer executing content or opening an untrusted file
+      description: >-
+        hh.exe either spawned a command interpreter, which no genuine help topic requires,
+        or rendered a help file located outside any installed application directory.
+      source: process_creation
+      field: CommandLine
+      indicates: proxy_execution_of_untrusted_module
+
+  supporting:
+    - id: interpreter_child
+      name: Interpreter spawned by the help viewer
+      description: >-
+        The viewer created a command interpreter or proxy-execution binary, confirming the
+        help file carried an executable shortcut object rather than documentation.
+      source: process_creation
+      field: FileName
+      indicates: execution_chain_progression
+    - id: delivery_parent
+      name: Archive tool, browser or mail client as parent
+      description: >-
+        The help file was opened through an archive utility, browser or mail client,
+        establishing that it arrived through a delivery channel.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: recently_written_chm
+      name: Help file written shortly before opening
+      description: >-
+        The .chm was created on the host shortly before it was opened, consistent with
+        delivery followed immediately by user interaction.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: external_egress
+      name: Outbound connection from the viewer
+      description: >-
+        The hh.exe process connected to a routable external address, which locally
+        rendered documentation does not do.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: possible_payload_retrieval
+
+  contradicting:
+    - id: installed_help_file
+      name: Help file inside an installed application
+      description: >-
+        The .chm resides in an application installation directory and is opened from that
+        product's own help mechanism.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_application_component
+    - id: application_parent
+      name: Application opening its own help
+      description: >-
+        hh.exe was launched by the application whose documentation it is rendering, which
+        is the ordinary Help menu path.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_application_component
+    - id: fleetwide_help_usage
+      name: Same help file opened across the estate
+      description: >-
+        The same help file is opened by many users over the baseline window, which is
+        documentation for deployed software rather than a delivered lure.
+      source: baseline
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - chm_execution_behaviour
+
+    supporting:
+      any:
+        - interpreter_child
+        - delivery_parent
+        - recently_written_chm
+        - external_egress
+      all:
+        - interpreter_child
+        - delivery_parent
+
+    contradicting:
+      any:
+        - installed_help_file
+        - application_parent
+        - fleetwide_help_usage
+      all: []
+
+  verdict:
+    low_risk_when:
+      - chm_execution_behaviour
+      - installed_help_file
+      - application_parent
+      - fleetwide_help_usage
+    suspicious_when:
+      - chm_execution_behaviour
+      - recently_written_chm
+    high_risk_when:
+      - chm_execution_behaviour
+      - interpreter_child
+      - delivery_parent
+      - external_egress
+
+  false_positive:
+    - condition: A user opens the help file of an installed application from its Help menu.
+      explanation: >-
+        Compiled help is still shipped with a good deal of software, particularly older
+        line-of-business applications. The file sits in the installation directory and the
+        application itself is the parent process.
+    - condition: Support staff open a vendor help file while troubleshooting.
+      explanation: >-
+        Documentation may be opened from a temporary directory if it was downloaded
+        separately, reproducing the writable-path evidence. No interpreter is spawned,
+        which is why the child process carries the escalation rather than the path.
+    - condition: A documentation build produces and opens a .chm during testing.
+      explanation: >-
+        Technical writing toolchains compile help files and open them to verify output.
+        This is confined to engineering or documentation hosts and recurs for the same user.
