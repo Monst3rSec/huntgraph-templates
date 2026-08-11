@@ -1,0 +1,293 @@
+type: detection
+
+id: hg-lin-systemd-timer-created-for-untrusted-payload-t1053-006
+version: 1.0.0
+
+info:
+  name: Systemd timer created to run an untrusted payload
+  description: >-
+    A systemd timer is cron's modern equivalent and a quieter place to hide: an
+    investigator who checks crontabs may never think to enumerate timer units, and a timer
+    can be scoped to a user without any privilege at all. The unit pair — a timer and the
+    service it activates — is written into the same directories as ordinary units, so the
+    discriminator is the same as for services: packaged software points at binaries under
+    system paths, while persistence points at a temporary directory or an interpreter.
+  severity: high
+  author: huntgraph
+  tags:
+    - execution
+    - persistence
+    - privilege-escalation
+    - systemd
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1053/006
+    - https://attack.mitre.org/detectionstrategies/DET0231
+    - https://attack.mitre.org/techniques/T1053
+
+mitre:
+  tactics:
+    - TA0002
+    - TA0003
+    - TA0004
+  techniques:
+    - T1053
+  sub_techniques:
+    - T1053.006
+  detection_strategies:
+    - DET0231
+  analytics:
+    - AN0645
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+    - linux:osquery
+  data_components:
+    - Process Creation
+    - File Creation
+    - Scheduled Job Creation
+
+hypothesis:
+  statement: >-
+    An adversary may create a systemd timer and its paired service unit to run a payload on
+    a schedule, obtaining persistence that survives reboot and is not visible to anyone
+    inspecting cron alone.
+  attacker_behavior:
+    - Writes a .timer unit and a matching .service unit into a systemd directory.
+    - Points the service at a payload in a temporary or home directory.
+    - Enables and starts the timer immediately rather than waiting for a reboot.
+    - Uses a user-scoped timer so no privilege is required at all.
+  legitimate_behavior:
+    - Distributions ship timers for maintenance, cleanup and update checks.
+    - Package installation adds timers for the software it deploys.
+    - Configuration management deploys timers across a fleet.
+    - Administrators replace cron jobs with timers as part of modernisation.
+  risk_indicator:
+    - The paired service executes a binary in a temporary or writable directory.
+    - The units are written outside package management.
+    - The timer is enabled and started in the same activity.
+    - The unit pair does not appear on comparable hosts.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: timer-unit-written
+        name: Timer unit written into a systemd directory
+        purpose: >-
+          Surface timer creation outside package management, which is how scheduled
+          persistence arrives without touching cron.
+        query: |
+          #event_simpleName=NewScriptWritten
+          | TargetFileName=/^\/(etc\/systemd\/system|lib\/systemd\/system|usr\/lib\/systemd\/system|run\/systemd\/system|home\/[^\/]+\/\.config\/systemd\/user)\/.*\.timer$/
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of the package manager and configuration-management agent"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: timer-enabled-immediately
+        name: Timer enabled and started in the same activity
+        purpose: >-
+          Catch activation following creation, which brings the schedule into effect
+          without waiting for a reboot.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/systemctl\s+.*(enable|start|--now)/i
+          | CommandLine=/\.timer\b/
+          | groupBy([ComputerName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=commands), collect([CommandLine], limit=5)])
+          | sort(commands, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the package manager and configuration-management agent"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: timer-activated-writable-payload
+        name: Timer-activated process running from a writable directory
+        purpose: >-
+          Observe the outcome, where a systemd-parented process launched on a schedule runs
+          from a location no packaged unit occupies.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^systemd$/i
+          | ImageFileName=/^\/(tmp|dev\/shm|var\/tmp|home)\//
+          | groupBy([ComputerName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: timer_unit_created
+      name: Systemd timer created or activating an untrusted payload
+      description: >-
+        A timer unit was written outside package management, or a systemd-parented process
+        launched on a schedule is running from a temporary or writable directory.
+      source: file_creation
+      field: TargetFileName
+      indicates: persistence_established
+
+  supporting:
+    - id: writable_payload
+      name: Scheduled payload in a writable directory
+      description: >-
+        The process the timer activates runs from /tmp, /dev/shm, /var/tmp or a home
+        directory rather than from a system binary path.
+      source: process_creation
+      field: ImageFileName
+      indicates: untrusted_execution_location
+    - id: immediate_activation
+      name: Timer enabled and started immediately
+      description: >-
+        The timer was enabled and started in the same activity as it was written, bringing
+        the schedule into effect without a reboot.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_activated
+    - id: nonpackage_writer
+      name: Written outside package management
+      description: >-
+        The unit was created by a shell, script or service account rather than by the
+        package manager or configuration management.
+      source: file_creation
+      field: ContextProcessId
+      indicates: abnormal_execution_chain
+    - id: rare_in_fleet
+      name: Timer absent from comparable hosts
+      description: >-
+        The same timer does not appear on peer systems during the baseline window, unlike
+        the maintenance timers distributions ship.
+      source: baseline
+      field: TargetFileName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: package_installed_timer
+      name: Installed by package management
+      description: >-
+        The timer was written by the package manager while installing or updating system
+        software.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_enterprise_activity
+    - id: config_management_timer
+      name: Deployed by configuration management
+      description: >-
+        The unit was written by the approved configuration-management agent as part of a
+        governed schedule definition.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: software_deployment_wave
+    - id: fleetwide_timer
+      name: Same timer across comparable hosts
+      description: >-
+        The identical unit is present on peer systems throughout the baseline window, which
+        is a distribution or managed schedule rather than targeted persistence.
+      source: baseline
+      field: ComputerName
+      indicates: scheduled_automation_job
+
+  risk_logic:
+    required:
+      - timer_unit_created
+
+    supporting:
+      any:
+        - writable_payload
+        - immediate_activation
+        - nonpackage_writer
+        - rare_in_fleet
+      all:
+        - writable_payload
+        - nonpackage_writer
+
+    contradicting:
+      any:
+        - package_installed_timer
+        - config_management_timer
+        - fleetwide_timer
+      all: []
+
+  verdict:
+    low_risk_when:
+      - timer_unit_created
+      - package_installed_timer
+      - config_management_timer
+      - fleetwide_timer
+    suspicious_when:
+      - timer_unit_created
+      - rare_in_fleet
+    high_risk_when:
+      - timer_unit_created
+      - writable_payload
+      - immediate_activation
+      - nonpackage_writer
+
+  false_positive:
+    - condition: A distribution ships maintenance and update-check timers.
+      explanation: >-
+        Modern distributions use timers extensively for cleanup and update checks, so
+        timer units are common. They are written by the package manager and appear on every
+        host running that release.
+    - condition: Package installation adds a timer for the software it deploys.
+      explanation: >-
+        Software that needs periodic work installs a timer and enables it immediately,
+        reproducing the activation evidence. The package manager as writer is the
+        discriminator.
+    - condition: Configuration management deploys timers across a fleet.
+      explanation: >-
+        Managed schedules are written programmatically outside the package manager, which
+        matches the non-package evidence. They appear identically across many hosts.
+    - condition: An administrator replaces a cron job with a timer.
+      explanation: >-
+        Migrating scheduled work to systemd is ordinary modernisation. It is interactive,
+        points at an administered script path, and normally has a change record.

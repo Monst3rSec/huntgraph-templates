@@ -1,0 +1,290 @@
+type: detection
+
+id: hg-lin-authorized-keys-modified-for-persistence-t1098-004
+version: 1.0.0
+
+info:
+  name: SSH authorized_keys modified to add adversary access
+  description: >-
+    Appending a public key to authorized_keys grants passwordless SSH access that does not
+    depend on any credential the adversary stole, survives password rotation, and often
+    survives incident response entirely because remediation focuses on accounts rather than
+    on key files. It needs only write access to a home directory. Adding a key to root's
+    file, or to an account other than the writer's own, is the strongest form because it
+    grants access the writer did not previously have.
+  severity: critical
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - ssh
+    - authorized-keys
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1098/004
+    - https://attack.mitre.org/detectionstrategies/DET0126
+    - https://attack.mitre.org/techniques/T1098
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1098
+  sub_techniques:
+    - T1098.004
+  detection_strategies:
+    - DET0126
+  analytics:
+    - AN0350
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+  data_components:
+    - File Modification
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may append their own public key to an SSH authorized_keys file, obtaining
+    passwordless access that is independent of any stolen credential and that survives
+    password rotation and most account-focused remediation.
+  attacker_behavior:
+    - Appends a key to authorized_keys with a redirect, tee or sed rather than an editor.
+    - Targets root's authorized_keys or another user's rather than their own.
+    - Creates the .ssh directory and file where none existed before.
+    - Fetches the key over the network and writes it in one command.
+  legitimate_behavior:
+    - Configuration management distributes authorized keys across a fleet.
+    - Provisioning seeds keys during host build or instance launch.
+    - Users add their own keys when setting up access from a new machine.
+    - Automation rotates deployment keys on a schedule.
+  risk_indicator:
+    - The file written belongs to a different account than the writing process.
+    - The key is fetched from the network in the same command.
+    - The writing process is a web service account or a shell reached remotely.
+    - The change does not appear on comparable hosts.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: authorized-keys-appended
+        name: Authorized keys file written programmatically
+        purpose: >-
+          Surface unattended edits to the file that governs key-based access, which is how
+          persistence is installed rather than how a user configures their own access.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/authorized_keys/
+          | CommandLine=/(>>|>|tee\b|sed\s+-i|printf\b|echo\b|cat\b)/i
+          | groupBy([ComputerName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the configuration-management agent"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: key-fetched-and-written
+        name: Key retrieved from the network and written
+        purpose: >-
+          Isolate the fully remote form, where the key never existed on the host before and
+          is pulled in as part of establishing access.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/authorized_keys/
+          | CommandLine=/(curl|wget|nc\b|base64\s+-d|https?:\/\/)/i
+          | groupBy([ComputerName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: root-or-other-user-targeted
+        name: Keys written to root or another account
+        purpose: >-
+          Catch writes that grant access the writer did not previously hold, which is the
+          escalation rather than the configuration.
+        query: |
+          #event_simpleName=NewScriptWritten
+          | TargetFileName=/^\/(root\/\.ssh\/authorized_keys|home\/[^\/]+\/\.ssh\/authorized_keys|etc\/ssh\/authorized_keys)/
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of the configuration-management agent and provisioning automation"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+evidence:
+  required:
+    - id: authorized_keys_modified
+      name: Authorized keys file modified programmatically
+      description: >-
+        An SSH authorized_keys file was appended to or created by a redirect, tee or sed
+        rather than through an editor, granting key-based access to whoever holds the
+        matching private key.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_established
+
+  supporting:
+    - id: privileged_or_other_account
+      name: Root or another user's file targeted
+      description: >-
+        The file written belongs to root or to an account other than the one performing the
+        write, so the change grants access the writer did not previously have.
+      source: file_creation
+      field: TargetFileName
+      indicates: privilege_escalation_attempt
+    - id: key_fetched_remotely
+      name: Key retrieved over the network
+      description: >-
+        The public key was fetched from a remote source in the same command, which is
+        establishing new access rather than configuring existing access.
+      source: process_creation
+      field: CommandLine
+      indicates: possible_payload_retrieval
+    - id: service_account_writer
+      name: Written by a service account or remote shell
+      description: >-
+        The writing process is a web service, application account or a shell reached
+        remotely rather than an interactive session belonging to the file's owner.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: rare_in_fleet
+      name: Change absent from comparable hosts
+      description: >-
+        The same modification does not appear on peer systems during the baseline window,
+        unlike keys distributed by configuration management.
+      source: baseline
+      field: TargetFileName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: config_management_keys
+      name: Distributed by configuration management
+      description: >-
+        The keys were written by the approved configuration-management agent as part of a
+        governed access definition.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: provisioning_seed
+      name: Seeded during host build or instance launch
+      description: >-
+        The write occurred during provisioning, where access keys are placed deliberately
+        before the host enters service.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: fleetwide_key
+      name: Same key across comparable hosts
+      description: >-
+        The identical change is present on peer systems throughout the baseline window,
+        which is managed access rather than targeted persistence.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - authorized_keys_modified
+
+    supporting:
+      any:
+        - privileged_or_other_account
+        - key_fetched_remotely
+        - service_account_writer
+        - rare_in_fleet
+      all:
+        - privileged_or_other_account
+        - service_account_writer
+
+    contradicting:
+      any:
+        - config_management_keys
+        - provisioning_seed
+        - fleetwide_key
+      all: []
+
+  verdict:
+    low_risk_when:
+      - authorized_keys_modified
+      - config_management_keys
+      - provisioning_seed
+      - fleetwide_key
+    suspicious_when:
+      - authorized_keys_modified
+      - rare_in_fleet
+    high_risk_when:
+      - authorized_keys_modified
+      - privileged_or_other_account
+      - key_fetched_remotely
+      - service_account_writer
+
+  false_positive:
+    - condition: Configuration management distributes authorized keys across a fleet.
+      explanation: >-
+        Managed key distribution writes these files programmatically on every host, often
+        including root's, which reproduces the strongest supporting evidence. The agent as
+        the writing process and the fleet-wide pattern are the discriminators.
+    - condition: Provisioning seeds keys during host build or instance launch.
+      explanation: >-
+        Cloud instances and freshly built hosts receive keys as part of coming into
+        service. Host build state is the discriminator rather than anything in the command.
+    - condition: A user adds their own key when setting up access from a new machine.
+      explanation: >-
+        Self-service key setup is routine and often done with a redirect. The file belongs
+        to the user performing the write and the session is interactive.
+    - condition: Automation rotates deployment keys on a schedule.
+      explanation: >-
+        Key rotation rewrites authorized_keys regularly, sometimes fetching the new key
+        remotely. These run under a known automation identity on a predictable cadence.
