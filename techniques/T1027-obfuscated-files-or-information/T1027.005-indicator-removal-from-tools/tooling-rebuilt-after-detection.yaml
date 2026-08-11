@@ -1,0 +1,303 @@
+type: detection
+
+id: hg-win-tooling-rebuilt-after-detection-t1027-005
+version: 1.0.0
+
+info:
+  name: Tooling rebuilt and retried after detection
+  description: >-
+    When a payload is caught, an operator who is still on the host does not usually leave —
+    they change the file until it stops being caught and try again. The loop is
+    recognisable even though each individual step looks minor: a detection fires, a
+    slightly different binary appears in the same directory, that one is caught too, and
+    the cycle repeats over minutes. Any single iteration is unremarkable; the sequence is
+    an adversary iterating against your controls in real time, which is a stronger signal
+    than any of the detections in isolation.
+  severity: critical
+  author: huntgraph
+  tags:
+    - stealth
+    - obfuscation
+    - defence-evasion-testing
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1027/005
+    - https://attack.mitre.org/detectionstrategies/DET0189
+    - https://attack.mitre.org/techniques/T1027
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1027
+  sub_techniques:
+    - T1027.005
+  detection_strategies:
+    - DET0189
+  analytics:
+    - AN0540
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Application
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - Application Log Content
+
+hypothesis:
+  statement: >-
+    An adversary whose payload has been detected may modify it and retry repeatedly until a
+    variant runs, producing a short sequence of near-identical files in one directory that
+    is far more informative than any single detection within it.
+  attacker_behavior:
+    - Writes a modified build of the same payload after a detection fires.
+    - Repeats the write-and-run cycle several times within a short period.
+    - Keeps the file name or path constant while the hash changes each time.
+    - Tests variants until one executes without being stopped.
+  legitimate_behavior:
+    - Developers rebuild and rerun binaries continuously during compilation cycles.
+    - Build pipelines produce a new artefact hash on every run.
+    - Update mechanisms replace binaries with new versions.
+    - Security testing deliberately exercises variants against controls.
+  risk_indicator:
+    - Several distinct hashes appear at the same path in a short window.
+    - The path is a user-writable directory rather than a build workspace.
+    - Detections fire between the writes.
+    - The host has no development or testing role.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: multiple-hashes-same-path
+        name: Several distinct hashes written to one path
+        purpose: >-
+          Surface the iteration itself, where the same location receives repeatedly
+          modified builds rather than a single file.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+          | TargetFileName=/\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\/i
+          | TargetFileName!=/\\(ccmcache|SoftwareDistribution|Installer)\\/i
+          | groupBy([ComputerName, TargetFileName],
+                    function=[count(SHA256HashData, distinct=true, as=distinct_hashes),
+                              collect([SHA256HashData], limit=10)])
+          | distinct_hashes >= 3
+        filters:
+          include: []
+          exclude:
+            - "Build workspace directories on engineering hosts"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: repeated-execution-same-path
+        name: Repeated execution from one path with changing images
+        purpose: >-
+          Catch the retry side of the loop, where the operator runs each variant to see
+          whether this one survives.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\/i
+          | ImageFileName!=/\\Program Files( \(x86\))?\\/i
+          | groupBy([ComputerName, ImageFileName],
+                    function=[count(SHA256HashData, distinct=true, as=distinct_images),
+                              count(as=executions), collect([CommandLine], limit=5)])
+          | distinct_images >= 3
+        filters:
+          include: []
+          exclude:
+            - "ComputerName in the engineering and build-server asset groups"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: rebuild-driven-by-script-host
+        name: Variants written by a script host rather than a compiler
+        purpose: >-
+          Separate an operator modifying a delivered binary from a developer rebuilding
+          from source.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+          | TargetFileName=/\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(SHA256HashData, distinct=true, as=distinct_hashes),
+                              count(as=writes)])
+          | distinct_hashes >= 2
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of compilers, linkers and build agents"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+
+evidence:
+  required:
+    - id: repeated_variants_at_one_path
+      name: Multiple distinct builds written to the same location
+      description: >-
+        Several different hashes were written to, or executed from, one path in a
+        user-writable directory within a short period, which is a payload being modified
+        and retried rather than a file being used.
+      source: file_creation
+      field: SHA256HashData
+      indicates: control_evasion_iteration
+
+  supporting:
+    - id: repeated_execution
+      name: Each variant executed in turn
+      description: >-
+        The differing images were run from the same path, which is the retry half of the
+        loop rather than files merely accumulating.
+      source: process_creation
+      field: ImageFileName
+      indicates: hands_on_keyboard_activity
+    - id: non_compiler_writer
+      name: Variants written by something other than a compiler
+      description: >-
+        The writing process is an interpreter, archive tool or delivery application rather
+        than a compiler, linker or build agent.
+      source: file_creation
+      field: ContextProcessId
+      indicates: abnormal_execution_chain
+    - id: writable_location
+      name: Iteration occurring in a user-writable directory
+      description: >-
+        The path is a download, temporary or profile directory rather than a build
+        workspace or installation tree.
+      source: process_creation
+      field: ImageFileName
+      indicates: untrusted_execution_location
+    - id: non_developer_host
+      name: Host with no build or testing role
+      description: >-
+        The host shows no ordinary compilation or build activity during the baseline
+        window, so repeated new binaries at one path are inconsistent with its role.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: build_workspace
+      name: Build workspace on an engineering host
+      description: >-
+        The path is a build output directory where a new artefact hash on every run is the
+        expected behaviour.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+    - id: compiler_writer
+      name: Written by a compiler or build agent
+      description: >-
+        The differing binaries were produced by a compiler, linker or continuous-integration
+        agent rather than dropped by another process.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_enterprise_activity
+    - id: update_mechanism
+      name: Update mechanism replacing a binary
+      description: >-
+        The changing hashes belong to an approved updater replacing a product binary with
+        successive versions.
+      source: file_creation
+      field: TargetFileName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - repeated_variants_at_one_path
+
+    supporting:
+      any:
+        - repeated_execution
+        - non_compiler_writer
+        - writable_location
+        - non_developer_host
+      all:
+        - repeated_execution
+        - non_compiler_writer
+
+    contradicting:
+      any:
+        - build_workspace
+        - compiler_writer
+        - update_mechanism
+      all: []
+
+  verdict:
+    low_risk_when:
+      - repeated_variants_at_one_path
+      - build_workspace
+      - compiler_writer
+      - update_mechanism
+    suspicious_when:
+      - repeated_variants_at_one_path
+      - non_developer_host
+    high_risk_when:
+      - repeated_variants_at_one_path
+      - repeated_execution
+      - non_compiler_writer
+      - writable_location
+
+  false_positive:
+    - condition: A developer rebuilds and reruns a binary during a compilation cycle.
+      explanation: >-
+        Build cycles produce a new hash at the same path repeatedly, which is exactly the
+        required evidence. The compiler as writer and the engineering host are the
+        discriminators.
+    - condition: A build pipeline produces a new artefact hash on every run.
+      explanation: >-
+        Continuous integration writes differing binaries to workspace paths continuously.
+        These occur on build servers under build agents.
+    - condition: An updater replaces a product binary with successive versions.
+      explanation: >-
+        Frequent updates produce several hashes at one path over time, though usually across
+        days rather than minutes and always in an installation directory.
+    - condition: Security testing exercises payload variants against controls.
+      explanation: >-
+        Validation work reproduces this loop deliberately and completely. Only the
+        engagement record and the testing host distinguish it from an intrusion, which is
+        why neither appears as a query filter.

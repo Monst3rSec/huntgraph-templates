@@ -1,0 +1,295 @@
+type: detection
+
+id: hg-win-payload-carved-out-of-a-carrier-file-t1027-009
+version: 1.0.0
+
+info:
+  name: Payload carved out of a carrier file and executed
+  description: >-
+    Embedding a payload inside another file means the thing that arrives is genuinely the
+    file it claims to be — a working document, a real image, an installer that installs
+    something. Inspection sees a valid file because it is one, and the payload only exists
+    after a second step splits it out. That step is the observable: a carrier lands, an
+    executable appears beside it that did not come from the network, and it runs. The
+    carrier passing inspection is the point, so the hunt has to sit after delivery.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - obfuscation
+    - embedded-payload
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1027/009
+    - https://attack.mitre.org/detectionstrategies/DET0214
+    - https://attack.mitre.org/techniques/T1027
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1027
+  sub_techniques:
+    - T1027.009
+  detection_strategies:
+    - DET0214
+  analytics:
+    - AN0599
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - File Metadata
+
+hypothesis:
+  statement: >-
+    An adversary may hide a payload inside a legitimate carrier file so that what crosses
+    the network is genuinely valid, then extract and execute the embedded content on the
+    endpoint where inspection has already been passed.
+  attacker_behavior:
+    - Appends or embeds an executable inside a document, image, installer or archive.
+    - Splits the payload out on the host with a utility or a script.
+    - Runs the extracted content from the same directory the carrier landed in.
+    - Deletes the carrier afterwards so only the extracted payload remains.
+  legitimate_behavior:
+    - Self-extracting installers embed and unpack their own payloads.
+    - Applications bundle resources inside their binaries and write them out at runtime.
+    - Media and document formats legitimately contain embedded objects.
+    - Build tooling embeds artefacts and extracts them during packaging.
+  risk_indicator:
+    - An executable appears in a delivery directory without an inbound transfer.
+    - The extraction is performed by a script host rather than an installer.
+    - The extracted file runs from the directory the carrier arrived in.
+    - The carrier is removed shortly after the payload appears.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: executable-written-by-script-host
+        name: Executable written into a delivery directory by a script host
+        purpose: >-
+          Surface a payload appearing where a carrier landed, written by something that is
+          not an installer and did not fetch it from the network.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+          | TargetFileName=/\\(Downloads|AppData\\Local\\Temp|Users\\Public|Content\.Outlook)\\/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId, SHA256HashData],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of browsers, installers and approved self-extracting packages"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: carving-utility-invoked
+        name: Utility used to split content out of a file
+        purpose: >-
+          Catch the extraction step directly, where a stream or byte range is carved from a
+          carrier rather than an archive being unpacked.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(certutil(\.exe)?\s+.*-decode|ReadAllBytes|WriteAllBytes|Get-Content\s+.*-Encoding\s+Byte|\[Convert\]::FromBase64|Substring\s*\(\s*\d+|Seek\s*\(\s*\d+)/i
+          | CommandLine=/\\(Downloads|AppData\\Local\\Temp|Users\\Public|Content\.Outlook)\\/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: extracted-payload-executed
+        name: Extracted payload executed from the delivery directory
+        purpose: >-
+          Confirm the carved content ran, which is what distinguishes an embedded payload
+          from an application writing out a resource.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/\\(Downloads|AppData\\Local\\Temp|Users\\Public|Content\.Outlook)\\/i
+          | ParentBaseFileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|explorer|7zfm|winrar|outlook)\.exe$/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved self-service installers"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - path
+
+evidence:
+  required:
+    - id: payload_appeared_locally
+      name: Executable appeared in a delivery directory
+      description: >-
+        An executable or script was written into a download, mail or temporary directory by
+        a local process rather than arriving through a browser or installer, which is what
+        an embedded payload looks like once carved out.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+
+  supporting:
+    - id: carving_performed
+      name: Content split out of a carrier file
+      description: >-
+        A byte-range read, decode or stream extraction was performed against a file in the
+        delivery directory, which is the step that produces the payload.
+      source: process_creation
+      field: CommandLine
+      indicates: payload_extraction
+    - id: payload_executed
+      name: Extracted payload executed
+      description: >-
+        A process started from the extracted path under an interactive or script parent,
+        confirming the carved content was intended to run.
+      source: process_creation
+      field: ImageFileName
+      indicates: user_execution_foothold
+    - id: script_host_writer
+      name: Written by a script host rather than an installer
+      description: >-
+        The writing process is an interpreter or document handler rather than a browser,
+        installer or self-extracting package.
+      source: file_creation
+      field: ContextProcessId
+      indicates: abnormal_execution_chain
+    - id: unique_hash
+      name: Hash unknown across the estate
+      description: >-
+        The extracted file's hash appears on very few hosts, unlike application resources
+        that are written out identically wherever the product runs.
+      source: baseline
+      field: SHA256HashData
+      indicates: unusual_binary_in_environment
+
+  contradicting:
+    - id: self_extracting_installer
+      name: Self-extracting installer unpacking itself
+      description: >-
+        The executable was produced by a recognised self-extracting package writing out its
+        own contents during installation.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_enterprise_activity
+    - id: application_resource
+      name: Application writing out a bundled resource
+      description: >-
+        The file is a resource an installed application extracts from its own binary at
+        runtime, which it does identically on every host running it.
+      source: baseline
+      field: SHA256HashData
+      indicates: legitimate_application_component
+    - id: build_packaging
+      name: Build or packaging workflow
+      description: >-
+        The extraction belongs to a packaging pipeline on an engineering host where
+        embedding and unpacking artefacts is routine.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - payload_appeared_locally
+
+    supporting:
+      any:
+        - carving_performed
+        - payload_executed
+        - script_host_writer
+        - unique_hash
+      all:
+        - carving_performed
+        - payload_executed
+
+    contradicting:
+      any:
+        - self_extracting_installer
+        - application_resource
+        - build_packaging
+      all: []
+
+  verdict:
+    low_risk_when:
+      - payload_appeared_locally
+      - self_extracting_installer
+      - application_resource
+      - build_packaging
+    suspicious_when:
+      - payload_appeared_locally
+      - unique_hash
+    high_risk_when:
+      - payload_appeared_locally
+      - carving_performed
+      - payload_executed
+      - script_host_writer
+
+  false_positive:
+    - condition: A self-extracting installer unpacks its own payload.
+      explanation: >-
+        Self-extracting packages write executables into temporary directories and run them,
+        which is structurally identical to this technique. The writing process is a
+        recognised installer and the package is common across the estate.
+    - condition: An application writes out a bundled resource at runtime.
+      explanation: >-
+        Products frequently extract helper binaries from their own executables. These
+        produce the same hash on every host running the product.
+    - condition: A build pipeline embeds and extracts artefacts during packaging.
+      explanation: >-
+        Embedding resources and unpacking them is normal packaging work. It occurs on
+        engineering hosts under build agents.
+    - condition: A user downloads and runs an installer.
+      explanation: >-
+        Ordinary software installation writes executables into Downloads and runs them. The
+        distinguishing factor is that the file arrived through the browser rather than being
+        produced locally, which the writing process identifies.
