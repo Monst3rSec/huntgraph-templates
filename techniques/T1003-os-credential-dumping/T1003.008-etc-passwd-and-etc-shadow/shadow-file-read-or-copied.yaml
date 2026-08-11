@@ -1,0 +1,275 @@
+type: detection
+
+id: hg-lin-shadow-file-read-or-copied-t1003-008
+version: 1.0.0
+
+info:
+  name: Shadow file read or copied for offline cracking
+  description: >-
+    On Linux the password hashes live in /etc/shadow, readable only by root, and the
+    account names live in /etc/passwd alongside it. Taking both gives an adversary
+    everything needed to crack local credentials offline, and the act of taking them is a
+    useful confirmation that root was actually obtained rather than merely attempted. Very
+    little reads shadow directly — authentication goes through PAM, not through cat — so a
+    process opening it outside that path is a narrow and meaningful observation.
+  severity: critical
+  author: huntgraph
+  tags:
+    - credential-access
+    - credential-dumping
+    - shadow-file
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1003/008
+    - https://attack.mitre.org/detectionstrategies/DET0446
+    - https://attack.mitre.org/techniques/T1003
+
+mitre:
+  tactics:
+    - TA0006
+  techniques:
+    - T1003
+  sub_techniques:
+    - T1003.008
+  detection_strategies:
+    - DET0446
+  analytics:
+    - AN1234
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+  data_components:
+    - Process Creation
+    - File Access
+
+hypothesis:
+  statement: >-
+    An adversary who has obtained root may read or copy /etc/shadow, usually alongside
+    /etc/passwd, taking local password hashes for offline cracking and confirming in the
+    process that privileged access was genuinely achieved.
+  attacker_behavior:
+    - Reads or copies /etc/shadow with a shell utility rather than through authentication.
+    - Takes /etc/passwd in the same activity so the hashes can be matched to accounts.
+    - Uses a utility such as unshadow to combine the two files for cracking.
+    - Archives the result before moving it off the host.
+  legitimate_behavior:
+    - Backup agents include /etc in their sweeps.
+    - Configuration management reads account files to evaluate state.
+    - Security scanning tools audit password policy and account configuration.
+    - Administrators inspect account entries while diagnosing a login problem.
+  risk_indicator:
+    - Both shadow and passwd are handled in the same activity.
+    - The reader is an interactive shell or a web service account rather than an agent.
+    - The files are copied or archived rather than read in place.
+    - A password-cracking utility appears in the same session.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: shadow-read-directly
+        name: Shadow file read by a shell utility
+        purpose: >-
+          Surface direct reads of the hash file, which authentication never performs
+          because it goes through PAM rather than through a shell.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\/etc\/shadow\b/
+          | CommandLine=/\b(cat|less|more|head|tail|cp|scp|dd|base64|xxd|strings|awk|sed|vi|vim|nano)\b/i
+          | groupBy([ComputerName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=reads), collect([CommandLine], limit=5)])
+          | sort(reads, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved backup, configuration-management and compliance-scanning agents"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: shadow-and-passwd-together
+        name: Shadow and passwd handled in the same activity
+        purpose: >-
+          Isolate the pairing that makes the hashes usable, since shadow without the
+          account names is far less valuable.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\/etc\/shadow\b/
+          | CommandLine=/\/etc\/passwd\b/
+          | groupBy([ComputerName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: cracking-utility-present
+        name: Password cracking or combining utility invoked
+        purpose: >-
+          Catch the processing step, where the collected files are prepared for or
+          submitted to cracking.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(unshadow|john|hashcat|hydra)\b/i
+          | groupBy([ComputerName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Security testing hosts where credential auditing tooling is approved"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: shadow_accessed
+      name: Shadow file read or copied
+      description: >-
+        The shadow password file was read or copied by a shell utility, which
+        authentication itself never does because it operates through PAM.
+      source: process_creation
+      field: CommandLine
+      indicates: credential_material_capture
+
+  supporting:
+    - id: passwd_taken_too
+      name: Account file taken alongside the hashes
+      description: >-
+        /etc/passwd was handled in the same activity, which is what allows the hashes to be
+        matched to accounts and cracked usefully.
+      source: process_creation
+      field: CommandLine
+      indicates: credential_decryption_attempt
+    - id: cracking_tooling
+      name: Cracking or combining utility invoked
+      description: >-
+        A utility for combining or cracking password files was run on the host, which turns
+        collection into an attempt to recover plaintext credentials.
+      source: process_creation
+      field: CommandLine
+      indicates: offline_cracking_attempt
+    - id: interactive_or_service_actor
+      name: Read by an interactive shell or service account
+      description: >-
+        The reading process is a shell or a web service account rather than a backup,
+        configuration-management or compliance agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: hands_on_keyboard_activity
+    - id: unprecedented_read
+      name: No comparable access in the baseline
+      description: >-
+        This host has not seen a comparable direct read of the shadow file during the
+        baseline window outside its agents' regular cadence.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: backup_or_config_agent
+      name: Backup or configuration-management agent
+      description: >-
+        The reader is an approved backup, configuration-management or compliance agent
+        whose sweep necessarily covers account files.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_enterprise_activity
+    - id: compliance_scanning
+      name: Approved compliance or password-policy audit
+      description: >-
+        The access belongs to a sanctioned audit that inspects account configuration and
+        password policy on a schedule.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: recorded_investigation
+      name: Recorded administrative investigation
+      description: >-
+        An incident record covers an administrator inspecting account entries while
+        diagnosing a login or account fault.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - shadow_accessed
+
+    supporting:
+      any:
+        - passwd_taken_too
+        - cracking_tooling
+        - interactive_or_service_actor
+        - unprecedented_read
+      all:
+        - passwd_taken_too
+        - interactive_or_service_actor
+
+    contradicting:
+      any:
+        - backup_or_config_agent
+        - compliance_scanning
+        - recorded_investigation
+      all: []
+
+  verdict:
+    low_risk_when:
+      - shadow_accessed
+      - backup_or_config_agent
+      - compliance_scanning
+      - recorded_investigation
+    suspicious_when:
+      - shadow_accessed
+      - unprecedented_read
+    high_risk_when:
+      - shadow_accessed
+      - passwd_taken_too
+      - cracking_tooling
+      - interactive_or_service_actor
+
+  false_positive:
+    - condition: A backup agent includes /etc in its sweep.
+      explanation: >-
+        Full-system backup necessarily reads both shadow and passwd, reproducing the
+        pairing evidence. The acting process is an approved client with a fixed schedule.
+    - condition: Configuration management evaluates account state.
+      explanation: >-
+        Managing users requires reading the account files, sometimes on every run. The
+        agent is the acting process and the pattern is identical across the fleet.
+    - condition: A compliance scanner audits password policy.
+      explanation: >-
+        Security auditing tools inspect shadow to check ageing and lock status, which is
+        the same read an adversary performs. The product and its cadence are the
+        discriminators.
+    - condition: An administrator inspects an account entry while fixing a login fault.
+      explanation: >-
+        Reading passwd or shadow to diagnose an account problem is reasonable support work.
+        It is interactive, tied to a named engineer, and normally has an incident record.

@@ -1,0 +1,287 @@
+type: detection
+
+id: hg-any-private-key-material-collected-t1552-004
+version: 1.0.0
+
+info:
+  name: Private key material located and collected
+  description: >-
+    Private keys are credentials that usually outlive the passwords around them: an SSH key
+    grants access until someone rotates it, a code-signing key lets an adversary produce
+    trusted binaries, and a certificate key can impersonate a service. They also sit in
+    predictable places with recognisable file extensions, which makes locating them cheap.
+    The behaviour to hunt is the sweep — searching for key files or reading several at once
+    — rather than any single access, because applications open their own keys constantly.
+  severity: high
+  author: huntgraph
+  tags:
+    - credential-access
+    - private-keys
+    - unsecured-credentials
+    - windows
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1552/004
+    - https://attack.mitre.org/detectionstrategies/DET0549
+    - https://attack.mitre.org/techniques/T1552
+
+mitre:
+  tactics:
+    - TA0006
+  techniques:
+    - T1552
+  sub_techniques:
+    - T1552.004
+  detection_strategies:
+    - DET0549
+  analytics:
+    - AN1516
+    - AN1517
+  platforms:
+    - Windows
+    - Linux
+  data_sources:
+    - WinEventLog:Sysmon
+    - auditd:EXECVE
+  data_components:
+    - Process Creation
+    - File Creation
+    - File Access
+
+hypothesis:
+  statement: >-
+    An adversary may search for and collect private key files, obtaining credentials that
+    grant access to other systems, allow trusted code signing, or permit impersonation of a
+    service, and which typically remain valid until someone notices and rotates them.
+  attacker_behavior:
+    - Searches the filesystem for key file extensions or for PEM header strings.
+    - Reads several SSH, certificate or signing keys in one session.
+    - Exports certificates with their private keys from the local store.
+    - Archives the collected keys before moving them off the host.
+  legitimate_behavior:
+    - Applications and services read their own keys at startup.
+    - Certificate management tooling enumerates and exports keys during renewal.
+    - Backup products include key directories in their sweeps.
+    - Developers handle keys routinely on engineering hosts.
+  risk_indicator:
+    - A search targets key extensions or PEM headers rather than one known file.
+    - Several distinct key locations are touched in the same session.
+    - Certificates are exported together with their private keys.
+    - The collected material is archived shortly afterwards.
+
+requires:
+  platforms:
+    - windows
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: key-file-search
+        name: Filesystem searched for key material
+        purpose: >-
+          Surface the sweep pattern, where key files are hunted by extension or by their
+          header rather than opened by the application that owns them.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(find|grep|egrep|rg|dir|Get-ChildItem|ls)\b/i
+          | CommandLine=/(\.pem\b|\.key\b|\.pfx\b|\.p12\b|\.ppk\b|id_rsa|id_ed25519|id_ecdsa|BEGIN\s+(RSA|EC|OPENSSH|ENCRYPTED)?\s*PRIVATE)/i
+          | groupBy([ComputerName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=searches), collect([CommandLine], limit=5)])
+          | sort(searches, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Certificate management tooling performing scheduled inventory"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: certificate-exported-with-key
+        name: Certificate exported with its private key
+        purpose: >-
+          Catch export operations that include the private half, which is what makes an
+          exported certificate usable for impersonation or signing.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(certutil(\.exe)?\s+.*-exportPFX|Export-PfxCertificate|openssl\s+(pkcs12|rsa|ec)\b)/i
+          | CommandLine=/(-export|\.pfx|\.p12|-out\b)/i
+          | groupBy([ComputerName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=exports), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Certificate renewal automation and its service account"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+
+      - id: keys-archived
+        name: Key material collected into an archive
+        purpose: >-
+          Identify the packaging step, which converts a search into a collection prepared
+          for transfer.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(tar|zip|gzip|7z|rar|Compress-Archive|base64)\b/i
+          | CommandLine=/(\.pem\b|\.key\b|\.pfx\b|\.p12\b|\.ppk\b|id_rsa|id_ed25519|\.ssh\b)/i
+          | groupBy([ComputerName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Backup agents that archive key directories by design"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: key_material_targeted
+      name: Private key material searched, exported or collected
+      description: >-
+        A search was run for key files or PEM headers, a certificate was exported with its
+        private key, or key files were archived, all of which target credentials rather
+        than using them.
+      source: process_creation
+      field: CommandLine
+      indicates: credential_material_capture
+
+  supporting:
+    - id: broad_key_sweep
+      name: Search spans directories rather than one known file
+      description: >-
+        The search covers home directories, system paths or the filesystem broadly rather
+        than opening the single key an application owns.
+      source: process_creation
+      field: CommandLine
+      indicates: systematic_collection
+    - id: exported_with_private_half
+      name: Export includes the private key
+      description: >-
+        The certificate export includes the private key, which is what makes the output
+        usable for signing or impersonation rather than for distribution.
+      source: process_creation
+      field: CommandLine
+      indicates: high_impact_credential_theft
+    - id: material_archived
+      name: Key material compressed for transfer
+      description: >-
+        Keys were archived shortly after being located, indicating collection for
+        exfiltration rather than local use.
+      source: process_creation
+      field: CommandLine
+      indicates: collection_staging
+    - id: untrusted_actor
+      name: Actor is a script host or a binary in a writable path
+      description: >-
+        The acting process is an interpreter or an executable from a user-writable
+        directory rather than an installed certificate or backup tool.
+      source: process_creation
+      field: ImageFileName
+      indicates: untrusted_execution_location
+
+  contradicting:
+    - id: certificate_automation
+      name: Certificate management automation
+      description: >-
+        The activity belongs to approved certificate lifecycle tooling that enumerates and
+        exports keys during issuance or renewal.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_enterprise_activity
+    - id: backup_sweep
+      name: Backup agent including key directories
+      description: >-
+        The acting process is an approved backup client whose sweep necessarily covers
+        directories holding keys.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: engineering_host
+      name: Engineering host where keys are handled routinely
+      description: >-
+        The host belongs to an engineering asset group where developers generate, inspect
+        and move key material as normal work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - key_material_targeted
+
+    supporting:
+      any:
+        - broad_key_sweep
+        - exported_with_private_half
+        - material_archived
+        - untrusted_actor
+      all:
+        - broad_key_sweep
+        - material_archived
+
+    contradicting:
+      any:
+        - certificate_automation
+        - backup_sweep
+        - engineering_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - key_material_targeted
+      - certificate_automation
+      - backup_sweep
+      - engineering_host
+    suspicious_when:
+      - key_material_targeted
+      - broad_key_sweep
+    high_risk_when:
+      - key_material_targeted
+      - broad_key_sweep
+      - exported_with_private_half
+      - material_archived
+
+  false_positive:
+    - condition: Certificate management tooling enumerates and exports keys during renewal.
+      explanation: >-
+        Lifecycle automation exports certificates with their private keys as a normal part
+        of issuance, reproducing the strongest supporting evidence. The acting product and
+        its schedule are the discriminators.
+    - condition: An application reads its own key at startup.
+      explanation: >-
+        Services open their keys on every start, which is why the required evidence is a
+        search, export or archive rather than a file access.
+    - condition: A backup agent includes key directories in its sweep.
+      explanation: >-
+        Backups necessarily archive directories containing keys, matching the archiving
+        evidence. The acting process is an approved client operating on a fixed schedule.
+    - condition: A developer generates and moves keys on an engineering host.
+      explanation: >-
+        Key handling is routine development work, including searching for and archiving
+        them. Asset group membership is the discriminator rather than anything in the
+        command.
