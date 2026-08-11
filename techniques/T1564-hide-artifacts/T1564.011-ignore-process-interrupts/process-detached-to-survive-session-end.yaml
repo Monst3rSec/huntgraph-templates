@@ -1,0 +1,286 @@
+type: detection
+
+id: hg-any-process-detached-to-survive-session-end-t1564-011
+version: 1.0.0
+
+info:
+  name: Process detached from its session to survive disconnection
+  description: >-
+    A payload launched from an interactive session dies when that session ends, which is
+    useless to an operator working over SSH or a remote shell. Detaching it — through nohup,
+    setsid, disown, or a background start that ignores hangup signals — keeps it running
+    after the connection drops and after the operator logs off. The constructs are ordinary
+    administrative tools, so the signal is not the construct but what is being detached and
+    who is doing it.
+  severity: medium
+  author: huntgraph
+  tags:
+    - stealth
+    - hide-artifacts
+    - session-detachment
+    - linux
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1564/011
+    - https://attack.mitre.org/detectionstrategies/DET0067
+    - https://attack.mitre.org/techniques/T1564
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1564
+  sub_techniques:
+    - T1564.011
+  detection_strategies:
+    - DET0067
+  analytics:
+    - AN0181
+    - AN0182
+  platforms:
+    - Linux
+    - Windows
+  data_sources:
+    - auditd:SYSCALL
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    An adversary may detach a process from its controlling session so it continues running
+    after the connection that started it is closed, keeping a payload or tunnel alive
+    without any persistence mechanism being installed.
+  attacker_behavior:
+    - Wraps a payload in nohup, setsid or disown so it ignores hangup signals.
+    - Backgrounds a long-running process from a remote shell before disconnecting.
+    - Redirects the detached process's output to a file or to null so nothing appears on screen.
+    - Detaches a tunnel, listener or beacon rather than a maintenance task.
+  legitimate_behavior:
+    - Administrators background long-running maintenance jobs so a dropped connection does not kill them.
+    - Deployment scripts detach services they start.
+    - Terminal multiplexers keep sessions alive by design.
+    - Batch jobs are launched detached as normal practice.
+  risk_indicator:
+    - The detached command is an interpreter, tunnel or listener rather than a maintenance task.
+    - The detachment happens inside a session reached remotely.
+    - Output is redirected to null rather than to a log.
+    - The pattern is unprecedented for the host and account.
+
+requires:
+  platforms:
+    - linux
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: detached-interpreter-or-tunnel
+        name: Interpreter or tunnel detached from its session
+        purpose: >-
+          Surface detachment applied to the things an operator keeps alive, as distinct
+          from a maintenance job an administrator backgrounds.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(nohup|setsid|disown|start\s+\/b|Start-Process\s+.*-WindowStyle\s+Hidden)\b/i
+          | CommandLine=/\b(bash|sh|zsh|python\d?|perl|ruby|nc|ncat|socat|ssh\s+-[NfR]|chisel|powershell|pwsh)\b/i
+          | groupBy([ComputerName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Deployment automation that detaches the services it starts"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: detached-with-output-suppressed
+        name: Detached process with output discarded
+        purpose: >-
+          Isolate detachment paired with output suppression, which keeps the process both
+          alive and silent rather than merely surviving a disconnect.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(nohup|setsid|disown)\b/i
+          | CommandLine=/(>\s*\/dev\/null|2>&1\s*&|>\s*NUL)/i
+          | groupBy([ComputerName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - command_line
+
+      - id: detachment-from-remote-session
+        name: Detachment issued from a remotely reached shell
+        purpose: >-
+          Establish that the session being escaped was a remote one, which is what makes
+          surviving disconnection valuable.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(nohup|setsid|disown|start\s+\/b)\b/i
+          | ParentBaseFileName=/^(sshd|bash|sh|zsh|wsmprovhost|winrshost|WmiPrvSE|w3wp)$|^(sshd|wsmprovhost|winrshost|WmiPrvSE|w3wp)\.exe$/i
+          | groupBy([ComputerName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Approved maintenance automation reached over remote sessions"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - command_line
+
+evidence:
+  required:
+    - id: process_detached
+      name: Process detached from its controlling session
+      description: >-
+        A command was launched with a construct that detaches it from its session or makes
+        it ignore hangup signals, so it survives the connection that started it closing.
+      source: process_creation
+      field: CommandLine
+      indicates: session_independent_execution
+
+  supporting:
+    - id: interpreter_or_tunnel
+      name: Detached command is an interpreter, tunnel or listener
+      description: >-
+        What was detached is a shell, scripting runtime, network relay or listener rather
+        than a maintenance or batch task.
+      source: process_creation
+      field: CommandLine
+      indicates: operator_infrastructure
+    - id: output_suppressed
+      name: Output discarded rather than logged
+      description: >-
+        The detached process writes its output to null rather than to a log file, which
+        keeps it silent as well as alive.
+      source: process_creation
+      field: CommandLine
+      indicates: execution_concealment
+    - id: remote_session_parent
+      name: Detachment from a remotely reached shell
+      description: >-
+        The parent is an SSH daemon, remote-execution host or web service process, so the
+        session being escaped was reached from elsewhere.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: rare_for_host
+      name: Pattern unprecedented for this host
+      description: >-
+        This host has not seen comparable detachment during the baseline window, unlike
+        systems where batch and maintenance jobs are backgrounded routinely.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: maintenance_job
+      name: Long-running maintenance job
+      description: >-
+        The detached command is a backup, migration, compile or other maintenance task that
+        an administrator would reasonably protect from a dropped connection.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_administrative_action
+    - id: deployment_automation
+      name: Deployment automation detaching a service
+      description: >-
+        The detachment was performed by deployment or orchestration automation that starts
+        services this way by design.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: recurring_pattern
+      name: Recurring identical detachment
+      description: >-
+        The same command recurs on a stable cadence across hosts, which is a deployed job
+        rather than an operator keeping a foothold alive.
+      source: baseline
+      field: CommandLine
+      indicates: scheduled_automation_job
+
+  risk_logic:
+    required:
+      - process_detached
+
+    supporting:
+      any:
+        - interpreter_or_tunnel
+        - output_suppressed
+        - remote_session_parent
+        - rare_for_host
+      all:
+        - interpreter_or_tunnel
+        - remote_session_parent
+
+    contradicting:
+      any:
+        - maintenance_job
+        - deployment_automation
+        - recurring_pattern
+      all: []
+
+  verdict:
+    low_risk_when:
+      - process_detached
+      - maintenance_job
+      - deployment_automation
+      - recurring_pattern
+    suspicious_when:
+      - process_detached
+      - rare_for_host
+    high_risk_when:
+      - process_detached
+      - interpreter_or_tunnel
+      - output_suppressed
+      - remote_session_parent
+
+  false_positive:
+    - condition: An administrator backgrounds a long-running maintenance job over SSH.
+      explanation: >-
+        Protecting a long job from a dropped connection is exactly what these constructs
+        exist for, and it is issued from a remote shell, reproducing the strongest
+        supporting evidence. What is being detached is the discriminator.
+    - condition: Deployment automation detaches the services it starts.
+      explanation: >-
+        Orchestration commonly launches processes detached so they outlive the deploy. These
+        run under automation accounts with an unchanging command shape.
+    - condition: A terminal multiplexer keeps a session alive.
+      explanation: >-
+        Screen and tmux exist to survive disconnection and are widely used by engineers.
+        They appear consistently for the same users over long periods.
+    - condition: A batch job is launched detached as normal practice.
+      explanation: >-
+        Scheduled and manual batch work is routinely backgrounded. These recur with stable
+        commands and log their output rather than discarding it.

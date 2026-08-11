@@ -1,0 +1,279 @@
+type: detection
+
+id: hg-win-right-to-left-override-in-filename-t1036-002
+version: 1.0.0
+
+info:
+  name: Right-to-left override character used to disguise a filename
+  description: >-
+    The Unicode right-to-left override reverses how the text after it is displayed, so a
+    file named with the override before a reversed extension shows to the user as something
+    else entirely — a document rather than an executable. Nothing about the file changes;
+    only its rendering does. The character has no legitimate purpose in a filename outside
+    genuine right-to-left language content, which makes its presence in a delivered file a
+    narrow and reliable observation.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - masquerading
+    - unicode
+    - user-deception
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1036/002
+    - https://attack.mitre.org/detectionstrategies/DET0527
+    - https://attack.mitre.org/techniques/T1036
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1036
+  sub_techniques:
+    - T1036.002
+  detection_strategies:
+    - DET0527
+  analytics:
+    - AN1461
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:PowerShell
+  data_components:
+    - Process Creation
+    - Command Execution
+    - File Metadata
+
+hypothesis:
+  statement: >-
+    An adversary may embed a right-to-left override character in a filename so that the
+    displayed name reverses and presents an executable as a document, causing the user to
+    open a payload they believe is harmless.
+  attacker_behavior:
+    - Inserts the override character before a reversed extension in the filename.
+    - Pairs the disguise with an icon matching the impersonated document type.
+    - Delivers the file inside an archive so the name survives to the user intact.
+    - Relies on the user launching it from a download or extraction directory.
+  legitimate_behavior:
+    - Documents in Arabic, Hebrew and other right-to-left languages contain directional characters.
+    - Internationalised applications may write filenames containing directional marks.
+    - Localisation and translation workflows handle such filenames routinely.
+  risk_indicator:
+    - The override appears in a filename whose real extension is executable.
+    - The file runs from a download or extraction directory.
+    - The parent process is an archive tool, browser or mail client.
+    - The file was written to the host shortly before it ran.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - SHA256HashData
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: override-in-executed-path
+        name: Directional override character in an executed path
+        purpose: >-
+          Surface execution of a file whose name carries the override, which is the
+          disguise being acted on.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/[\x{202E}\x{202B}\x{202D}\x{2066}\x{2067}]/
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine, SHA256HashData], limit=3)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: override-in-written-file
+        name: Directional override character in a written filename
+        purpose: >-
+          Catch the payload at delivery, before the user opens it, which is the earliest
+          point of intervention.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten|NewScriptWritten)$/
+          | TargetFileName=/[\x{202E}\x{202B}\x{202D}\x{2066}\x{2067}]/
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: override-file-from-delivery-parent
+        name: Override-named file launched by an archive tool or browser
+        purpose: >-
+          Establish the delivery route, which confirms the disguised file reached a user
+          through a channel they acted on.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/[\x{202E}\x{202B}\x{202D}]/
+          | ParentBaseFileName=/^(7zfm|7zg|winrar|winzip|explorer|chrome|msedge|firefox|outlook|thunderbird)\.exe$/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: directional_override_present
+      name: Directional override character in a filename
+      description: >-
+        A file that was written or executed carries a Unicode directional override in its
+        name, which reverses how the extension is displayed to the user.
+      source: process_creation
+      field: ImageFileName
+      indicates: user_facing_deception
+
+  supporting:
+    - id: delivery_parent
+      name: Archive tool, browser or mail client as parent
+      description: >-
+        The file was launched by a delivery application, establishing that it arrived
+        through a channel the user acted on rather than being local content.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: recently_written
+      name: File written shortly before execution
+      description: >-
+        The file was created on the host shortly before it ran, consistent with delivery
+        followed immediately by the user opening it.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: writable_location
+      name: File in a download or temporary directory
+      description: >-
+        The image runs from a download, extraction or temporary directory rather than from
+        an installed application path.
+      source: process_creation
+      field: ImageFileName
+      indicates: untrusted_execution_location
+    - id: unique_hash
+      name: Hash unique in the estate
+      description: >-
+        The image hash appears on one or very few hosts, which is inconsistent with any
+        localisation asset that happens to carry directional characters.
+      source: baseline
+      field: SHA256HashData
+      indicates: unusual_binary_in_environment
+
+  contradicting:
+    - id: localisation_content
+      name: Genuine right-to-left language content
+      description: >-
+        The file belongs to localisation, translation or language-pack content where
+        directional characters occur naturally.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: vendor_installation_path
+      name: File inside a vendor installation directory
+      description: >-
+        The file resides in an installed application directory rather than a delivery
+        location.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: fleetwide_presence
+      name: Same file across the estate
+      description: >-
+        The identical name and hash appear on many hosts, which is distributed content
+        rather than a targeted lure.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - directional_override_present
+
+    supporting:
+      any:
+        - delivery_parent
+        - recently_written
+        - writable_location
+        - unique_hash
+      all:
+        - delivery_parent
+        - writable_location
+
+    contradicting:
+      any:
+        - localisation_content
+        - vendor_installation_path
+        - fleetwide_presence
+      all: []
+
+  verdict:
+    low_risk_when:
+      - directional_override_present
+      - localisation_content
+      - vendor_installation_path
+      - fleetwide_presence
+    suspicious_when:
+      - directional_override_present
+      - unique_hash
+    high_risk_when:
+      - directional_override_present
+      - delivery_parent
+      - writable_location
+      - recently_written
+
+  false_positive:
+    - condition: Localisation content contains directional characters in filenames.
+      explanation: >-
+        Right-to-left languages use these characters legitimately, and translation
+        workflows handle such files routinely. Those appear in application or content
+        directories rather than in download paths, and are not executables.
+    - condition: An internationalised application writes filenames containing directional marks.
+      explanation: >-
+        Some applications generate names from user-supplied text that may include
+        directional characters. The resulting files are documents rather than executables.
+    - condition: A localisation tester deliberately creates such filenames.
+      explanation: >-
+        Testing right-to-left rendering involves creating exactly these names. This is
+        confined to engineering or localisation hosts under known accounts.
