@@ -1,0 +1,290 @@
+type: detection
+
+id: hg-win-sam-and-system-hives-exported-t1003-002
+version: 1.0.0
+
+info:
+  name: SAM and SYSTEM registry hives exported from a host
+  description: >-
+    Local account hashes live in the SAM hive, encrypted with a boot key held in SYSTEM,
+    which means neither file is useful alone and both must be taken together. That
+    requirement is what makes the technique tractable to hunt: the pairing is specific,
+    it has almost no legitimate counterpart outside disaster recovery, and it holds
+    whether the adversary uses reg save, a shadow copy or a direct file copy. Local hashes
+    still matter because they enable reuse against every host built from the same image.
+  severity: critical
+  author: huntgraph
+  tags:
+    - credential-access
+    - credential-dumping
+    - registry-hive
+    - sam
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1003/002
+    - https://attack.mitre.org/detectionstrategies/DET0085
+    - https://attack.mitre.org/techniques/T1003
+
+mitre:
+  tactics:
+    - TA0006
+  techniques:
+    - T1003
+  sub_techniques:
+    - T1003.002
+  detection_strategies:
+    - DET0085
+  analytics:
+    - AN0235
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An adversary may export the SAM and SYSTEM registry hives from a host so that local
+    account password hashes can be extracted offline and reused against other systems
+    built from the same image or sharing the same local credentials.
+  attacker_behavior:
+    - Runs reg save against HKLM\SAM and HKLM\SYSTEM, usually within moments of each other.
+    - Copies the hive files out of a volume shadow copy to bypass the file lock.
+    - Writes the exported hives into a temporary or user-writable directory.
+    - Compresses the output and removes the originals after collection.
+  legitimate_behavior:
+    - Backup products capture system state including registry hives.
+    - Disaster-recovery procedures export hives before a risky change.
+    - Forensic collection deliberately gathers hives during an investigation.
+    - Migration tooling reads registry data when moving a system.
+  risk_indicator:
+    - Both SAM and SYSTEM are exported in the same activity.
+    - The output lands in a temporary or user-writable path rather than a backup target.
+    - The export is issued interactively or through a remote-execution channel.
+    - The output is archived shortly afterwards.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewExecutableWritten
+        - PeFileWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: hive-save-commands
+        name: Registry hives saved to disk
+        purpose: >-
+          Surface hive exports and capture which hive was taken, since the SAM and SYSTEM
+          pairing is what makes the output usable.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(reg(\.exe)?\s+save|reg(\.exe)?\s+export)/i
+          | CommandLine=/(?<hive>hklm\\\\(sam|system|security)|hkey_local_machine\\\\(sam|system|security))/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=exports), count(hive, distinct=true, as=distinct_hives),
+                              collect([CommandLine], limit=5)])
+          | sort(exports, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the approved backup product performing system-state capture"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: hive-copied-from-shadow
+        name: Hive files copied from a shadow copy or config directory
+        purpose: >-
+          Cover the route that avoids reg.exe entirely, taking the files from a snapshot or
+          directly out of the config directory.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(config\\\\SAM|config\\\\SYSTEM|HarddiskVolumeShadowCopy)/i
+          | CommandLine=/\b(copy|xcopy|robocopy|Copy-Item|esentutl)\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: hives-then-archived
+        name: Exported hives compressed for collection
+        purpose: >-
+          Catch the packaging step, which indicates the output is being prepared to leave
+          the host rather than read locally.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(sam|system|security)\.(hiv|hive|save|bak|dat)?\b/i
+          | CommandLine=/\b(Compress-Archive|7z|rar|tar|makecab|zip)\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: hive_export
+      name: Registry hive exported or copied
+      description: >-
+        The SAM, SYSTEM or SECURITY hive was saved, exported or copied out of the running
+        system, producing a file from which credential material can be recovered offline.
+      source: process_creation
+      field: CommandLine
+      indicates: credential_material_capture
+
+  supporting:
+    - id: paired_hives
+      name: SAM and SYSTEM taken together
+      description: >-
+        More than one hive was exported in the same activity, which is required for the
+        output to be decryptable and has no purpose otherwise.
+      source: process_creation
+      field: CommandLine
+      indicates: credential_decryption_attempt
+    - id: writable_output
+      name: Output written to a user-writable directory
+      description: >-
+        The exported hives were placed under a temporary or user-writable path rather than
+        a backup target or a recovery staging area.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: archived_output
+      name: Output compressed after export
+      description: >-
+        The exported files were compressed shortly afterwards, indicating preparation for
+        transfer rather than local inspection.
+      source: process_creation
+      field: CommandLine
+      indicates: collection_staging
+    - id: interactive_or_remote
+      name: Issued interactively or remotely
+      description: >-
+        The export was issued from an interactive shell or a remote-execution channel
+        rather than by a scheduled backup process.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: hands_on_keyboard_activity
+
+  contradicting:
+    - id: backup_system_state
+      name: Backup product capturing system state
+      description: >-
+        The export was performed by an approved backup product as part of its scheduled
+        system-state protection.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: recorded_recovery
+      name: Recorded recovery or migration activity
+      description: >-
+        A change record covers exporting hives ahead of a risky change, a migration or a
+        recovery exercise.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: forensic_collection
+      name: Sanctioned forensic collection
+      description: >-
+        The export belongs to a recorded investigation in which registry hives were
+        deliberately collected by a named responder.
+      source: change_management
+      field: UserName
+      indicates: authorised_security_testing
+
+  risk_logic:
+    required:
+      - hive_export
+
+    supporting:
+      any:
+        - paired_hives
+        - writable_output
+        - archived_output
+        - interactive_or_remote
+      all:
+        - paired_hives
+        - interactive_or_remote
+
+    contradicting:
+      any:
+        - backup_system_state
+        - recorded_recovery
+        - forensic_collection
+      all: []
+
+  verdict:
+    low_risk_when:
+      - hive_export
+      - backup_system_state
+      - recorded_recovery
+      - forensic_collection
+    suspicious_when:
+      - hive_export
+      - interactive_or_remote
+    high_risk_when:
+      - hive_export
+      - paired_hives
+      - writable_output
+      - archived_output
+
+  false_positive:
+    - condition: A backup product captures system state including registry hives.
+      explanation: >-
+        System-state backup necessarily reads SAM and SYSTEM together, reproducing the
+        strongest supporting evidence. The backup process as the actor and the scheduled
+        cadence are the discriminators.
+    - condition: An administrator exports hives before a risky configuration change.
+      explanation: >-
+        Taking a registry backup before a change is prudent practice and may well involve
+        both hives. It is interactive but covered by a change record and the output goes to
+        a documented location.
+    - condition: Forensic tooling collects hives during an investigation.
+      explanation: >-
+        Investigative collection gathers exactly these files and archives them, matching
+        nearly every supporting item. Only the incident record separates it.
+    - condition: Migration tooling reads registry data while moving a system.
+      explanation: >-
+        Migration products export configuration wholesale. These run under the product's
+        own process against a staging share rather than a user directory.

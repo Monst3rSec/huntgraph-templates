@@ -1,0 +1,291 @@
+type: detection
+
+id: hg-win-winrm-remote-command-execution-t1021-006
+version: 1.0.0
+
+info:
+  name: Remote command execution through Windows Remote Management
+  description: >-
+    WinRM is the sanctioned remote management channel, which is exactly why it is used for
+    lateral movement: the traffic is expected, the ports are open, and the resulting
+    execution is attributed to a Windows service host rather than to anything that
+    explains its origin. On the target, wsmprovhost.exe parents whatever the remote
+    session runs, which gives a single reliable landing marker. On the source, the
+    interesting question is whether this machine and account have ever managed that target
+    before.
+  severity: high
+  author: huntgraph
+  tags:
+    - lateral-movement
+    - winrm
+    - remote-execution
+    - powershell-remoting
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1021/006
+    - https://attack.mitre.org/detectionstrategies/DET0477
+    - https://attack.mitre.org/techniques/T1021
+
+mitre:
+  tactics:
+    - TA0008
+  techniques:
+    - T1021
+  sub_techniques:
+    - T1021.006
+  detection_strategies:
+    - DET0477
+  analytics:
+    - AN1313
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+    - WinEventLog:WinRM
+  data_components:
+    - Process Creation
+    - Logon Session Creation
+    - Service Metadata
+
+hypothesis:
+  statement: >-
+    An adversary holding valid credentials may execute commands on a remote host through
+    Windows Remote Management, moving laterally over a sanctioned management channel whose
+    resulting processes carry no lineage explaining where the instruction came from.
+  attacker_behavior:
+    - Runs Invoke-Command, Enter-PSSession or winrs against a remote host.
+    - Uses explicit credentials to authenticate as a harvested account.
+    - Enables WinRM on the target first if the service is not already listening.
+    - Issues commands to several targets from one source in a short period.
+  legitimate_behavior:
+    - Administrators manage servers through PowerShell remoting continuously.
+    - Configuration-management platforms use WinRM as a primary transport.
+    - Monitoring and inventory collection runs remote queries on a schedule.
+    - Support staff run diagnostic commands on remote machines.
+  risk_indicator:
+    - The remote session host parents an interpreter or a proxy-execution binary.
+    - The source is a workstation rather than a management server or jump host.
+    - WinRM was enabled on the target shortly beforehand.
+    - The source and target pairing is new for the account across the baseline window.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: wsmprovhost-spawns-process
+        name: Remote session host spawning a process
+        purpose: >-
+          Observe the landing point, where a remotely issued instruction becomes a local
+          process with no lineage explaining it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(wsmprovhost|winrshost)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "UserName of the configuration-management platform service account"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - process
+            - organization
+
+      - id: remote-session-initiated
+        name: Remote session initiated from this host
+        purpose: >-
+          Capture the calling side so the origin of lateral movement is identified along
+          with the account used.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Invoke-Command|Enter-PSSession|New-PSSession|winrs(\.exe)?\s+-r|Invoke-WSManAction)/i
+          | CommandLine=/(-ComputerName|-ConnectionUri|-r\s*:?\s*https?)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=sessions), collect([CommandLine], limit=5)])
+          | sort(sessions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of approved management servers and jump hosts"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: winrm-enabled-on-host
+        name: WinRM enabled or configured permissively
+        purpose: >-
+          Catch the preparatory step, where the management channel is turned on or its
+          trust settings widened so a session can be established.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Enable-PSRemoting|winrm\s+quickconfig|Set-Item\s+.*WSMan.*TrustedHosts|winrm\s+set\s+.*AllowUnencrypted)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Provisioning automation that enables remoting during host build"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+evidence:
+  required:
+    - id: winrm_remote_execution
+      name: Command executed through Windows Remote Management
+      description: >-
+        A remote session host spawned a process, or a remote session was initiated against
+        another machine, meaning code ran on a host through the management channel.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: remote_execution_channel
+
+  supporting:
+    - id: interpreter_or_lolbin_child
+      name: Session runs an interpreter or proxy-execution binary
+      description: >-
+        The remote session host created a script interpreter or proxy-execution binary
+        rather than a specific management cmdlet host, which is operator activity.
+      source: process_creation
+      field: FileName
+      indicates: dynamic_code_execution
+    - id: workstation_origin
+      name: Session originating from a workstation
+      description: >-
+        The calling host is an ordinary workstation rather than a management server or jump
+        host whose role includes remote administration.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: remoting_enabled_first
+      name: Remoting enabled or widened beforehand
+      description: >-
+        WinRM was enabled, or its trusted-host or encryption settings relaxed, shortly
+        before the session, indicating the path was created rather than already available.
+      source: process_creation
+      field: CommandLine
+      indicates: access_path_creation
+    - id: new_account_target_pair
+      name: Account and target pairing new
+      description: >-
+        This account has not managed this target during the baseline window, which is what
+        distinguishes lateral movement from routine administration.
+      source: baseline
+      field: UserName
+      indicates: lateral_movement_attempt
+
+  contradicting:
+    - id: management_platform_account
+      name: Configuration-management service account
+      description: >-
+        The activity runs under the service account of an approved platform that uses WinRM
+        as a documented transport.
+      source: process_creation
+      field: UserName
+      indicates: legitimate_enterprise_activity
+    - id: approved_admin_source
+      name: Approved management server or jump host
+      description: >-
+        The calling host is a designated administration system from which remote management
+        is expected and continuous.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: established_management_pattern
+      name: Long-standing management relationship
+      description: >-
+        This source, account and target combination recurs steadily throughout the baseline
+        window, which is routine operation rather than novel access.
+      source: baseline
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - winrm_remote_execution
+
+    supporting:
+      any:
+        - interpreter_or_lolbin_child
+        - workstation_origin
+        - remoting_enabled_first
+        - new_account_target_pair
+      all:
+        - workstation_origin
+        - new_account_target_pair
+
+    contradicting:
+      any:
+        - management_platform_account
+        - approved_admin_source
+        - established_management_pattern
+      all: []
+
+  verdict:
+    low_risk_when:
+      - winrm_remote_execution
+      - management_platform_account
+      - approved_admin_source
+      - established_management_pattern
+    suspicious_when:
+      - winrm_remote_execution
+      - workstation_origin
+    high_risk_when:
+      - winrm_remote_execution
+      - workstation_origin
+      - new_account_target_pair
+      - remoting_enabled_first
+
+  false_positive:
+    - condition: An administrator manages servers through PowerShell remoting.
+      explanation: >-
+        This is the intended use of WinRM and accounts for nearly all of its traffic. The
+        source is a management host and the source-account-target relationships are stable
+        over long periods.
+    - condition: A configuration-management platform uses WinRM as its transport.
+      explanation: >-
+        Platforms that manage Windows at scale run remote sessions constantly, spawning
+        interpreters on every target. The service account and the regular cadence separate
+        them.
+    - condition: Monitoring collection runs remote queries on a schedule.
+      explanation: >-
+        Agent-less monitoring reaches many hosts through WinRM, which resembles fan-out.
+        The pattern repeats on a fixed cycle against an unchanging target set.
+    - condition: Support staff run diagnostic commands on a remote machine.
+      explanation: >-
+        Interactive support produces sessions to targets an engineer may never have reached
+        before, matching the strongest supporting evidence. The incident record is the
+        discriminator.

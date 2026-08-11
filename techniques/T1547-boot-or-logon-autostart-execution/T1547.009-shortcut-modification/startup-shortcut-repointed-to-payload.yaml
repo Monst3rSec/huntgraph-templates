@@ -1,0 +1,295 @@
+type: detection
+
+id: hg-win-startup-shortcut-repointed-to-payload-t1547-009
+version: 1.0.0
+
+info:
+  name: Shortcut repointed to launch a payload
+  description: >-
+    A shortcut is a small file describing what to run, and nothing about its appearance
+    changes when its target does. Repointing one a user clicks every day — the browser on
+    their taskbar, an application in the Start menu — gives persistence that the user
+    triggers themselves, with no autostart entry and no registry change for a review to
+    find. The observation that holds is a shortcut being written or modified by something
+    that is not an installer, particularly one carrying an interpreter or arguments, since
+    a normal shortcut points at an application and little else.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - shortcut
+    - user-triggered
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1547/009
+    - https://attack.mitre.org/detectionstrategies/DET0180
+    - https://attack.mitre.org/techniques/T1547
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1547
+  sub_techniques:
+    - T1547.009
+  detection_strategies:
+    - DET0180
+  analytics:
+    - AN0510
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - File Creation
+    - File Modification
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may modify or create a shortcut so that it launches their payload,
+    obtaining persistence that the user triggers themselves through an icon they already
+    trust, without registering any autostart entry.
+  attacker_behavior:
+    - Rewrites the target of an existing Start menu or desktop shortcut to run an interpreter.
+    - Adds arguments to a shortcut so it launches the real application and a payload together.
+    - Places a new shortcut in the Startup folder pointing at a user-writable executable.
+    - Keeps the shortcut's icon and name unchanged so nothing appears different to the user.
+  legitimate_behavior:
+    - Installers create and update shortcuts for the applications they deploy.
+    - Application updates rewrite shortcut targets when a version path changes.
+    - Management tooling deploys shortcuts across the estate.
+    - Users create their own shortcuts and edit their targets.
+  risk_indicator:
+    - The shortcut target is an interpreter or a program in a user-writable directory.
+    - The shortcut was modified by a script host rather than an installer.
+    - The shortcut carries command-line arguments that fetch or decode content.
+    - The change affects a shortcut the user launches routinely.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+        - PeFileWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: shortcut-written-by-script-host
+        name: Shortcut created or modified by a script host
+        purpose: >-
+          Surface shortcut manipulation performed programmatically outside an installer,
+          which is how an existing icon gets quietly repointed.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(WScript\.Shell.*CreateShortcut|New-Object\s+-ComObject\s+WScript\.Shell|\.TargetPath\s*=|\.Arguments\s*=|\.lnk\b)/i
+          | FileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of approved installers and profile-management tooling"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: shortcut-target-interpreter
+        name: Shortcut target set to an interpreter or writable path
+        purpose: >-
+          Isolate shortcuts whose target is not an application, which is the contrast
+          between a launcher and a persistence mechanism.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\.(TargetPath|Arguments)\s*=/i
+          | CommandLine=/(powershell|pwsh|cmd\.exe|wscript|cscript|mshta|rundll32|regsvr32|\\AppData\\|\\Temp\\|\\ProgramData\\)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: shortcut-in-startup-folder
+        name: Shortcut written into the Startup folder
+        purpose: >-
+          Cover the simplest variant, where a new shortcut is dropped where Windows will
+          launch it at logon without any existing icon being touched.
+        query: |
+          #event_simpleName=/^(NewScriptWritten|PeFileWritten)$/
+          | TargetFileName=/\\Start Menu\\Programs\\Startup\\.*\.lnk$/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of approved installers and management agents"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+evidence:
+  required:
+    - id: shortcut_manipulated
+      name: Shortcut created or repointed programmatically
+      description: >-
+        A shortcut file was created or its target rewritten by a process other than an
+        installer, changing what runs when a user activates an icon they already trust.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_established
+
+  supporting:
+    - id: interpreter_or_writable_target
+      name: Target is an interpreter or a user-writable program
+      description: >-
+        The shortcut points at a script interpreter or an executable under a user-writable
+        directory rather than at an installed application.
+      source: process_creation
+      field: CommandLine
+      indicates: untrusted_execution_location
+    - id: script_host_actor
+      name: Modified by a script host
+      description: >-
+        The manipulation was performed by PowerShell, cmd or a Windows script host rather
+        than by setup or profile-management tooling.
+      source: process_creation
+      field: FileName
+      indicates: non_standard_automation
+    - id: startup_folder_placement
+      name: Shortcut placed in the Startup folder
+      description: >-
+        The shortcut was written where Windows launches it at logon, which converts a user
+        convenience into automatic execution.
+      source: file_creation
+      field: TargetFileName
+      indicates: autostart_established
+    - id: rare_for_host
+      name: Manipulation unprecedented for this host
+      description: >-
+        No comparable programmatic shortcut change has been observed on this host during
+        the baseline window, unlike installer-driven shortcut maintenance.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: installer_shortcut
+      name: Installer creating or updating its shortcuts
+      description: >-
+        An approved installer or updater created or rewrote the shortcut for the
+        application it deploys.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: managed_shortcut_deployment
+      name: Managed shortcut deployment
+      description: >-
+        The shortcut was deployed by management tooling across a collection of hosts as
+        part of a governed configuration.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+    - id: user_created_shortcut
+      name: Shortcut created interactively by the user
+      description: >-
+        The shortcut was created through explorer during an interactive session and points
+        at an installed application.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - shortcut_manipulated
+
+    supporting:
+      any:
+        - interpreter_or_writable_target
+        - script_host_actor
+        - startup_folder_placement
+        - rare_for_host
+      all:
+        - interpreter_or_writable_target
+        - script_host_actor
+
+    contradicting:
+      any:
+        - installer_shortcut
+        - managed_shortcut_deployment
+        - user_created_shortcut
+      all: []
+
+  verdict:
+    low_risk_when:
+      - shortcut_manipulated
+      - installer_shortcut
+      - managed_shortcut_deployment
+      - user_created_shortcut
+    suspicious_when:
+      - shortcut_manipulated
+      - rare_for_host
+    high_risk_when:
+      - shortcut_manipulated
+      - interpreter_or_writable_target
+      - script_host_actor
+      - startup_folder_placement
+
+  false_positive:
+    - condition: An installer creates or updates application shortcuts.
+      explanation: >-
+        Shortcut creation is part of nearly every installation, and updates rewrite targets
+        when version paths change. The installer as the acting process and the estate-wide
+        pattern separate it.
+    - condition: Management tooling deploys shortcuts across the estate.
+      explanation: >-
+        Managed desktops commonly receive shortcuts from policy or a deployment agent,
+        sometimes created through scripting. These appear identically across a host
+        collection.
+    - condition: A user creates or edits their own shortcut.
+      explanation: >-
+        Users arrange their own desktops, occasionally with arguments attached. This is
+        interactive through explorer and points at installed software.
+    - condition: A profile-management product recreates shortcuts at logon.
+      explanation: >-
+        Roaming profile and desktop-management tools rewrite shortcuts on every logon,
+        which would otherwise generate constant volume. They act through their own agent
+        with a stable set of targets.

@@ -1,0 +1,287 @@
+type: detection
+
+id: hg-win-service-ticket-harvesting-t1558-003
+version: 1.0.0
+
+info:
+  name: Service tickets requested in bulk for offline cracking
+  description: >-
+    Any domain user can request a service ticket for any account with a service principal
+    name, and that ticket is encrypted with the service account's password hash. That
+    makes kerberoasting a privilege-escalation path available to every authenticated user,
+    with no exploit and no privileged access required. The behaviour that separates it
+    from normal Kerberos traffic is shape rather than content: an ordinary workstation
+    asks for a handful of tickets for services it actually uses, while harvesting asks for
+    many, in a burst, often for accounts the requester has no relationship with.
+  severity: high
+  author: huntgraph
+  tags:
+    - credential-access
+    - kerberos
+    - kerberoasting
+    - active-directory
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1558/003
+    - https://attack.mitre.org/detectionstrategies/DET0157
+    - https://attack.mitre.org/techniques/T1558
+
+mitre:
+  tactics:
+    - TA0006
+  techniques:
+    - T1558
+  sub_techniques:
+    - T1558.003
+  detection_strategies:
+    - DET0157
+  analytics:
+    - AN0444
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Active Directory Credential Request
+    - Logon Session Creation
+    - Process Access
+
+hypothesis:
+  statement: >-
+    An adversary holding any domain credential may enumerate accounts with service
+    principal names and request their service tickets in bulk, obtaining material that can
+    be cracked offline to recover service account passwords without touching a domain
+    controller interactively.
+  attacker_behavior:
+    - Enumerates accounts carrying a service principal name through LDAP or setspn.
+    - Requests service tickets for many of those accounts in a short period.
+    - Uses tooling that requests tickets with weaker encryption to make cracking cheaper.
+    - Exports the tickets from memory for offline processing.
+  legitimate_behavior:
+    - Applications request service tickets for the services they genuinely use.
+    - Directory administration tools enumerate service principal names during audits.
+    - Monitoring and inventory products query service accounts on a schedule.
+    - Security teams run kerberoasting assessments deliberately.
+  risk_indicator:
+    - Service principal names are enumerated and ticket requests follow shortly after.
+    - The requesting host is a workstation rather than an application server.
+    - Ticket export tooling is invoked in the same session.
+    - The requester has no prior relationship with the services requested.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: spn-enumeration
+        name: Service principal names enumerated
+        purpose: >-
+          Surface the reconnaissance step that necessarily precedes harvesting, since an
+          adversary must first learn which accounts are roastable.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(setspn(\.exe)?\s+.*-[qQtTlL]|servicePrincipalName|Get-ADUser\s+.*-Filter\s+.*ServicePrincipalName|Get-ADServiceAccount|KerberosRequestorSecurityToken)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=queries), collect([CommandLine], limit=5)])
+          | sort(queries, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of directory administration and audit tooling hosts"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: ticket-request-tooling
+        name: Ticket request or export tooling invoked
+        purpose: >-
+          Catch the harvesting step itself, where tickets are requested or pulled out of
+          memory for offline work.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(KerberosRequestorSecurityToken|Add-Type\s+.*System\.IdentityModel|kerberoast|Request-SPNTicket|klist\s+.*purge|sekurlsa::tickets|kerberos::list.*\/export|tgtdeleg)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=requests), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: enumerate-then-request
+        name: Enumeration followed by ticket requests on the same host
+        purpose: >-
+          Join reconnaissance to harvesting, which is the sequence that separates an audit
+          query from an attack.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(setspn(\.exe)?\s+.*-[qQ]|servicePrincipalName)/i
+                | spn_query := CommandLine ;
+              CommandLine=/(KerberosRequestorSecurityToken|Request-SPNTicket|kerberoast|kerberos::list)/i
+                | ticket_request := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([spn_query, ticket_request, ParentBaseFileName]),
+                              count(as=events)])
+          | spn_query=/.+/ and ticket_request=/.+/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: ticket_harvesting_activity
+      name: Service principal enumeration or ticket request tooling
+      description: >-
+        Accounts carrying service principal names were enumerated, or tooling was invoked
+        to request or export service tickets, which is the mechanism by which crackable
+        credential material is obtained.
+      source: process_creation
+      field: CommandLine
+      indicates: credential_material_capture
+
+  supporting:
+    - id: enumerate_then_request
+      name: Enumeration followed by ticket requests
+      description: >-
+        Service principal enumeration was followed by ticket requests on the same host and
+        account, which is the harvesting sequence rather than an isolated directory query.
+      source: process_creation
+      field: CommandLine
+      indicates: hands_on_keyboard_activity
+    - id: export_tooling
+      name: Ticket export tooling invoked
+      description: >-
+        Tooling capable of extracting tickets from memory was used, indicating collection
+        for offline cracking rather than ordinary Kerberos use.
+      source: process_creation
+      field: CommandLine
+      indicates: credential_decryption_attempt
+    - id: workstation_origin
+      name: Activity originating from a workstation
+      description: >-
+        The requesting host is an ordinary workstation rather than an application server or
+        a directory administration system.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: rare_for_account
+      name: Unprecedented for this account
+      description: >-
+        This account has not enumerated service principals or requested tickets in this
+        pattern during the baseline window.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: directory_admin_host
+      name: Directory administration or audit host
+      description: >-
+        The activity originates from a designated directory administration system where
+        service principal enumeration is routine work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: inventory_product
+      name: Monitoring or inventory product
+      description: >-
+        An approved monitoring or inventory product queries service accounts on a schedule
+        as part of its documented behaviour.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: scheduled_automation_job
+    - id: sanctioned_assessment
+      name: Recorded security assessment
+      description: >-
+        A recorded engagement covers a kerberoasting assessment, naming the operator, the
+        source host and the window.
+      source: change_management
+      field: UserName
+      indicates: authorised_security_testing
+
+  risk_logic:
+    required:
+      - ticket_harvesting_activity
+
+    supporting:
+      any:
+        - enumerate_then_request
+        - export_tooling
+        - workstation_origin
+        - rare_for_account
+      all:
+        - enumerate_then_request
+        - export_tooling
+
+    contradicting:
+      any:
+        - directory_admin_host
+        - inventory_product
+        - sanctioned_assessment
+      all: []
+
+  verdict:
+    low_risk_when:
+      - ticket_harvesting_activity
+      - directory_admin_host
+      - inventory_product
+      - sanctioned_assessment
+    suspicious_when:
+      - ticket_harvesting_activity
+      - workstation_origin
+    high_risk_when:
+      - ticket_harvesting_activity
+      - enumerate_then_request
+      - export_tooling
+      - workstation_origin
+
+  false_positive:
+    - condition: A directory administrator audits service principal names.
+      explanation: >-
+        Enumerating service principals is standard directory hygiene, particularly before
+        delegation changes or during account clean-up. It originates from administration
+        hosts under administrative accounts.
+    - condition: A monitoring product queries service accounts on a schedule.
+      explanation: >-
+        Inventory and monitoring tools enumerate directory objects including service
+        principals. These recur on a predictable cadence from the product's own process.
+    - condition: An application requests service tickets for services it uses.
+      explanation: >-
+        Ordinary Kerberos operation involves ticket requests constantly, which is why the
+        required evidence is enumeration or export tooling rather than ticket requests in
+        isolation.
+    - condition: A security team runs a kerberoasting assessment.
+      explanation: >-
+        Assessments reproduce the technique exactly, including the enumerate-then-request
+        sequence. Only the engagement record and the source host distinguish them.
