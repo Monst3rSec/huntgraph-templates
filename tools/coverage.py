@@ -36,7 +36,22 @@ from attack_extract import Attack, attack_id, load_bundle  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TECHNIQUES_DIR = os.path.join(ROOT, "techniques")
 
-TARGET_TACTICS = ["stealth", "defense-impairment", "credential-access"]
+PRIORITY_1 = [
+    "execution",
+    "persistence",
+    "privilege-escalation",
+    "stealth",
+    "defense-impairment",
+    "credential-access",
+    "lateral-movement",
+]
+PRIORITY_2 = [
+    "discovery",
+    "collection",
+    "command-and-control",
+    "exfiltration",
+]
+TARGET_TACTICS = PRIORITY_1 + PRIORITY_2
 ENDPOINT_PLATFORMS = {"Windows", "Linux", "macOS"}
 
 
@@ -88,13 +103,21 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tactic", choices=TARGET_TACTICS)
+    ap.add_argument("--priority", choices=["1", "2"], help="restrict to a priority tier")
     ap.add_argument("--remaining", action="store_true", help="list uncovered targets only")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
     atk = Attack(load_bundle())
     covered = corpus_coverage()
-    tactics = [args.tactic] if args.tactic else TARGET_TACTICS
+    if args.tactic:
+        tactics = [args.tactic]
+    elif args.priority == "1":
+        tactics = PRIORITY_1
+    elif args.priority == "2":
+        tactics = PRIORITY_2
+    else:
+        tactics = TARGET_TACTICS
 
     result = {}
     for tac in tactics:
@@ -137,10 +160,17 @@ def main() -> int:
                 print("      %-12s %-52s %s"
                       % (t["id"], t["name"][:52], ",".join(t["platforms"])))
 
-    total_scope = sum(r["in_scope"] for r in result.values())
-    total_done = sum(r["covered"] for r in result.values())
-    print("\ntotal %d/%d targets covered, %d remaining"
-          % (total_done, total_scope, total_scope - total_done))
+    # techniques belong to several tactics (T1574 is Stealth, Persistence and
+    # Privilege Escalation at once), so summing per-tactic counts overstates
+    # the work. Report the unique target set.
+    unique = {}
+    for tac in tactics:
+        in_scope, _ = targets(atk, tac)
+        for t in in_scope:
+            unique[attack_id(t)] = t
+    done = [tid for tid in unique if tid in covered]
+    print("\nunique targets %d, covered %d, remaining %d"
+          % (len(unique), len(done), len(unique) - len(done)))
     return 0
 
 

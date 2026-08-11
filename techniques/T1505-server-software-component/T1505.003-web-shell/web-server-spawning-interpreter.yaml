@@ -1,0 +1,296 @@
+type: detection
+
+id: hg-win-web-server-spawning-interpreter-t1505-003
+version: 1.0.0
+
+info:
+  name: Web server process spawning a command interpreter
+  description: >-
+    A web shell turns a web server into a remote command channel. Whatever language it is
+    written in and however it is obfuscated, the moment it does anything useful the web
+    server process spawns a child, and web servers are not supposed to spawn interpreters.
+    That single lineage relationship is the most durable observation available for this
+    technique: it does not depend on the shell's contents, its filename, or the framework
+    it targets, and it survives every obfuscation applied to the file itself.
+  severity: critical
+  author: huntgraph
+  tags:
+    - persistence
+    - web-shell
+    - process-lineage
+    - server
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1505/003
+    - https://attack.mitre.org/detectionstrategies/DET0394
+    - https://attack.mitre.org/techniques/T1505
+
+mitre:
+  tactics:
+    - TA0003
+  techniques:
+    - T1505
+  sub_techniques:
+    - T1505.003
+  detection_strategies:
+    - DET0394
+  analytics:
+    - AN1108
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary who has placed a web shell on a server will cause the web server worker
+    process to execute operating-system commands, producing a parent-child relationship
+    between the web service and a command interpreter that normal web application
+    behaviour does not create.
+  attacker_behavior:
+    - Uploads a script into a web-accessible directory and invokes it over HTTP.
+    - Runs discovery, credential access or lateral movement commands through the shell.
+    - Uses the web server's service account, which often has more privilege than expected.
+    - Writes further tooling into the web root for later use.
+  legitimate_behavior:
+    - Some applications legitimately shell out for image processing, PDF generation or archiving.
+    - Deployment and health-check scripts may be invoked by the application server.
+    - Administrators occasionally trigger maintenance jobs through a web interface.
+    - Application frameworks may invoke command-line utilities during a build or cache warm.
+  risk_indicator:
+    - The child process is a general-purpose shell rather than a specific utility.
+    - The command performs discovery, credential access or file transfer.
+    - A script file was written into the web root shortly before the execution.
+    - The pattern is new for a server that has run the same application for months.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+        - PeFileWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: web-worker-spawns-shell
+        name: Web worker process spawning a shell
+        purpose: >-
+          Capture the defining lineage, which holds regardless of how the shell itself is
+          written or obfuscated.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(w3wp|httpd|nginx|tomcat\d*|java|php-cgi|node)\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh|wscript|cscript|net|net1|whoami|systeminfo|ipconfig|nltest|certutil|bitsadmin|curl)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Application servers whose software documents shelling out for media or document processing"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - parent_process
+            - process
+            - organization
+
+      - id: web-shell-discovery-commands
+        name: Discovery commands issued from a web worker
+        purpose: >-
+          Isolate the subset where the command is reconnaissance, which is the first thing
+          an operator does through a new shell and is never part of an application feature.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(w3wp|httpd|nginx|tomcat\d*|java|php-cgi|node)\.exe$/i
+          | CommandLine=/(whoami|net\s+user|net\s+group|net\s+localgroup|systeminfo|ipconfig\s*\/all|nltest|net\s+view|tasklist|query\s+user)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=10)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: script-written-into-web-root
+        name: Script written into a web-accessible directory
+        purpose: >-
+          Catch the shell at upload, which allows a response before the operator returns to
+          use it.
+        query: |
+          #event_simpleName=/^(NewScriptWritten|PeFileWritten)$/
+          | TargetFileName=/\\(inetpub|wwwroot|htdocs|webapps|www|public_html)\\/i
+          | TargetFileName=/\.(aspx?|ashx|asmx|php\d?|jsp|jspx|cfm|pl|py|cgi)$/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of the approved deployment pipeline agent"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+
+evidence:
+  required:
+    - id: web_worker_child_process
+      name: Command interpreter spawned by a web server process
+      description: >-
+        A web server worker process created a shell or command-line utility, a lineage
+        relationship that ordinary web request handling does not produce.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: web_shell_execution
+
+  supporting:
+    - id: discovery_commands
+      name: Reconnaissance commands executed
+      description: >-
+        The commands run through the web server enumerate users, groups, network
+        configuration or domain trust, which is operator reconnaissance rather than
+        application functionality.
+      source: process_creation
+      field: CommandLine
+      indicates: hands_on_keyboard_activity
+    - id: script_in_web_root
+      name: Script written into a web-accessible directory
+      description: >-
+        A server-side script file was created under the web root, which is how a shell is
+        placed and is not part of normal runtime behaviour for a deployed application.
+      source: file_creation
+      field: TargetFileName
+      indicates: web_shell_staging
+    - id: general_purpose_shell
+      name: Child is a general-purpose shell
+      description: >-
+        The spawned process is cmd or PowerShell rather than a specific media or document
+        utility, so the application is being used as a command channel.
+      source: process_creation
+      field: FileName
+      indicates: remote_execution_channel
+    - id: new_for_server
+      name: Behaviour new for this server
+      description: >-
+        This lineage has not been observed on the host during the baseline window, despite
+        the server running the same application throughout.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: documented_shellout
+      name: Application documented to shell out
+      description: >-
+        The application running on this server is known to invoke a specific command-line
+        utility for image processing, document conversion or archiving.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_application_component
+    - id: deployment_pipeline
+      name: Deployment pipeline activity
+      description: >-
+        The file write or execution belongs to an approved deployment run that publishes
+        application content to the web root.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_enterprise_activity
+    - id: recurring_utility_child
+      name: Recurring specific utility invocation
+      description: >-
+        The same specific utility is invoked continuously with a stable command shape,
+        matching an application feature rather than interactive use.
+      source: baseline
+      field: CommandLine
+      indicates: legitimate_application_component
+
+  risk_logic:
+    required:
+      - web_worker_child_process
+
+    supporting:
+      any:
+        - discovery_commands
+        - script_in_web_root
+        - general_purpose_shell
+        - new_for_server
+      all:
+        - discovery_commands
+        - general_purpose_shell
+
+    contradicting:
+      any:
+        - documented_shellout
+        - deployment_pipeline
+        - recurring_utility_child
+      all: []
+
+  verdict:
+    low_risk_when:
+      - web_worker_child_process
+      - documented_shellout
+      - deployment_pipeline
+      - recurring_utility_child
+    suspicious_when:
+      - web_worker_child_process
+      - new_for_server
+    high_risk_when:
+      - web_worker_child_process
+      - discovery_commands
+      - general_purpose_shell
+      - script_in_web_root
+
+  false_positive:
+    - condition: An application shells out for image processing or document conversion.
+      explanation: >-
+        Some applications genuinely invoke command-line tools per request. The child is a
+        specific named utility rather than a general shell, and the invocation repeats with
+        a stable argument shape at high volume.
+    - condition: A deployment pipeline publishes application content to the web root.
+      explanation: >-
+        Deployments write server-side script files into web-accessible directories by
+        definition, reproducing the staging evidence. The writing process is the pipeline
+        agent and the writes cluster in release windows.
+    - condition: An administrator triggers a maintenance job through a web interface.
+      explanation: >-
+        Some internal tools expose operational actions over HTTP, which will spawn a shell
+        from the worker process. These are a fixed set of commands recurring over time
+        rather than reconnaissance.
+    - condition: An application framework invokes utilities during startup or cache warm.
+      explanation: >-
+        Frameworks sometimes call command-line tools while initialising. This clusters
+        around service starts and deployments rather than appearing at arbitrary times.

@@ -1,0 +1,294 @@
+type: detection
+
+id: hg-win-wmi-remote-process-creation-t1047
+version: 1.0.0
+
+info:
+  name: Process created on a remote host through WMI
+  description: >-
+    WMI can start a process on another machine without dropping a service, copying a
+    binary or opening a shell, which makes it a favoured way to move laterally while
+    leaving very little behind. On the target the payload's parent is WmiPrvSE.exe rather
+    than anything that explains where it came from, so lineage alone will not tell an
+    analyst what happened. That is precisely why WmiPrvSE parenting an interpreter is the
+    observation worth keeping: it marks the arrival point of a remotely issued command.
+  severity: high
+  author: huntgraph
+  tags:
+    - execution
+    - lateral-movement
+    - wmi
+    - remote-execution
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1047
+    - https://attack.mitre.org/detectionstrategies/DET0364
+    - https://attack.mitre.org/techniques/T1021
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1047
+  sub_techniques: []
+  detection_strategies:
+    - DET0364
+  analytics:
+    - AN1031
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:WMI
+  data_components:
+    - Process Creation
+    - WMI Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may create a process on a remote host through WMI so that code executes
+    without a service being installed or a file being copied, and so that the resulting
+    process has no lineage on the target explaining its origin.
+  attacker_behavior:
+    - Invokes Win32_Process Create against a remote host through wmic or the CIM cmdlets.
+    - Uses explicit credentials with the call to authenticate as another account.
+    - Runs an interpreter or a proxy-execution binary as the created process.
+    - Repeats the pattern across multiple hosts in a short period while moving laterally.
+  legitimate_behavior:
+    - Administrative scripts use WMI to run maintenance commands across a fleet.
+    - Management platforms invoke WMI as one of their remote-execution transports.
+    - Inventory tooling queries and occasionally acts through WMI.
+    - Support staff use WMI to restart or reconfigure a service on a remote machine.
+  risk_indicator:
+    - WmiPrvSE is the parent of a script interpreter or a proxy-execution binary.
+    - The invocation supplies explicit credentials rather than using the caller's context.
+    - The source host is a workstation rather than a management server or jump host.
+    - The same source contacts several targets in a short window.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: wmiprvse-spawns-interpreter
+        name: WMI provider host spawning an interpreter
+        purpose: >-
+          Observe the arrival point on the target, where a remotely issued command becomes
+          a local process with no lineage explaining it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^WmiPrvSE\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin|net|net1|sc)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "UserName of the management platform service account performing scheduled maintenance"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - process
+            - organization
+
+      - id: remote-process-create-issued
+        name: Remote process creation issued from this host
+        purpose: >-
+          Capture the calling side, which identifies the origin of lateral movement rather
+          than only its landing points.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(wmic(\.exe)?\s+.*\/node\s*:|Invoke-WmiMethod|Invoke-CimMethod|Win32_Process.*Create|New-CimSession)/i
+          | CommandLine=/(?<target_node>\/node\s*:\s*[^\s"']+|-ComputerName\s+[^\s"']+)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, target_node],
+                    function=[count(as=invocations), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of the approved management servers and jump hosts"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: explicit-credentials-supplied
+        name: Remote WMI call using explicit credentials
+        purpose: >-
+          Isolate calls that authenticate as a different account, which is how stolen
+          credentials are used and is uncommon in tooling that runs under its own service
+          identity.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(wmic(\.exe)?\s+.*\/node\s*:|Invoke-WmiMethod|Invoke-CimMethod|New-CimSession)/i
+          | CommandLine=/(\/user\s*:|\/password\s*:|-Credential\b)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=invocations), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: wmi_remote_execution
+      name: Process created through WMI
+      description: >-
+        A process was created by the WMI provider host, or a remote Win32_Process create
+        was issued, meaning code executed through WMI rather than through a local launch.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: remote_execution_channel
+
+  supporting:
+    - id: interpreter_payload
+      name: Created process is an interpreter or LOLBin
+      description: >-
+        The process WMI created is a script interpreter or proxy-execution binary rather
+        than a maintenance utility, which is the shape of hands-on-keyboard operation.
+      source: process_creation
+      field: FileName
+      indicates: dynamic_code_execution
+    - id: explicit_credentials
+      name: Explicit credentials supplied to the call
+      description: >-
+        The invocation carried a user and password or a credential object rather than
+        relying on the caller's own context, which is how harvested credentials are used.
+      source: process_creation
+      field: CommandLine
+      indicates: credential_reuse
+    - id: workstation_origin
+      name: Call originating from a workstation
+      description: >-
+        The invoking host is an ordinary workstation rather than a management server or
+        jump host, so remote administration is not its role.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: remote_smb_or_rpc
+      name: Outbound administrative connection from the caller
+      description: >-
+        The calling process opened a connection to a remote host on an administrative
+        port, confirming the call left the machine.
+      source: network_connection
+      field: RemotePort
+      indicates: lateral_movement_attempt
+
+  contradicting:
+    - id: management_platform_account
+      name: Management platform service account
+      description: >-
+        The activity runs under the service account of an approved management platform
+        that uses WMI as a documented remote-execution transport.
+      source: process_creation
+      field: UserName
+      indicates: legitimate_enterprise_activity
+    - id: approved_jump_host
+      name: Approved management server or jump host
+      description: >-
+        The calling host is a designated administration system where fleet-wide remote
+        execution is expected.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: recurring_maintenance
+      name: Recurring maintenance pattern
+      description: >-
+        The same command runs on a stable schedule against the same target set, matching a
+        deployed maintenance job.
+      source: baseline
+      field: CommandLine
+      indicates: scheduled_automation_job
+
+  risk_logic:
+    required:
+      - wmi_remote_execution
+
+    supporting:
+      any:
+        - interpreter_payload
+        - explicit_credentials
+        - workstation_origin
+        - remote_smb_or_rpc
+      all:
+        - interpreter_payload
+        - workstation_origin
+
+    contradicting:
+      any:
+        - management_platform_account
+        - approved_jump_host
+        - recurring_maintenance
+      all: []
+
+  verdict:
+    low_risk_when:
+      - wmi_remote_execution
+      - management_platform_account
+      - approved_jump_host
+      - recurring_maintenance
+    suspicious_when:
+      - wmi_remote_execution
+      - workstation_origin
+    high_risk_when:
+      - wmi_remote_execution
+      - interpreter_payload
+      - explicit_credentials
+      - workstation_origin
+
+  false_positive:
+    - condition: A management platform executes maintenance commands through WMI.
+      explanation: >-
+        WMI is a standard remote-execution transport for management tooling, and it does
+        spawn interpreters on targets. The service account and the regular cadence against
+        a known target set are the discriminators.
+    - condition: An administrative script runs a command across a fleet.
+      explanation: >-
+        Fleet-wide scripting through WMI is ordinary administration. It originates from a
+        management server or jump host rather than from a user workstation.
+    - condition: Support staff restart a service on a remote machine.
+      explanation: >-
+        Interactive remote administration produces a single call to a single target under
+        a named administrator, usually with an incident record, rather than a spread across
+        many hosts.
+    - condition: Inventory tooling acts through WMI after querying.
+      explanation: >-
+        Some inventory products both query and act through WMI. These run under the
+        product's service account with an unchanging command shape.

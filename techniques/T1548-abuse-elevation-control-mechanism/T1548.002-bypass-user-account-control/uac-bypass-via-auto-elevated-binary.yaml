@@ -1,0 +1,272 @@
+type: detection
+
+id: hg-win-uac-bypass-via-auto-elevated-binary-t1548-002
+version: 1.0.0
+
+info:
+  name: UAC bypass through a hijacked auto-elevating binary
+  description: >-
+    A number of Windows binaries elevate silently because they are signed, marked
+    auto-elevate and located in System32. Several of them read a registry value or load a
+    component from a path a standard user can write, so redirecting that lookup gives the
+    user's code a free ride into a high-integrity process with no consent prompt. The
+    binaries involved are few and well known, and in each case the registry key they read
+    has no other purpose, which makes the write itself a specific and durable observation
+    even as the payloads change.
+  severity: high
+  author: huntgraph
+  tags:
+    - privilege-escalation
+    - uac-bypass
+    - registry
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1548/002
+    - https://attack.mitre.org/detectionstrategies/DET0388
+    - https://attack.mitre.org/techniques/T1548
+
+mitre:
+  tactics:
+    - TA0004
+  techniques:
+    - T1548
+  sub_techniques:
+    - T1548.002
+  detection_strategies:
+    - DET0388
+  analytics:
+    - AN1094
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+    - Windows Registry Key Modification
+    - Module Load
+
+hypothesis:
+  statement: >-
+    An adversary holding a standard user token may write to a registry location that an
+    auto-elevating Windows binary consults, so that launching that binary executes their
+    command at high integrity without presenting a consent prompt.
+  attacker_behavior:
+    - Writes a command into a hijackable key such as the ms-settings or mscfile shell open handler.
+    - Sets a DelegateExecute value so the shell honours the redirected command.
+    - Launches fodhelper, computerdefaults, sdclt, eventvwr or a similar auto-elevating binary.
+    - Deletes the registry entry immediately after elevation to remove the artefact.
+  legitimate_behavior:
+    - Applications register their own file and protocol handlers under the user hive.
+    - Installers set shell open commands for the file types they own.
+    - Administrators legitimately run the same auto-elevating binaries for their intended purpose.
+  risk_indicator:
+    - A shell open command is written under one of the known hijackable keys.
+    - An auto-elevating binary launches shortly after that write.
+    - The written command is an interpreter or a program in a user-writable directory.
+    - The registry value is removed shortly after the binary runs.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: hijackable-handler-written
+        name: Shell open command written under a hijackable key
+        purpose: >-
+          Surface writes to the specific keys the known bypasses depend on, each of which
+          has no purpose other than being consulted by an auto-elevating binary.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(ms-settings|mscfile|Folder\\\\shell\\\\open|exefile\\\\shell\\\\runas|AppX[a-z0-9]+)\\\\shell\\\\open\\\\command/i
+          | CommandLine=/(reg(\.exe)?\s+add|Set-ItemProperty|New-ItemProperty|New-Item)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=writes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: delegate-execute-set
+        name: DelegateExecute value written
+        purpose: >-
+          Catch the accompanying value that makes the shell honour a redirected command,
+          which is close to unique to this technique.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/DelegateExecute/i
+          | CommandLine=/(reg(\.exe)?\s+add|Set-ItemProperty|New-ItemProperty)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=writes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: auto-elevating-binary-child
+        name: Auto-elevating binary spawning an interpreter
+        purpose: >-
+          Observe the elevation succeeding, where a silently elevating binary becomes the
+          parent of a shell it has no reason to launch.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(fodhelper|computerdefaults|sdclt|eventvwr|slui|wsreset|dccw|cmstp|msconfig|CompMgmtLauncher)\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: elevation_hijack
+      name: Auto-elevation path hijacked or exercised
+      description: >-
+        A command was written into a registry location that an auto-elevating binary
+        consults, or such a binary spawned a command interpreter, indicating the silent
+        elevation path is being used to run attacker-chosen code.
+      source: process_creation
+      field: CommandLine
+      indicates: elevation_control_bypass
+
+  supporting:
+    - id: delegate_execute
+      name: DelegateExecute value present
+      description: >-
+        The accompanying DelegateExecute value was written, which makes the shell honour
+        the redirected command and has essentially no other use.
+      source: process_creation
+      field: CommandLine
+      indicates: deliberate_evasion
+    - id: interpreter_target
+      name: Redirected command is an interpreter
+      description: >-
+        The command placed in the handler is a script interpreter or a program in a
+        user-writable directory rather than an installed application.
+      source: process_creation
+      field: CommandLine
+      indicates: dynamic_code_execution
+    - id: script_host_writer
+      name: Written by a script host or delivery application
+      description: >-
+        The registry write was performed by an interpreter, document handler or archive
+        utility rather than by an installer registering its own file associations.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: rare_for_estate
+      name: Pattern rare across the estate
+      description: >-
+        Writes to these particular keys are essentially absent from the estate during the
+        baseline window, which is the expected state.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: installer_association
+      name: Installer registering file associations
+      description: >-
+        An approved installer wrote a shell open command for a file type its product owns,
+        which is normal association registration.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: legitimate_tool_use
+      name: Auto-elevating binary used for its own purpose
+      description: >-
+        The binary was launched interactively and performed its intended function without
+        spawning an interpreter.
+      source: process_creation
+      field: FileName
+      indicates: legitimate_administrative_action
+    - id: fleetwide_association
+      name: Same association across the estate
+      description: >-
+        The identical handler registration appears across many hosts, matching deployed
+        software rather than a targeted bypass.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - elevation_hijack
+
+    supporting:
+      any:
+        - delegate_execute
+        - interpreter_target
+        - script_host_writer
+        - rare_for_estate
+      all:
+        - delegate_execute
+        - interpreter_target
+
+    contradicting:
+      any:
+        - installer_association
+        - legitimate_tool_use
+        - fleetwide_association
+      all: []
+
+  verdict:
+    low_risk_when:
+      - elevation_hijack
+      - installer_association
+      - legitimate_tool_use
+      - fleetwide_association
+    suspicious_when:
+      - elevation_hijack
+      - rare_for_estate
+    high_risk_when:
+      - elevation_hijack
+      - delegate_execute
+      - interpreter_target
+      - script_host_writer
+
+  false_positive:
+    - condition: An installer registers a shell open command for a file type it owns.
+      explanation: >-
+        Association registration writes to shell open command keys legitimately, though
+        under the application's own progid rather than the specific keys the known bypasses
+        target, which is why the required evidence names those keys.
+    - condition: An administrator opens Event Viewer or Disk Cleanup for its intended purpose.
+      explanation: >-
+        These binaries are ordinary administrative tools and will run frequently. They do
+        not spawn command interpreters when used normally, which is why the child process
+        rather than the launch carries the evidence.
+    - condition: A software package registers a custom protocol handler.
+      explanation: >-
+        Applications that handle custom URL schemes write handler commands during
+        installation. These appear across every host running the product and reference the
+        application's own executable.

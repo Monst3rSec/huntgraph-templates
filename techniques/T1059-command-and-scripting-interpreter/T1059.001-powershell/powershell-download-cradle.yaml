@@ -1,0 +1,307 @@
+type: detection
+
+id: hg-win-powershell-download-cradle-t1059-001
+version: 1.0.0
+
+info:
+  name: PowerShell download cradle retrieving and executing remote code
+  description: >-
+    A download cradle is the shortest path from initial execution to a real payload: fetch
+    a string over HTTP and hand it straight to the interpreter, with nothing written to
+    disk for a scanner to examine. The construct is stable across tooling because it is
+    the minimum viable stager, and it is expressed in a handful of recognisable forms —
+    Net.WebClient, Invoke-WebRequest, Invoke-RestMethod — always paired with an execution
+    verb. Administrators do fetch scripts remotely, so the discriminator is where the
+    content comes from and who asked for it, not the fetch itself.
+  severity: high
+  author: huntgraph
+  tags:
+    - execution
+    - powershell
+    - download-cradle
+    - fileless
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1059/001
+    - https://attack.mitre.org/detectionstrategies/DET0455
+    - https://attack.mitre.org/techniques/T1059
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1059
+  sub_techniques:
+    - T1059.001
+  detection_strategies:
+    - DET0455
+  analytics:
+    - AN1252
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:PowerShell
+  data_components:
+    - Process Creation
+    - Command Execution
+    - Module Load
+
+hypothesis:
+  statement: >-
+    An adversary may use PowerShell to retrieve code from a remote host and execute it
+    directly in memory, so that the payload never exists as a file and the only durable
+    artefact is the command line that fetched it.
+  attacker_behavior:
+    - Calls DownloadString or DownloadData and pipes the result into Invoke-Expression.
+    - Uses Invoke-WebRequest or Invoke-RestMethod and executes the response content.
+    - Combines the cradle with profile skipping, policy bypass and a hidden window.
+    - Runs the cradle from a document handler, archive tool or another interpreter.
+  legitimate_behavior:
+    - Administrators bootstrap tooling from an internal script repository.
+    - Package managers and installers fetch and run setup scripts from vendor endpoints.
+    - Build pipelines retrieve helper scripts as part of a job.
+    - Monitoring agents pull configuration over HTTP on a schedule.
+  risk_indicator:
+    - The remote host is external and not an approved script repository.
+    - The fetch is combined with execution rather than saving to a file for review.
+    - The parent process implies a user opened content rather than an administrator working.
+    - The command line is new for the host and user across the baseline window.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - DomainName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: fetch-and-execute
+        name: Remote content fetched and executed in one command
+        purpose: >-
+          Surface the cradle proper, where retrieval and execution appear together, which
+          is what separates a stager from an administrator downloading a script to read.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/(Net\.WebClient|DownloadString|DownloadData|DownloadFile|Invoke-WebRequest|Invoke-RestMethod|\biwr\b|\bcurl\b|\bwget\b)/i
+          | CommandLine=/(iex|Invoke-Expression|\|\s*&|\.Invoke\s*\(|Start-Process)/i
+          | CommandLine=/(?<remote_host>https?\s*:?\s*(\[:\])?\/\/[^\s"']+)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, remote_host],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "remote_host on the internal script repository and approved package registries"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - domain
+            - command_line
+
+      - id: cradle-with-suppression-flags
+        name: Download cradle combined with policy and window suppression
+        purpose: >-
+          Isolate cradles that also disable the execution policy, skip the profile or hide
+          the window, indicating the caller wants the run unobserved as well as remote.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/(DownloadString|DownloadData|Invoke-WebRequest|Invoke-RestMethod)/i
+          | CommandLine=/-ex(ec(ution)?(policy)?)?\s+bypass|-nop(rofile)?|-w(in(dowstyle)?)?\s+hidden/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the configuration-management agent"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - command_line
+
+      - id: cradle-resolution
+        name: Name resolved by a cradle process
+        purpose: >-
+          Confirm the fetch was attempted by joining the invocation to a DNS query from
+          the same process, separating a live stager from an inert command line.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|DnsRequest)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | FileName=/^(powershell|pwsh)\.exe$/i
+                | CommandLine=/(DownloadString|DownloadData|Invoke-WebRequest|Invoke-RestMethod)/i
+                | cradle_pid := TargetProcessId ;
+              #event_simpleName=DnsRequest ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([CommandLine, ParentBaseFileName, DomainName]),
+                              count(as=events)])
+          | cradle_pid = ContextProcessId
+        filters:
+          include: []
+          exclude:
+            - "DomainName on the approved corporate and package-registry allowlist"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - domain
+            - host
+
+evidence:
+  required:
+    - id: fetch_and_execute
+      name: Remote retrieval combined with execution
+      description: >-
+        A PowerShell command line retrieves content over HTTP and passes it directly to an
+        execution verb, so remote code runs without ever being written to disk.
+      source: process_creation
+      field: CommandLine
+      indicates: fileless_remote_execution
+
+  supporting:
+    - id: external_destination
+      name: External or unapproved remote host
+      description: >-
+        The host being fetched from is external and not one of the approved script
+        repositories or package registries the organisation operates.
+      source: process_creation
+      field: CommandLine
+      indicates: possible_payload_retrieval
+    - id: suppression_flags
+      name: Policy, profile or window suppression
+      description: >-
+        The invocation also bypasses the execution policy, skips the profile or hides the
+        window, showing intent to run without interference or visibility.
+      source: process_creation
+      field: CommandLine
+      indicates: defensive_control_avoidance
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        PowerShell was launched by a document handler, archive utility, mail client,
+        browser or another interpreter rather than by an administrator shell or an agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: resolution_observed
+      name: Name resolved by the cradle process
+      description: >-
+        The same process issued a DNS query, confirming the retrieval was attempted rather
+        than the command line merely containing a URL.
+      source: dns_request
+      field: DomainName
+      indicates: active_command_and_control_attempt
+
+  contradicting:
+    - id: internal_repository
+      name: Internal script repository as the source
+      description: >-
+        The content is fetched from the organisation's own script repository or an
+        approved package registry.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_enterprise_activity
+    - id: automation_agent_parent
+      name: Configuration-management agent as parent
+      description: >-
+        The cradle was executed by an approved configuration-management, build or
+        monitoring agent that bootstraps tooling this way by design.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: recurring_bootstrap
+      name: Recurring identical bootstrap
+      description: >-
+        The same cradle recurs on a stable cadence across many hosts, which is a deployed
+        bootstrap rather than an opportunistic stager.
+      source: baseline
+      field: CommandLine
+      indicates: scheduled_automation_job
+
+  risk_logic:
+    required:
+      - fetch_and_execute
+
+    supporting:
+      any:
+        - external_destination
+        - suppression_flags
+        - delivery_parent
+        - resolution_observed
+      all:
+        - external_destination
+        - resolution_observed
+
+    contradicting:
+      any:
+        - internal_repository
+        - automation_agent_parent
+        - recurring_bootstrap
+      all: []
+
+  verdict:
+    low_risk_when:
+      - fetch_and_execute
+      - internal_repository
+      - automation_agent_parent
+      - recurring_bootstrap
+    suspicious_when:
+      - fetch_and_execute
+      - external_destination
+    high_risk_when:
+      - fetch_and_execute
+      - external_destination
+      - suppression_flags
+      - delivery_parent
+
+  false_positive:
+    - condition: An administrator bootstraps tooling from the internal script repository.
+      explanation: >-
+        Fetch-and-run is a normal way to distribute administrative scripts, and it produces
+        the required evidence exactly. The source host is internal and known, which is why
+        destination reputation carries the first escalation.
+    - condition: A package manager or installer fetches and runs a setup script.
+      explanation: >-
+        Several ecosystems document installation as piping a remote script into a shell.
+        These target well-known vendor endpoints and recur identically across hosts.
+    - condition: A build pipeline retrieves helper scripts during a job.
+      explanation: >-
+        Build jobs commonly pull shared scripts at run time. The parent is a build agent
+        on an engineering host and the same fetch repeats every pipeline run.
+    - condition: A monitoring agent pulls configuration over HTTP.
+      explanation: >-
+        Agents refresh configuration on a schedule, sometimes evaluating what they fetch.
+        These originate from the agent process against a fixed internal endpoint.

@@ -1,0 +1,309 @@
+type: detection
+
+id: hg-win-run-key-pointing-to-user-writable-payload-t1547-001
+version: 1.0.0
+
+info:
+  name: Autostart entry pointing at a user-writable payload
+  description: >-
+    Run keys and the startup folder are the oldest persistence in Windows and remain
+    popular because they need no privilege beyond the user's own and survive every reboot.
+    Legitimate software uses them constantly, so the entry itself is meaningless — what
+    matters is what it points at. Installed software autostarts from its installation
+    directory; a payload autostarts from AppData, Temp or a profile folder, because those
+    are the only places an unprivileged process can write. That contrast is stable across
+    every family that uses this technique.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - autostart
+    - run-keys
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1547/001
+    - https://attack.mitre.org/detectionstrategies/DET0365
+    - https://attack.mitre.org/techniques/T1547
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1547
+  sub_techniques:
+    - T1547.001
+  detection_strategies:
+    - DET0365
+  analytics:
+    - AN1032
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Windows Registry Key Modification
+    - File Creation
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may register an autostart entry that points at an executable or script in
+    a user-writable directory, obtaining persistence that survives reboot and requires no
+    privilege beyond the compromised user's own.
+  attacker_behavior:
+    - Adds a Run or RunOnce value referencing a payload under AppData, Temp or ProgramData.
+    - Drops a shortcut or script into the Startup folder for the user or all users.
+    - Names the value after a plausible updater or helper so it survives a glance at autoruns.
+    - Writes the payload and the autostart entry within moments of each other.
+  legitimate_behavior:
+    - Installed applications register autostart entries pointing at their own binaries.
+    - Updaters and sync clients legitimately autostart from ProgramData or AppData.
+    - Management tooling deploys autostart entries across the estate.
+    - Users place shortcuts to their own applications in the Startup folder.
+  risk_indicator:
+    - The referenced program sits in a user-writable directory rather than an installation path.
+    - The entry was created by a script host or a document handler.
+    - The payload was written to the host shortly before the entry was registered.
+    - The value name and target pairing appears on very few hosts.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: run-key-writable-target
+        name: Run key registered against a user-writable path
+        purpose: >-
+          Surface autostart registrations whose target lies outside the installation trees,
+          which is the contrast between installed software and a staged payload.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(CurrentVersion\\\\Run|CurrentVersion\\\\RunOnce|CurrentVersion\\\\RunServices)/i
+          | CommandLine=/(reg(\.exe)?\s+add|Set-ItemProperty|New-ItemProperty)/i
+          | CommandLine=/(?<autostart_target>[A-Za-z]:\\[^",]+\.(exe|dll|ps1|vbs|js|bat|cmd|scr))/i
+          | autostart_target=/\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\/i
+          | autostart_target!=/\\Program Files( \(x86\))?\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, autostart_target],
+                    function=[count(as=registrations), collect([CommandLine], limit=3)])
+          | sort(registrations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "autostart_target under approved updater and sync-client directories"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: startup-folder-payload
+        name: Executable or script written into the Startup folder
+        purpose: >-
+          Cover the filesystem equivalent of a Run key, which requires no registry write
+          at all and is often missed by registry-focused review.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten|NewScriptWritten)$/
+          | TargetFileName=/\\Start Menu\\Programs\\Startup\\/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of approved installers and management agents"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: payload-written-then-registered
+        name: Payload written then registered for autostart
+        purpose: >-
+          Join the drop to the persistence, distinguishing a payload installing itself from
+          an installer registering a binary it placed under Program Files.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten|NewScriptWritten|ProcessRollup2)$/
+          | case {
+              #event_simpleName=/^(PeFileWritten|NewExecutableWritten|NewScriptWritten)$/
+                | TargetFileName=/\\(AppData|Temp|ProgramData|Users|Public)\\/i
+                | dropped_payload := TargetFileName ;
+              #event_simpleName=ProcessRollup2
+                | CommandLine=/CurrentVersion\\\\Run(Once)?/i
+                | autostart_command := CommandLine ;
+            }
+          | groupBy([ComputerName],
+                    function=[collect([dropped_payload, autostart_command, UserName, ParentBaseFileName]),
+                              count(as=events)])
+          | dropped_payload=/.+/ and autostart_command=/.+/
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of approved installers"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+
+evidence:
+  required:
+    - id: autostart_untrusted_target
+      name: Autostart entry referencing a user-writable program
+      description: >-
+        A Run key, RunOnce value or Startup folder item points at an executable or script
+        located in a directory any unprivileged process can write to.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_established
+
+  supporting:
+    - id: payload_recently_written
+      name: Target written shortly before registration
+      description: >-
+        The referenced program was created on the host shortly before the autostart entry
+        was made, which is self-installation rather than software setup.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: script_host_creator
+      name: Script host or delivery application registered the entry
+      description: >-
+        The registration was performed by an interpreter, document handler or archive
+        utility rather than by an installer or management agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: rare_entry
+      name: Entry rare across the estate
+      description: >-
+        The value name and target pairing appears on very few hosts during the baseline
+        window, unlike autostart entries belonging to deployed software.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+    - id: interpreter_target
+      name: Autostart target is an interpreter
+      description: >-
+        The entry launches a script interpreter or proxy-execution binary rather than an
+        application executable, which installed software does not require.
+      source: process_creation
+      field: CommandLine
+      indicates: dynamic_code_execution
+
+  contradicting:
+    - id: installer_registered
+      name: Registered by an approved installer
+      description: >-
+        The entry was created by an approved installer or updater as part of setting up its
+        own product.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: vendor_target_path
+      name: Target inside a vendor installation
+      description: >-
+        The referenced program resolves to a Program Files subtree or a documented vendor
+        updater directory.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_application_component
+    - id: fleetwide_entry
+      name: Same entry across the estate
+      description: >-
+        The identical autostart entry appears on many hosts, which is deployed software or
+        managed configuration rather than targeted persistence.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - autostart_untrusted_target
+
+    supporting:
+      any:
+        - payload_recently_written
+        - script_host_creator
+        - rare_entry
+        - interpreter_target
+      all:
+        - payload_recently_written
+        - script_host_creator
+
+    contradicting:
+      any:
+        - installer_registered
+        - vendor_target_path
+        - fleetwide_entry
+      all: []
+
+  verdict:
+    low_risk_when:
+      - autostart_untrusted_target
+      - installer_registered
+      - vendor_target_path
+      - fleetwide_entry
+    suspicious_when:
+      - autostart_untrusted_target
+      - rare_entry
+    high_risk_when:
+      - autostart_untrusted_target
+      - payload_recently_written
+      - script_host_creator
+      - interpreter_target
+
+  false_positive:
+    - condition: An updater or sync client autostarts from AppData or ProgramData.
+      explanation: >-
+        Several widely deployed products install per-user into AppData and legitimately
+        autostart from there, which produces the required evidence on every host that runs
+        them. The estate-wide footprint is the discriminator, not the path.
+    - condition: An installer registers an autostart entry during setup.
+      explanation: >-
+        Registration immediately after writing the binary is normal installation
+        behaviour and reproduces the sequence evidence. The installer as parent and the
+        vendor target path separate it.
+    - condition: A user places a shortcut in their Startup folder.
+      explanation: >-
+        Users do arrange their own startup applications. These point at installed software
+        and are created by explorer during an interactive session.
+    - condition: Management tooling deploys an autostart entry across the estate.
+      explanation: >-
+        Managed configuration frequently includes autostart entries, sometimes targeting
+        ProgramData. These appear simultaneously across a collection of hosts.

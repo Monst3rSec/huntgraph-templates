@@ -1,0 +1,291 @@
+type: detection
+
+id: hg-win-ntds-extracted-via-shadow-copy-t1003-003
+version: 1.0.0
+
+info:
+  name: NTDS database extracted from a domain controller
+  description: >-
+    NTDS.dit holds every credential in the domain, so obtaining a copy is close to a
+    terminal event: it converts a domain controller foothold into offline access to every
+    account. The file is locked while the directory service runs, which forces the
+    adversary through a small number of mechanisms — a volume shadow copy, ntdsutil's own
+    IFM export, or a raw volume read. Each is loud, each is rare on a healthy domain
+    controller outside a backup window, and all of them must also take the SYSTEM hive to
+    be useful.
+  severity: critical
+  author: huntgraph
+  tags:
+    - credential-access
+    - domain-controller
+    - ntds
+    - shadow-copy
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1003/003
+    - https://attack.mitre.org/detectionstrategies/DET0586
+    - https://attack.mitre.org/techniques/T1003
+
+mitre:
+  tactics:
+    - TA0006
+  techniques:
+    - T1003
+  sub_techniques:
+    - T1003.003
+  detection_strategies:
+    - DET0586
+  analytics:
+    - AN1611
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+    - WinEventLog:Microsoft-Windows-VSS
+  data_components:
+    - Process Creation
+    - File Creation
+    - Volume Creation
+
+hypothesis:
+  statement: >-
+    An adversary with privileged access to a domain controller may copy the NTDS database
+    out from under the running directory service using a shadow copy, an ntdsutil export
+    or a raw volume read, obtaining every domain credential for offline extraction.
+  attacker_behavior:
+    - Creates a volume shadow copy and copies NTDS.dit and the SYSTEM hive out of it.
+    - Uses ntdsutil to perform an install-from-media export to a working directory.
+    - Reads the database through a raw volume access tool that bypasses the file lock.
+    - Compresses the output and moves it off the host shortly afterwards.
+  legitimate_behavior:
+    - Backup products create shadow copies on domain controllers on a schedule.
+    - Administrators use ntdsutil IFM to build a new domain controller.
+    - Disaster-recovery testing exercises directory restore procedures.
+    - Directory maintenance occasionally requires an offline defragmentation.
+  risk_indicator:
+    - The shadow copy is created interactively rather than by the backup product.
+    - NTDS.dit and the SYSTEM hive are copied to a user-writable directory.
+    - The output is compressed shortly after extraction.
+    - No change record covers domain controller promotion or a restore test.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewExecutableWritten
+        - PeFileWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: shadow-copy-then-ntds-copy
+        name: Shadow copy created and NTDS copied from it
+        purpose: >-
+          Surface the most common route, which requires a snapshot and then a file copy
+          referencing the shadow path.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(vssadmin\s+create\s+shadow|Win32_ShadowCopy|wmic\s+shadowcopy\s+call\s+create|diskshadow)/i or CommandLine=/HarddiskVolumeShadowCopy.*ntds\.dit/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the approved backup product"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: ntdsutil-ifm-export
+        name: Ntdsutil install-from-media export
+        purpose: >-
+          Catch the directory service's own supported export path, which produces a usable
+          copy without any shadow-copy command appearing.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/ntdsutil/i
+          | CommandLine=/(ifm|create\s+full|activate\s+instance)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=exports), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: ntds-and-system-hive-together
+        name: NTDS database and SYSTEM hive handled together
+        purpose: >-
+          Isolate the pairing that makes the database usable, since NTDS.dit without the
+          boot key from the SYSTEM hive cannot be decrypted.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/ntds\.dit/i
+          | CommandLine=/(\bSYSTEM\b.*\bhive\b|reg(\.exe)?\s+save\s+hklm\\\\system|\\\\config\\\\SYSTEM)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: ntds_extraction
+      name: NTDS database copied or exported
+      description: >-
+        The directory database was obtained through a shadow copy, an ntdsutil export or a
+        raw volume read, producing a copy of every domain credential outside the running
+        directory service.
+      source: process_creation
+      field: CommandLine
+      indicates: domain_credential_capture
+
+  supporting:
+    - id: system_hive_taken
+      name: SYSTEM hive taken alongside the database
+      description: >-
+        The SYSTEM registry hive was saved or copied in the same activity, which is
+        required to decrypt the database and has no purpose without it.
+      source: process_creation
+      field: CommandLine
+      indicates: credential_material_capture
+    - id: writable_output_path
+      name: Output written to a user-writable directory
+      description: >-
+        The extracted files were placed under a temporary or user-writable path rather
+        than a backup target or a staging location for domain controller promotion.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: interactive_actor
+      name: Interactive rather than scheduled execution
+      description: >-
+        The extraction was issued by an interactive shell or remote-execution channel
+        rather than by the backup product's own scheduled process.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: hands_on_keyboard_activity
+    - id: unprecedented_on_host
+      name: No comparable activity in the baseline
+      description: >-
+        This domain controller has not seen a comparable extraction during the baseline
+        window outside the backup product's regular cadence.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: backup_product_context
+      name: Approved backup product performing a snapshot
+      description: >-
+        The shadow copy was created by the approved backup product as part of its
+        scheduled protection of the domain controller.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: dc_promotion_change
+      name: Recorded domain controller promotion
+      description: >-
+        A change record covers building a new domain controller from media, which is the
+        supported use of an ntdsutil IFM export.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: recurring_backup_cadence
+      name: Regular backup cadence
+      description: >-
+        Shadow copies occur on this host on a stable schedule matching the backup policy,
+        rather than at an arbitrary time.
+      source: baseline
+      field: ComputerName
+      indicates: scheduled_automation_job
+
+  risk_logic:
+    required:
+      - ntds_extraction
+
+    supporting:
+      any:
+        - system_hive_taken
+        - writable_output_path
+        - interactive_actor
+        - unprecedented_on_host
+      all:
+        - system_hive_taken
+        - interactive_actor
+
+    contradicting:
+      any:
+        - backup_product_context
+        - dc_promotion_change
+        - recurring_backup_cadence
+      all: []
+
+  verdict:
+    low_risk_when:
+      - ntds_extraction
+      - backup_product_context
+      - dc_promotion_change
+      - recurring_backup_cadence
+    suspicious_when:
+      - ntds_extraction
+      - unprecedented_on_host
+    high_risk_when:
+      - ntds_extraction
+      - system_hive_taken
+      - writable_output_path
+      - interactive_actor
+
+  false_positive:
+    - condition: A backup product creates shadow copies on the domain controller.
+      explanation: >-
+        Protecting a domain controller necessarily involves snapshotting the volume holding
+        NTDS.dit, so shadow-copy creation alone cannot carry a verdict. The backup process
+        as the actor and the scheduled cadence are the discriminators.
+    - condition: An administrator builds a new domain controller from media.
+      explanation: >-
+        The ntdsutil IFM export is the supported way to seed a new domain controller and
+        produces exactly the required evidence. It is planned work with a change record and
+        the output goes to a staging share rather than a user directory.
+    - condition: Disaster-recovery testing exercises a directory restore.
+      explanation: >-
+        Recovery rehearsals copy the database deliberately. These are scheduled exercises
+        with named owners and defined windows.
+    - condition: Directory maintenance performs an offline defragmentation.
+      explanation: >-
+        Compaction operates on the database file directly. It occurs during a maintenance
+        window on a controller taken out of service, and does not involve the SYSTEM hive.

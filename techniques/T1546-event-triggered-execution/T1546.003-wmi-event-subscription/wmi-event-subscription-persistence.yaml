@@ -1,0 +1,281 @@
+type: detection
+
+id: hg-win-wmi-event-subscription-persistence-t1546-003
+version: 1.0.0
+
+info:
+  name: WMI event subscription registered for persistence
+  description: >-
+    A permanent WMI event subscription runs a command whenever a condition it defines is
+    met — a time interval, a process start, a logon. It lives in the WMI repository rather
+    than in the registry or the filesystem, so it is invisible to autostart review, and it
+    executes under SYSTEM. Very little software uses permanent subscriptions, which makes
+    the creation of a filter-to-consumer binding an unusually specific event: outside a
+    handful of management products, an estate may see none at all in a year.
+  severity: critical
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - wmi
+    - fileless
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1546/003
+    - https://attack.mitre.org/detectionstrategies/DET0086
+    - https://attack.mitre.org/techniques/T1546
+
+mitre:
+  tactics:
+    - TA0004
+    - TA0003
+  techniques:
+    - T1546
+  sub_techniques:
+    - T1546.003
+  detection_strategies:
+    - DET0086
+  analytics:
+    - AN0236
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:WMI
+  data_components:
+    - WMI Creation
+    - Process Creation
+    - Module Load
+
+hypothesis:
+  statement: >-
+    An adversary may create a permanent WMI event subscription that executes a command
+    when a chosen condition occurs, obtaining persistence that runs as SYSTEM, stores no
+    file on disk and does not appear in registry or startup-folder review.
+  attacker_behavior:
+    - Creates an EventFilter with a timer or process-start query and binds it to a CommandLine or ActiveScript consumer.
+    - Registers the subscription through PowerShell, wmic or a compiled MOF file.
+    - Points the consumer at an interpreter with an encoded or obfuscated payload.
+    - Uses an innocuous filter and consumer name so a listing of subscriptions looks ordinary.
+  legitimate_behavior:
+    - Some monitoring and management products install permanent subscriptions by design.
+    - Hardware vendors ship subscriptions for device and health events.
+    - Administrators occasionally build a subscription for an operational alerting need.
+  risk_indicator:
+    - The consumer runs a script interpreter or an encoded command.
+    - The subscription was created by a script host rather than by an installer.
+    - No management product that uses subscriptions is deployed on the host.
+    - The filter and consumer names appear on very few hosts.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: subscription-components-created
+        name: Event filter, consumer or binding created
+        purpose: >-
+          Surface creation of any of the three objects a permanent subscription requires,
+          since all three must exist and any one of them is a sufficient starting point.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(__EventFilter|CommandLineEventConsumer|ActiveScriptEventConsumer|__FilterToConsumerBinding|Register-WmiEvent|Set-WmiInstance\s+.*subscription)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=registrations), collect([CommandLine], limit=5)])
+          | sort(registrations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of monitoring products that install subscriptions by design"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: consumer-runs-interpreter
+        name: Consumer configured to run an interpreter
+        purpose: >-
+          Isolate subscriptions whose action is a script interpreter or an encoded command,
+          which is execution rather than the event forwarding monitoring products perform.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(CommandLineEventConsumer|ActiveScriptEventConsumer)/i
+          | CommandLine=/(powershell|pwsh|cmd\.exe|wscript|cscript|mshta|rundll32|-enc|FromBase64String|scrcons)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=registrations), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: mof-compiled
+        name: MOF file compiled into the WMI repository
+        purpose: >-
+          Cover the mofcomp route, which installs a subscription without any PowerShell or
+          wmic subscription syntax appearing on a command line.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^mofcomp\.exe$/i
+          | CommandLine=/(?<mof_path>[A-Za-z]:\\[^",]+\.mof)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, mof_path],
+                    function=[count(as=compiles), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude:
+            - "mof_path under vendor installation directories"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+evidence:
+  required:
+    - id: subscription_created
+      name: Permanent WMI subscription component created
+      description: >-
+        An event filter, event consumer, filter-to-consumer binding or compiled MOF was
+        created, establishing execution that triggers on a WMI event and persists in the
+        repository.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_established
+
+  supporting:
+    - id: interpreter_consumer
+      name: Consumer executes an interpreter or encoded command
+      description: >-
+        The consumer is configured to run a script interpreter, a proxy-execution binary or
+        an encoded command rather than to forward or log an event.
+      source: process_creation
+      field: CommandLine
+      indicates: dynamic_code_execution
+    - id: script_host_creator
+      name: Created by a script host or delivery application
+      description: >-
+        The subscription was registered by an interpreter, document handler or archive
+        utility rather than by a product installer.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: no_subscription_product
+      name: No subscription-using product deployed
+      description: >-
+        The estate shows no monitoring or management product that installs permanent
+        subscriptions on this host during the baseline window.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: rare_names
+      name: Filter and consumer names rare in the estate
+      description: >-
+        The names used appear on very few hosts, unlike vendor subscriptions which are
+        uniform wherever the product is installed.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: monitoring_product_install
+      name: Monitoring product installing its subscription
+      description: >-
+        The subscription was created by an approved monitoring, management or hardware
+        vendor product that uses permanent subscriptions as its documented mechanism.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: fleetwide_subscription
+      name: Same subscription across the estate
+      description: >-
+        The identical filter and consumer appear on many hosts, which is a deployed product
+        rather than targeted persistence.
+      source: baseline
+      field: CommandLine
+      indicates: software_deployment_wave
+    - id: recorded_change
+      name: Recorded administrative change
+      description: >-
+        A change record covers the creation of an operational subscription, naming the host,
+        the engineer and the purpose.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - subscription_created
+
+    supporting:
+      any:
+        - interpreter_consumer
+        - script_host_creator
+        - no_subscription_product
+        - rare_names
+      all:
+        - interpreter_consumer
+        - script_host_creator
+
+    contradicting:
+      any:
+        - monitoring_product_install
+        - fleetwide_subscription
+        - recorded_change
+      all: []
+
+  verdict:
+    low_risk_when:
+      - subscription_created
+      - monitoring_product_install
+      - fleetwide_subscription
+      - recorded_change
+    suspicious_when:
+      - subscription_created
+      - rare_names
+    high_risk_when:
+      - subscription_created
+      - interpreter_consumer
+      - script_host_creator
+      - no_subscription_product
+
+  false_positive:
+    - condition: A monitoring product installs permanent subscriptions as part of setup.
+      explanation: >-
+        A small number of management and hardware products genuinely use permanent
+        subscriptions. They are installed once per host by the product installer and are
+        identical everywhere the product is deployed.
+    - condition: A hardware vendor ships subscriptions for device or health events.
+      explanation: >-
+        Vendor agents register subscriptions to react to hardware events. The consumer
+        forwards or logs rather than launching an interpreter, which is why the consumer
+        action carries the escalation.
+    - condition: An administrator builds a subscription for operational alerting.
+      explanation: >-
+        Occasionally an engineer creates a subscription to react to a specific condition.
+        This is rare, interactive, and normally accompanied by a change record explaining
+        the need.

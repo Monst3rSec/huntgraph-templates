@@ -1,0 +1,300 @@
+type: detection
+
+id: hg-win-admin-share-remote-execution-t1021-002
+version: 1.0.0
+
+info:
+  name: Remote execution through administrative shares
+  description: >-
+    Copying a binary to ADMIN$ or C$ and starting it as a service is the oldest reliable
+    way to move laterally in a Windows estate, and it remains popular because it uses only
+    built-in functionality and valid credentials. The activity is not stealthy — it leaves
+    a service creation and a file write on the target — but it hides in plain sight
+    because administrators do the same thing. The discriminators are direction and origin:
+    who is reaching whom, and whether the source is a machine whose role includes remote
+    administration.
+  severity: high
+  author: huntgraph
+  tags:
+    - lateral-movement
+    - admin-shares
+    - remote-execution
+    - smb
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1021/002
+    - https://attack.mitre.org/detectionstrategies/DET0530
+    - https://attack.mitre.org/techniques/T1021
+
+mitre:
+  tactics:
+    - TA0008
+  techniques:
+    - T1021
+  sub_techniques:
+    - T1021.002
+  detection_strategies:
+    - DET0530
+  analytics:
+    - AN1468
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Logon Session Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary holding valid credentials may write a payload to an administrative share
+    on a remote host and execute it as a service, moving laterally using only built-in
+    Windows functionality and leaving a service creation as the primary artefact.
+  attacker_behavior:
+    - Mounts ADMIN$ or C$ on a remote host and copies an executable to it.
+    - Creates and starts a service on the target that runs the copied binary.
+    - Uses a service-execution utility that automates the copy, create, run and clean-up sequence.
+    - Repeats the sequence against several hosts from one source in a short window.
+  legitimate_behavior:
+    - Administrators deploy patches and tooling through administrative shares.
+    - Management platforms use the same mechanism as one of their transports.
+    - Backup and inventory agents access administrative shares routinely.
+    - Support staff copy diagnostic tooling to a machine they are working on.
+  risk_indicator:
+    - The source of the connection is a workstation rather than a management server.
+    - The service binary path points at a recently written file in a temporary location.
+    - The service name is randomly generated or imitates a system component.
+    - One source touches administrative shares on many hosts in a short period.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: admin-share-access-issued
+        name: Administrative share mounted from this host
+        purpose: >-
+          Capture the calling side so the origin of lateral movement is identified, not
+          only the hosts it lands on.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\\\\\\\\[^\s"\\]+\\\\(ADMIN\$|C\$|IPC\$)/i
+          | CommandLine=/(net(\.exe)?\s+use|copy|xcopy|robocopy|Copy-Item|New-PSDrive)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=connections), collect([CommandLine], limit=5)])
+          | sort(connections, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of approved management servers, jump hosts and backup infrastructure"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: service-created-for-temp-binary
+        name: Service created for a binary in a temporary location
+        purpose: >-
+          Observe the landing side, where the copied payload is turned into a running
+          service pointing at a path no installed product would use.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(sc(\.exe)?\s+.*\bcreate\b|New-Service|sc(\.exe)?\s+.*\bstart\b)/i
+          | CommandLine=/(?<service_binary>[A-Za-z]:\\[^",]+\.(exe|dll|bat|cmd|ps1))/i
+          | service_binary=/\\(Windows\\Temp|Temp|AppData|ProgramData|Users|PerfLogs)\\/i
+          | service_binary!=/\\Program Files( \(x86\))?\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, service_binary],
+                    function=[count(as=registrations), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude:
+            - "service_binary under approved deployment staging directories"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: executable-written-to-share-path
+        name: Executable written into an administrative share location
+        purpose: >-
+          Catch the payload arriving, which precedes execution and gives the earliest
+          opportunity to respond.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+          | TargetFileName=/\\(Windows\\Temp|PerfLogs|Windows\\System32\\Tasks|ProgramData)\\/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of approved patching and deployment agents"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+
+evidence:
+  required:
+    - id: admin_share_execution
+      name: Administrative share used to stage or run a payload
+      description: >-
+        An administrative share was accessed to copy content, or a service was created for
+        a binary in a temporary location, which together constitute the copy-and-run
+        lateral movement sequence.
+      source: process_creation
+      field: CommandLine
+      indicates: lateral_movement_attempt
+
+  supporting:
+    - id: workstation_origin
+      name: Connection originating from a workstation
+      description: >-
+        The source is an ordinary workstation rather than a management server, jump host
+        or backup system whose role includes reaching administrative shares.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: temporary_service_binary
+      name: Service binary in a temporary directory
+      description: >-
+        The service points at an executable under a temporary or user-writable path rather
+        than an installation directory, which no packaged product does.
+      source: process_creation
+      field: CommandLine
+      indicates: untrusted_execution_location
+    - id: binary_recently_written
+      name: Binary written shortly before the service was created
+      description: >-
+        The executable arrived on the target immediately before the service registration,
+        completing the copy-then-execute sequence.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: multiple_targets
+      name: Several targets from one source
+      description: >-
+        The same source reached administrative shares on multiple hosts within a short
+        window, which is the fan-out shape of lateral movement.
+      source: baseline
+      field: UserName
+      indicates: lateral_movement_attempt
+
+  contradicting:
+    - id: management_infrastructure
+      name: Approved management or backup infrastructure
+      description: >-
+        The source host is designated management, patching or backup infrastructure where
+        administrative share access is its function.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: deployment_agent
+      name: Deployment or patching agent performing the copy
+      description: >-
+        The write or service creation was performed by an approved deployment agent during
+        a recorded maintenance window.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: recurring_admin_pattern
+      name: Recurring administrative pattern
+      description: >-
+        The same source and target relationship recurs on a stable cadence, matching a
+        deployed operational process rather than an intrusion.
+      source: baseline
+      field: CommandLine
+      indicates: scheduled_automation_job
+
+  risk_logic:
+    required:
+      - admin_share_execution
+
+    supporting:
+      any:
+        - workstation_origin
+        - temporary_service_binary
+        - binary_recently_written
+        - multiple_targets
+      all:
+        - workstation_origin
+        - multiple_targets
+
+    contradicting:
+      any:
+        - management_infrastructure
+        - deployment_agent
+        - recurring_admin_pattern
+      all: []
+
+  verdict:
+    low_risk_when:
+      - admin_share_execution
+      - management_infrastructure
+      - deployment_agent
+      - recurring_admin_pattern
+    suspicious_when:
+      - admin_share_execution
+      - workstation_origin
+    high_risk_when:
+      - admin_share_execution
+      - workstation_origin
+      - temporary_service_binary
+      - binary_recently_written
+
+  false_positive:
+    - condition: An administrator deploys a patch or tool through administrative shares.
+      explanation: >-
+        This is the same sequence an adversary uses, performed for good reasons. The source
+        is management infrastructure and the activity falls in a maintenance window with a
+        change record.
+    - condition: A management platform uses administrative shares as a transport.
+      explanation: >-
+        Several platforms copy an agent to ADMIN$ and register it as a service, which is
+        indistinguishable at the telemetry level. The source host and the regular cadence
+        are the discriminators.
+    - condition: A backup or inventory agent accesses administrative shares.
+      explanation: >-
+        Agent-less backup and inventory products reach administrative shares continuously.
+        These originate from dedicated infrastructure against a stable target set.
+    - condition: Support staff copy diagnostic tooling to a machine they are working on.
+      explanation: >-
+        Copying a utility to a user's machine during an incident is ordinary support work.
+        It involves one target rather than many and is tied to a named engineer.

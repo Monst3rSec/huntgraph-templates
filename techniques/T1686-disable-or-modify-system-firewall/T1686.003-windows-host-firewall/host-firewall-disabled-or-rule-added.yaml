@@ -1,0 +1,293 @@
+type: detection
+
+id: hg-win-host-firewall-disabled-or-rule-added-t1686-003
+version: 1.0.0
+
+info:
+  name: Windows host firewall disabled or opened for an untrusted program
+  description: >-
+    The host firewall is what stops a foothold becoming a listening service. An adversary
+    who wants an inbound channel — a reverse-connect handler, a remote access tool, a
+    peer-to-peer relay — has to turn it off, open a port, or add a program exception. All
+    three are done through the same two utilities, and in a managed estate the firewall is
+    configured by policy rather than by hand, so a local change is a deviation from
+    baseline as much as it is a technique. The strongest form is an exception naming a
+    program in a directory the user can write to.
+  severity: high
+  author: huntgraph
+  tags:
+    - defense-impairment
+    - firewall
+    - host-hardening
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1686/003
+    - https://attack.mitre.org/detectionstrategies/DET0901
+    - https://attack.mitre.org/techniques/T1686
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1686
+  sub_techniques:
+    - T1686.003
+  detection_strategies:
+    - DET0901
+  analytics:
+    - AN2043
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:System
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Windows Registry Key Modification
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may disable the Windows firewall or add an inbound exception for a
+    program they control, so that a payload can accept connections or a remote access
+    channel can be reached directly rather than only calling outward.
+  attacker_behavior:
+    - Turns off the firewall for one or all profiles through netsh or the PowerShell cmdlets.
+    - Adds an inbound allow rule naming a program in a user-writable directory.
+    - Opens a specific port associated with a remote access or tunnelling tool.
+    - Names the rule after a system component so it survives a review of the rule set.
+  legitimate_behavior:
+    - Installers add firewall exceptions for the services they deploy.
+    - Group Policy and management tooling push firewall configuration across the estate.
+    - Administrators temporarily disable the firewall while diagnosing connectivity.
+    - Developers open ports for local services during testing.
+  risk_indicator:
+    - The program named in the exception sits in a user-writable directory.
+    - The firewall is turned off entirely rather than a specific exception being added.
+    - The change is made by a script host or a document handler.
+    - The change is local rather than arriving through managed policy.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: firewall-disabled
+        name: Firewall turned off for one or more profiles
+        purpose: >-
+          Surface wholesale disabling, which is the bluntest form and the one least likely
+          to have a legitimate explanation on a managed endpoint.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(netsh\s+.*firewall.*set.*state\s+off|Set-NetFirewallProfile\s+.*-Enabled\s+False|netsh\s+firewall\s+set\s+opmode\s+disable)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of approved imaging and provisioning automation"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+            - organization
+
+      - id: inbound-rule-for-writable-program
+        name: Inbound exception added for a user-writable program
+        purpose: >-
+          Isolate exceptions naming a program outside the installation trees, which is how
+          a payload is given an inbound channel.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(netsh\s+advfirewall\s+firewall\s+add\s+rule|New-NetFirewallRule)/i
+          | CommandLine=/(dir\s*=\s*in|-Direction\s+Inbound)/i
+          | CommandLine=/(?<allowed_program>[A-Za-z]:\\[^",]+\.exe)/i
+          | allowed_program=/\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\/i
+          | allowed_program!=/\\Program Files( \(x86\))?\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, allowed_program],
+                    function=[count(as=rules), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude:
+            - "allowed_program under approved vendor staging directories"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: remote-access-port-opened
+        name: Inbound rule opening a remote access port
+        purpose: >-
+          Catch exceptions that open ports associated with remote control and tunnelling,
+          independent of which program is named.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(netsh\s+advfirewall\s+firewall\s+add\s+rule|New-NetFirewallRule)/i
+          | CommandLine=/(localport\s*=\s*(3389|5985|5986|22|4444|1080|8080|5900)|-LocalPort\s+(3389|5985|5986|22|4444|1080|8080|5900))/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=rules), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Hosts where remote administration ports are opened by managed policy"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+evidence:
+  required:
+    - id: firewall_weakened
+      name: Firewall disabled or an inbound exception added
+      description: >-
+        The host firewall was turned off, or an inbound rule was created, reducing the
+        protection that prevents a foothold from accepting connections.
+      source: process_creation
+      field: CommandLine
+      indicates: defensive_control_degradation
+
+  supporting:
+    - id: writable_program_exception
+      name: Exception naming a user-writable program
+      description: >-
+        The allowed program sits under AppData, Temp, ProgramData, Public or a user
+        profile rather than in an installation directory.
+      source: process_creation
+      field: CommandLine
+      indicates: untrusted_execution_location
+    - id: wholesale_disable
+      name: Firewall disabled entirely
+      description: >-
+        Rather than a targeted exception, the firewall was turned off for one or more
+        profiles, which removes protection for every program on the host.
+      source: process_creation
+      field: CommandLine
+      indicates: deliberate_evasion
+    - id: script_host_actor
+      name: Change made by a script host or delivery application
+      description: >-
+        The change was issued by an interpreter, document handler or archive utility rather
+        than by an installer or management agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: local_deviation
+      name: Local change against a managed baseline
+      description: >-
+        The change was made locally on a host whose firewall configuration is otherwise
+        governed by policy, so it is a deviation as well as a weakening.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: installer_exception
+      name: Installer adding its own exception
+      description: >-
+        An approved installer created the rule for a service it deploys, which is normal
+        setup behaviour.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: managed_policy_change
+      name: Change delivered by managed policy
+      description: >-
+        The configuration arrived through Group Policy or the management platform as part
+        of a governed rollout.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: recorded_troubleshooting
+      name: Recorded connectivity troubleshooting
+      description: >-
+        A change or incident record covers temporarily disabling the firewall while
+        diagnosing a connectivity fault.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - firewall_weakened
+
+    supporting:
+      any:
+        - writable_program_exception
+        - wholesale_disable
+        - script_host_actor
+        - local_deviation
+      all:
+        - writable_program_exception
+        - script_host_actor
+
+    contradicting:
+      any:
+        - installer_exception
+        - managed_policy_change
+        - recorded_troubleshooting
+      all: []
+
+  verdict:
+    low_risk_when:
+      - firewall_weakened
+      - installer_exception
+      - managed_policy_change
+      - recorded_troubleshooting
+    suspicious_when:
+      - firewall_weakened
+      - local_deviation
+    high_risk_when:
+      - firewall_weakened
+      - writable_program_exception
+      - wholesale_disable
+      - script_host_actor
+
+  false_positive:
+    - condition: An installer adds a firewall exception for a service it deploys.
+      explanation: >-
+        Applications that listen must be allowed through, so installers create rules
+        routinely. The program named sits in the installation directory and the same rule
+        appears on every host receiving the package.
+    - condition: Group Policy pushes firewall configuration across the estate.
+      explanation: >-
+        Managed configuration changes firewall state constantly and legitimately. It
+        arrives through policy processing rather than an interactive command line.
+    - condition: An administrator disables the firewall while diagnosing connectivity.
+      explanation: >-
+        Turning the firewall off to isolate a fault is common troubleshooting, and it
+        produces the strongest supporting evidence. It is interactive, short-lived and
+        normally attached to an incident record.
+    - condition: A developer opens a port for a local service during testing.
+      explanation: >-
+        Engineering hosts frequently gain inbound rules for development servers, sometimes
+        naming binaries in user directories. These cluster on engineering assets under the
+        developer's own account.
