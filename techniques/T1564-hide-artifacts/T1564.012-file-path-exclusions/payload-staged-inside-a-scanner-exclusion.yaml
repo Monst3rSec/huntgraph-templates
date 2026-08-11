@@ -1,0 +1,305 @@
+type: detection
+
+id: hg-win-payload-staged-inside-a-scanner-exclusion-t1564-012
+version: 1.0.0
+
+info:
+  name: Payload staged inside a scanner exclusion path
+  description: >-
+    Every estate has exclusions — the database directory the vendor insisted on, the build
+    output tree that was too noisy, the line-of-business application that broke under
+    scanning. They are documented, they are stable, and they are exactly where a payload
+    wants to live. Using an existing exclusion costs the adversary nothing and creates no
+    artefact at all; they simply write somewhere the scanner has been told not to look.
+    The observable is therefore not the exclusion but what appears inside it.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - hide-artifacts
+    - scanner-exclusion
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1564/012
+    - https://attack.mitre.org/detectionstrategies/DET0051
+    - https://attack.mitre.org/techniques/T1564
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1564
+  sub_techniques:
+    - T1564.012
+  detection_strategies:
+    - DET0051
+  analytics:
+    - AN0139
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:Security
+  data_components:
+    - File Creation
+    - File Access
+
+hypothesis:
+  statement: >-
+    An adversary may place and run their payload inside a directory the endpoint protection
+    product has been told to exclude, obtaining execution that is never scanned without
+    having to disable or reconfigure anything.
+  attacker_behavior:
+    - Writes an executable or script into a documented exclusion directory.
+    - Executes the payload from inside that directory so it is never inspected.
+    - Adds a new exclusion first when a suitable one does not already exist.
+    - Chooses an exclusion belonging to an application unrelated to their payload.
+  legitimate_behavior:
+    - Applications covered by exclusions write and execute their own files there constantly.
+    - Build systems produce executables in excluded output directories.
+    - Database and virtualisation products write large files into excluded paths.
+    - Installers stage content into excluded application directories.
+  risk_indicator:
+    - The file written into the exclusion is unrelated to the application the exclusion exists for.
+    - The writer is a script host, browser or archive tool rather than the covered application.
+    - A new exclusion was added shortly before the file appeared.
+    - The file hash is unknown across the estate.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: executable-written-by-unrelated-process
+        name: Executable written into an exclusion by an unrelated process
+        purpose: >-
+          Surface content arriving in an excluded directory from a writer that has no
+          relationship to the application the exclusion exists for.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten|NewScriptWritten)$/
+          | TargetFileName=/\\(SQL|MSSQL|Databases|Hyper-V|VirtualMachines|Backup|Antivirus|Jenkins|workspace|build|artifacts)\\/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId, SHA256HashData],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of the application each exclusion exists for"
+            - "Build agents writing into their own workspace directories"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: exclusion-added-then-file-written
+        name: New exclusion added shortly before a file appears in it
+        purpose: >-
+          Catch the case where no suitable exclusion existed, so one was created — the
+          only variant that leaves a configuration artefact.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|PeFileWritten|NewExecutableWritten)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | CommandLine=/(Add-MpPreference\s+.*-Exclusion|Exclusions\\\\(Paths|Processes))/i
+                | CommandLine=/(?<excluded_path>[A-Za-z]:\\[^",]+)/i
+                | exclusion_added := excluded_path ;
+              #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+                | staged_file := TargetFileName ;
+            }
+          | groupBy([ComputerName],
+                    function=[collect([exclusion_added, staged_file, ContextProcessId]),
+                              count(as=events)])
+          | exclusion_added=/.+/ and staged_file=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Documented exclusions approved for line-of-business applications"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+
+      - id: execution-from-exclusion-path
+        name: Process executing from an excluded directory
+        purpose: >-
+          Observe the payload running from inside the blind spot, which is the point of
+          staging it there.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/\\(SQL|MSSQL|Databases|Hyper-V|VirtualMachines|Backup|Antivirus|Jenkins|workspace|artifacts)\\/i
+          | ParentBaseFileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|explorer|winword|excel|outlook|chrome|msedge)\.exe$/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - process
+
+evidence:
+  required:
+    - id: content_in_exclusion
+      name: Executable content written into or run from an excluded path
+      description: >-
+        An executable or script was created in, or executed from, a directory the endpoint
+        protection product is configured not to scan.
+      source: file_creation
+      field: TargetFileName
+      indicates: scanner_blind_spot_use
+
+  supporting:
+    - id: unrelated_writer
+      name: Writer unrelated to the excluded application
+      description: >-
+        The process that wrote the file is a script host, browser or archive utility rather
+        than the application the exclusion exists to accommodate.
+      source: file_creation
+      field: ContextProcessId
+      indicates: abnormal_execution_chain
+    - id: exclusion_recently_added
+      name: Exclusion created shortly beforehand
+      description: >-
+        The exclusion covering the path was added shortly before the file appeared, which
+        is the adversary creating the blind spot rather than finding one.
+      source: process_creation
+      field: CommandLine
+      indicates: deliberate_evasion
+    - id: interactive_parent
+      name: Execution parented by a shell or delivery application
+      description: >-
+        The process running from the excluded path was launched by an interpreter, document
+        handler or browser rather than by the covered application's own service.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: user_execution_foothold
+    - id: rare_hash
+      name: Hash unknown across the estate
+      description: >-
+        The file's hash appears on very few hosts, unlike the application binaries and
+        build outputs that legitimately occupy excluded directories.
+      source: baseline
+      field: SHA256HashData
+      indicates: unusual_binary_in_environment
+
+  contradicting:
+    - id: covered_application_writer
+      name: Written by the application the exclusion exists for
+      description: >-
+        The writing process is the database, virtualisation, backup or build product whose
+        directory the exclusion covers.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_application_component
+    - id: build_output
+      name: Build output in a workspace directory
+      description: >-
+        The file is a build artefact produced by a build agent in its own workspace, which
+        is why the directory is excluded in the first place.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: expected_developer_activity
+    - id: documented_exclusion
+      name: Documented exclusion and expected content
+      description: >-
+        The exclusion is recorded as an approved exception and the file matches the content
+        that exception was granted for.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - content_in_exclusion
+
+    supporting:
+      any:
+        - unrelated_writer
+        - exclusion_recently_added
+        - interactive_parent
+        - rare_hash
+      all:
+        - unrelated_writer
+        - rare_hash
+
+    contradicting:
+      any:
+        - covered_application_writer
+        - build_output
+        - documented_exclusion
+      all: []
+
+  verdict:
+    low_risk_when:
+      - content_in_exclusion
+      - covered_application_writer
+      - build_output
+      - documented_exclusion
+    suspicious_when:
+      - content_in_exclusion
+      - rare_hash
+    high_risk_when:
+      - content_in_exclusion
+      - unrelated_writer
+      - exclusion_recently_added
+      - interactive_parent
+
+  false_positive:
+    - condition: A database or virtualisation product writes into its own excluded directory.
+      explanation: >-
+        Exclusions exist precisely because these applications write large files constantly.
+        The writing process is the covered application, which is the discriminator rather
+        than the path.
+    - condition: A build agent produces executables in an excluded workspace.
+      explanation: >-
+        Build output directories are excluded for performance and contain new executables
+        with unique hashes on every run, reproducing the rarity evidence. The build agent as
+        writer and the engineering host separate it.
+    - condition: An installer stages content into an excluded application directory.
+      explanation: >-
+        Setup routines write into the directories their products own. These occur during
+        rollout windows with the installer as the writing process.
+    - condition: A backup product writes archives into an excluded path.
+      explanation: >-
+        Backup targets are commonly excluded to avoid scanning large archives. The acting
+        process is an approved backup client on a fixed schedule.

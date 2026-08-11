@@ -1,0 +1,300 @@
+type: detection
+
+id: hg-win-html-smuggled-payload-assembled-locally-t1027-006
+version: 1.0.0
+
+info:
+  name: Payload assembled in the browser from smuggled HTML content
+  description: >-
+    HTML smuggling moves the payload past network inspection by never sending it as a file:
+    the page carries encoded data and script that reconstructs the executable in the
+    browser, then hands it to the user as a download. Anything watching the wire sees HTML,
+    and anything scanning attachments sees a document. The artefact that survives is on the
+    endpoint — an executable or archive materialising in the download directory with the
+    browser as its writer, followed by the user opening it.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - obfuscation
+    - html-smuggling
+    - phishing-payload
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1027/006
+    - https://attack.mitre.org/detectionstrategies/DET0313
+    - https://attack.mitre.org/techniques/T1027
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1027
+  sub_techniques:
+    - T1027.006
+  detection_strategies:
+    - DET0313
+  analytics:
+    - AN0872
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - File Creation
+    - File Metadata
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may deliver a page whose script reconstructs an executable or archive in
+    the browser and offers it as a download, bypassing network and mail inspection because
+    the payload never crosses either as a file.
+  attacker_behavior:
+    - Serves HTML containing encoded payload data and script that reassembles it.
+    - Triggers a download of the reconstructed file without a server round trip.
+    - Chooses a container or archive format so the extracted content also avoids the zone marker.
+    - Relies on the user opening the reconstructed file from their download directory.
+  legitimate_behavior:
+    - Web applications generate files client-side for export and reporting.
+    - Document and design tools assemble downloads in the browser by design.
+    - Users download installers and archives from vendor sites constantly.
+    - Internal portals produce generated reports as browser-side downloads.
+  risk_indicator:
+    - The browser writes an executable or archive rather than a document.
+    - The written file is executed shortly afterwards.
+    - The file hash is unknown across the estate.
+    - The originating site is not a known internal or vendor destination.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: browser-writes-executable
+        name: Browser writing an executable or archive
+        purpose: >-
+          Surface the reconstruction landing on disk, which is the first point at which a
+          smuggled payload becomes visible to endpoint telemetry.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten|NewScriptWritten)$/
+          | TargetFileName=/\.(exe|dll|scr|iso|img|vhd|vhdx|7z|zip|rar|js|jse|vbs|hta|lnk|msi)$/i
+          | TargetFileName=/\\(Downloads|INetCache|Temporary Internet Files|AppData\\Local\\Temp)\\/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId, SHA256HashData],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Hashes of approved software downloaded through self-service portals"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: downloaded-file-executed
+        name: Downloaded file executed from the download directory
+        purpose: >-
+          Join the reconstruction to the user acting on it, which is what turns a delivered
+          payload into an execution.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/\\(Downloads|INetCache|AppData\\Local\\Temp)\\/i
+          | ParentBaseFileName=/^(explorer|chrome|msedge|firefox|7zfm|winrar)\.exe$/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved self-service installers"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - path
+
+      - id: rare-hash-from-browser
+        name: Browser-written file with a hash unknown to the estate
+        purpose: >-
+          Use estate rarity to separate a targeted payload from the vendor software many
+          users download.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+          | TargetFileName=/\\(Downloads|INetCache)\\/i
+          | groupBy([SHA256HashData],
+                    function=[count(ComputerName, distinct=true, as=host_count),
+                              collect([TargetFileName, ComputerName], limit=10)])
+          | host_count <= 2
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - organization
+            - path
+
+evidence:
+  required:
+    - id: browser_wrote_payload
+      name: Browser wrote an executable or archive
+      description: >-
+        A browser process created an executable, script or container file in a download or
+        cache directory, which is what a smuggled payload looks like once reconstructed.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+
+  supporting:
+    - id: executed_after_download
+      name: File executed after landing
+      description: >-
+        A process started from the downloaded path under an interactive parent, confirming
+        the user opened what the page produced.
+      source: process_creation
+      field: ImageFileName
+      indicates: user_execution_foothold
+    - id: rare_hash
+      name: Hash unknown across the estate
+      description: >-
+        The file's hash appears on very few hosts, unlike the vendor software that many
+        users legitimately download.
+      source: baseline
+      field: SHA256HashData
+      indicates: unusual_binary_in_environment
+    - id: container_format
+      name: Container or archive format used
+      description: >-
+        The reconstructed file is a disk image or archive, which also strips the zone
+        marker from its contents and compounds the evasion.
+      source: file_creation
+      field: TargetFileName
+      indicates: trust_control_subversion
+    - id: interpreter_payload
+      name: Reconstructed file is a script or shortcut
+      description: >-
+        The written file is a script, shortcut or HTML application rather than an
+        installer, which is a payload shape rather than software distribution.
+      source: file_creation
+      field: TargetFileName
+      indicates: user_facing_deception
+
+  contradicting:
+    - id: approved_self_service
+      name: Approved self-service software download
+      description: >-
+        The file is recognised software obtained through a sanctioned self-service or
+        vendor channel.
+      source: baseline
+      field: SHA256HashData
+      indicates: legitimate_enterprise_activity
+    - id: client_side_export
+      name: Web application generating an export
+      description: >-
+        The writing page belongs to an internal or approved application that assembles
+        reports and exports in the browser by design.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_application_component
+    - id: widely_downloaded
+      name: File downloaded broadly across the estate
+      description: >-
+        The same hash appears across many hosts over the baseline window, which is common
+        software rather than a targeted delivery.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - browser_wrote_payload
+
+    supporting:
+      any:
+        - executed_after_download
+        - rare_hash
+        - container_format
+        - interpreter_payload
+      all:
+        - executed_after_download
+        - rare_hash
+
+    contradicting:
+      any:
+        - approved_self_service
+        - client_side_export
+        - widely_downloaded
+      all: []
+
+  verdict:
+    low_risk_when:
+      - browser_wrote_payload
+      - approved_self_service
+      - client_side_export
+      - widely_downloaded
+    suspicious_when:
+      - browser_wrote_payload
+      - rare_hash
+    high_risk_when:
+      - browser_wrote_payload
+      - executed_after_download
+      - rare_hash
+      - interpreter_payload
+
+  false_positive:
+    - condition: A user downloads an installer or archive from a vendor site.
+      explanation: >-
+        Browsers write executables and archives constantly, which is why the required
+        evidence alone cannot carry a verdict. Widely downloaded software has a hash seen
+        across many hosts.
+    - condition: A web application generates an export or report client-side.
+      explanation: >-
+        Modern applications assemble files in the browser deliberately, which is the same
+        mechanism smuggling uses. These produce documents and spreadsheets rather than
+        executables, and originate from known internal applications.
+    - condition: A design or document tool assembles a download in the browser.
+      explanation: >-
+        Client-side file generation is a normal feature. The output type and the
+        originating application are what separate it from a reconstructed payload.
+    - condition: A developer downloads a build artefact.
+      explanation: >-
+        Engineering work involves downloading executables with hashes unique to a build,
+        reproducing the rarity evidence. These cluster on engineering hosts and come from
+        internal build infrastructure.
