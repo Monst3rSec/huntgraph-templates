@@ -16,16 +16,16 @@ A **target** is a leaf: a sub-technique, or a technique with no sub-techniques o
 
 | Tactic | Covered | In scope | Remaining | Out of scope |
 |---|---:|---:|---:|---:|
-| Execution | 31 (69%) | 45 | 14 | 12 |
-| Persistence | 53 (62%) | 85 | 32 | 14 |
-| Privilege Escalation | 42 (54%) | 78 | 36 | 7 |
-| Stealth | 76 (60%) | 127 | 51 | 5 |
-| Defense Impairment | 23 (77%) | 30 | 7 | 16 |
-| Credential Access | 32 (64%) | 50 | 18 | 8 |
-| Lateral Movement | 13 (81%) | 16 | 3 | 4 |
-| **unique total** | **207** | **315** | **108** | |
+| Execution | 32 (71%) | 45 | 13 | 12 |
+| Persistence | 55 (65%) | 85 | 30 | 14 |
+| Privilege Escalation | 43 (55%) | 78 | 35 | 7 |
+| Stealth | 78 (61%) | 127 | 49 | 5 |
+| Defense Impairment | 24 (80%) | 30 | 6 | 16 |
+| Credential Access | 34 (68%) | 50 | 16 | 8 |
+| Lateral Movement | 14 (88%) | 16 | 2 | 4 |
+| **unique total** | **213** | **315** | **102** | |
 
-Of the 108 remaining, **8 are recorded as deliberately skipped** in `skipped.yaml` — targets whose only observable is telemetry this deployment cannot collect, where any template would look like coverage and detect nothing. They are gaps, but acknowledged ones: T1129, T1218.003, T1218.008, T1218.009, T1480.002, T1497.002, T1497.003, T1622.
+Of the 102 remaining, **9 are recorded as deliberately skipped** in `skipped.yaml` — targets whose only observable is telemetry this deployment cannot collect, where any template would look like coverage and detect nothing. They are gaps, but acknowledged ones: T1129, T1218.003, T1218.008, T1218.009, T1480.002, T1497.002, T1497.003, T1622, T1684.002.
 
 ## Priority 2
 
