@@ -1,0 +1,342 @@
+type: detection
+
+id: hg-win-electron-application-passed-a-command-executing-flag-t1218-015
+
+version: 1.0.0
+
+info:
+  name: Electron application passed a command-executing flag
+  description: >-
+    Electron applications are Chromium plus Node, packaged and signed by a vendor the estate
+    already trusts. Teams, Slack, Discord, VS Code and the browsers built on the same engine
+    are installed deliberately, run constantly, and are allowed by every application control
+    policy in the building. They also accept the Chromium command-line switches, and several
+    of those switches exist to name a program the runtime will launch on your behalf —
+    --gpu-launcher, --utility-cmd-prefix and --renderer-cmd-prefix each take a string that
+    ends up being executed. Others load code rather than launch it: --app and --require
+    point the runtime at JavaScript of the caller's choosing, and the ELECTRON_RUN_AS_NODE
+    variable turns the application into a plain Node interpreter. Nothing about the binary
+    is modified, nothing unsigned is dropped, and the parent-child relationship looks like a
+    normal application starting a helper. The command line is the entire finding, which is
+    why this hunt reads arguments rather than reputation, and why the discriminator is the
+    argument's payload: a vendor's own switches name a bundled helper inside the install
+    directory, while the abuse names a shell, a script or a path outside it.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - proxy-execution
+    - electron
+    - command-line
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1218/015
+    - https://attack.mitre.org/detectionstrategies/DET0025
+    - https://attack.mitre.org/techniques/T1218
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1218
+  sub_techniques:
+    - T1218.015
+  detection_strategies:
+    - DET0025
+  analytics:
+    - AN0071
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may pass a signed Electron or Chromium application a command-line switch
+    that names a program or script for the runtime to execute, obtaining code execution
+    under a trusted, allow-listed application without modifying or dropping a binary.
+  attacker_behavior:
+    - Invokes an installed Electron application with --gpu-launcher naming a shell command.
+    - Uses --utility-cmd-prefix or --renderer-cmd-prefix to prepend a command to a helper launch.
+    - Points --app or --require at JavaScript staged outside the application's install directory.
+    - Sets ELECTRON_RUN_AS_NODE on the command line to use the application as a Node interpreter.
+    - Relies on the application's signature and allow-listing rather than on any dropped file.
+  legitimate_behavior:
+    - Electron applications launch their own helper processes with Chromium switches.
+    - Vendor updaters and launchers relaunch the application with flags after an update.
+    - Developers run Electron and Chromium with debugging and extension-loading switches.
+    - Automation and test frameworks drive browsers with scripted command lines.
+  risk_indicator:
+    - The value passed to a launcher switch names a shell, script host or interpreter.
+    - The referenced script or application directory sits outside the install path.
+    - The application was started by a script host, document handler or archive utility.
+    - The child process is an interpreter rather than the vendor's own helper.
+    - This command line has no precedent for the application anywhere in the estate.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: launcher-switch-naming-a-command
+        name: Chromium launcher switch naming a command to run
+        purpose: >-
+          Read the switches whose value is executed directly. The vendor uses these to point
+          at a bundled helper inside the install directory, so a value that names a shell,
+          an interpreter or a path elsewhere is the abuse in a single field.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/--(gpu-launcher|utility-cmd-prefix|renderer-cmd-prefix|browser-subprocess-path|ppapi-plugin-launcher)=/i
+          | CommandLine=/(cmd(\.exe)?|powershell(\.exe)?|pwsh(\.exe)?|wscript|cscript|mshta|rundll32|regsvr32|bitsadmin|certutil|curl|\\AppData\\|\\Temp\\|\\ProgramData\\|\\Downloads\\|\\Public\\)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=launches), collect([CommandLine], limit=5)])
+          | sort(launches, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "browser-subprocess-path values resolving inside the application's own install directory"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: electron-loading-external-javascript
+        name: Electron application loading JavaScript from outside its install path
+        purpose: >-
+          Cover the load route rather than the launch route. --app and --require hand the
+          runtime code to execute, and an application directory or module path outside the
+          vendor's own install tree means that code is not the vendor's.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(--app=|--require[= ]|--load-extension=|--js-flags=)/i
+          | CommandLine=/(?<js_target>[A-Za-z]:\\[^",]+(\.(js|mjs|cjs|asar|json)|\\))/i
+          | js_target=/\\(AppData\\Local\\Temp|AppData\\Roaming\\[^\\]+\\?$|Temp|Tmp|ProgramData|Users\\Public|Downloads|Desktop)\\/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName, js_target],
+                    function=[count(as=loads), collect([CommandLine], limit=3)])
+          | sort(loads, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Extension and application directories used by the approved developer tooling"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: electron-application-spawning-an-interpreter
+        name: Electron application spawning a shell or script host
+        purpose: >-
+          Catch the result rather than the argument, for the cases where the switch is
+          obfuscated or arrives through a shortcut. These applications spawn their own named
+          helpers; a command shell or script host as their child is not one of them.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(teams|ms-teams|slack|discord|code|cursor|signal|whatsapp|notion|obsidian|postman|figma|spotify|chrome|msedge|brave|element|skype|zoom)\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|bitsadmin|certutil|schtasks|net|net1|reg)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=children), collect([CommandLine], limit=5)])
+          | sort(children, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Vendor updater and crash-handler children launched through cmd.exe wrappers"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - parent_process
+            - organization
+
+      - id: electron-run-as-node-set-inline
+        name: Electron application switched into Node interpreter mode
+        purpose: >-
+          Find the variant that drops the graphical application entirely. With
+          ELECTRON_RUN_AS_NODE set, a signed desktop application becomes a general Node
+          interpreter that will run whatever script it is given, and setting it on the same
+          command line makes that visible.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/ELECTRON_RUN_AS_NODE/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=runs), collect([CommandLine], limit=5)])
+          | sort(runs, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: command_executing_flag
+      name: Trusted application given a flag that executes code
+      description: >-
+        An installed Electron or Chromium application was invoked with a switch whose value
+        is launched or loaded by the runtime, so the application is acting as an execution
+        vehicle for a command the caller chose.
+      source: process_creation
+      field: CommandLine
+      indicates: trusted_binary_proxy_execution
+
+  supporting:
+    - id: external_javascript_target
+      name: Code loaded from outside the install directory
+      description: >-
+        The application, module or extension path handed to the runtime resolves to a temp,
+        profile or download directory rather than to the vendor's own install tree.
+      source: process_creation
+      field: CommandLine
+      indicates: untrusted_execution_location
+    - id: interpreter_child_process
+      name: Interpreter spawned by the application
+      description: >-
+        The application's child is a command shell or script host rather than one of the
+        named helper processes it normally launches.
+      source: process_creation
+      field: FileName
+      indicates: abnormal_execution_chain
+    - id: node_interpreter_mode
+      name: Application switched into Node mode
+      description: >-
+        ELECTRON_RUN_AS_NODE was set for the invocation, which turns the signed desktop
+        application into a general-purpose script interpreter.
+      source: process_creation
+      field: CommandLine
+      indicates: runtime_repurposed_as_interpreter
+    - id: delivery_parent
+      name: Application launched by a delivery-style parent
+      description: >-
+        The Electron application was started by a script host, document handler, archive
+        utility or mail client rather than by the shell, its own updater or the user's
+        session.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: unprecedented_command_line
+      name: No precedent for this invocation
+      description: >-
+        This application has not been invoked with these switches anywhere in the estate
+        during the baseline window, unlike the vendor's own helper launches which repeat
+        identically across every host.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: vendor_helper_launch
+      name: Vendor's own helper launch
+      description: >-
+        The switch value resolves to a helper executable inside the application's install
+        directory, which is how the runtime starts its own GPU, utility and renderer
+        processes.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: updater_or_launcher_parent
+      name: Vendor updater or launcher as parent
+      description: >-
+        The invocation came from the application's own updater, launcher or relaunch path,
+        which passes flags by design after an install or update.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_application_component
+    - id: engineering_asset
+      name: Registered engineering host
+      description: >-
+        The host belongs to the engineering asset group, where running Electron and Chromium
+        with debugging, extension and Node switches is ordinary development work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - command_executing_flag
+
+    supporting:
+      any:
+        - external_javascript_target
+        - interpreter_child_process
+        - node_interpreter_mode
+        - delivery_parent
+        - unprecedented_command_line
+      all:
+        - external_javascript_target
+        - unprecedented_command_line
+
+    contradicting:
+      any:
+        - vendor_helper_launch
+        - updater_or_launcher_parent
+        - engineering_asset
+      all: []
+
+  verdict:
+    low_risk_when:
+      - command_executing_flag
+      - vendor_helper_launch
+      - updater_or_launcher_parent
+      - engineering_asset
+    suspicious_when:
+      - command_executing_flag
+      - unprecedented_command_line
+    high_risk_when:
+      - command_executing_flag
+      - external_javascript_target
+      - interpreter_child_process
+      - delivery_parent
+      - node_interpreter_mode
+
+  false_positive:
+    - condition: An Electron application launches its own helper processes.
+      explanation: >-
+        The runtime uses these switches internally on every start, so the switch alone means
+        nothing. The value points at an executable inside the application's install
+        directory and the command line repeats identically on every host running the
+        product.
+    - condition: A vendor updater relaunches the application with flags after an update.
+      explanation: >-
+        Update paths commonly restart the application with extra switches, including from a
+        cmd.exe wrapper that looks like an interpreter child. The parent traces back to the
+        product's own updater and the behaviour appears fleet-wide when a release lands.
+    - condition: A developer runs Electron or Chromium with debugging and extension switches.
+      explanation: >-
+        Loading an unpacked extension, pointing --app at a local project or running the
+        binary in Node mode are all normal development actions and produce the strongest
+        evidence here. They cluster on registered engineering assets, under the developer's
+        own account, with paths inside a source tree.
+    - condition: A test framework drives a browser with scripted command lines.
+      explanation: >-
+        Automation harnesses launch Chromium with long, unusual argument lists and temporary
+        profile directories. These come from a test runner as the parent process, run on
+        build agents, and repeat with the same structure across many runs.

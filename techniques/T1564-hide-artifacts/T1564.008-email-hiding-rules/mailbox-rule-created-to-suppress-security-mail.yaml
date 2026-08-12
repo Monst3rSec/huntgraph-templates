@@ -1,0 +1,338 @@
+type: detection
+
+id: hg-win-mailbox-rule-created-to-suppress-security-mail-t1564-008
+
+version: 1.0.0
+
+info:
+  name: Mailbox rule created to suppress security mail
+  description: >-
+    A mailbox rule is usually the first thing configured after an account is taken over,
+    because it decides what the real owner is allowed to notice. A rule that files anything
+    matching phish, malware, suspicious, password reset or the name of a security vendor
+    into Deleted Items, RSS Feeds or Conversation History means the victim never sees the
+    alert about their own account, never sees the reply to a spearphish sent from it, and
+    never sees the reset notification for a credential the adversary just changed. Be clear
+    about where this is observable: the rule lives in the mailbox on the mail platform, and
+    the authoritative record is the Exchange Online audit trail, which an endpoint sensor
+    does not receive. A rule created through a browser session in OWA, or from the
+    adversary's own machine, leaves nothing at all on any managed host. What endpoint
+    telemetry does see is the operator path — an Exchange management session opened on a
+    managed workstation or server and the rule cmdlets run inside it, which is the pattern
+    behind most hands-on-keyboard mailbox tampering by an operator who already has an admin
+    workstation. This hunt is built on that command line and nothing else, and it should be
+    paired with mail-platform auditing rather than treated as full coverage. The
+    discriminator is the rule's content: helpdesk and migration work creates rules
+    constantly, but it does not filter on the vocabulary of security notifications and it
+    does not route mail somewhere the owner will never look.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - hide-artifacts
+    - email-rules
+    - anti-forensics
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1564/008
+    - https://attack.mitre.org/detectionstrategies/DET0192
+    - https://attack.mitre.org/techniques/T1564
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1564
+  sub_techniques:
+    - T1564.008
+  detection_strategies:
+    - DET0192
+  analytics:
+    - AN0551
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:PowerShell
+  data_components:
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    An adversary holding a mailbox or Exchange administrative session may create a rule
+    that deletes or reroutes security notifications, password-reset mail and replies, so
+    that the account owner and the security team never learn the mailbox is being used
+    against them.
+  attacker_behavior:
+    - Runs New-InboxRule or Set-InboxRule against a mailbox from an Exchange management session.
+    - Filters on words that appear in security notifications rather than on a correspondent.
+    - Routes matching mail to Deleted Items, RSS Feeds or Conversation History, or deletes it outright.
+    - Creates an organisation-wide transport rule so the suppression covers every mailbox at once.
+  legitimate_behavior:
+    - Helpdesk staff create or repair inbox rules on behalf of users who cannot.
+    - Migration and onboarding scripts recreate rules in bulk after a mailbox move.
+    - Mail hygiene products create transport rules to quarantine or tag inbound mail.
+    - Administrators build retention and routing rules as part of ordinary mail operations.
+  risk_indicator:
+    - The rule matches on security vocabulary such as phish, malware, hacked or password reset.
+    - Matching mail is deleted, marked read or moved to a folder the owner does not open.
+    - The cmdlets run under an account that does not normally administer mail.
+    - The rule targets a single high-value mailbox rather than a migration batch.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: inbox-rule-cmdlet-executed
+        name: Inbox rule cmdlet run on a managed host
+        purpose: >-
+          Establish the base observable. These cmdlets exist only to create or alter mailbox
+          rules, so their appearance on a host tells you who drove the change even though
+          the rule itself lands on the mail platform.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(New|Set|Enable|Remove)-InboxRule\b/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Mail migration and onboarding automation that recreates rules in batches"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: rule-filters-on-security-vocabulary
+        name: Rule matching on the words security mail uses
+        purpose: >-
+          This is the discriminator. A helpdesk rule files mail from a person or a
+          distribution list; a suppression rule matches on the words that appear in an
+          alert, a vendor notification or a password-reset message.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/-(Subject|Body|SubjectOrBody|From|Header)Contains(Words|Text)?\b/i
+          | CommandLine=/(phish|malware|suspicious|hack|compromis|breach|incident|quarantin|spam|virus|threat|security\s*alert|password\s*reset|reset\s*your|verify\s*your|unusual\s*sign|sign[-\s]?in\s*attempt|multi[-\s]?factor|helpdesk|abuse@|soc@|security@)/i
+          | groupBy([ComputerName, UserName, ImageFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: rule-hides-or-destroys-matching-mail
+        name: Rule action deletes or buries matching mail
+        purpose: >-
+          Separate a rule that organises mail from one that removes it from view. Deleting,
+          marking read, or moving to a folder nobody opens is what makes the technique work,
+          and it is a different intent from filing mail into a project folder.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(New|Set)-(Inbox|Transport)Rule\b/i
+          | CommandLine=/(-DeleteMessage|-SoftDeleteMessage|-MarkAsRead|-StopProcessingRules|-MoveToFolder\s*[":']?\s*(Deleted\s*Items|Junk|RSS\s*(Feeds|Subscriptions)|Conversation\s*History|Archive|Notes|Sync\s*Issues|[A-Za-z]{1,3}\b))/i
+          | groupBy([ComputerName, UserName, ImageFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved retention rules that soft-delete mail on a documented schedule"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: exchange-session-opened-then-rules-changed
+        name: Exchange session opened on a host that then changes rules
+        purpose: >-
+          Confirm the chain rather than the isolated cmdlet, and catch the organisation-wide
+          variant. An operator connecting a management session and then writing rules in the
+          same window is the hands-on-keyboard shape; a transport rule in that window means
+          the suppression covers every mailbox at once.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Connect-ExchangeOnline|Connect-IPPSSession|New-PSSession|outlook\.office365\.com\/powershell|ExchangeOnlineManagement|New-TransportRule|Set-TransportRule|New-InboxRule|Set-InboxRule)/i
+          | case {
+              CommandLine=/(Connect-ExchangeOnline|Connect-IPPSSession|outlook\.office365\.com\/powershell|ExchangeOnlineManagement)/i
+                | session := CommandLine ;
+              CommandLine=/\b(New|Set)-TransportRule\b/i
+                | orgwide := CommandLine ;
+              CommandLine=/\b(New|Set)-InboxRule\b/i
+                | mailboxrule := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([session, orgwide, mailboxrule], limit=3), count(as=events)])
+          | mailboxrule=/.+/ or orgwide=/.+/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: mailbox_rule_written
+      name: Mailbox or transport rule created from a managed host
+      description: >-
+        A process on a managed host ran a cmdlet that creates or alters a mailbox or
+        transport rule, which places a named operator and host behind a change whose
+        authoritative record lives on the mail platform.
+      source: process_creation
+      field: CommandLine
+      indicates: mailbox_rule_created
+
+  supporting:
+    - id: security_vocabulary_filter
+      name: Rule matches on security notification wording
+      description: >-
+        The rule's match conditions use the vocabulary of alerts, vendor notifications and
+        password-reset mail rather than a correspondent or a project, which is filtering for
+        what the owner must not see.
+      source: process_creation
+      field: CommandLine
+      indicates: notification_suppression
+    - id: rule_action_removes_mail_from_view
+      name: Rule deletes, marks read or buries matching mail
+      description: >-
+        The configured action removes matching mail from the owner's attention rather than
+        organising it, by deleting it or routing it to a folder that is never opened.
+      source: process_creation
+      field: CommandLine
+      indicates: evidence_concealment
+    - id: unexpected_operator_account
+      name: Rule written by an account that does not administer mail
+      description: >-
+        The account running the cmdlets is not one that normally performs mail
+        administration on this estate, so an ordinary administrative explanation is weaker.
+      source: process_creation
+      field: UserName
+      indicates: unexpected_account_context
+    - id: no_mail_administration_history
+      name: No history of mail administration on this host
+      description: >-
+        This host has not run Exchange management cmdlets during the baseline window, so the
+        management session is itself new rather than routine.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: mail_hygiene_product
+      name: Mail hygiene or migration product
+      description: >-
+        The acting binary belongs to a mail security, archiving or migration product whose
+        normal job is to create rules on behalf of the organisation.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: recorded_mailbox_change
+      name: Recorded helpdesk or migration change
+      description: >-
+        A ticket or change record covers rule work on the named mailbox, such as repairing a
+        user's rules or recreating them after a mailbox move.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: bulk_rule_recreation
+      name: Same rule applied across a migration batch
+      description: >-
+        The same rule shape is applied to many mailboxes in one window, which is a migration
+        or onboarding batch rather than a targeted suppression of one owner's mail.
+      source: baseline
+      field: CommandLine
+      indicates: bulk_administrative_operation
+
+  risk_logic:
+    required:
+      - mailbox_rule_written
+
+    supporting:
+      any:
+        - security_vocabulary_filter
+        - rule_action_removes_mail_from_view
+        - unexpected_operator_account
+        - no_mail_administration_history
+      all:
+        - security_vocabulary_filter
+        - rule_action_removes_mail_from_view
+
+    contradicting:
+      any:
+        - mail_hygiene_product
+        - recorded_mailbox_change
+        - bulk_rule_recreation
+      all: []
+
+  verdict:
+    low_risk_when:
+      - mailbox_rule_written
+      - mail_hygiene_product
+      - recorded_mailbox_change
+      - bulk_rule_recreation
+    suspicious_when:
+      - mailbox_rule_written
+      - no_mail_administration_history
+    high_risk_when:
+      - mailbox_rule_written
+      - security_vocabulary_filter
+      - rule_action_removes_mail_from_view
+      - unexpected_operator_account
+
+  false_positive:
+    - condition: Helpdesk staff repair a user's inbox rules on their behalf.
+      explanation: >-
+        This produces the same cmdlets from an admin workstation. It is distinguished by a
+        ticket, by a rule that files mail from a named correspondent into a folder the user
+        chose, and by the absence of delete or mark-as-read actions on security wording.
+    - condition: A migration script recreates rules after a mailbox move.
+      explanation: >-
+        Onboarding and migration tooling writes rules in bulk, sometimes thousands in a
+        window. The tell is volume and uniformity across many mailboxes at once, rather than
+        one rule on one high-value mailbox.
+    - condition: A mail hygiene product creates transport rules to quarantine inbound mail.
+      explanation: >-
+        Anti-phishing and archiving products legitimately create org-wide transport rules,
+        including ones that mention phish and malware in their match conditions. The acting
+        process is the product's own binary or connector and the rules are visible in the
+        product's configuration.
+    - condition: An administrator builds a retention or routing rule.
+      explanation: >-
+        Ordinary mail operations create rules that move or soft-delete mail on a schedule.
+        These are documented, apply to categories such as calendar or newsletter traffic,
+        and do not match on the wording of security notifications.
+    - condition: The rule was created through the web client and never appears here at all.
+      explanation: >-
+        This is the coverage gap rather than a false positive. A rule set from OWA or from an
+        unmanaged device produces no endpoint telemetry, so an empty result from this hunt is
+        not evidence of absence — the mail platform's own audit log is the authority.

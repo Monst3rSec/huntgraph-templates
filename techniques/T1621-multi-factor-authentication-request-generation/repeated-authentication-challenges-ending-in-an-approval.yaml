@@ -1,0 +1,366 @@
+type: detection
+
+id: hg-win-repeated-authentication-challenges-ending-in-an-approval-t1621
+
+version: 1.0.0
+
+info:
+  name: Repeated authentication challenges ending in an approval
+  description: >-
+    This technique starts where most credential attacks finish: the adversary already has
+    the password and it already works. What stands in the way is a person, and the attack
+    is aimed at that person's patience. Each login attempt fires another push, and the
+    prompts keep arriving — at two in the morning, during a meeting, for hours — until the
+    user taps approve to make them stop. The important consequence for a hunter is that the
+    interesting record is not the flood, it is the single event at the end of it. A burst of
+    refusals with no approval is a failed attack and a story about a resilient user; the
+    same burst with one approval at the end is an authenticated adversary, and after that
+    moment their session looks exactly like the user's own. The shape to hunt is therefore a
+    run of refusals for one account, from one source, terminating in a success. The second
+    discriminator separates this from ordinary brute force: here the password is not the
+    variable. Guessing produces wrong-password failures because the secret keeps changing;
+    fatigue produces failures for any reason but that one, because the secret is already
+    correct and only the second factor is refusing. The endpoint sensor sees the shadow of
+    this rather than the thing itself — the push notifications, the denials and the approval
+    are recorded by the identity provider or the MFA vendor, and only the logon-layer result
+    reaches Windows. That is enough to find the pattern where the second factor is enforced
+    at the Windows logon path, and not enough to see fatigue aimed purely at a browser-based
+    cloud sign-in, which will not appear in this data at all.
+  severity: high
+  author: huntgraph
+  tags:
+    - credential-access
+    - multi-factor-authentication
+    - mfa-fatigue
+    - authentication
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1621
+    - https://attack.mitre.org/detectionstrategies/DET0160
+    - https://attack.mitre.org/techniques/T1078
+
+mitre:
+  tactics:
+    - TA0006
+  techniques:
+    - T1621
+  sub_techniques: []
+  detection_strategies:
+    - DET0160
+  analytics:
+    - AN0451
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+  data_components:
+    - User Account Authentication
+
+hypothesis:
+  statement: >-
+    An adversary in possession of a valid password may repeatedly trigger the account's
+    second-factor challenge so that the user eventually approves one to stop the prompts,
+    obtaining a fully authenticated session that satisfies MFA and is indistinguishable from
+    the user's own from that point onward.
+  attacker_behavior:
+    - Replays a known-good password to trigger a second-factor challenge again and again.
+    - Paces the attempts so the prompts persist for hours rather than seconds.
+    - Times the run for the small hours or a busy period when the user is least likely to think it through.
+    - Stops immediately once one challenge is approved.
+    - Drives the attempts from one source against one chosen account rather than sweeping the population.
+  legitimate_behavior:
+    - A user's phone loses connectivity and several prompts time out before one lands.
+    - Someone retries a sign-in repeatedly while a device or token is being re-registered.
+    - A misconfigured client or agent re-authenticates on a loop with a correct cached secret.
+    - Users decline a prompt they did not expect, then start their own sign-in and approve it.
+  risk_indicator:
+    - Refusals concentrate on one account from one source with the rest of the estate quiet.
+    - The failures are not wrong-password failures, so the secret is already correct.
+    - The run terminates in a success rather than tailing off.
+    - The approval arrives from a source the account has never authenticated from before.
+    - The account is privileged or the run falls outside the user's working hours.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: authentication
+      event_types:
+        - UserLogonFailed2
+        - UserLogon
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - UserPrincipal
+        - LogonType
+        - LogonTime
+        - RemoteAddressIP4
+        - SubStatus
+        - LogonServer
+        - UserIsAdmin
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: refusals-where-the-password-is-not-the-variable
+        name: Repeated refusals for one account with a correct password
+        purpose: >-
+          Isolate the population of failures that cannot be explained by someone iterating a
+          secret. Excluding wrong-password and unknown-account outcomes leaves failures where
+          the credential was accepted and something after it refused, which is where a
+          declined or expired second factor lands.
+        query: |
+          #event_simpleName=UserLogonFailed2
+          | SubStatus!=/0xC000006A/i
+          | SubStatus!=/0xC0000064/i
+          | groupBy([UserName, RemoteAddressIP4],
+                    function=[count(as=refusals),
+                              min(LogonTime, as=first_prompt),
+                              max(LogonTime, as=last_prompt),
+                              collect([ComputerName, LogonType, LogonServer, SubStatus], limit=5)])
+          | refusals >= 5
+          | sort(refusals, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Accounts held by an appliance or agent that re-authenticates on a loop"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - user
+            - remote_address
+            - organization
+
+      - id: refusal-run-terminating-in-a-success
+        name: Run of refusals ending in an accepted logon
+        purpose: >-
+          Read the two halves as one event, because the verdict turns entirely on the last
+          one. This is the case that separates a user who held the line from a user who gave
+          in, and only the second is an incident.
+        query: |
+          #event_simpleName=/^(UserLogonFailed2|UserLogon)$/
+          | case {
+              #event_simpleName=UserLogonFailed2 and SubStatus!=/0xC000006A/i
+                | refusal := LogonTime ;
+              #event_simpleName=UserLogon
+                | approval := LogonTime ;
+            }
+          | groupBy([UserName, RemoteAddressIP4],
+                    function=[count(refusal, as=refusals),
+                              count(approval, as=approvals),
+                              max(approval, as=approved_at),
+                              collect([ComputerName, LogonType, LogonServer], limit=10)])
+          | refusals >= 4
+          | approvals >= 1
+          | sort(refusals, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Accounts whose sign-in is expected to fail once before succeeding, such as staged token refresh"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: one-source-fixated-on-one-account
+        name: A single source challenging one account and nothing else
+        purpose: >-
+          Aggregate on the source instead of the account so fixation becomes visible. A
+          spraying source touches many names once; a fatigue source touches one name over and
+          over, and the counts only tell them apart when read this way round.
+        query: |
+          #event_simpleName=UserLogonFailed2
+          | SubStatus!=/0xC000006A/i
+          | LogonType=/^(3|10)$/
+          | groupBy([RemoteAddressIP4],
+                    function=[count(as=attempts),
+                              count(UserName, distinct=true, as=distinct_accounts),
+                              collect([UserName, ComputerName, LogonServer], limit=5)])
+          | distinct_accounts <= 2
+          | attempts >= 5
+          | sort(attempts, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Gateways and reverse proxies that present as a single source for many users"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - user
+            - remote_address
+            - organization
+
+      - id: approval-from-an-unfamiliar-source
+        name: Successful logon from a source the account has not used
+        purpose: >-
+          Read the approval on its own terms. The moment an account first authenticates from
+          a source with no history is the moment the technique paid off, and it is worth
+          surfacing even when the preceding refusals fell outside the search window.
+        query: |
+          #event_simpleName=UserLogon
+          | LogonType=/^(3|10)$/
+          | groupBy([UserName, RemoteAddressIP4],
+                    function=[count(as=logons),
+                              min(LogonTime, as=first_seen),
+                              collect([ComputerName, LogonServer, UserIsAdmin], limit=10)])
+          | logons <= 2
+          | sort(logons, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Pooled egress addresses and VPN concentrators that change per session"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - user
+            - remote_address
+            - organization
+
+evidence:
+  required:
+    - id: refusal_burst_for_one_account
+      name: Burst of refused authentications for one account
+      description: >-
+        A single account accumulated repeated refused logons in a short period, which is the
+        observable left behind when a second-factor challenge is generated over and over for
+        the same identity.
+      source: authentication
+      field: UserName
+      indicates: repeated_authentication_challenges
+
+  supporting:
+    - id: password_not_the_variable
+      name: Failures are not wrong-password failures
+      description: >-
+        The refusals carry outcomes other than a bad password or an unknown account, meaning
+        the secret presented was correct and the refusal came from something after it.
+      source: authentication
+      field: SubStatus
+      indicates: credentials_already_valid
+    - id: approval_after_refusals
+      name: Success following the run of refusals
+      description: >-
+        A successful logon for the same account and source closes the sequence, which is the
+        point at which the adversary obtains a session rather than merely annoying a user.
+      source: authentication
+      field: LogonTime
+      indicates: challenge_finally_approved
+    - id: single_source_fixation
+      name: One source, one account
+      description: >-
+        The attempts originate from a source that touches this account and effectively no
+        other, which separates a targeted run from a sweep across the user population.
+      source: authentication
+      field: RemoteAddressIP4
+      indicates: source_fixated_on_one_account
+    - id: unfamiliar_source
+      name: Source with no history for this account
+      description: >-
+        The account has not authenticated from this source at any point in the baseline
+        window, so the approval granted a session to somewhere it has never been used from.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: unusual_source_for_user
+    - id: privileged_target
+      name: Privileged account targeted
+      description: >-
+        The account being challenged holds administrative rights, which raises both the
+        likelihood of deliberate selection and the consequence of a single approval.
+      source: authentication
+      field: UserIsAdmin
+      indicates: high_value_identity_targeted
+
+  contradicting:
+    - id: wrong_password_failures
+      name: Failures are bad-password failures
+      description: >-
+        The refusals are dominated by wrong-password outcomes, which means a secret is being
+        iterated. That is guessing or a stale cached credential, not a second factor being
+        worn down.
+      source: authentication
+      field: SubStatus
+      indicates: credential_guessing_instead
+    - id: automation_identity
+      name: Account belongs to automation
+      description: >-
+        The identity is a service or appliance account recorded as re-authenticating on a
+        schedule, which produces long even runs of failures with no human in the loop at all.
+      source: asset_inventory
+      field: UserName
+      indicates: legitimate_automation
+    - id: user_initiated_session
+      name: User was starting the session themselves
+      description: >-
+        The user was present and driving the sign-in, for example retrying during device
+        re-registration or after a network drop, so the approval was their own intent.
+      source: identity_context
+      field: UserName
+      indicates: user_present_and_authenticating
+
+  risk_logic:
+    required:
+      - refusal_burst_for_one_account
+
+    supporting:
+      any:
+        - password_not_the_variable
+        - approval_after_refusals
+        - single_source_fixation
+        - unfamiliar_source
+        - privileged_target
+      all:
+        - password_not_the_variable
+        - approval_after_refusals
+
+    contradicting:
+      any:
+        - wrong_password_failures
+        - automation_identity
+        - user_initiated_session
+      all: []
+
+  verdict:
+    low_risk_when:
+      - refusal_burst_for_one_account
+      - wrong_password_failures
+      - automation_identity
+      - user_initiated_session
+    suspicious_when:
+      - refusal_burst_for_one_account
+      - single_source_fixation
+    high_risk_when:
+      - refusal_burst_for_one_account
+      - password_not_the_variable
+      - approval_after_refusals
+      - unfamiliar_source
+      - privileged_target
+
+  false_positive:
+    - condition: A user's device loses connectivity and several challenges time out.
+      explanation: >-
+        Timeouts produce exactly the refusal pattern this hunt looks for. They are separated
+        by the source being one the account uses every day, by the run being short, and by the
+        eventual success arriving from that same familiar source.
+    - condition: A service or appliance account re-authenticates on a loop with a stale secret.
+      explanation: >-
+        Automation generates long, metronomic runs of failures and never stops on its own.
+        Those failures are usually wrong-password outcomes, the account is recorded as
+        non-interactive, and there is no human who could approve anything.
+    - condition: Someone retries repeatedly while re-registering a phone or token.
+      explanation: >-
+        Re-enrolment produces refusals followed by a success once the new factor is active.
+        The activity is from the user's own host and coincides with a helpdesk record or an
+        enrolment event for that account.
+    - condition: A user declines an unexpected prompt and then signs in themselves.
+      explanation: >-
+        This produces a refusal followed by a success and looks identical in isolation. The
+        difference is the source: the declines come from somewhere unfamiliar and the success
+        comes from the user's own device, whereas in the attack both share one source.

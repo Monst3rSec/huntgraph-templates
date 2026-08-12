@@ -1,0 +1,340 @@
+type: detection
+
+id: hg-win-certificate-obtained-for-an-identity-other-than-the-requester-t1649
+
+version: 1.0.0
+
+info:
+  name: Certificate obtained for an identity other than the requester
+  description: >-
+    A password is a secret you can change; an authentication certificate is a credential
+    with an expiry date. That difference is the whole point of this technique. Once an
+    adversary holds a certificate that binds to a privileged identity, the standard
+    containment move — reset the password, revoke the sessions — accomplishes nothing, and
+    the credential keeps working until someone thinks to revoke that specific certificate
+    or the validity period runs out, which is typically measured in years. The two routes
+    are theft and issuance. Theft means lifting an existing certificate and its private key
+    out of the store, which needs the key to be exportable. Issuance is more interesting and
+    much quieter: with enrolment rights over the wrong template, an ordinary user can ask
+    the enterprise CA for a certificate and specify whose name goes in it. The CA then signs
+    it, because that is what it was configured to do, and the resulting credential is
+    genuine — it will pass every validation, because nothing was forged. The observable is
+    therefore the request rather than the use: an enrolment where the subject alternative
+    name names a principal other than the requester, or a template or CA flag being changed
+    to permit exactly that. The benign twin is autoenrollment, which issues certificates
+    constantly and silently across the estate, so the discriminator is who asked and how.
+    Autoenrollment runs from the enrolment service under machine context and never supplies
+    a subject; the adversary form runs from a shell, names an identity, and is often
+    followed within minutes by a ticket request using the new certificate.
+  severity: critical
+  author: huntgraph
+  tags:
+    - credential-access
+    - certificates
+    - active-directory-certificate-services
+    - impersonation
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1649
+    - https://attack.mitre.org/detectionstrategies/DET0240
+    - https://attack.mitre.org/techniques/T1558/001
+
+mitre:
+  tactics:
+    - TA0006
+  techniques:
+    - T1649
+  sub_techniques: []
+  detection_strategies:
+    - DET0240
+  analytics:
+    - AN0671
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+  data_components:
+    - Active Directory Credential Request
+    - Windows Registry Key Access
+
+hypothesis:
+  statement: >-
+    An adversary with enrolment rights or access to a certificate store may obtain an
+    authentication certificate that binds to another principal so that they can authenticate
+    as that identity, obtaining a credential that survives a password reset and remains
+    valid until it is individually revoked or expires.
+  attacker_behavior:
+    - Requests a certificate from the enterprise CA while supplying a subject alternative name for another account.
+    - Exports a certificate together with its private key from the local or machine certificate store.
+    - Changes a template or CA flag so that requesters may supply their own subject.
+    - Uses the resulting certificate to request a Kerberos ticket for the named identity.
+    - Chooses templates that permit client authentication so the certificate is usable as a credential.
+  legitimate_behavior:
+    - Autoenrollment issues and renews user and machine certificates continuously across the estate.
+    - PKI administrators enrol on behalf of users as a documented delegated function.
+    - Certificates are exported with their keys during a genuine migration or backup.
+    - Application and web server certificates are requested by hand during deployment work.
+  risk_indicator:
+    - The request names a subject alternative name that is not the requesting account.
+    - The request is issued from a command shell or an unusual binary rather than the enrolment service.
+    - A template or CA flag permitting requester-supplied subjects was changed shortly beforehand.
+    - The private key is exported with a password to a file outside the certificate store.
+    - The certificate is used to request a ticket for a different account soon after issue.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - SHA256HashData
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: enrolment-supplying-another-subject
+        name: Certificate request naming a different principal
+        purpose: >-
+          Catch the issuance route at the moment it happens. A request that carries a subject
+          alternative name is asking the CA to bind the certificate to an identity the
+          requester chose, which is the entire mechanism of impersonation through PKI.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(certreq|certutil|Get-Certificate|Certify|certipy|ADCSPwn)/i
+          | CommandLine=/(SAN\s*:|subjectAltName|altname|upn\s*=|-on-behalf-of|\/template:|-Template\s)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=requests), collect([CommandLine], limit=5)])
+          | sort(requests, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "PKI administration hosts where enrolment on behalf of users is a delegated function"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: certificate-and-private-key-exported
+        name: Certificate exported together with its private key
+        purpose: >-
+          Cover the theft route. A certificate without its private key is not a credential,
+          so an export that carries the key — and a password to protect the resulting file —
+          is the step that turns stored material into something portable and usable.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(exportPFX|Export-PfxCertificate|crypto::certificates|crypto::capi|CertStealer|pkcs12|\.pfx|\.p12)/i
+          | CommandLine=/(-p\s|\/p\s|-Password|-ExportPolicy|privatekey|NoClobber|export)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=exports), collect([CommandLine, SHA256HashData], limit=5)])
+          | sort(exports, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Certificate lifecycle tooling that exports keys as part of a documented migration"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: template-or-ca-permitted-supplied-subjects
+        name: Template or CA configured to accept requester-supplied subjects
+        purpose: >-
+          Find the enabling change rather than the abuse. Setting the attribute that lets a
+          requester name the subject, or the equivalent name flag on a template, converts an
+          ordinary enrolment right into the ability to impersonate anyone in the domain.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(EDITF_ATTRIBUTESUBJECTALTNAME2|msPKI-Certificate-Name-Flag|ENROLLEE_SUPPLIES_SUBJECT|Set-CertificateTemplate|Set-CATemplate|dstemplate)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: certificate-used-to-request-a-ticket
+        name: Certificate presented to obtain a Kerberos ticket
+        purpose: >-
+          Confirm the credential was not merely obtained but exercised. A ticket request that
+          presents a certificate for a named user is the moment the impersonation becomes an
+          authenticated session, and it separates a stolen file from an active one.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(asktgt|/certificate:|-pfx\s|getcredentials|pkinit|Rubeus|certipy\s+auth)/i
+          | CommandLine=/(\/user:|-username|\/domain:|-domain|\.pfx|\.p12)/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=ticket_requests), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: certificate_material_acquired
+      name: Authentication certificate requested or exported
+      description: >-
+        A command was executed that obtains authentication certificate material, either by
+        enrolling with the certificate authority or by exporting an existing certificate and
+        its private key out of the store.
+      source: process_creation
+      field: CommandLine
+      indicates: authentication_certificate_obtained
+
+  supporting:
+    - id: alternate_identity_requested
+      name: Request names a principal other than the requester
+      description: >-
+        The enrolment supplies a subject alternative name or user principal name belonging to
+        a different account, which is what makes the issued certificate a credential for that
+        identity rather than for the requester.
+      source: process_creation
+      field: CommandLine
+      indicates: identity_impersonation_in_certificate
+    - id: template_permits_supplied_subject
+      name: Template or CA flag permitting supplied subjects changed
+      description: >-
+        A certificate template name flag or the CA attribute governing subject alternative
+        names was modified, which is the configuration that makes impersonation through
+        enrolment possible at all.
+      source: process_creation
+      field: CommandLine
+      indicates: certificate_template_weakened
+    - id: certificate_used_for_authentication
+      name: Certificate presented for a ticket request
+      description: >-
+        A binary was run that presents a certificate to obtain a Kerberos ticket for a named
+        user, showing the certificate is being exercised as a credential.
+      source: process_creation
+      field: ImageFileName
+      indicates: certificate_authentication_attempted
+    - id: shell_issued_enrolment
+      name: Enrolment issued from a shell or unusual binary
+      description: >-
+        The request came from a command shell, script host or standalone tool rather than the
+        certificate enrolment service that normally performs issuance on a managed host.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: no_enrolment_history
+      name: Host has no history of manual enrolment
+      description: >-
+        This host has not performed manual certificate enrolment or key export during the
+        baseline window, so the activity is a deviation as well as a sensitive operation.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: autoenrollment_driven
+      name: Issued through autoenrollment
+      description: >-
+        The certificate was obtained by the enrolment service under machine or policy context,
+        which is how the estate issues and renews most of its certificates and which never
+        supplies a subject of its own.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: pki_administration_role
+      name: Host or operator holds a PKI role
+      description: >-
+        The activity comes from a certificate authority, registration authority or an operator
+        recorded as holding delegated enrolment rights, for whom this is the daily job.
+      source: asset_inventory
+      field: ComputerName
+      indicates: sanctioned_pki_role
+    - id: renewal_wave
+      name: Part of a renewal cycle
+      description: >-
+        The same enrolment appears across many hosts within one window, which is a template
+        rollout or an expiry-driven renewal wave rather than a targeted request.
+      source: baseline
+      field: CommandLine
+      indicates: certificate_renewal_cycle
+
+  risk_logic:
+    required:
+      - certificate_material_acquired
+
+    supporting:
+      any:
+        - alternate_identity_requested
+        - template_permits_supplied_subject
+        - certificate_used_for_authentication
+        - shell_issued_enrolment
+        - no_enrolment_history
+      all:
+        - alternate_identity_requested
+        - certificate_used_for_authentication
+
+    contradicting:
+      any:
+        - autoenrollment_driven
+        - pki_administration_role
+        - renewal_wave
+      all: []
+
+  verdict:
+    low_risk_when:
+      - certificate_material_acquired
+      - autoenrollment_driven
+      - pki_administration_role
+      - renewal_wave
+    suspicious_when:
+      - certificate_material_acquired
+      - no_enrolment_history
+    high_risk_when:
+      - certificate_material_acquired
+      - alternate_identity_requested
+      - template_permits_supplied_subject
+      - certificate_used_for_authentication
+      - shell_issued_enrolment
+
+  false_positive:
+    - condition: Autoenrollment issues and renews certificates across the estate.
+      explanation: >-
+        This is by far the highest-volume source of enrolment activity and it is entirely
+        normal. It runs under the enrolment service rather than a shell, never supplies a
+        subject alternative name, and produces the same pattern on every managed host.
+    - condition: A PKI administrator enrols on behalf of a user.
+      explanation: >-
+        Enrolment agents exist precisely to request certificates for other people, so the
+        command looks the same. The separation is the operator holding the enrolment agent
+        role, the request coming from a registration authority host, and a request record
+        existing for the named user.
+    - condition: Certificates are exported with their keys during a migration or backup.
+      explanation: >-
+        Server migrations and load-balancer changes legitimately export certificates with
+        private keys. These are server authentication certificates rather than user
+        certificates, are performed on the host that owns them, and coincide with change work.
+    - condition: An engineer requests a web server certificate by hand.
+      explanation: >-
+        Manual enrolment for service certificates is common during deployment. Such requests
+        name the server's own hostname in the subject rather than a user principal name, and
+        the template requested is a server rather than a client authentication template.

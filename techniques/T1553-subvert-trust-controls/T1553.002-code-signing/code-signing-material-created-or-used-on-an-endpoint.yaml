@@ -1,0 +1,340 @@
+type: detection
+
+id: hg-win-code-signing-material-created-or-used-on-an-endpoint-t1553-002
+
+version: 1.0.0
+
+info:
+  name: Code signing material created or used on an endpoint
+  description: >-
+    A valid signature is not a statement that code is safe, it is a statement that someone
+    holding a private key vouched for it. Everything downstream treats that as trust:
+    application control rules keyed on publisher, driver loading, reputation systems and
+    analysts skimming a process list all relax when a binary is signed. An adversary
+    therefore wants signing material, and there are only three ways to get it — generate a
+    certificate, take a private key out of a certificate store, or use one already stolen.
+    All three leave the same kind of trace, which is a signing operation happening somewhere
+    that does not build software. That is the discriminator. Signing belongs in a build
+    pipeline on a small, known set of hosts; a certificate being generated with a code
+    signing purpose, a PFX being exported with its private key, or signtool running against
+    a binary in a temp directory on an ordinary workstation has no legitimate counterpart
+    there. This hunt does not attempt to judge signatures at execution time, which endpoint
+    telemetry does not carry — it looks for the endpoint doing the signing.
+  severity: high
+  author: huntgraph
+  tags:
+    - defense-impairment
+    - trust-controls
+    - code-signing
+    - certificate
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1553/002
+    - https://attack.mitre.org/detectionstrategies/DET0230
+    - https://attack.mitre.org/techniques/T1553
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1553
+  sub_techniques:
+    - T1553.002
+  detection_strategies:
+    - DET0230
+  analytics:
+    - AN0643
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may generate a code signing certificate, export a private key from a
+    certificate store, or sign a payload on a compromised host, so that their tooling
+    carries a valid signature and inherits the trust that publisher-based controls and
+    analysts extend to signed code.
+  attacker_behavior:
+    - Generates a self-signed certificate with a code signing purpose on the host.
+    - Exports an existing certificate together with its private key into a PFX file.
+    - Signs an executable, driver or script with signtool or the Authenticode cmdlets.
+    - Passes a key file staged in a user-writable directory along with its password.
+    - Signs on a host that has no build or release role, using material taken from elsewhere.
+  legitimate_behavior:
+    - Build and release pipelines sign artefacts as their final step.
+    - Developers create test certificates to sign code during local development.
+    - Certificate lifecycle tooling exports and re-imports keys during renewal or migration.
+    - Some installers sign or re-sign components during setup on the target machine.
+  risk_indicator:
+    - The host has no build, release or signing role in the estate.
+    - The certificate is generated locally rather than issued by the internal authority.
+    - A private key is exported with a password supplied on the command line.
+    - The file being signed sits in a temp, profile or download directory.
+    - The signing command is launched by a script host rather than a build agent.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: code-signing-certificate-generated-locally
+        name: Certificate generated with a code signing purpose
+        purpose: >-
+          Find signing material being manufactured rather than issued. A certificate created
+          on an endpoint with a code signing extended key usage exists for one reason, and
+          an internal certificate authority is the route that produces this legitimately.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(New-SelfSignedCertificate|New-SelfSignedCertificateEx|makecert(\.exe)?|openssl(\.exe)?\s+req)/i
+          | CommandLine=/(CodeSigning|CodeSigningCert|1\.3\.6\.1\.5\.5\.7\.3\.3|-eku\s|-sky\s+signature)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=creations), collect([CommandLine], limit=5)])
+          | sort(creations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName in the build, release and code-signing asset groups"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: private-key-exported-from-certificate-store
+        name: Certificate exported together with its private key
+        purpose: >-
+          Separate reading a certificate from taking the key that makes it useful. Exporting
+          a PFX moves a signing identity off the machine that holds it, which is how a
+          legitimate publisher's certificate becomes an adversary's.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Export-PfxCertificate|certutil(\.exe)?\s+.*-exportpfx|certmgr(\.exe)?\s+.*-put)/i
+          | CommandLine=/(Cert:\\|\bMy\b|CurrentUser|LocalMachine|\.pfx|\.p12)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=exports), collect([CommandLine], limit=5)])
+          | sort(exports, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the approved certificate lifecycle and renewal tooling"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: binary-signed-on-the-endpoint
+        name: Executable or driver signed on the host
+        purpose: >-
+          Catch the signing operation itself. This is the moment the payload acquires the
+          property the adversary is after, and on any host outside the release pipeline it
+          has no benign reason to happen.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(signtool(\.exe)?\s+sign|Set-AuthenticodeSignature|osslsigncode(\.exe)?\s+sign|nuget(\.exe)?\s+sign)/i
+          | CommandLine=/\.(exe|dll|sys|ocx|cat|msi|cab|ps1|psm1|appx|msix)\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=signings), collect([CommandLine], limit=5)])
+          | sort(signings, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName in the build, release and code-signing asset groups"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: key-file-supplied-from-a-writable-path
+        name: Signing key file used from a user-writable directory
+        purpose: >-
+          Isolate the case where the key material is a loose file rather than a protected
+          store entry. A PFX in Temp or a download directory, with its password on the
+          command line, is how stolen or purchased material is carried and used.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(signtool|osslsigncode|certutil|Set-AuthenticodeSignature|Import-PfxCertificate)/i
+          | CommandLine=/(?<key_file>[A-Za-z]:\\[^",]+\.(pfx|p12|pvk|snk|key))/i
+          | key_file=/\\(AppData|Temp|Tmp|ProgramData|Users\\Public|Downloads|Desktop)\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, key_file],
+                    function=[count(as=uses), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: signing_material_handled
+      name: Code signing material created, exported or used
+      description: >-
+        A command was run that manufactures a code signing certificate, exports a private
+        key out of a certificate store, or applies a signature to a file, meaning the host
+        is producing trust rather than consuming it.
+      source: process_creation
+      field: CommandLine
+      indicates: trust_control_subversion
+
+  supporting:
+    - id: signing_operation_observed
+      name: A file was actually signed
+      description: >-
+        A signing utility was run against an executable, driver, catalogue or script,
+        confirming that a payload was given a signature rather than material merely being
+        prepared.
+      source: process_creation
+      field: CommandLine
+      indicates: payload_given_valid_signature
+    - id: private_key_exported
+      name: Private key taken out of a certificate store
+      description: >-
+        The utility that ran exports a certificate with its private key, which converts a
+        store-resident identity into a portable file that can sign anywhere.
+      source: process_creation
+      field: FileName
+      indicates: signing_material_acquisition
+    - id: key_file_in_writable_path
+      name: Key material loose in a writable directory
+      description: >-
+        The PFX, PVK or SNK passed to the signing utility sits under AppData, Temp, a user
+        profile or a download directory rather than in a protected store or a pipeline
+        secret location.
+      source: process_creation
+      field: CommandLine
+      indicates: untrusted_execution_location
+    - id: script_host_signer
+      name: Signing driven by a script host
+      description: >-
+        The signing or export command was launched by an interpreter, document handler or
+        archive utility rather than by a build agent, IDE or certificate lifecycle tool.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: no_signing_history
+      name: Host does not sign software
+      description: >-
+        No signing or certificate generation activity appears on this host across the
+        baseline window, so the operation is inconsistent with the machine's role.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: build_pipeline_parent
+      name: Release pipeline as parent
+      description: >-
+        The signing command was launched by a continuous-integration agent, build tool or
+        release script, which is the intended path for signing artefacts.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: signing_or_engineering_asset
+      name: Registered signing or engineering host
+      description: >-
+        The host belongs to the code-signing, build or engineering asset group, where
+        certificate generation and signing are the machine's function.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+    - id: approved_certificate_operation
+      name: Recorded certificate lifecycle work
+      description: >-
+        The export or generation corresponds to an approved certificate renewal, migration
+        or issuance recorded in the change record.
+      source: change_management
+      field: CommandLine
+      indicates: planned_change
+
+  risk_logic:
+    required:
+      - signing_material_handled
+
+    supporting:
+      any:
+        - signing_operation_observed
+        - private_key_exported
+        - key_file_in_writable_path
+        - script_host_signer
+        - no_signing_history
+      all:
+        - signing_operation_observed
+        - no_signing_history
+
+    contradicting:
+      any:
+        - build_pipeline_parent
+        - signing_or_engineering_asset
+        - approved_certificate_operation
+      all: []
+
+  verdict:
+    low_risk_when:
+      - signing_material_handled
+      - build_pipeline_parent
+      - signing_or_engineering_asset
+      - approved_certificate_operation
+    suspicious_when:
+      - signing_material_handled
+      - no_signing_history
+    high_risk_when:
+      - signing_material_handled
+      - signing_operation_observed
+      - key_file_in_writable_path
+      - script_host_signer
+      - no_signing_history
+
+  false_positive:
+    - condition: A release pipeline signs build artefacts.
+      explanation: >-
+        Signing is the last step of most release processes and produces exactly the required
+        evidence. It happens on a small, stable set of hosts, is launched by a build agent,
+        and repeats on a schedule — none of which holds for an ad hoc signing on a
+        workstation.
+    - condition: A developer creates a test certificate to sign code locally.
+      explanation: >-
+        Local development against signed components often needs a throwaway code signing
+        certificate, generated with the same cmdlet an adversary would use. It clusters on
+        registered engineering assets under the developer's own account and the resulting
+        certificate is not trusted anywhere else.
+    - condition: Certificate lifecycle tooling exports a key during renewal or migration.
+      explanation: >-
+        Moving a certificate between machines legitimately requires exporting the private
+        key. The operation is performed by the certificate management tooling, is scoped to
+        the certificate infrastructure, and is normally recorded as a planned change.
+    - condition: An installer signs or re-signs a component during setup.
+      explanation: >-
+        Some products sign drivers or catalogues at install time on the target machine. The
+        installer is the parent process, the material comes from the product's own files,
+        and the activity appears on every host where the product is deployed rather than on
+        one.

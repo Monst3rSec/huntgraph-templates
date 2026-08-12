@@ -1,0 +1,342 @@
+type: detection
+
+id: hg-win-mail-client-driven-to-send-internal-phishing-t1534
+
+version: 1.0.0
+
+info:
+  name: Mail client driven to send internal phishing
+  description: >-
+    Nothing about an internally sent phish is wrong on paper. It comes from a real colleague's
+    real mailbox, it authenticates because it genuinely is that account, it carries the
+    corporate signature and the correct display name, and it arrives in a thread the
+    recipient recognises. Every control designed to answer the question "is this sender who
+    they claim to be" answers yes, correctly. So the content and the headers are the wrong
+    place to look, and this template does not look there. It looks at how the mail was
+    composed: a person writing to a colleague types in Outlook, whereas an adversary sitting
+    on that person's machine drives Outlook through automation, from a script host, or
+    through a macro module that turns the client into a sender. That difference is visible on
+    the endpoint even though the message itself is unremarkable. The recipient side is
+    covered too, because the same lure landing from the mail cache on several different
+    machines is the fan-out that separates a campaign from one person opening one odd file.
+    What this proves is that a mail client was being operated by code rather than by a
+    person, and that a payload from the mail path executed on peers; it does not read the
+    message, identify the recipients, or establish that the account owner is unaware of it.
+  severity: high
+  author: huntgraph
+  tags:
+    - lateral-movement
+    - internal-phishing
+    - mail-client
+    - process-lineage
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1534
+    - https://attack.mitre.org/detectionstrategies/DET0054
+    - https://attack.mitre.org/techniques/T1566
+
+mitre:
+  tactics:
+    - TA0008
+  techniques:
+    - T1534
+  sub_techniques: []
+  detection_strategies:
+    - DET0054
+  analytics:
+    - AN0147
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary holding a genuine internal account may send mail from it to colleagues so
+    that the message passes every authentication and reputation check on its way, obtaining a
+    level of trust from the recipients that no externally sent lure can buy.
+  attacker_behavior:
+    - Drives the installed mail client through automation to compose and send.
+    - Sends through the internal relay from a script host rather than the client interface.
+    - Plants a macro module in the mail client so sending happens as the user works.
+    - Attaches or links a payload that peers then execute from the mail cache.
+  legitimate_behavior:
+    - Service desk and HR tooling sends notification mail through scripts on a schedule.
+    - Monitoring and backup jobs mail their reports through the internal relay.
+    - Users legitimately open attachments from colleagues, which run from the mail cache.
+    - Add-ins and mail integrations start helper processes from the client.
+  risk_indicator:
+    - A mail client is composed and sent through automation on an ordinary user workstation.
+    - The mail client is the parent of a script host on a machine with no such history.
+    - A payload runs from the mail attachment cache on several unrelated hosts.
+    - The same file executes from the mail path across many recipients in one short window.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - SHA256HashData
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: mail-composed-through-automation
+        name: Mail composed and sent through automation
+        purpose: >-
+          This is the finding. A colleague writing to a colleague uses the client interface,
+          which leaves no command line at all, so a command line that constructs a message
+          and sends it means the mailbox is being operated by code. Scoping to the sending
+          verbs rather than to the mail client name keeps this on the act of sending instead
+          of on the presence of a mail application.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|python\d*)\.exe$/i
+          | CommandLine=/(Send-MailMessage|New-Object\s+Net\.Mail|SmtpClient|Outlook\.Application|CreateItem\s*\(\s*0|MailItem|\.Send\s*\(\s*\)|CDO\.Message)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=sends), collect([CommandLine], limit=5)])
+          | sort(sends, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Notification and reporting jobs on servers whose role is to send mail"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: mail-client-spawned-script-host
+        name: Mail client became the parent of a script host
+        purpose: >-
+          Cover the route that leaves no sending command line, where a macro module inside the
+          client does the composing. The client starting an interpreter is the visible edge of
+          that arrangement, and on a workstation it is also the point at which the mailbox
+          stops being operated by the person sitting in front of it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(outlook|olk|ms-teams|Teams|thunderbird|HxOutlook)\.exe$/i
+          | FileName=/^(wscript|cscript|powershell|pwsh|mshta|rundll32|regsvr32|cmd|curl|certutil|bitsadmin)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=spawns), collect([CommandLine], limit=5)])
+          | sort(spawns, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved mail add-ins that start helper processes from the client"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: payload-executed-from-mail-cache
+        name: Program running from the mail attachment cache
+        purpose: >-
+          Move to the receiving side. Attachments opened from a message are written to a
+          client-specific cache before they run, so a process whose image sits in that cache
+          is by definition something that arrived by mail and that somebody chose to open.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/\\(INetCache\\+Content\.Outlook|Content\.Outlook|Outlook Temp|OLK[0-9A-Z]+|Microsoft\\+Teams\\+Cache|Downloads\\+Teams)\\/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=runs), collect([SHA256HashData], limit=3)])
+          | sort(runs, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Document formats routinely exchanged and opened by their own application"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: same-lure-across-multiple-recipients
+        name: One file executing from the mail path on several hosts
+        purpose: >-
+          Confirm that this is a campaign rather than an incident. One person opening an odd
+          attachment is a user problem; the same file opening from the mail cache on several
+          unrelated machines inside a short window is a lure that went to a distribution of
+          colleagues, which is what internal spearphishing is for.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/\\(INetCache\\+Content\.Outlook|Content\.Outlook|Outlook Temp|OLK[0-9A-Z]+|Microsoft\\+Teams\\+Cache)\\/i
+          | groupBy([FileName, SHA256HashData],
+                    function=[count(field=ComputerName, distinct=true, as=recipients),
+                              collect([ComputerName], limit=10)])
+          | recipients >= 3
+          | sort(recipients, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Files circulated deliberately to a team, such as an agreed installer or form"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - organization
+            - path
+            - process
+
+evidence:
+  required:
+    - id: mail_client_operated_by_code
+      name: Mail client operated by code rather than a person
+      description: >-
+        A message was composed and sent through automation, or the mail client started an
+        interpreter, either of which means the mailbox was being driven programmatically
+        instead of by the person it belongs to.
+      source: process_creation
+      field: CommandLine
+      indicates: mailbox_driven_programmatically
+
+  supporting:
+    - id: client_spawned_interpreter
+      name: Mail client is the parent of a script host
+      description: >-
+        The client itself started a script host or shell, which is the shape of a macro module
+        planted inside the mail application doing the sending.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: sender_side_automation_in_client
+    - id: payload_ran_from_mail_cache
+      name: A payload ran from the mail attachment cache
+      description: >-
+        A process executed from the directory the mail client uses to stage opened
+        attachments, so the file arrived by mail and a recipient opened it.
+      source: process_creation
+      field: ImageFileName
+      indicates: mail_delivered_payload_executed
+    - id: lure_reached_multiple_recipients
+      name: Same file opened on several hosts
+      description: >-
+        One file executed from the mail path on multiple unrelated machines inside a short
+        window, which is a distribution rather than an individual's mistake.
+      source: process_creation
+      field: SHA256HashData
+      indicates: campaign_fanout_across_peers
+    - id: sender_account_recently_abnormal
+      name: Sender account already behaving abnormally
+      description: >-
+        The account whose mailbox is sending showed abnormal sign-in or device activity
+        shortly beforehand, which is how a genuine internal account comes to be sending on
+        somebody else's behalf.
+      source: identity_context
+      field: UserName
+      indicates: account_likely_compromised
+
+  contradicting:
+    - id: notification_job_on_a_server
+      name: Notification or reporting job
+      description: >-
+        The sending host is a server whose role includes mailing reports, alerts or service
+        desk notifications, and the command line matches that job's recurring pattern.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_application_component
+    - id: approved_mail_add_in
+      name: Approved add-in or mail integration
+      description: >-
+        The process started by the client belongs to a sanctioned add-in or archiving
+        integration that runs from its own installation directory on every host that has it.
+      source: process_creation
+      field: FileName
+      indicates: expected_product_behaviour
+    - id: file_circulated_deliberately
+      name: File shared deliberately with a team
+      description: >-
+        The file that ran on several hosts was circulated on purpose, such as an agreed
+        installer or a form, and there is a record or an owner who confirms sending it.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_business_distribution
+
+  risk_logic:
+    required:
+      - mail_client_operated_by_code
+
+    supporting:
+      any:
+        - client_spawned_interpreter
+        - payload_ran_from_mail_cache
+        - lure_reached_multiple_recipients
+        - sender_account_recently_abnormal
+      all:
+        - payload_ran_from_mail_cache
+        - lure_reached_multiple_recipients
+
+    contradicting:
+      any:
+        - notification_job_on_a_server
+        - approved_mail_add_in
+        - file_circulated_deliberately
+      all: []
+
+  verdict:
+    low_risk_when:
+      - mail_client_operated_by_code
+      - notification_job_on_a_server
+      - approved_mail_add_in
+      - file_circulated_deliberately
+    suspicious_when:
+      - mail_client_operated_by_code
+      - sender_account_recently_abnormal
+    high_risk_when:
+      - mail_client_operated_by_code
+      - client_spawned_interpreter
+      - payload_ran_from_mail_cache
+      - lure_reached_multiple_recipients
+
+  false_positive:
+    - condition: A scheduled job mails a report through the internal relay.
+      explanation: >-
+        Monitoring, backup and service desk tooling sends mail from scripts constantly, and it
+        uses exactly these cmdlets and objects. It runs on servers rather than workstations,
+        it recurs on a schedule with a stable command line, and it sends to a distribution
+        address rather than to individual colleagues.
+    - condition: A user opens a legitimate attachment from a colleague.
+      explanation: >-
+        Every opened attachment runs from the mail cache, so this case on its own describes
+        normal office life. It becomes meaningful only alongside the required evidence or when
+        the same file appears across several recipients, which is why it is supporting rather
+        than sufficient.
+    - condition: An approved add-in starts a helper from the mail client.
+      explanation: >-
+        Archiving, encryption and CRM integrations hook the client and start their own
+        processes. They are signed, they run from the add-in's installation directory, and
+        they appear on every host with that add-in rather than on one user's machine.
+    - condition: A team deliberately circulates an installer or a form.
+      explanation: >-
+        Files genuinely do get mailed to a whole team and opened by all of them, which
+        reproduces the fan-out pattern precisely. The difference is provenance: somebody will
+        own having sent it, and the file will usually be signed or already known in the
+        estate.
+    - condition: A user runs a mail-sending script for their own work.
+      explanation: >-
+        Some people automate their own reminders or mail merges from a workstation. This
+        tends to be a stable habit visible across the baseline window for that user, whereas
+        a compromised mailbox starts sending programmatically for the first time.

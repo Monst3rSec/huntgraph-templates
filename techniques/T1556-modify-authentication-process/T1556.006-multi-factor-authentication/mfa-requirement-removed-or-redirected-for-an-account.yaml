@@ -1,0 +1,352 @@
+type: detection
+
+id: hg-win-mfa-requirement-removed-or-redirected-for-an-account-t1556-006
+
+version: 1.0.0
+
+info:
+  name: MFA requirement removed or redirected for an account
+  description: >-
+    Every other control in an identity estate is priced on the assumption that a stolen
+    password is not enough. Removing the second factor from one account quietly repeals
+    that assumption for that account, and nothing else in the stack notices: the logon that
+    follows is a clean, policy-compliant, single-factor success. There are three routes to
+    the same end and they look nothing like each other. The factor can be cleared from the
+    account outright; a new factor the adversary controls can be registered alongside the
+    user's own, which leaves MFA nominally enabled and passing; or the account can be
+    excluded from the conditional-access rule that demands MFA in the first place, leaving
+    both the account and the policy apparently intact. A fourth route does not touch
+    identity at all — pointing the MFA or RADIUS server's name at localhost in the hosts
+    file makes the challenge fail, and a fail-open policy then admits the session. This
+    template reads the endpoint side: the PowerShell and command-line execution that
+    performs the change on a managed Windows host. The authoritative record of an MFA
+    method being deleted or a policy being edited lives in the identity provider's audit
+    log, which a Falcon sensor does not see, so a change made from an unmanaged machine or
+    a browser session will not appear here at all. The discriminator is not the change —
+    helpdesks reset factors all day — but who issued it and through what. A governed reset
+    arrives through the identity platform's own tooling against a user who asked for it; a
+    weakening arrives from a shell, from an operator with no history of identity
+    administration, and is frequently paired with a registration of a new factor in the
+    same window.
+  severity: critical
+  author: huntgraph
+  tags:
+    - defense-impairment
+    - persistence
+    - credential-access
+    - multi-factor-authentication
+    - identity
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1556/006
+    - https://attack.mitre.org/detectionstrategies/DET0190
+    - https://attack.mitre.org/techniques/T1556
+
+mitre:
+  tactics:
+    - TA0112
+    - TA0003
+    - TA0006
+  techniques:
+    - T1556
+  sub_techniques:
+    - T1556.006
+  detection_strategies:
+    - DET0190
+  analytics:
+    - AN0543
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:PowerShell
+  data_components:
+    - Active Directory Object Modification
+    - Script Execution
+
+hypothesis:
+  statement: >-
+    An adversary holding a password may remove, replace or exclude the account's second
+    authentication factor so that the password alone authenticates again, obtaining durable
+    access that survives detection of the original intrusion and that every downstream
+    control will read as a compliant logon.
+  attacker_behavior:
+    - Clears the registered MFA methods or strong-authentication requirement from a compromised account.
+    - Registers an additional phone, authenticator or token that the adversary controls.
+    - Adds the account to the exclusion list of the conditional-access policy that enforces MFA.
+    - Redirects the MFA or RADIUS server name to localhost so the challenge fails into a fail-open path.
+    - Runs the change through offensive identity tooling rather than the administration console.
+  legitimate_behavior:
+    - Helpdesk staff reset a factor for a user who has lost or replaced a phone.
+    - Users enrol a second device of their own alongside an existing one.
+    - Identity teams add break-glass accounts to conditional-access exclusions by design.
+    - Migration work temporarily excludes a group while a new policy is piloted.
+  risk_indicator:
+    - The change is issued from a command shell or script host rather than the identity platform.
+    - A new factor is registered for an account other than the one running the command.
+    - The operator has no history of identity administration in the baseline window.
+    - Removal of one factor and registration of another happen in the same short window.
+    - An MFA or RADIUS hostname is redirected to a loopback address in the hosts file.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: mfa-requirement-cleared
+        name: Strong authentication requirement cleared from an account
+        purpose: >-
+          Surface the blunt form of the technique, where the requirement or the registered
+          methods are removed outright and the account falls back to a password. This is
+          rare enough per account that the count matters less than the fact it happened.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Set-AADIntUserMFA|StrongAuthenticationRequirements|StrongAuthenticationMethods|Remove-MgUserAuthentication|Set-MsolUser\s+.*StrongAuthentication|Set-ADAuthenticationPolicy|Set-AuthenticationPolicy)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Identity administration jump hosts where factor resets are the documented workflow"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - user
+            - host
+            - organization
+
+      - id: additional-factor-registered-for-another-user
+        name: New authentication method registered against another account
+        purpose: >-
+          Catch the quieter form, where MFA stays enabled and passing but a method the
+          adversary holds is added beside the user's own. The separator from ordinary
+          self-enrolment is that the command names a different principal than the one
+          running it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(New-MgUserAuthentication(PhoneMethod|EmailMethod|MicrosoftAuthenticatorMethod|Fido2Method|SoftwareOathMethod)|Set-AADIntUserMFA|StrongAuthenticationUserDetails|Set-MsolUser\s+.*PhoneNumber)/i
+          | CommandLine=/(-UserId|-UserPrincipalName|-Identity|-ObjectId|@)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=registrations), collect([CommandLine], limit=5)])
+          | sort(registrations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Self-service enrolment portals running under the user's own context"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - user
+            - organization
+
+      - id: conditional-access-exclusion-added
+        name: Account or group excluded from a conditional access policy
+        purpose: >-
+          Cover the route that leaves both the account and the policy looking healthy. The
+          account still has MFA registered and the policy still exists and is enabled; the
+          account is simply no longer in scope of it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(ConditionalAccess|Update-MgIdentityConditionalAccessPolicy|New-MgIdentityConditionalAccessPolicy|AzureADMSConditionalAccessPolicy)/i
+          | CommandLine=/(excludeUsers|excludeGroups|excludeApplications|ExcludeUsers|ExcludeGroups|State\s*=\s*.?disabled|-State\s+disabled)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=policy_edits), collect([CommandLine], limit=5)])
+          | sort(policy_edits, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Break-glass account exclusions recorded as a standing design decision"
+            - "Policy pilots run by the identity engineering team from managed workstations"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - user
+            - organization
+
+      - id: mfa-endpoint-redirected-to-loopback
+        name: MFA or RADIUS server redirected to a loopback address
+        purpose: >-
+          Detect the fail-open route, which never touches an identity object at all. Writing
+          the MFA provider's hostname to a loopback address in the hosts file makes the
+          challenge unreachable, and any policy that fails open then grants the session on
+          the password alone.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(drivers\\+etc\\+hosts|System32\\+drivers\\+etc)/i
+          | CommandLine=/(127\.0\.0\.1|0\.0\.0\.0|::1)/
+          | CommandLine=/(duo|okta|rsa|securid|radius|mfa|pingid|authpoint|entrust|azuremfa)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=edits), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: mfa_control_changed
+      name: MFA enforcement changed for an account
+      description: >-
+        A command was executed that removes the strong-authentication requirement, deletes a
+        registered method, excludes the account from the policy that enforces MFA, or breaks
+        the path to the MFA service, so a password alone becomes sufficient.
+      source: process_creation
+      field: CommandLine
+      indicates: authentication_control_weakened
+
+  supporting:
+    - id: adversary_factor_registered
+      name: A new factor registered against another principal
+      description: >-
+        An authentication method was registered for an account other than the one issuing
+        the command, which leaves MFA enabled and passing while the adversary holds a factor
+        that satisfies it.
+      source: process_creation
+      field: CommandLine
+      indicates: adversary_controlled_second_factor
+    - id: offensive_identity_tooling
+      name: Offensive identity tooling used to make the change
+      description: >-
+        The change was made by a binary or module associated with adversary identity tooling
+        rather than by the platform's own administration cmdlets or console.
+      source: process_creation
+      field: FileName
+      indicates: offensive_tooling_present
+    - id: shell_issued_change
+      name: Change issued from a shell or script host
+      description: >-
+        The parent of the process making the change is a command shell or script host rather
+        than the identity management platform that owns authentication methods.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: operator_without_identity_role
+      name: Operator with no identity administration history
+      description: >-
+        The account issuing the change has not administered authentication methods or access
+        policies at any point in the baseline window.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_user
+    - id: single_account_targeted
+      name: Change scoped to one account rather than a population
+      description: >-
+        The change touches a single named principal instead of a group or a policy-wide
+        rollout, which is the shape of an adversary keeping one identity rather than an
+        estate-wide administrative task.
+      source: derived
+      field: UserName
+      indicates: targeted_scope
+
+  contradicting:
+    - id: governed_identity_workflow
+      name: Change made through the identity platform
+      description: >-
+        The change was issued by the sanctioned identity management or helpdesk tooling under
+        its own service context, which is how factor resets are supposed to reach the tenant.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: recorded_factor_reset
+      name: Recorded helpdesk factor reset
+      description: >-
+        A ticket or change record covers a factor reset for this user, typically a lost or
+        replaced phone, with the request originating from the user themselves.
+      source: change_management
+      field: UserName
+      indicates: legitimate_administrative_action
+    - id: policy_rollout_wave
+      name: Part of a broad policy change
+      description: >-
+        The same conditional-access or authentication-policy edit appears across many
+        principals in one window, which is a rollout or pilot rather than a targeted
+        weakening of one account.
+      source: baseline
+      field: CommandLine
+      indicates: policy_rollout_wave
+
+  risk_logic:
+    required:
+      - mfa_control_changed
+
+    supporting:
+      any:
+        - adversary_factor_registered
+        - offensive_identity_tooling
+        - shell_issued_change
+        - operator_without_identity_role
+        - single_account_targeted
+      all:
+        - adversary_factor_registered
+        - shell_issued_change
+
+    contradicting:
+      any:
+        - governed_identity_workflow
+        - recorded_factor_reset
+        - policy_rollout_wave
+      all: []
+
+  verdict:
+    low_risk_when:
+      - mfa_control_changed
+      - governed_identity_workflow
+      - recorded_factor_reset
+      - policy_rollout_wave
+    suspicious_when:
+      - mfa_control_changed
+      - single_account_targeted
+    high_risk_when:
+      - mfa_control_changed
+      - adversary_factor_registered
+      - offensive_identity_tooling
+      - shell_issued_change
+      - operator_without_identity_role
+
+  false_positive:
+    - condition: A helpdesk operator resets a factor for a user who replaced their phone.
+      explanation: >-
+        This is the single most common source of these commands and it is indistinguishable
+        at the command line. It is separated by the operator being a member of the helpdesk
+        role with a long history of the same action, by a ticket covering the user, and by
+        the reset removing the old factor rather than adding a second one beside it.
+    - condition: A user enrols an additional device of their own.
+      explanation: >-
+        Self-enrolment produces a registration event for a new method. It runs under the
+        user's own context against their own principal, whereas the adversary form names a
+        different principal than the caller.
+    - condition: Break-glass accounts are excluded from conditional access by design.
+      explanation: >-
+        Emergency access accounts are deliberately kept outside MFA-enforcing policies so a
+        policy fault cannot lock an organisation out. These exclusions are long-standing, are
+        documented, and name accounts that exist for that purpose rather than ordinary users.
+    - condition: An identity team pilots a new access policy against a test group.
+      explanation: >-
+        Piloting produces exclusion edits and policy state changes from identity engineering
+        staff. It touches groups rather than individual production users, is repeated across
+        several policies in a short window, and comes from known administration hosts.

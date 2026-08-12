@@ -1,0 +1,337 @@
+type: detection
+
+id: hg-win-account-created-with-a-service-or-system-like-name-t1036-010
+
+version: 1.0.0
+
+info:
+  name: Account created with a service or system-like name
+  description: >-
+    An account list is read by eye, and an adversary who wants their account to survive that
+    reading only has to name it well. A local account called svc_backup, sqlagent or
+    DefaultAccount0 does not stand out beside the genuine service and built-in accounts it
+    sits next to, and once it has a name that belongs, its logons stop being remarkable too.
+    The cost is nothing and the payoff is that every subsequent review of who has access
+    passes over it. What makes this findable is that the name has to be chosen before the
+    account exists, so the creation event carries the whole tell: the string being passed to
+    the creation command either imitates an account that is already on the host, resembles a
+    built-in with a character changed, or is one of the generic trustworthy words adversaries
+    reach for. The discriminator against real service account provisioning is who creates it
+    and how — genuine service accounts arrive from a provisioning system or an identity
+    administrator following a naming standard, not from a shell that a payload happened to
+    open.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - masquerading
+    - account-creation
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1036/010
+    - https://attack.mitre.org/detectionstrategies/DET0383
+    - https://attack.mitre.org/techniques/T1036
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1036
+  sub_techniques:
+    - T1036.010
+  detection_strategies:
+    - DET0383
+  analytics:
+    - AN1077
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+  data_components:
+    - User Account Creation
+
+hypothesis:
+  statement: >-
+    An adversary may create an account whose name imitates a service, a built-in identity or
+    a generic trusted role, so that the account and its logons read as part of the system
+    when anyone reviews who has access to the host or the domain.
+  attacker_behavior:
+    - Creates a local account with a service-style prefix such as svc, srv or sql.
+    - Chooses a name one character away from a built-in account so a list reads as normal.
+    - Uses a short generic word such as help, admin, support or backup as the account name.
+    - Creates the account from a shell or script host opened by the intrusion rather than by tooling.
+    - Creates the equivalent account in the directory so the name works across the estate.
+  legitimate_behavior:
+    - Provisioning and endpoint management tooling creates local service accounts during setup.
+    - Applications create their own service accounts at install time.
+    - Identity administrators create service accounts following an agreed naming standard.
+    - Support staff create temporary local accounts during break-fix work.
+  risk_indicator:
+    - The creating process is a script host, remote shell or document handler.
+    - The name differs from an existing privileged account by one or two characters.
+    - The account is created by a user who does not otherwise administer identities.
+    - The host has no history of local account creation in the baseline window.
+    - The same name is created in the directory as well as locally.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: local-account-created-with-a-service-style-name
+        name: Local account created with a service-style name
+        purpose: >-
+          Catch the most common shape: an account named as though a product owns it. Real
+          service accounts of this form are created by installers and management tooling, so
+          the value of this case is that it puts the creating process next to the name.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(net(\d|\.exe)?\s+user\s+.*\/add|New-LocalUser|useradd)/i
+          | CommandLine=/\b(svc|srv|service|sql|sqlagent|mssql|iis|iusr|backup|veeam|sccm|winrm|monitor|health|update|scan|agent|task|sync|spool|report)[-_.]?[a-z0-9]{0,12}\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=creations), collect([CommandLine], limit=5)])
+          | sort(creations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the endpoint management and provisioning agents"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: account-name-imitating-a-built-in
+        name: Account name a character away from a built-in identity
+        purpose: >-
+          Isolate the near-miss. A name that differs from Administrator, Guest,
+          DefaultAccount or HelpAssistant by a substituted digit or an appended character is
+          not a naming convention, it is a name chosen to be misread in a list.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(net(\d|\.exe)?\s+user\s+.*\/add|New-LocalUser)/i
+          | CommandLine=/\b(adm[i1l]n[i1l]?strat[o0]r?[0-9]*|adm[i1l]n[0-9_-]*|gu[e3]st[0-9_.]*|d[e3]fault[-_]?account[0-9]*|help[-_]?assistant[0-9]*|wdag[-_]?utility[-_]?account[0-9]*|sy?st[e3]m[0-9_.]*|localsystem[0-9]*|netw?ork[-_]?service[0-9]*)\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=creations), collect([CommandLine], limit=5)])
+          | sort(creations, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: account-created-with-a-generic-trusted-name
+        name: Account created with a generic trusted name
+        purpose: >-
+          Cover the names that carry authority by themselves. Words like help, support,
+          admin or root read as infrastructure to anyone scanning a list, and they are short
+          enough that no naming standard would produce them in a managed estate.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(net(\d|\.exe)?\s+user\s+(?<new_account>[a-z0-9._-]{2,16})\s|New-LocalUser\s+(-Name\s+)?["']?(?<ps_account>[a-z0-9._-]{2,16}))/i
+          | CommandLine=/\/add/i or CommandLine=/New-LocalUser/i
+          | CommandLine=/\b(help|helpdesk|support|admin|root|test|temp|user|backup|it|itadmin|service|oracle|www|web)\b/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, new_account, ps_account],
+                    function=[count(as=creations), collect([CommandLine], limit=3)])
+          | sort(creations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Break-fix accounts created by named support staff under an open ticket"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: directory-account-created-with-a-service-style-name
+        name: Directory account created with a service-style name
+        purpose: >-
+          Extend the same naming question to the domain, where a well-named account is worth
+          far more than a local one because it is usable everywhere and is reviewed by
+          people who did not build the host it was created from.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(dsadd(\.exe)?\s+user|New-ADUser|net(\d|\.exe)?\s+user\s+.*\/add\s+.*\/domain|Add-ADUser)/i
+          | CommandLine=/\b(svc|srv|service|sql|backup|admin|adm|help|support|monitor|sync|agent|task|iis|exchange|sharepoint|vmware|veeam)[-_.]?[a-z0-9]{0,12}\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=creations), collect([CommandLine], limit=5)])
+          | sort(creations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Identity provisioning servers and the accounts their automation runs as"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: account_created_with_masquerading_name
+      name: Account created with a name that imitates an existing identity
+      description: >-
+        An account creation command was run with a name shaped like a service account, a
+        built-in identity or a generic trusted role, so the resulting account will read as
+        part of the system in any account listing.
+      source: process_creation
+      field: CommandLine
+      indicates: masquerading_identity
+
+  supporting:
+    - id: imitates_builtin_account
+      name: Name is a near-miss of a built-in
+      description: >-
+        The chosen name differs from a Windows built-in account by a substituted character
+        or an appended digit, which produces a name that survives a visual review of the
+        account list rather than one that follows a convention.
+      source: process_creation
+      field: CommandLine
+      indicates: visual_confusion_with_trusted_name
+    - id: created_by_script_host
+      name: Created from a script host or shell
+      description: >-
+        The creation command was launched by an interpreter, remote shell, document handler
+        or archive utility rather than by an installer or an endpoint management agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: creator_not_an_identity_admin
+      name: Created by an account that does not manage identities
+      description: >-
+        The account performing the creation is not one that provisions users in this estate,
+        which separates an intruder using stolen privilege from routine administration.
+      source: process_creation
+      field: UserName
+      indicates: unexpected_actor_for_operation
+    - id: directory_scope_creation
+      name: Equivalent account created in the directory
+      description: >-
+        The name was created against the domain rather than only locally, giving the
+        masquerading identity reach across the estate and a wider review audience to slip
+        past.
+      source: process_creation
+      field: FileName
+      indicates: change_affects_all_accounts
+    - id: no_account_creation_history
+      name: Host does not create accounts
+      description: >-
+        No local account creation appears on this host across the baseline window, so the
+        operation is a deviation from the host's history as well as a suspicious name.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: provisioning_agent_parent
+      name: Created by provisioning or management tooling
+      description: >-
+        The account was created by an endpoint management agent, installer or provisioning
+        script, which is how genuine local service accounts come into existence.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: approved_service_account
+      name: Recorded service account provisioning
+      description: >-
+        The account matches a service account requested and approved in the change record,
+        including its name and the host it belongs on.
+      source: change_management
+      field: CommandLine
+      indicates: planned_change
+    - id: identity_administrator
+      name: Created by a recognised identity administrator
+      description: >-
+        The creating account is one of the identities that administers users in this estate,
+        acting through its normal tooling and following the naming standard.
+      source: identity_context
+      field: UserName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - account_created_with_masquerading_name
+
+    supporting:
+      any:
+        - imitates_builtin_account
+        - created_by_script_host
+        - creator_not_an_identity_admin
+        - directory_scope_creation
+        - no_account_creation_history
+      all:
+        - imitates_builtin_account
+        - created_by_script_host
+
+    contradicting:
+      any:
+        - provisioning_agent_parent
+        - approved_service_account
+        - identity_administrator
+      all: []
+
+  verdict:
+    low_risk_when:
+      - account_created_with_masquerading_name
+      - provisioning_agent_parent
+      - approved_service_account
+      - identity_administrator
+    suspicious_when:
+      - account_created_with_masquerading_name
+      - no_account_creation_history
+    high_risk_when:
+      - account_created_with_masquerading_name
+      - imitates_builtin_account
+      - created_by_script_host
+      - creator_not_an_identity_admin
+      - directory_scope_creation
+
+  false_positive:
+    - condition: Endpoint management tooling creates a local service account.
+      explanation: >-
+        Management platforms and installers create accounts with exactly these names as part
+        of setup, which is why the name alone cannot carry the verdict. The agent or
+        installer is the parent process and the same account appears on every host the
+        product is deployed to.
+    - condition: An application creates its own service account during installation.
+      explanation: >-
+        Products routinely add a local account named after themselves. The creation happens
+        once, immediately after the installer runs, and is accompanied by the product's files
+        and services on the same host.
+    - condition: An identity administrator provisions a service account by hand.
+      explanation: >-
+        Hand-provisioning still happens in most estates and produces a service-styled name
+        from an interactive shell. It is performed by an account that provisions users
+        regularly and usually corresponds to a change record.
+    - condition: Support staff create a temporary local account during break-fix work.
+      explanation: >-
+        Names like temp, help or itadmin get used for genuine short-lived support accounts.
+        These are created under a named support identity, on a host with a matching incident,
+        and are normally removed shortly afterwards.

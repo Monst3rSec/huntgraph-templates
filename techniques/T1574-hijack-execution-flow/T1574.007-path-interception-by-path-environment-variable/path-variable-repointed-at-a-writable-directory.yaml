@@ -1,0 +1,360 @@
+type: detection
+
+id: hg-win-path-variable-repointed-at-a-writable-directory-t1574-007
+
+version: 1.0.0
+
+info:
+  name: PATH variable repointed at a directory the adversary can write
+  description: >-
+    The search order that resolves a bare command name is not fixed: it is read out of the
+    PATH value in the registry, and that value is writable. Rewriting it moves the hijack
+    away from planting a file where the search order already looks and towards changing
+    where the search order looks at all, which means the adversary chooses the directory
+    rather than having to find one. Scope is what makes it consequential. A user-scope
+    change under the account's own Environment key redirects that account; a machine-scope
+    change under Session Manager redirects every account on the host, including services
+    and scheduled tasks running as SYSTEM, and it persists across logons because the value
+    is read at process creation from the registry. The same key also holds the variables
+    that name the system directories themselves, so redefining windir or ComSpec for one
+    user reroutes anything that expands them. The observable is the write to the value, not
+    any later execution, because the write is what changes resolution for everything that
+    follows.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - execution
+    - hijack-execution-flow
+    - environment-variable
+    - registry
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1574/007
+    - https://attack.mitre.org/detectionstrategies/DET0004
+    - https://attack.mitre.org/techniques/T1574
+
+mitre:
+  tactics:
+    - TA0005
+    - TA0002
+  techniques:
+    - T1574
+  sub_techniques:
+    - T1574.007
+  detection_strategies:
+    - DET0004
+  analytics:
+    - AN0009
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Windows Registry Key Modification
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary may write a directory they control into the PATH environment value so that
+    every bare-name command resolution on the host or in the session searches their
+    directory first, obtaining execution under whatever account next invokes a utility by
+    name.
+  attacker_behavior:
+    - Prepends a user-writable directory to the machine-scope PATH value under Session Manager.
+    - Sets a PATH value under the account's own Environment key so the change survives logon.
+    - Redefines windir, ComSpec or SystemRoot at user scope so expansions resolve elsewhere.
+    - Preserves the previous PATH content so nothing on the host visibly breaks.
+    - Places an executable in the newly searched directory before or shortly after the change.
+  legitimate_behavior:
+    - Installers append their own program directory to PATH during setup.
+    - Language runtimes and SDKs add their tool directories to the user PATH.
+    - Managed deployment pushes a standard PATH to the estate as part of a build.
+    - Developers extend their own PATH with project and toolchain directories.
+  risk_indicator:
+    - The added directory sits under a user profile, Temp, ProgramData or Public.
+    - The change is made at machine scope, so it applies to service and SYSTEM contexts.
+    - A system-directory variable is redefined at user scope, where it is normally absent.
+    - An executable appears in the added directory close to the value being written.
+    - The host has no history of PATH being written during the baseline window.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: registry
+      event_types:
+        - RegSystemConfigValueUpdate
+        - RegGenericValueUpdate
+        - AsepValueUpdate
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - RegObjectName
+        - RegValueName
+        - RegStringValue
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: machine-scope-path-value-rewritten
+        name: Machine-scope PATH value rewritten to include a writable directory
+        purpose: >-
+          Surface the change with the widest blast radius. The Session Manager Environment
+          key supplies PATH to every process on the host, so a writable directory added here
+          redirects bare-name resolution for services and scheduled tasks as well as for
+          logged-on users.
+        query: |
+          #event_simpleName=/^(RegSystemConfigValueUpdate|RegGenericValueUpdate)$/
+          | RegObjectName=/\\Control\\Session Manager\\Environment$/i
+          | RegValueName=/^Path$/i
+          | RegStringValue=/\\(Users|AppData|Temp|Tmp|ProgramData|Public|Downloads|PerfLogs|Intel|Recovery)\\/i
+          | groupBy([ComputerName, UserName, RegValueName, RegStringValue],
+                    function=[count(as=changes)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "RegStringValue containing only approved agent and runtime install directories"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: user-scope-path-value-rewritten
+        name: Per-user PATH value rewritten to include a writable directory
+        purpose: >-
+          Catch the quieter half of the technique. A PATH written under the account's own
+          Environment hive needs no privilege at all, applies at the next logon and every
+          logon after it, and never appears in the machine configuration an administrator
+          would inspect.
+        query: |
+          #event_simpleName=/^(RegGenericValueUpdate|AsepValueUpdate)$/
+          | RegObjectName=/\\USER\\S-1-5-21-[0-9-]+\\Environment$/i
+          | RegValueName=/^Path$/i
+          | RegStringValue=/\\(AppData|Temp|Tmp|ProgramData|Public|Downloads|PerfLogs)\\/i
+          | groupBy([ComputerName, UserName, RegObjectName, RegStringValue],
+                    function=[count(as=changes)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Language runtime and SDK tool directories added by their own installers"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: system-directory-variable-redefined-per-user
+        name: System-directory variable redefined for a single account
+        purpose: >-
+          Cover the variant that leaves PATH alone and redefines the variables that name the
+          system directories. windir, SystemRoot and ComSpec are supplied by the machine
+          configuration and have no reason to exist under a user's Environment key, so a
+          per-user definition is an override rather than a setting.
+        query: |
+          #event_simpleName=/^(RegGenericValueUpdate|AsepValueUpdate)$/
+          | RegObjectName=/\\Environment$/i
+          | RegValueName=/^(windir|SystemRoot|ComSpec|SystemDrive|PATHEXT)$/i
+          | groupBy([ComputerName, UserName, RegObjectName, RegValueName, RegStringValue],
+                    function=[count(as=changes)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: executable-planted-in-a-candidate-path-directory
+        name: Executable written into a directory shaped like a PATH entry
+        purpose: >-
+          A rewritten PATH is inert until something is placed in the directory it now names.
+          This finds the other half: an executable landing in a bin, tools or scripts folder
+          under a writable root, which is the shape of a directory created to be added to
+          PATH rather than one that came with an installed product.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+          | TargetFileName=/\\(Users|ProgramData|PerfLogs|Public)\\/i
+          | TargetFileName=/\\(bin|sbin|tools|tool|scripts|utils|util|cmd|path)\\[^\\]+\.(exe|com|bat|cmd)$/i
+          | TargetFileName!=/\\Program Files( \(x86\))?\\/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId, SHA256HashData],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Package-manager and portable-toolchain directories on engineering hosts"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+evidence:
+  required:
+    - id: path_variable_repointed
+      name: PATH or a system-directory variable rewritten
+      description: >-
+        The value that supplies the executable search order, or one of the variables naming
+        the system directories, was written with content pointing at a location outside the
+        managed program and system directories.
+      source: registry
+      field: RegStringValue
+      indicates: hijacked_execution_flow
+
+  supporting:
+    - id: machine_scope_change
+      name: Change made at machine scope
+      description: >-
+        The value was written under the Session Manager Environment key rather than a user
+        hive, so the new search order applies to every account on the host, including
+        services and scheduled tasks running as SYSTEM.
+      source: registry
+      field: RegObjectName
+      indicates: change_affects_all_accounts
+    - id: system_variable_redefined
+      name: System-directory variable overridden for one account
+      description: >-
+        windir, SystemRoot, ComSpec or SystemDrive was defined under a user's Environment
+        key, overriding the machine value for anything that expands it in that session.
+      source: registry
+      field: RegValueName
+      indicates: execution_path_override
+    - id: payload_in_path_directory
+      name: Executable placed in a directory shaped like a PATH entry
+      description: >-
+        An executable was written into a bin, tools or scripts directory beneath a
+        user-writable root, which is what makes a rewritten search order actually resolve
+        to adversary code.
+      source: file_creation
+      field: TargetFileName
+      indicates: staged_payload_present
+    - id: writer_is_script_host
+      name: Directory populated by a script host
+      description: >-
+        The executable was written by an interpreter, archive utility or delivery
+        application rather than by an installer or package manager.
+      source: file_creation
+      field: ContextProcessId
+      indicates: abnormal_execution_chain
+    - id: no_history_of_path_change
+      name: No PATH history on this host
+      description: >-
+        These values have not been written on this host during the baseline window, so the
+        change is a deviation from the host's configuration history as well as a repointing.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: product_install_directory
+      name: Installed product appending its own directory
+      description: >-
+        The directory added to PATH is the installation path of a product present on the
+        host, which is how installers and SDKs make their tools callable by name.
+      source: registry
+      field: RegStringValue
+      indicates: legitimate_application_component
+    - id: developer_toolchain_host
+      name: Registered engineering host
+      description: >-
+        The host belongs to the engineering asset group, where extending PATH with project
+        and toolchain directories is routine work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+    - id: fleetwide_path_change
+      name: Same PATH content across the estate
+      description: >-
+        The identical value appears on many hosts within one window, which is a managed
+        deployment of a standard PATH rather than a targeted change.
+      source: baseline
+      field: RegStringValue
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - path_variable_repointed
+
+    supporting:
+      any:
+        - machine_scope_change
+        - system_variable_redefined
+        - payload_in_path_directory
+        - writer_is_script_host
+        - no_history_of_path_change
+      all:
+        - machine_scope_change
+        - payload_in_path_directory
+
+    contradicting:
+      any:
+        - product_install_directory
+        - developer_toolchain_host
+        - fleetwide_path_change
+      all: []
+
+  verdict:
+    low_risk_when:
+      - path_variable_repointed
+      - product_install_directory
+      - developer_toolchain_host
+      - fleetwide_path_change
+    suspicious_when:
+      - path_variable_repointed
+      - no_history_of_path_change
+    high_risk_when:
+      - path_variable_repointed
+      - machine_scope_change
+      - payload_in_path_directory
+      - writer_is_script_host
+      - system_variable_redefined
+
+  false_positive:
+    - condition: An installer appends its own program directory to PATH.
+      explanation: >-
+        This is the ordinary reason PATH is written, and it produces the required evidence
+        exactly. The added directory is the product's install path, the writing process is
+        the installer, and the same value appears wherever the product is deployed.
+    - condition: A language runtime or SDK adds its tool directory to the user PATH.
+      explanation: >-
+        Runtimes commonly install into a user profile and extend the per-user PATH from
+        there, which looks identical to the user-scope case. These cluster on engineering
+        hosts and the directory belongs to a runtime that is otherwise present on disk.
+    - condition: Managed deployment pushes a standard PATH to the estate.
+      explanation: >-
+        A standard build sets PATH on many hosts at once. The value is identical across the
+        population and arrives inside a short window, which is the opposite of the single
+        anomalous host this hypothesis is looking for.
+    - condition: A developer extends their own PATH with a project directory.
+      explanation: >-
+        Adding a project bin folder under the user profile is normal practice and produces
+        both the value change and the executable in a bin directory. It occurs under the
+        developer's own account on a registered engineering asset, and the executables there
+        are build outputs with a history on the host.

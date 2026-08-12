@@ -1,0 +1,366 @@
+type: detection
+
+id: hg-win-jamplus-running-commands-from-a-jam-file-t1127-003
+
+version: 1.0.0
+
+info:
+  name: JamPlus running commands from a jam file
+  description: >-
+    JamPlus is a build utility, and a build utility's entire purpose is to read a script and
+    run whatever commands that script names. Hand it a .jam file and it will execute the
+    rules inside it exactly as written, which makes it a general command runner that happens
+    to be a signed developer tool. That signature is the point: application control policies
+    and reputation systems that would stop a script host let a build utility through,
+    because a build utility is what a developer machine is supposed to run. JamPlus is also
+    far rarer than MSBuild — it is not part of Windows and not part of Visual Studio, so it
+    arrives because somebody put it there, and on most estates it appears on no host at all.
+    The hunt therefore turns on two things: where jam.exe is running, and what it was handed.
+    A jam file inside a source tree on a build machine is a build; the same binary invoked
+    against a file in a temp directory on a finance workstation, spawning a shell and
+    reaching the network, is the technique.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - execution
+    - proxy-execution
+    - jamplus
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1127/003
+    - https://attack.mitre.org/detectionstrategies/DET0585
+    - https://attack.mitre.org/techniques/T1127
+
+mitre:
+  tactics:
+    - TA0005
+    - TA0002
+  techniques:
+    - T1127
+  sub_techniques:
+    - T1127.003
+  detection_strategies:
+    - DET0585
+  analytics:
+    - AN1610
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may invoke the JamPlus build utility against a crafted jam file so that the
+    commands inside it are executed by a signed developer tool, obtaining code execution on
+    a host where application control would have blocked a script host doing the same thing.
+  attacker_behavior:
+    - Runs jam.exe against a .jam file staged in a user-writable directory.
+    - Writes build rules that shell out to a downloader or a loader instead of compiling.
+    - Brings the JamPlus binary with them onto a host that has no build tooling.
+    - Lets the build process write the payload it then executes.
+    - Allows the build process itself to make the outbound connection.
+  legitimate_behavior:
+    - Engineers build projects with JamPlus on development workstations.
+    - Continuous-integration agents invoke jam.exe as part of a build job.
+    - Game and engine toolchains that ship JamPlus run it during their build steps.
+    - Developers run jam interactively against a jamfile in a checked-out source tree.
+  risk_indicator:
+    - The host has no development or build role in the estate.
+    - The jam file lives outside a source tree, under a profile, temp or download directory.
+    - JamPlus spawns a command shell or script interpreter rather than a compiler or linker.
+    - The build process writes an executable into a user-writable directory.
+    - The build process connects to an external address that is not a package feed.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: jamplus-invoked-against-a-writable-jam-file
+        name: JamPlus building a jam file from a writable directory
+        purpose: >-
+          Surface builds whose script sits outside a source tree. A jam file under AppData,
+          Temp or a download directory is a staged payload with a build utility as its
+          interpreter, not a project someone is compiling.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(jam|jamplus|jamplus64|jam64)\.exe$/i
+          | CommandLine=/(?<jam_file>[A-Za-z]:\\[^",]+\.(jam|jamfile|jambase))/i
+          | jam_file=/\\(AppData|Temp|Tmp|ProgramData|Users\\Public|Downloads|Desktop)\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, jam_file],
+                    function=[count(as=builds), collect([CommandLine], limit=3)])
+          | sort(builds, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "jam_file under approved toolchain working and cache directories"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: jamplus-spawning-a-script-interpreter
+        name: JamPlus spawning a shell or script interpreter
+        purpose: >-
+          A build's children are compilers, linkers and archivers. A command shell,
+          PowerShell or a script host as the child of jam.exe means the rules in the jam
+          file were written to run commands rather than to build anything.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(jam|jamplus|jamplus64|jam64)\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|bitsadmin|curl|certutil|msiexec)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=children), collect([CommandLine], limit=5)])
+          | sort(children, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "cmd.exe wrappers used by the toolchain's own documented build rules"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - parent_process
+            - organization
+
+      - id: jamplus-on-a-host-that-never-builds
+        name: JamPlus running on a host with no build history
+        purpose: >-
+          Use the estate as the discriminator. JamPlus is not shipped with Windows or with
+          Visual Studio, so its appearance on a host outside the engineering population is
+          more informative than any single command line it was given.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(jam|jamplus|jamplus64|jam64)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=runs), collect([CommandLine], limit=3)])
+          | runs <= 3
+        filters:
+          include: []
+          exclude:
+            - "ComputerName in the engineering and build-server asset groups"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: jamplus-writing-an-executable-or-reaching-out
+        name: JamPlus process writing an executable or connecting outbound
+        purpose: >-
+          Confirm the build did something a build should not. Tying the file and network
+          events back to the jam.exe process id separates a compile that produces objects in
+          a workspace from one that drops an executable into a profile directory or fetches
+          a stage from the internet.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|PeFileWritten|NetworkConnectIP4)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | FileName=/^(jam|jamplus|jamplus64|jam64)\.exe$/i
+                | jam_pid := TargetProcessId ;
+              #event_simpleName=PeFileWritten
+                | TargetFileName=/\\(AppData|Temp|Tmp|ProgramData|Users\\Public|Downloads)\\/i ;
+              #event_simpleName=NetworkConnectIP4
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/ ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([CommandLine, TargetFileName, SHA256HashData,
+                                       RemoteAddressIP4, RemotePort]),
+                              count(as=events)])
+          | jam_pid = ContextProcessId
+        filters:
+          include: []
+          exclude:
+            - "RemoteAddressIP4 of the internal package feed and approved public registries"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: jamplus_execution
+      name: JamPlus invoked against a script
+      description: >-
+        jam.exe or one of its variants ran with a jam file, meaning a signed build utility
+        is executing the command rules that file contains.
+      source: process_creation
+      field: CommandLine
+      indicates: build_utility_proxy_execution
+
+  supporting:
+    - id: jam_file_in_writable_path
+      name: Jam file outside a source tree
+      description: >-
+        The script handed to JamPlus lives under AppData, Temp, ProgramData, a public folder
+        or a download directory rather than in a checked-out project.
+      source: process_creation
+      field: CommandLine
+      indicates: untrusted_execution_location
+    - id: interpreter_child
+      name: Shell or script host as a build child
+      description: >-
+        JamPlus spawned a command shell, PowerShell or a script host instead of the
+        compilers and linkers a build normally invokes.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: build_wrote_executable
+      name: Executable written by the build process
+      description: >-
+        The jam.exe process wrote a portable executable into a user-writable directory,
+        which is where a dropped payload lands rather than where build output goes.
+      source: file_creation
+      field: TargetFileName
+      indicates: staged_payload_present
+    - id: build_reached_out
+      name: Outbound connection from the build process
+      description: >-
+        The jam.exe process connected to an external address outside the known package
+        feeds, which a local build of a local project has no reason to do.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: possible_payload_retrieval
+    - id: non_build_host
+      name: Host with no build history
+      description: >-
+        JamPlus has essentially no history on this host across the baseline window, and the
+        host is not part of the engineering population.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: engineering_asset
+      name: Registered engineering or build host
+      description: >-
+        The host belongs to the engineering or build-server asset group, where JamPlus
+        activity is part of the machine's function.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+    - id: build_agent_parent
+      name: Build agent or IDE as parent
+      description: >-
+        JamPlus was launched by a continuous-integration agent, an IDE or a toolchain
+        wrapper script, which is its intended invocation path.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: source_tree_project
+      name: Jam file inside a checked-out source tree
+      description: >-
+        The script sits in a repository working copy or a build workspace alongside the
+        project it belongs to, which is where a real jamfile lives.
+      source: process_creation
+      field: CommandLine
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - jamplus_execution
+
+    supporting:
+      any:
+        - jam_file_in_writable_path
+        - interpreter_child
+        - build_wrote_executable
+        - build_reached_out
+        - non_build_host
+      all:
+        - jam_file_in_writable_path
+        - non_build_host
+
+    contradicting:
+      any:
+        - engineering_asset
+        - build_agent_parent
+        - source_tree_project
+      all: []
+
+  verdict:
+    low_risk_when:
+      - jamplus_execution
+      - engineering_asset
+      - build_agent_parent
+      - source_tree_project
+    suspicious_when:
+      - jamplus_execution
+      - non_build_host
+    high_risk_when:
+      - jamplus_execution
+      - non_build_host
+      - jam_file_in_writable_path
+      - interpreter_child
+      - build_wrote_executable
+
+  false_positive:
+    - condition: An engineer builds a project with JamPlus on a development workstation.
+      explanation: >-
+        JamPlus exists to be run this way, which is why the hypothesis is anchored on host
+        role and script location rather than on the binary executing. Asset group membership
+        and a jam file inside a source tree remove this class.
+    - condition: A continuous-integration agent runs a JamPlus build job.
+      explanation: >-
+        Build servers run jam.exe repeatedly with a stable command line, from a build agent
+        parent, against workspace paths. The volume and consistency are the opposite of the
+        one-off invocation this hunt is looking for.
+    - condition: A game or engine toolchain that ships JamPlus runs it during setup.
+      explanation: >-
+        Some engine distributions bundle JamPlus and invoke it from their own scripts,
+        including from cmd.exe wrappers that look like an interpreter child. The parent chain
+        traces back to the toolchain's own launcher and the paths stay inside its directory.
+    - condition: A build legitimately downloads dependencies during the run.
+      explanation: >-
+        Dependency fetching produces real outbound connections from the build process, so
+        egress alone cannot carry the verdict. Known internal and public feeds are excluded,
+        leaving connections to arbitrary destinations as the meaningful case.

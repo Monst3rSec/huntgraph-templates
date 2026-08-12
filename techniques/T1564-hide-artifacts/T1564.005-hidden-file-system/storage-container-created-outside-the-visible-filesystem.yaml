@@ -1,0 +1,337 @@
+type: detection
+
+id: hg-lin-storage-container-created-outside-the-visible-filesystem-t1564-005
+
+version: 1.0.0
+
+info:
+  name: Storage container created outside the visible filesystem
+  description: >-
+    A hidden file system is storage the operating system is never asked to enumerate.
+    Unallocated space between partitions, a partition with no table entry, a custom format
+    the kernel has no driver for — none of it appears in a directory listing, none of it is
+    walked by a scanner, and none of it is covered by the file-integrity baseline, because
+    from the host's point of view there is nothing there. That is the point of the
+    technique, and it is also why endpoint telemetry is close to blind to the storage
+    itself. What an endpoint sensor can genuinely witness is the moment the container is
+    built or attached: a process allocating a large opaque file and formatting it, a loop
+    device being bound to that file, an encrypted volume being created and opened, or a
+    utility writing directly to a raw block device rather than through a mounted path. This
+    hunt is built entirely on that provisioning moment, because once the container exists
+    and is unmounted there is nothing left to see. The discriminator is who is doing it and
+    where the backing store lives: container runtimes, snap, cloud-init and installer
+    packages create loopback filesystems constantly, but they do so from their own service
+    binaries against their own managed paths, not from an interactive shell against a file
+    in a temporary directory.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - hide-artifacts
+    - hidden-file-system
+    - anti-forensics
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1564/005
+    - https://attack.mitre.org/detectionstrategies/DET0461
+    - https://attack.mitre.org/techniques/T1564
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1564
+  sub_techniques:
+    - T1564.005
+  detection_strategies:
+    - DET0461
+  analytics:
+    - AN1272
+  platforms:
+    - Linux
+  data_sources:
+    - linux:syslog
+  data_components:
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    An adversary may build or attach a storage container the operating system does not
+    mount as part of its normal filesystem, so that tooling, staged data and second-stage
+    components live somewhere a directory walk, a file-integrity baseline and an on-access
+    scanner will never look.
+  attacker_behavior:
+    - Allocates a large opaque file and formats a filesystem inside it.
+    - Binds a loop device to that file and mounts it only while it is being used.
+    - Creates an encrypted volume so the container is opaque even if the file is found.
+    - Writes payload bytes straight to a raw block device past the end of the partition table.
+  legitimate_behavior:
+    - Container runtimes and snap create and mount loopback filesystems as part of normal operation.
+    - Cloud-init and image build tooling format volumes during provisioning.
+    - Administrators create encrypted volumes for backup staging or for regulated data.
+    - Installers and imaging tools write directly to block devices when preparing media.
+  risk_indicator:
+    - The backing file sits in a temporary, shared-memory or home directory rather than a managed path.
+    - The acting process is an interactive shell or a script rather than a runtime or provisioning agent.
+    - A raw block device is written to by a utility that is not part of any imaging workflow.
+    - The host has no history of loopback or encrypted volume creation in the baseline window.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: filesystem-formatted-inside-a-plain-file
+        name: A filesystem formatted inside an ordinary file
+        purpose: >-
+          Catch the container being manufactured. Formatting a filesystem into a regular
+          file is how a portable partition image is produced, and outside image-build
+          tooling almost nothing does it on a running production host.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(mkfs[a-z0-9.]*|mke2fs|mkdosfs|mkntfs|fallocate)\b/
+          | CommandLine=/\.(img|imag|dat|bin|iso|raw|vol|tmp|cache)\b/i
+          | CommandLine!=/(if|of)=\/dev\/(sd|nvme|vd|hd|mmcblk)/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Image build and provisioning pipelines that assemble disk images on build hosts"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: loop-device-bound-to-a-file-backed-store
+        name: Loop device bound to a file outside the managed paths
+        purpose: >-
+          Separate the attach step from the create step. A container only becomes usable
+          when it is bound to a loop device, and the backing path is what distinguishes a
+          snap or container image from a file dropped in a temporary directory.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(losetup|mount)\b/
+          | CommandLine=/(-o\s+[^\s]*loop|\/dev\/loop|--find|--show|--attach)/i
+          | CommandLine!=/\/(snap|var\/lib\/snapd|var\/lib\/docker|var\/lib\/containers|var\/lib\/machines|var\/lib\/flatpak)\//i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Container, snap and flatpak runtimes attaching their own squashfs images"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: encrypted-volume-created-or-opened
+        name: Encrypted volume created or opened over a file
+        purpose: >-
+          Cover the variant where the container is opaque as well as unmounted, so that
+          finding the backing file yields nothing. Encrypted volumes over regular files are
+          a deliberate concealment choice rather than a storage one.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(cryptsetup|veracrypt|truecrypt|tcplay|zulucrypt-cli|gocryptfs|encfs)\b/i
+          | CommandLine=/\b(luksFormat|luksOpen|plainOpen|open|create|--mount|--create|--init)\b/
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved full-disk and backup-staging encryption managed by the platform team"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: raw-block-device-written-directly
+        name: Bytes written straight to a raw block device
+        purpose: >-
+          Catch the case with no file at all — payload placed in unallocated space or past
+          the partition table. Writing to a raw device bypasses the filesystem entirely, and
+          outside imaging and firmware work no ordinary process has a reason to do it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(dd|pv|shred|cat|tee|python[0-9.]*|perl)\b/
+          | CommandLine=/(of=|>\s*)\/dev\/(sd[a-z]|nvme[0-9]+n[0-9]+|vd[a-z]|hd[a-z]|mmcblk[0-9]+)([0-9]*)?\b/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Imaging, bootloader and firmware maintenance performed under an approved change"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+evidence:
+  required:
+    - id: concealed_container_provisioned
+      name: Storage container built or attached outside the mounted filesystem
+      description: >-
+        A process created, formatted, attached or wrote directly to storage that the host
+        does not present as part of its ordinary filesystem, which is the whole of the
+        technique rather than a step towards it.
+      source: process_creation
+      field: CommandLine
+      indicates: concealed_storage_provisioned
+
+  supporting:
+    - id: raw_device_addressed
+      name: Raw block device addressed rather than a path
+      description: >-
+        The write targeted a block device node directly instead of a mounted path, so the
+        bytes land somewhere no filesystem structure describes and no scanner walks.
+      source: process_creation
+      field: CommandLine
+      indicates: raw_storage_access
+    - id: backing_store_in_a_transient_path
+      name: Backing file in a temporary or user-writable location
+      description: >-
+        The file behind the container sits under a temporary, shared-memory or home
+        directory rather than under a runtime's managed image path, which is where
+        legitimate loopback filesystems live.
+      source: process_creation
+      field: CommandLine
+      indicates: unusual_staging_location
+    - id: interactive_shell_lineage
+      name: Provisioning driven from an interactive shell
+      description: >-
+        The acting process descends from a shell or remote session rather than from a
+        container runtime, package manager or provisioning agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: no_container_history_on_host
+      name: No history of volume creation on this host
+      description: >-
+        Neither this host nor this account has created or attached a loopback or encrypted
+        volume during the baseline window, so the activity is a deviation as well as a
+        concealment.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: runtime_or_provisioning_agent
+      name: Container runtime or provisioning agent
+      description: >-
+        The acting binary is a container runtime, snap, flatpak, cloud-init or package
+        manager, all of which mount file-backed filesystems as a matter of routine.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: approved_encrypted_storage
+      name: Approved encrypted storage build
+      description: >-
+        A change record covers the creation of an encrypted volume for backup staging or
+        for regulated data on this host.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: identical_command_fleetwide
+      name: Same command across many hosts
+      description: >-
+        The identical provisioning command appears on many hosts inside one window, which
+        is a build standard being applied rather than a targeted concealment.
+      source: baseline
+      field: CommandLine
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - concealed_container_provisioned
+
+    supporting:
+      any:
+        - raw_device_addressed
+        - backing_store_in_a_transient_path
+        - interactive_shell_lineage
+        - no_container_history_on_host
+      all:
+        - backing_store_in_a_transient_path
+        - interactive_shell_lineage
+
+    contradicting:
+      any:
+        - runtime_or_provisioning_agent
+        - approved_encrypted_storage
+        - identical_command_fleetwide
+      all: []
+
+  verdict:
+    low_risk_when:
+      - concealed_container_provisioned
+      - runtime_or_provisioning_agent
+      - approved_encrypted_storage
+      - identical_command_fleetwide
+    suspicious_when:
+      - concealed_container_provisioned
+      - no_container_history_on_host
+    high_risk_when:
+      - concealed_container_provisioned
+      - raw_device_addressed
+      - backing_store_in_a_transient_path
+      - interactive_shell_lineage
+
+  false_positive:
+    - condition: A container runtime or snap attaches a squashfs image.
+      explanation: >-
+        Every snap install and most container pulls bind a loop device to an image file,
+        which reproduces the attach evidence exactly. The acting binary is the runtime, the
+        backing path is under the runtime's own state directory, and the pattern repeats on
+        every host that runs the same workloads.
+    - condition: Cloud-init or image build tooling formats a volume during provisioning.
+      explanation: >-
+        Provisioning formats filesystems, sometimes into files when building images. It
+        happens once at instance birth or on a dedicated build host, under a provisioning
+        service account, and correlates with an instance launch or pipeline run.
+    - condition: An administrator creates an encrypted volume for backup staging.
+      explanation: >-
+        This produces the same cryptsetup or veracrypt command line as the adversary
+        version. It is distinguished by a change record, a durable mount point under a
+        managed path, and a volume that stays mounted rather than being opened only while
+        in use.
+    - condition: Imaging or bootloader work writes directly to a block device.
+      explanation: >-
+        Writing an installer image to a device, or reinstalling a bootloader, addresses the
+        raw device legitimately. These run from installer or imaging tooling during a
+        maintenance window, and they write the whole device rather than an offset inside
+        unallocated space.

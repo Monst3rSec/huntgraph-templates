@@ -1,0 +1,328 @@
+type: detection
+
+id: hg-mac-payload-hidden-in-a-file-resource-fork-t1564-009
+
+version: 1.0.0
+
+info:
+  name: Payload hidden in a file resource fork
+  description: >-
+    The resource fork is a legacy macOS structure that hangs off a file and is reachable
+    through its own path suffix, file/..namedfork/rsrc, or as the com.apple.ResourceFork
+    extended attribute. It predates application bundles and now survives mainly to carry
+    custom icons, so almost nothing writes one. That makes it a good hiding place: the fork
+    does not appear in a directory listing, does not count towards the size Finder reports,
+    is not what cat or a text editor reads, and is frequently not what a scanner hashes.
+    Shlayer and Keydnap both used it — one to stash a compressed copy of itself behind a
+    file that looked like a document, the other to carry the icon that made an executable
+    look like a JPEG. The operational shape is a write, then later a read of the same fork
+    by a loader that decodes it and drops the result somewhere executable. This is
+    deliberately narrower than the general extended-attribute case: here the attribute is
+    one specific legacy structure with its own filesystem access path and its own benign
+    twin, which is a file that someone gave a custom icon. The discriminator is direction
+    and context — Finder and legacy Carbon applications set icon forks on documents the
+    user is looking at, while a loader reads a fork out of a file it did not create and
+    pipes the result into an interpreter.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - hide-artifacts
+    - resource-fork
+    - extended-attributes
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1564/009
+    - https://attack.mitre.org/detectionstrategies/DET0584
+    - https://attack.mitre.org/techniques/T1564
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1564
+  sub_techniques:
+    - T1564.009
+  detection_strategies:
+    - DET0584
+  analytics:
+    - AN1609
+  platforms:
+    - macOS
+  data_sources:
+    - macos:unifiedlog
+  data_components:
+    - Command Execution
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may store a payload in a file's resource fork so that the visible file
+    contents, the reported size and the hash a scanner computes all stay innocuous, then
+    read the fork back at run time and execute what it contains.
+  attacker_behavior:
+    - Writes payload bytes into com.apple.ResourceFork with the xattr utility.
+    - Addresses the fork through the ..namedfork/rsrc path to copy data in or out.
+    - Reads the fork back, decodes it, and writes the result to an executable location.
+    - Attaches an icon fork so an executable presents as a document to the user.
+  legitimate_behavior:
+    - Finder and legacy applications store custom icons in resource forks.
+    - Archive and copy tools such as ditto preserve forks when moving files between volumes.
+    - Backup and sync products read forks so that metadata survives a restore.
+    - Developers inspect forks with ls -l@ or xattr while debugging file metadata.
+  risk_indicator:
+    - The fork is written by a shell or script rather than by a GUI application.
+    - Fork contents are piped through a decoder or an interpreter in the same command.
+    - The result of reading the fork is made executable or moved to a run location.
+    - The host has no history of resource fork manipulation in the baseline window.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: resource-fork-written-with-xattr
+        name: Resource fork written with the xattr utility
+        purpose: >-
+          Catch the store being filled. Writing com.apple.ResourceFork from the command line
+          is not how icons get set — Finder does that internally — so an explicit write from
+          a shell is the technique rather than a by-product of it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\bxattr\b/
+          | CommandLine=/\-(w|wx|-write)\b/
+          | CommandLine=/com\.apple\.ResourceFork/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: resource-fork-read-back-by-a-loader
+        name: Resource fork printed back out
+        purpose: >-
+          Catch the retrieval half, which is where the loader lives. A fork that is only
+          written is latent; a fork that is read back on a host that never writes one is the
+          second stage collecting its own payload.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\bxattr\b/
+          | CommandLine=/\-(p|-print|l|-list)\b/
+          | CommandLine=/com\.apple\.ResourceFork/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Developer and support workflows that enumerate file metadata during debugging"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - process
+
+      - id: namedfork-stream-addressed-directly
+        name: The ..namedfork/rsrc stream addressed by a utility
+        purpose: >-
+          Cover the route that needs no xattr command at all. The fork has its own path in
+          the filesystem namespace, so an ordinary copy or read utility can move data in and
+          out of it, and that path suffix is the only thing that gives it away.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\.\.namedfork\/rsrc/i
+          | CommandLine=/\b(cp|dd|cat|tail|head|mv|ditto|tar|base64|openssl|xxd|python[0-9.]*|osascript|curl|nc)\b/
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Backup and sync agents that copy forks to preserve metadata across volumes"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: fork-contents-decoded-into-something-runnable
+        name: Fork contents decoded and made runnable
+        purpose: >-
+          Confirm the hiding place was used rather than merely populated. Extracting the
+          fork, decompressing or decoding it, and then making the result executable is the
+          step that turns concealed bytes into a running process.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\.\.namedfork\/rsrc|com\.apple\.ResourceFork)/i
+          | CommandLine=/\b(base64|openssl\s+enc|xxd|gunzip|funzip|unzip|tar\s+-?x|chmod\s+[0-7]*[157][0-7]*|chmod\s+\+x|bash|sh|zsh|python[0-9.]*|osascript|perl|ruby)\b/
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: resource_fork_manipulated
+      name: Resource fork written or read from a command line
+      description: >-
+        A process addressed a file's resource fork, either through the com.apple.ResourceFork
+        attribute or the ..namedfork/rsrc path, which is a structure that almost nothing
+        outside Finder and legacy applications touches.
+      source: process_creation
+      field: CommandLine
+      indicates: concealed_payload_storage
+
+  supporting:
+    - id: fork_contents_decoded
+      name: Fork contents piped into a decoder or interpreter
+      description: >-
+        The bytes taken out of the fork were decoded, decompressed or handed to an
+        interpreter in the same command, which is retrieval of a payload rather than
+        inspection of metadata.
+      source: process_creation
+      field: CommandLine
+      indicates: payload_extraction
+    - id: non_gui_actor
+      name: Fork touched by a shell utility rather than an application
+      description: >-
+        The acting binary is a command-line utility or interpreter, whereas legitimate fork
+        writes come from Finder or from a document application setting an icon.
+      source: process_creation
+      field: ImageFileName
+      indicates: abnormal_writer
+    - id: script_or_remote_lineage
+      name: Driven from a script or remote session
+      description: >-
+        The process descends from a shell, installer script or remote session rather than
+        from a user-facing application, placing the fork access inside an automated chain.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: no_fork_history_on_host
+      name: No history of resource fork use on this host
+      description: >-
+        Resource forks have not been written or read on this host during the baseline
+        window, so the access is a deviation as well as an unusual structure to touch.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: finder_or_system_service
+      name: Finder or a system metadata service
+      description: >-
+        The acting process is Finder, Spotlight, a document application or another Apple
+        service that maintains icon and metadata forks as part of its normal work.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: metadata_preserving_copy
+      name: Backup or archive preserving metadata
+      description: >-
+        The access comes from a backup, sync or archive operation whose whole purpose is to
+        carry forks and attributes across a copy so a restore is faithful.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: legacy_application_on_host
+      name: Host runs legacy fork-dependent software
+      description: >-
+        Inventory shows this host runs older software that still stores resources in forks,
+        which produces the same accesses as a matter of course.
+      source: asset_inventory
+      field: ComputerName
+      indicates: known_software_behaviour
+
+  risk_logic:
+    required:
+      - resource_fork_manipulated
+
+    supporting:
+      any:
+        - fork_contents_decoded
+        - non_gui_actor
+        - script_or_remote_lineage
+        - no_fork_history_on_host
+      all:
+        - fork_contents_decoded
+        - non_gui_actor
+
+    contradicting:
+      any:
+        - finder_or_system_service
+        - metadata_preserving_copy
+        - legacy_application_on_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - resource_fork_manipulated
+      - finder_or_system_service
+      - metadata_preserving_copy
+      - legacy_application_on_host
+    suspicious_when:
+      - resource_fork_manipulated
+      - no_fork_history_on_host
+    high_risk_when:
+      - resource_fork_manipulated
+      - fork_contents_decoded
+      - non_gui_actor
+      - script_or_remote_lineage
+
+  false_positive:
+    - condition: A user or application sets a custom icon on a file.
+      explanation: >-
+        Custom icons live in the resource fork, so this writes exactly the attribute the
+        hunt looks for. It comes from Finder or a document application rather than a shell,
+        the payload is a small icon resource, and nothing reads it back afterwards.
+    - condition: ditto or a backup agent copies files between volumes.
+      explanation: >-
+        Tools that preserve metadata read and write forks by design, and ditto is explicitly
+        built to do so. These run as part of a copy of many files, under a backup or sync
+        process, without any decode or execute step attached.
+    - condition: A developer inspects file metadata with ls -l@ or xattr.
+      explanation: >-
+        Listing attributes is ordinary debugging and shows the same fork name. The command
+        prints attributes rather than writing them, the output goes to a terminal instead of
+        into a decoder, and it happens on developer hosts under an interactive session.
+    - condition: Legacy software on the host still stores resources in forks.
+      explanation: >-
+        Some older macOS applications continue to keep resources where they always did. The
+        accesses come from the application's own binary, target files inside its own
+        installation or document set, and repeat on every host running that software.

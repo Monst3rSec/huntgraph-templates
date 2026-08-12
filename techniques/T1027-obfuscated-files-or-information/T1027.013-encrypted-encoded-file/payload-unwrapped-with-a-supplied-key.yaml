@@ -1,0 +1,332 @@
+type: detection
+
+id: hg-win-payload-unwrapped-with-a-supplied-key-t1027-013
+
+version: 1.0.0
+
+info:
+  name: Delivered payload unwrapped on the host with a supplied key
+  description: >-
+    Encrypting a payload before delivery defeats every control that reads file content on
+    the way in. A password-protected archive, an encrypted container or a base64 blob is
+    opaque to the mail gateway, the proxy and the on-access scanner, because there is
+    nothing to match until the file is turned back into what it really is. The cost to the
+    adversary is that the key has to travel with the lure — written in the email body, in
+    the document, or baked into the command that unwraps it — and the unwrapping has to
+    happen on the endpoint. That unwrapping is the observable. A password handed to an
+    archive utility on the command line, an inline key passed to a decryption tool, or an
+    encoded file converted back into a binary all leave a command line, and they all sit in
+    the narrow window between delivery and execution. The discriminator is the key itself
+    plus the location: legitimate encrypted-archive workflows exist, but they exchange
+    files inside document and backup systems that hold the key elsewhere, and their output
+    does not land in a download or temporary directory and immediately run.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - obfuscation
+    - encrypted-payload
+    - archive
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1027/013
+    - https://attack.mitre.org/detectionstrategies/DET0087
+    - https://attack.mitre.org/techniques/T1027
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1027
+  sub_techniques:
+    - T1027.013
+  detection_strategies:
+    - DET0087
+  analytics:
+    - AN0237
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may deliver a payload as an encrypted archive or an encoded file so that
+    nothing inspecting it in transit or at rest can read it, then unwrap it on the endpoint
+    with a key supplied alongside the lure, obtaining an executable that never crossed a
+    control in a readable form.
+  attacker_behavior:
+    - Sends a password-protected archive and puts the password in the message body.
+    - Extracts the archive on the host with the password given on the command line.
+    - Decrypts a container with an inline key or passphrase passed to a decryption utility.
+    - Converts an encoded file back into a binary and runs it from the same directory.
+  legitimate_behavior:
+    - Users exchange password-protected archives when sending files that a gateway would strip.
+    - Backup and file-transfer products encrypt and decrypt archives as part of their normal work.
+    - Vendor self-extracting installers unpack their own contents at install time.
+    - Developers and administrators decode base64 configuration blobs during routine work.
+  risk_indicator:
+    - The password or key appears in the command line rather than in a key store.
+    - The archive or encoded file sits in a download, mail-cache or temporary directory.
+    - The unwrapped output is an executable or script rather than a document.
+    - The extraction utility becomes the parent of something that runs from the same path.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: archive-extracted-with-a-supplied-password
+        name: Archive extracted with a password on the command line
+        purpose: >-
+          Surface the most common form of the technique, where the payload is an encrypted
+          archive and the password travels with the lure. A password given inline is the
+          part that separates this from an encrypted archive handled by a product that
+          holds its keys elsewhere.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(7z|7za|7zg|7zfm|rar|unrar|winrar|winzip|wzzip|peazip)\.exe$/i
+          | CommandLine=/\s[-\/](p|hp|pw|s2)\S+/i
+          | CommandLine=/\\(Downloads|Temp|AppData|Public|ProgramData|INetCache|Content\.Outlook)\\/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=extractions), collect([CommandLine], limit=5)])
+          | sort(extractions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Backup and file-transfer products that extract encrypted archives on a schedule"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: file-decrypted-with-an-inline-key
+        name: File decrypted with a key passed on the command line
+        purpose: >-
+          Cover the container route, where the payload is not an archive but an encrypted
+          blob handed to a general-purpose decryption utility. The inline key is the whole
+          point: managed encryption never puts key material in an argument.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(openssl(\.exe)?\s+(enc|aes-\d+-\w+|rc4|des3)|gpg(\.exe)?\s|certutil(\.exe)?\s[^\n]*-decrypt|Security\.Cryptography\.(Aes|AesManaged|RijndaelManaged|TripleDES|RC2))/i
+          | CommandLine=/(\s-k\s|\s-K\s|\s-pass\s|--passphrase|--batch|ConvertTo-SecureString|\bkey\s*=|\bIV\s*=)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=decryptions), collect([CommandLine], limit=5)])
+          | sort(decryptions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Signing, certificate and build pipelines that call openssl with managed material"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: encoded-file-converted-back-to-a-binary
+        name: Encoded file read and written back out as bytes
+        purpose: >-
+          Catch the encoding rather than encryption variant, where a text file that passed
+          inspection is read and written back out as a binary. Both a file being read and a
+          file being written distinguish this from a one-off base64 string on a console.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(certutil(\.exe)?\s[^\n]*-decode(hex)?|FromBase64String|\[Convert\]::FromBase64|base64\s+-d)/i
+          | CommandLine=/(Get-Content|ReadAllText|ReadAllBytes|WriteAllBytes|Set-Content\s[^\n]*-Encoding\s+Byte|\.(b64|txt|dat|log|cfg|tmp)\b)/i
+          | CommandLine=/\\(Downloads|Temp|AppData|Public|ProgramData)\\/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=conversions), collect([CommandLine], limit=5)])
+          | sort(conversions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Packaging and deployment scripts that decode embedded resources during a build"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: unwrapped-payload-executed
+        name: Extraction or decryption utility becomes the parent of an execution
+        purpose: >-
+          Confirm the unwrapping produced something that ran. An encrypted archive that is
+          merely opened is a file exchange; one whose contents execute from the directory
+          they landed in is the delivery completing.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(7z|7za|7zg|7zfm|rar|unrar|winrar|winzip|peazip|openssl|gpg|certutil)\.exe$/i
+          | ImageFileName=/\\(Downloads|Temp|AppData|Public|ProgramData|INetCache|Content\.Outlook)\\/i
+          | FileName=/\.(exe|scr|com|pif|js|jse|vbs|vbe|wsf|wsh|hta|bat|cmd|ps1|dll|lnk)$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, ImageFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Vendor self-extracting installers approved for user installation"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - path
+
+evidence:
+  required:
+    - id: payload_unwrapped_with_supplied_key
+      name: Archive or file unwrapped with a key given inline
+      description: >-
+        A password or key was passed on the command line to an archive utility or a
+        decryption tool, which is how a payload that was opaque in transit becomes readable
+        on the endpoint.
+      source: process_creation
+      field: CommandLine
+      indicates: encrypted_payload_unwrapped
+
+  supporting:
+    - id: unwrapped_in_delivery_path
+      name: Unwrapping happened in a delivery directory
+      description: >-
+        The input or output path is a download, mail-cache or temporary directory rather
+        than a document library or a backup target, which places the operation immediately
+        after delivery.
+      source: process_creation
+      field: CommandLine
+      indicates: payload_staging
+    - id: encoded_file_converted_to_binary
+      name: Encoded file converted back into bytes
+      description: >-
+        A file was read as text and written back out as bytes, which turns content that
+        passed inspection into something executable.
+      source: process_creation
+      field: FileName
+      indicates: encoded_payload_restored
+    - id: unwrapped_payload_executed
+      name: Unwrapped content executed from the same path
+      description: >-
+        The extraction or decryption utility became the parent of an executable or script
+        running from the directory it wrote to, showing the payload was used rather than
+        merely opened.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: execution_chain_progression
+    - id: first_time_for_host
+      name: No history of inline-key unwrapping on this host
+      description: >-
+        Keys have not been passed to archive or decryption utilities on this host during
+        the baseline window, so the operation is a deviation as well as an unwrapping.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: approved_encryption_tooling
+      name: Sanctioned encryption or transfer product
+      description: >-
+        The utility belongs to a backup, managed-file-transfer or archiving product that is
+        part of the standard build and handles encrypted content by design.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_application_component
+    - id: routine_encrypted_exchange
+      name: Recurring encrypted exchange for this user
+      description: >-
+        The same user extracts password-protected archives regularly across the baseline
+        window, which is common in legal, finance and payroll workflows.
+      source: baseline
+      field: UserName
+      indicates: legitimate_enterprise_activity
+    - id: vendor_self_extracting_installer
+      name: Vendor self-extracting installer
+      description: >-
+        The unwrapping is a signed vendor installer unpacking its own contents into a
+        temporary directory, which is structurally identical and appears on many hosts.
+      source: process_creation
+      field: ImageFileName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - payload_unwrapped_with_supplied_key
+
+    supporting:
+      any:
+        - unwrapped_in_delivery_path
+        - encoded_file_converted_to_binary
+        - unwrapped_payload_executed
+        - first_time_for_host
+      all:
+        - unwrapped_in_delivery_path
+        - unwrapped_payload_executed
+
+    contradicting:
+      any:
+        - approved_encryption_tooling
+        - routine_encrypted_exchange
+        - vendor_self_extracting_installer
+      all: []
+
+  verdict:
+    low_risk_when:
+      - payload_unwrapped_with_supplied_key
+      - approved_encryption_tooling
+      - routine_encrypted_exchange
+      - vendor_self_extracting_installer
+    suspicious_when:
+      - payload_unwrapped_with_supplied_key
+      - first_time_for_host
+    high_risk_when:
+      - payload_unwrapped_with_supplied_key
+      - unwrapped_in_delivery_path
+      - unwrapped_payload_executed
+      - encoded_file_converted_to_binary
+
+  false_positive:
+    - condition: A user extracts a password-protected archive a colleague or client sent them.
+      explanation: >-
+        This is genuinely common wherever gateways strip executables and attachments, and it
+        produces the same command line. The separation is what happens next: a business file
+        exchange ends in a document being opened, not in an executable running out of the
+        extraction directory.
+    - condition: A backup or managed-file-transfer product decrypts archives on a schedule.
+      explanation: >-
+        These products call the same utilities and sometimes pass credentials through
+        arguments. They run under a service account on a fixed schedule from an installed
+        path, and the same pattern appears on every host running the product.
+    - condition: A vendor self-extracting installer unpacks itself into a temporary directory.
+      explanation: >-
+        An SFX stub is by construction an executable that unwraps and runs its own contents.
+        The stub is signed, carries recognisable vendor metadata, and shows up across the
+        estate rather than on one host shortly after mail delivery.
+    - condition: A developer or administrator decodes a base64 configuration blob.
+      explanation: >-
+        Certificates, tokens and configuration files are routinely exchanged as base64 to
+        survive transport. The output is a text or certificate file that nothing executes,
+        and the work happens on engineering hosts under an interactive shell session.

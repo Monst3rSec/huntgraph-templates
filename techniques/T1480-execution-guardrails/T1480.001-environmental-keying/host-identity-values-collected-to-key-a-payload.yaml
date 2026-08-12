@@ -1,0 +1,360 @@
+type: detection
+
+id: hg-win-host-identity-values-collected-to-key-a-payload-t1480-001
+
+version: 1.0.0
+
+info:
+  name: Host identity values collected to key a payload
+  description: >-
+    Environmental keying derives the decryption key for the next stage from values that
+    only exist on the intended victim — the volume serial number, the machine GUID, the
+    adapter address, the joined domain, the system locale. If the sample lands anywhere
+    else the key is wrong, the payload never decrypts, and an analyst is left with an
+    encrypted blob and no way to recover it. The decryption itself is arithmetic inside a
+    process and produces no telemetry at all, so there is nothing to detect at the moment
+    the guardrail fires. What is detectable is the step before it: the payload has to ask
+    the host who it is, and when the loader shells out for those values instead of calling
+    the API directly, each question becomes a command line. The discriminator against
+    ordinary reconnaissance is which values are asked for. General recon wants what the
+    host can do — its patch level, its users, its shares. Keying wants what makes the host
+    unique and unrepeatable elsewhere, which is a narrow and unusual set to collect
+    together, and it is followed by execution rather than by anything that uses the answers.
+  severity: medium
+  author: huntgraph
+  tags:
+    - stealth
+    - execution-guardrails
+    - environmental-keying
+    - anti-analysis
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1480/001
+    - https://attack.mitre.org/detectionstrategies/DET0474
+    - https://attack.mitre.org/techniques/T1480
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1480
+  sub_techniques:
+    - T1480.001
+  detection_strategies:
+    - DET0474
+  analytics:
+    - AN1305
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may collect values unique to the target host and use them as key material
+    for an encrypted stage, so that the payload decrypts only on the intended victim and
+    remains unrecoverable to any sandbox, scanner or analyst that obtains the sample
+    elsewhere.
+  attacker_behavior:
+    - Reads the volume serial number, machine GUID or system UUID for use as key material.
+    - Collects the adapter hardware address or hostname to bind the payload to one machine.
+    - Confirms the joined Active Directory domain or system locale matches the intended target.
+    - Resolves an address-echo service to learn the network the host sits on.
+    - Proceeds straight to a proxy-execution binary once the values have been gathered.
+  legitimate_behavior:
+    - Asset inventory agents collect serials, UUIDs and adapter addresses on a schedule.
+    - Licensing and activation routines fingerprint the machine to bind a licence.
+    - Logon and imaging scripts read the domain and hostname to apply the right configuration.
+    - Support engineers gather machine identifiers while raising or working a ticket.
+  risk_indicator:
+    - Several distinct host-unique identifiers are collected in one burst under one parent.
+    - The collecting process was launched by a document handler, archive tool or script host.
+    - The same parent spawns a proxy-execution binary immediately after the collection.
+    - The pattern is unprecedented on the host rather than part of a recurring inventory cycle.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - DomainName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: host-unique-identifiers-collected
+        name: Values unique to this machine read from the command line
+        purpose: >-
+          Surface the collection of the specific identifiers that make usable key material:
+          volume and BIOS serials, the machine GUID, the system UUID and the adapter
+          address. These are the values named in reporting on keyed loaders, and unlike
+          patch level or user lists they are worthless for planning an intrusion and useful
+          only for binding something to this host.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(volume\s+get\s+serialnumber|diskdrive\s+get\s+serialnumber|bios\s+get\s+serialnumber|csproduct\s+get\s+(uuid|identifyingnumber)|Win32_Volume|Win32_ComputerSystemProduct|MachineGuid|GetVolumeInformation|\bvol\s+[a-z]:|getmac|PhysicalAddress|Get-NetAdapter)/i
+          | FileName=/^(cmd|powershell|pwsh|wmic|wscript|cscript|mshta|reg|getmac)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=probes), collect([CommandLine], limit=5)])
+          | sort(probes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the approved asset inventory, licensing and monitoring agents"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - command_line
+
+      - id: target-environment-validated
+        name: Domain membership or system language checked
+        purpose: >-
+          Cover the coarser keying values, where the payload confirms it is inside the
+          intended organisation or geography before unlocking. Domain and locale are also
+          the values used to stay out of environments the operator does not want to touch,
+          which is why they are read together and why the answer is never acted upon
+          visibly.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(computersystem\s+get\s+domain|nltest\s+\/(dsgetdc|domain_trusts|dclist)|Get-ADDomain|USERDNSDOMAIN|USERDOMAIN|Get-WinSystemLocale|GetUserDefaultUILanguage|GetSystemDefaultLangID|os\s+get\s+(oslanguage|countrycode|locale))/i
+          | FileName=/^(cmd|powershell|pwsh|wmic|nltest|systeminfo|wscript|cscript|mshta)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=checks), collect([CommandLine], limit=5)])
+          | sort(checks, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Domain join, imaging and logon scripts run by the build and management agents"
+            - "Directory administration workstations where domain enumeration is routine work"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: external-address-echo-lookup
+        name: Address-echo service resolved to learn the public network
+        purpose: >-
+          Catch the keying value that has to be fetched rather than read locally. A host
+          cannot see its own external address, so a payload keyed on the victim's egress
+          network must ask a third party, and the handful of services that answer that
+          question are not resolved by anything in a normal enterprise build.
+        query: |
+          #event_simpleName=/^DnsRequest$/
+          | DomainName=/^(api\.)?(ipify\.org|ip-api\.com|ipinfo\.io|ifconfig\.(me|co|io)|icanhazip\.com|checkip\.amazonaws\.com|myexternalip\.com|wtfismyip\.com|whatismyipaddress\.com|myip\.opendns\.com|myip\.com|ident\.me|ipecho\.net)$/i
+          | groupBy([ComputerName, DomainName, ContextProcessId],
+                    function=[count(as=lookups)])
+          | sort(lookups, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "VPN, SD-WAN and connectivity-check agents that resolve address services by design"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - domain
+            - organization
+
+      - id: identity-collection-then-proxy-execution
+        name: Identity collection and a proxy-execution launch under one parent
+        purpose: >-
+          Join the questions to what happens next, which is the closest observable stand-in
+          for the decryption that cannot be seen. Inventory tooling collects identifiers and
+          then reports them; a keyed loader collects them and then runs something. One
+          parent doing both inside a single window is the shape of the guardrail passing.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              FileName=/^(wmic|getmac|nltest|systeminfo|hostname|reg)\.exe$/i
+                | identity_probe := FileName ;
+              FileName=/^(rundll32|regsvr32|mshta|certutil|msiexec|installutil)\.exe$/i
+                | follow_on := FileName ;
+            }
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[collect([identity_probe, follow_on], limit=10),
+                              count(as=events)])
+          | identity_probe=/.+/ and follow_on=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Software deployment agents that fingerprint the host and then invoke an installer"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - process
+
+evidence:
+  required:
+    - id: host_identity_values_collected
+      name: Machine-unique identifiers read
+      description: >-
+        A command line reads values that identify this specific machine and cannot be
+        reproduced elsewhere — volume or BIOS serial, machine GUID, system UUID or adapter
+        hardware address.
+      source: process_creation
+      field: CommandLine
+      indicates: host_specific_key_material_collected
+
+  supporting:
+    - id: environment_membership_validated
+      name: Domain or locale confirmed
+      description: >-
+        The joined Active Directory domain or the system language was queried, which
+        establishes that the host belongs to the environment the payload was built for.
+      source: process_creation
+      field: CommandLine
+      indicates: target_environment_validation
+    - id: external_address_resolved
+      name: Address-echo service resolved
+      description: >-
+        The host looked up one of the small number of services that report a caller's
+        public address, which is how a payload learns the network it landed on.
+      source: dns_request
+      field: DomainName
+      indicates: external_environment_probe
+    - id: proxy_execution_followed
+      name: Proxy-execution binary launched after collection
+      description: >-
+        The same parent that gathered the identifiers went on to run a signed
+        proxy-execution binary, which is the payload proceeding once the values matched.
+      source: process_creation
+      field: FileName
+      indicates: execution_chain_progression
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        The collecting process was launched by a document handler, archive utility, mail
+        client, browser or script host rather than by an inventory or deployment agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: rare_for_host
+      name: Collection unprecedented on this host
+      description: >-
+        No comparable identifier collection has run on this host during the baseline
+        window, unlike inventory work which recurs on a predictable cycle.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: inventory_agent
+      name: Asset inventory or monitoring agent
+      description: >-
+        The approved inventory, monitoring or endpoint management agent performed the
+        collection as part of its scheduled hardware reporting.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: licensing_fingerprint
+      name: Licence activation or hardware binding
+      description: >-
+        A licensed product read machine identifiers to bind or revalidate its licence,
+        which is the one benign use that genuinely needs unrepeatable values.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: fleetwide_recurring_collection
+      name: Same collection across the estate on a cycle
+      description: >-
+        The identical sequence appears on many hosts at a stable interval, which is a
+        management platform rather than a payload deciding whether to unlock.
+      source: baseline
+      field: ComputerName
+      indicates: scheduled_automation_job
+
+  risk_logic:
+    required:
+      - host_identity_values_collected
+
+    supporting:
+      any:
+        - environment_membership_validated
+        - external_address_resolved
+        - proxy_execution_followed
+        - delivery_parent
+        - rare_for_host
+      all:
+        - environment_membership_validated
+        - proxy_execution_followed
+
+    contradicting:
+      any:
+        - inventory_agent
+        - licensing_fingerprint
+        - fleetwide_recurring_collection
+      all: []
+
+  verdict:
+    low_risk_when:
+      - host_identity_values_collected
+      - inventory_agent
+      - licensing_fingerprint
+      - fleetwide_recurring_collection
+    suspicious_when:
+      - host_identity_values_collected
+      - rare_for_host
+    high_risk_when:
+      - host_identity_values_collected
+      - environment_membership_validated
+      - proxy_execution_followed
+      - delivery_parent
+
+  false_positive:
+    - condition: An asset inventory agent collects serials and adapter addresses on every host.
+      explanation: >-
+        Inventory tooling asks for the same identifiers a keyed loader does, often several
+        in one pass, so it reproduces the required evidence exactly. It runs from a known
+        agent on a fixed cycle, produces an identical command line across the whole estate,
+        and reports the values somewhere rather than launching a proxy-execution binary.
+    - condition: A licensed product fingerprints the machine to bind or revalidate a licence.
+      explanation: >-
+        Hardware binding is the one legitimate reason to want values that cannot be
+        reproduced on another machine, so the value set is genuinely the same. It happens at
+        install or on a renewal cycle, from the product's own installation path, and the
+        follow-on activity is the product starting rather than an interpreter.
+    - condition: A logon or imaging script reads the domain and hostname.
+      explanation: >-
+        Build and logon scripts branch on domain, site and locale constantly. They run under
+        the management agent or the logon process, they touch the coarse values only, and
+        they never pair those with volume serials or adapter addresses in the same burst.
+    - condition: A connectivity or VPN client resolves a public address service.
+      explanation: >-
+        Captive-portal and split-tunnel checks legitimately resolve address-echo domains.
+        The resolving process is the client itself, the lookups recur on a heartbeat, and
+        they are not preceded by machine identifier collection under the same parent.
