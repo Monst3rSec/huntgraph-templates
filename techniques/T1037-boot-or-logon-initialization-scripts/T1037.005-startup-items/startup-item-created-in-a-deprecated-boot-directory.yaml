@@ -1,0 +1,336 @@
+type: detection
+
+id: hg-mac-startup-item-created-in-a-deprecated-boot-directory-t1037-005
+version: 1.0.0
+
+info:
+  name: Startup item created in a deprecated boot directory
+  description: >-
+    A startup item is a directory under /Library/StartupItems containing an executable and a
+    StartupParameters.plist that tells the system when to run it during boot. It is the
+    oldest surviving macOS init mechanism, superseded by launchd, and the directory does not
+    exist on a stock modern install. That absence is the detection. Where a LaunchAgents
+    folder is full of legitimate entries and every write has to be argued about, nothing on
+    a current build creates /Library/StartupItems, so its appearance is close to unambiguous
+    and the whole hunt reduces to noticing a directory that should not be there. The
+    mechanism persists in adversary tooling for the same reason it persists in the
+    filesystem: it is old enough that persistence review, endpoint tooling and human triage
+    all look past it. Anything placed here runs as root at boot, and even on a build recent
+    enough that the item will never execute, the write is still worth catching — it marks an
+    operator working from a dated playbook and is usually accompanied by a working
+    persistence attempt elsewhere.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - legacy-mechanism
+    - boot
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1037/005
+    - https://attack.mitre.org/detectionstrategies/DET0429
+    - https://attack.mitre.org/techniques/T1037
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1037
+  sub_techniques:
+    - T1037.005
+  detection_strategies:
+    - DET0429
+  analytics:
+    - AN1197
+  platforms:
+    - macOS
+  data_sources:
+    - "macos:unifiedlog"
+    - "macos:fsevents"
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary may create a startup item under /Library/StartupItems so that their
+    executable runs as root during the final phase of boot, obtaining privileged persistence
+    through a mechanism so old that the directory it needs does not exist on a current system
+    and nothing in the estate inspects it.
+  attacker_behavior:
+    - Creates the /Library/StartupItems directory, which is absent on a stock modern install.
+    - Places an executable and a StartupParameters.plist together in a subdirectory.
+    - Sets ownership to root and marks the item executable so the boot sequence will run it.
+    - Names the item after a plausible system or vendor service.
+    - Falls back to this mechanism when launchd paths are already monitored or blocked.
+  legitimate_behavior:
+    - Very old third-party software that has never been repackaged for launchd.
+    - Migration of an aged machine or image that carried the directory forward.
+    - Administrators or vendors removing a legacy startup item during cleanup.
+    - Forensic and research tooling enumerating historical persistence locations.
+  risk_indicator:
+    - The StartupItems directory is created on a host where it did not previously exist.
+    - An executable is written into the tree from a shell, an archive or a download.
+    - A StartupParameters.plist is authored alongside the executable in the same window.
+    - A process executes from inside the StartupItems tree at boot.
+    - The same session also touched LaunchAgents or LaunchDaemons paths.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: startup-items-directory-populated
+        name: /Library/StartupItems created or written from a command line
+        purpose: >-
+          Catch the act of bringing a directory back into existence. Because a current build
+          ships without /Library/StartupItems, a mkdir, copy, install or archive extraction
+          naming that path is not a change to an existing configuration but the construction
+          of a boot mechanism from nothing.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\/Library\/StartupItems/i
+          | FileName=/^(mkdir|install|ditto|cp|mv|tar|unzip|rsync|bash|sh|zsh|python3?|osascript|curl|chown|chmod)$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=writes), collect([CommandLine], limit=5)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Cleanup scripts that delete a legacy startup item rather than create one"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: startupparameters-plist-authored
+        name: StartupParameters.plist written on the host
+        purpose: >-
+          Isolate the file that makes a directory into a startup item. Without
+          StartupParameters.plist the boot sequence has no ordering information and will not
+          run the executable, so this filename appearing on any command line is a narrow and
+          high-value signal that does not depend on the parent path being spelled out.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/StartupParameters\.plist/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=writes), collect([CommandLine], limit=5)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Security research and forensic tooling enumerating legacy persistence paths"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: executable-written-into-the-startup-items-tree
+        name: New executable landing under /Library/StartupItems
+        purpose: >-
+          Confirm the payload rather than the scaffolding. A startup item that is only a
+          directory and a plist does nothing; the executable dropped beside them is what will
+          run as root, and the hash gives triage something to pivot on immediately.
+        query: |
+          #event_simpleName=/^(NewExecutableWritten)$/
+          | TargetFileName=/^\/Library\/StartupItems\//i
+          | groupBy([ComputerName, TargetFileName],
+                    function=[count(as=writes), collect([SHA256HashData], limit=3)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: process-executing-from-the-startup-items-tree
+        name: Process running from inside a startup item
+        purpose: >-
+          Establish whether the mechanism still works on this build. On systems that retain
+          the boot phase, the item runs as root with SystemStarter or StartupItemContext in
+          its lineage; on newer builds nothing ever executes from this tree, and the absence
+          of this case alongside a populated directory tells triage the persistence was
+          attempted but is inert.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/^\/Library\/StartupItems\//i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: startup_item_created
+      name: Startup item written under /Library/StartupItems
+      description: >-
+        A directory or file was created under /Library/StartupItems, a path that does not
+        exist on a stock modern macOS build, meaning a boot-time execution mechanism was
+        constructed rather than modified.
+      source: process_creation
+      field: CommandLine
+      indicates: boot_persistence_established
+
+  supporting:
+    - id: startup_parameters_authored
+      name: StartupParameters.plist written alongside the item
+      description: >-
+        The ordering plist that the boot sequence requires was created, which turns a
+        directory of files into an item the system will actually attempt to run.
+      source: process_creation
+      field: FileName
+      indicates: persistence_made_loadable
+    - id: payload_written_into_tree
+      name: Executable placed inside the startup item
+      description: >-
+        A new executable was written under /Library/StartupItems, which is the file that
+        would run as root at boot and the thing worth hashing and pivoting on.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staged_in_boot_path
+    - id: startup_item_executed
+      name: Process ran from inside the startup item tree
+      description: >-
+        A process started with its image inside /Library/StartupItems, confirming the boot
+        mechanism is still live on this build and that the item ran.
+      source: process_creation
+      field: ImageFileName
+      indicates: execution_chain_progression
+    - id: unusual_for_host
+      name: Directory absent from this host's history
+      description: >-
+        No activity involving /Library/StartupItems appears on this host during the baseline
+        window, consistent with a path that a current build never creates.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: legacy_vendor_software
+      name: Item belongs to aged third-party software
+      description: >-
+        The item name and executable match a long-installed product that has never been
+        repackaged for launchd and carries this directory on every host running it.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_application_component
+    - id: cleanup_or_migration
+      name: Activity is removal rather than installation
+      description: >-
+        The write is part of an approved cleanup or platform migration that deletes the
+        legacy item, which touches the same path in the opposite direction.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_change
+    - id: research_enumeration
+      name: Path touched by security or forensic tooling
+      description: >-
+        The parent process is an audit, forensic or compliance tool that enumerates
+        historical persistence locations without writing to them.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: security_tooling_activity
+
+  risk_logic:
+    required:
+      - startup_item_created
+
+    supporting:
+      any:
+        - startup_parameters_authored
+        - payload_written_into_tree
+        - startup_item_executed
+        - unusual_for_host
+      all:
+        - startup_parameters_authored
+        - payload_written_into_tree
+
+    contradicting:
+      any:
+        - legacy_vendor_software
+        - cleanup_or_migration
+        - research_enumeration
+      all: []
+
+  verdict:
+    low_risk_when:
+      - startup_item_created
+      - legacy_vendor_software
+      - cleanup_or_migration
+      - research_enumeration
+    suspicious_when:
+      - startup_item_created
+      - unusual_for_host
+    high_risk_when:
+      - startup_item_created
+      - startup_parameters_authored
+      - payload_written_into_tree
+      - startup_item_executed
+
+  false_positive:
+    - condition: Aged third-party software still ships a startup item.
+      explanation: >-
+        A handful of very old products never migrated to launchd. The item is present on
+        every host running that product, has a long baseline history, and its executable
+        matches the vendor's own naming rather than a freshly created directory.
+    - condition: A migration or image carries the directory forward.
+      explanation: >-
+        Restoring an old machine onto new hardware can recreate the tree wholesale. It
+        arrives as a bulk copy alongside many other directories rather than as a single item
+        assembled from a shell.
+    - condition: Cleanup tooling removes a legacy startup item.
+      explanation: >-
+        Deletion touches the same path as creation. The command is a removal rather than a
+        copy or mkdir, no executable is written afterwards, and no process runs from the tree.
+    - condition: Forensic or audit tooling enumerates legacy persistence paths.
+      explanation: >-
+        Persistence-review utilities read /Library/StartupItems by design, which puts the
+        path on a command line. These are read operations with a known tool as the parent,
+        and no file appears under the path as a result.

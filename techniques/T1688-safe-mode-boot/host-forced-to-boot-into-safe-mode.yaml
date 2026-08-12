@@ -1,0 +1,341 @@
+type: detection
+
+id: hg-win-host-forced-to-boot-into-safe-mode-t1688
+
+version: 1.0.0
+
+info:
+  name: Host forced to boot into safe mode
+  description: >-
+    Safe mode starts Windows with a whitelist of boot-start drivers and services, and
+    third-party endpoint agents are almost never on that list. Setting the safeboot flag in
+    the Boot Configuration Data store therefore does not disable the EDR sensor, it prevents
+    the sensor from ever loading: the filter driver is not attached, no process, file or
+    registry telemetry is produced, and the console shows the host as offline rather than as
+    unprotected. To the operator that reads the same as a reboot. The adversary then adds
+    their own service or COM object to the SafeBoot minimal-services list so their payload is
+    one of the few things that does start, encrypts or wipes with no sensor watching, and
+    clears the flag afterwards so the next boot looks normal. The observable is narrow and
+    high value: the boot configuration of a running production host is changed, usually
+    seconds before a forced restart, and almost nothing legitimate does that outside of
+    hands-on driver troubleshooting.
+  severity: critical
+  author: huntgraph
+  tags:
+    - defense-impairment
+    - safe-mode-boot
+    - boot-configuration
+    - registry
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1688
+    - https://attack.mitre.org/detectionstrategies/DET0116
+    - https://attack.mitre.org/techniques/T1112
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1688
+  sub_techniques: []
+  detection_strategies:
+    - DET0116
+  analytics:
+    - AN0323
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Windows Registry Key Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An adversary may set the safeboot flag in the boot configuration and restart the host so
+    that endpoint security drivers never load, obtaining a boot session in which their
+    payload runs with no sensor attached and no telemetry produced at all.
+  attacker_behavior:
+    - Sets the safeboot option in the BCD store with bcdedit before restarting the host.
+    - Registers their own service or COM object under the SafeBoot minimal-services list.
+    - Forces an immediate restart so the safe-mode session begins before anyone reacts.
+    - Deletes the safeboot value after the payload runs so the next boot appears normal.
+  legitimate_behavior:
+    - Support staff boot a host into safe mode to remove a faulty driver or application.
+    - Recovery and imaging workflows manipulate the BCD store during build or repair.
+    - Some antivirus removal tools require a safe-mode boot to uninstall cleanly.
+    - Driver certification and diagnostics use boot configuration changes deliberately.
+  risk_indicator:
+    - The boot change and a forced restart happen within the same short window.
+    - A service or driver entry is added under SafeBoot rather than only the flag being set.
+    - The change is issued by a script host or a remote-execution channel, not an interactive console.
+    - The safeboot value is deleted again shortly after the host returns.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: registry
+      event_types:
+        - RegKeyCreate
+        - RegSystemConfigValueUpdate
+        - RegGenericValueUpdate
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - RegObjectName
+        - RegValueName
+        - RegStringValue
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: safeboot-flag-set-in-bcd
+        name: Safe mode flag written to the boot configuration
+        purpose: >-
+          Surface the change that decides whether the endpoint sensor loads on the next boot.
+          This is the technique itself rather than a precursor, because once the flag is set
+          the next restart produces a session with no security drivers attached.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(bcdedit(\.exe)?\s+.*\/set\b|bootcfg(\.exe)?\s+.*\/raw\b)/i
+          | CommandLine=/\bsafeboot(alternateshell)?\b/i
+          | CommandLine!=/\/deletevalue\b/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Build and imaging hosts where BCD manipulation is part of provisioning"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: service-added-to-safeboot-minimal
+        name: Service or driver registered under the SafeBoot minimal list
+        purpose: >-
+          Catch the second half of the technique, where the adversary buys back execution for
+          themselves inside the stripped-down session. Only entries under SafeBoot start when
+          the host boots limited, so an addition here is a deliberate choice about what runs
+          while defenses do not.
+        query: |
+          #event_simpleName=/^(RegKeyCreate|RegSystemConfigValueUpdate|RegGenericValueUpdate)$/
+          | RegObjectName=/\\Control\\SafeBoot\\(Minimal|Network)\\/i
+          | groupBy([ComputerName, UserName, RegObjectName],
+                    function=[count(as=writes), collect([RegValueName, RegStringValue], limit=5)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Security product installers that legitimately register themselves for safe mode"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: safeboot-set-then-forced-restart
+        name: Boot configuration changed and a forced restart issued together
+        purpose: >-
+          Separate an operator planning a maintenance reboot from a payload driving the host
+          into safe mode now. Support staff set the flag and let the user reboot; automated
+          abuse pairs the change with an immediate forced restart in the same window.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(bcdedit|shutdown|Restart-Computer)/i
+          | case {
+              CommandLine=/bcdedit(\.exe)?\s+.*\/set\b.*\bsafeboot\b/i
+                | boot_change := CommandLine ;
+              CommandLine=/(shutdown(\.exe)?\s+.*\/r\b|Restart-Computer)/i
+                | forced_restart := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([boot_change, forced_restart]), count(as=events)])
+          | boot_change=/.+/
+          | forced_restart=/.+/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: safeboot-flag-cleared-again
+        name: Safe mode flag deleted after the host returns
+        purpose: >-
+          Confirm the round trip. Deleting the safeboot value is the cleanup step that makes
+          the next boot look ordinary, so its presence indicates the safe-mode session was
+          used rather than merely configured, and it is the surviving artefact once the flag
+          itself is gone.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/bcdedit(\.exe)?\s+.*\/deletevalue\b/i
+          | CommandLine=/\bsafeboot(alternateshell)?\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=reversions), collect([CommandLine], limit=5)])
+          | sort(reversions, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: safeboot_configured
+      name: Safe mode flag set in the boot configuration
+      description: >-
+        The boot configuration of a running host was changed so the next restart brings it up
+        with a limited driver set, which is the state in which the endpoint sensor does not
+        load.
+      source: process_creation
+      field: CommandLine
+      indicates: defensive_control_degradation
+
+  supporting:
+    - id: safeboot_service_registered
+      name: Entry added to the SafeBoot minimal-services list
+      description: >-
+        A service, driver or COM registration was written under the SafeBoot key, which grants
+        that component execution inside the limited session where security tooling is absent.
+      source: registry
+      field: RegObjectName
+      indicates: execution_reserved_for_impaired_session
+    - id: forced_immediate_restart
+      name: Forced restart issued in the same window
+      description: >-
+        A restart was forced immediately after the boot configuration changed, which turns a
+        latent setting into an active session with no sensor loaded.
+      source: process_creation
+      field: FileName
+      indicates: impairment_activated
+    - id: script_host_actor
+      name: Boot change issued by a script host or remote channel
+      description: >-
+        The boot configuration was modified by an interpreter or a remote-execution channel
+        rather than from an interactive support session, which is how the change is normally
+        made.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: unprecedented_for_host
+      name: No boot configuration changes in the baseline
+      description: >-
+        This host has not had its boot configuration altered during the baseline window, which
+        is the expected state for a production system that is not being rebuilt or repaired.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: recorded_troubleshooting
+      name: Recorded driver or application troubleshooting
+      description: >-
+        A change or incident record covers a deliberate safe-mode boot to remove a faulty
+        driver, uninstall a product or recover a host.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: build_or_recovery_host
+      name: Host in a build or recovery state
+      description: >-
+        The host is being imaged, provisioned or repaired, where BCD manipulation is an
+        ordinary part of the workflow rather than a defensive change.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: support_engineer_session
+      name: Change made from a known support session
+      description: >-
+        The acting identity is an endpoint support engineer working an open ticket on that
+        host, which is the population that legitimately boots machines into safe mode.
+      source: identity_context
+      field: UserName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - safeboot_configured
+
+    supporting:
+      any:
+        - safeboot_service_registered
+        - forced_immediate_restart
+        - script_host_actor
+        - unprecedented_for_host
+      all:
+        - safeboot_service_registered
+        - forced_immediate_restart
+
+    contradicting:
+      any:
+        - recorded_troubleshooting
+        - build_or_recovery_host
+        - support_engineer_session
+      all: []
+
+  verdict:
+    low_risk_when:
+      - safeboot_configured
+      - recorded_troubleshooting
+      - build_or_recovery_host
+      - support_engineer_session
+    suspicious_when:
+      - safeboot_configured
+      - unprecedented_for_host
+    high_risk_when:
+      - safeboot_configured
+      - safeboot_service_registered
+      - forced_immediate_restart
+      - script_host_actor
+
+  false_positive:
+    - condition: Support staff boot a host into safe mode to remove a faulty driver.
+      explanation: >-
+        This is the one routine use of the flag and it produces the identical command. It
+        arrives from an interactive session on a host with an open ticket, no service is added
+        under SafeBoot, and the restart is normally left to the user rather than forced.
+    - condition: An antivirus or endpoint product requires safe mode to uninstall.
+      explanation: >-
+        Some vendors ship removal tools that set the safeboot flag themselves. The acting
+        process is the vendor's signed removal utility and the activity coincides with a
+        planned product migration across a group of hosts.
+    - condition: Imaging or recovery automation manipulates the BCD store.
+      explanation: >-
+        Build pipelines and recovery media edit boot configuration as a matter of course. The
+        host is in a build state rather than serving production traffic, and the same commands
+        appear on every machine that passes through the pipeline.
+    - condition: A security product registers itself under the SafeBoot key at install time.
+      explanation: >-
+        Well-behaved endpoint agents add themselves to the minimal-services list precisely so
+        they survive a safe-mode boot. This is written by the product installer, matches the
+        vendor's own service name, and appears once per host at deployment.

@@ -1,0 +1,382 @@
+type: detection
+
+id: hg-win-listener-opened-behind-a-knock-sequence-t1205-001
+
+version: 1.0.0
+
+info:
+  name: Listener opened behind a knock sequence
+  description: >-
+    Port knocking exists to make a backdoor invisible to the thing that usually finds one: a
+    port scan. The listening port is closed until a specific series of connection attempts
+    arrives, so the implant has no exposed surface between uses and the C2 channel has no
+    steady traffic to profile. The knocks themselves are not visible to an endpoint sensor —
+    packets to closed ports are dropped by the stack and nothing records them — so a hunt from
+    the host has to work from what the knock causes rather than from the knock. That leaves
+    two observables that are genuinely collected: a port that becomes listening when it was
+    not, usually together with an inbound firewall rule appearing to let it through, and the
+    outbound mirror image, where an implant on this host knocks a remote server by touching a
+    handful of its closed ports before connecting properly. Both are sparse and deliberate.
+    The outbound case in particular has an obvious benign twin in scanning, and the shape is
+    what separates them: a knock is a few ports on one host, a scan is many hosts or hundreds
+    of ports. Rarity carries this hunt, so the baseline is not optional.
+  severity: high
+  author: huntgraph
+  tags:
+    - command-and-control
+    - persistence
+    - defense-evasion
+    - traffic-signaling
+    - port-knocking
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1205/001
+    - https://attack.mitre.org/detectionstrategies/DET0302
+    - https://attack.mitre.org/techniques/T1205
+
+mitre:
+  tactics:
+    - TA0005
+    - TA0003
+    - TA0011
+  techniques:
+    - T1205
+  sub_techniques:
+    - T1205.001
+  detection_strategies:
+    - DET0302
+  analytics:
+    - AN0842
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - "WinEventLog:Microsoft-Windows-Windows Firewall With Advanced Security/Firewall"
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+    - Network Traffic Flow
+
+hypothesis:
+  statement: >-
+    An adversary may hold a backdoor port closed until a predefined sequence of connection
+    attempts arrives, so that the channel is absent from any scan taken between uses and only
+    opens for the source that knows the sequence, obtaining command and control that survives
+    both reboot and routine exposure checks.
+  attacker_behavior:
+    - Watches for a knock sequence with a raw socket or a packet capture library.
+    - Opens an inbound firewall rule for the port only once the sequence completes.
+    - Binds a listener on a port the host has never served, then closes it after the session.
+    - Knocks a remote server by touching a short run of its closed ports before connecting.
+  legitimate_behavior:
+    - Installers and administrators add inbound firewall rules for services they deploy.
+    - Engineering hosts run packet capture tools as ordinary diagnostic work.
+    - Applications bind high ephemeral ports for peer-to-peer and clustering features.
+    - Monitoring and discovery tools probe several ports on a host to identify services.
+  risk_indicator:
+    - A port becomes listening on a host that has never served it in the baseline window.
+    - The inbound firewall rule and the listener appear within the same short window.
+    - The rule is added from a shell or script host rather than by an installer or policy.
+    - A process touches a few closed ports on one remote host and then connects successfully.
+    - The listener belongs to a binary in a user-writable path rather than to installed software.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: network_connection
+      event_types:
+        - NetworkListenIP4
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - ContextBaseFileName
+        - LocalAddressIP4
+        - LocalPort
+        - RemoteAddressIP4
+        - RemotePort
+        - Protocol
+    - source: registry
+      event_types:
+        - RegGenericValueUpdate
+        - RegSystemConfigValueUpdate
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - RegObjectName
+        - RegValueName
+        - RegStringValue
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: dormant-port-becomes-listening
+        name: A port the host has never served becomes listening
+        purpose: >-
+          The knock is invisible but its result is not. A bind on a remote-access or
+          commonly-backdoored port, by a process that is not the service that owns it, is the
+          moment the hidden channel becomes reachable.
+        query: |
+          #event_simpleName=/^NetworkListenIP4$/
+          | LocalPort in (22, 23, 2323, 8022, 3389, 4444, 5555, 8080, 8443, 9001)
+          | ContextBaseFileName!=/^(System|svchost\.exe|services\.exe|sshd\.exe|lsass\.exe|Idle)$/i
+          | groupBy([ComputerName, ContextBaseFileName, LocalPort],
+                    function=[count(as=binds), collect([LocalAddressIP4, Protocol], limit=5)])
+          | sort(binds, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Development and application servers that legitimately bind these ports"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: inbound-firewall-rule-opened
+        name: Inbound firewall rule added to expose a port
+        purpose: >-
+          A knock daemon opens the way as well as the socket, and the host firewall keeps its
+          rules where a change is visible. Catching the rule and the command that wrote it
+          separates an implant reacting to a signal from a service installed by a package.
+        query: |
+          #event_simpleName=/^(RegGenericValueUpdate|RegSystemConfigValueUpdate|ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              #event_simpleName=/^(RegGenericValueUpdate|RegSystemConfigValueUpdate)$/
+                | RegObjectName=/\\SharedAccess\\Parameters\\FirewallPolicy\\FirewallRules$/i
+                | RegStringValue=/Action=Allow/i
+                | RegStringValue=/Dir=In/i
+                | rule_written := RegStringValue ;
+              #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+                | CommandLine=/(netsh\s+.*firewall\s+.*add\s+rule|New-NetFirewallRule|Set-NetFirewallRule.*Enabled\s+True)/i
+                | rule_command := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[count(as=changes),
+                              collect([rule_written, rule_command, FileName, ParentBaseFileName], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Installers and management agents that register rules for products they deploy"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: outbound-knock-sequence-to-one-host
+        name: Short run of ports touched on one remote host
+        purpose: >-
+          The mirror case, where the implant on this host is the one knocking. The shape is
+          the discriminator: a knock is a handful of distinct ports against a single address
+          with almost no repetition, whereas a scan sprays either many hosts or many ports.
+        query: |
+          #event_simpleName=/^NetworkConnectIP4$/
+          | ContextBaseFileName!=/^(chrome\.exe|msedge\.exe|firefox\.exe|Teams\.exe|OneDrive\.exe|svchost\.exe|SearchIndexer\.exe)$/i
+          | groupBy([ComputerName, ContextBaseFileName, RemoteAddressIP4],
+                    function=[count(field=RemotePort, distinct=true, as=ports),
+                              count(as=attempts), collect([RemotePort], limit=12)])
+          | ports >= 3
+          | ports <= 8
+          | attempts <= 20
+          | sort(ports, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Monitoring and discovery tooling that probes several ports per host by design"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: raw-socket-or-capture-based-listener
+        name: Packet capture or raw socket tooling on a non-engineering host
+        purpose: >-
+          A knock daemon has to observe packets addressed to closed ports, which it does with
+          a capture library or a raw socket. Capture tooling on a host with no diagnostic role
+          is the capability the technique depends on.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(tshark\.exe|dumpcap\.exe|windump\.exe|tcpdump\.exe|rawcap\.exe|knockd\.exe|knock\.exe|pktmon\.exe)$/i
+            or CommandLine=/(WinPcap|Npcap|libpcap|SOCK_RAW|pktmon\s+start|--raw)/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=starts), collect([CommandLine], limit=5)])
+          | sort(starts, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Network engineering and support hosts where capture tooling is routine"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+evidence:
+  required:
+    - id: dormant_port_became_listening
+      name: A previously closed port started listening
+      description: >-
+        A process bound a port that the host has not served during the baseline window,
+        which is the point at which a channel that was invisible to scanning becomes
+        reachable.
+      source: network_connection
+      field: LocalPort
+      indicates: hidden_channel_opened
+
+  supporting:
+    - id: inbound_rule_added_for_port
+      name: Inbound firewall rule written to allow the port
+      description: >-
+        An allow rule for inbound traffic was written to the host firewall's rule store,
+        which is what makes the new listener reachable from outside rather than only locally.
+      source: registry
+      field: RegStringValue
+      indicates: exposure_deliberately_created
+    - id: firewall_changed_from_a_shell
+      name: Firewall changed from a shell or script host
+      description: >-
+        The rule was added from a command line rather than by an installer or by policy,
+        which is how an implant reacts to a signal rather than how software is deployed.
+      source: process_creation
+      field: CommandLine
+      indicates: abnormal_execution_chain
+    - id: outbound_knock_sequence
+      name: Short port sequence touched on one remote host
+      description: >-
+        A process made a small number of attempts across a handful of distinct ports on a
+        single remote address, the shape of a signal rather than of a scan or of ordinary use.
+      source: network_connection
+      field: RemotePort
+      indicates: traffic_signaling_pattern
+    - id: capture_capability_present
+      name: Packet capture or raw socket tooling present
+      description: >-
+        Software able to observe traffic addressed to closed ports ran on the host, which is
+        the capability a knock listener needs in order to see the sequence at all.
+      source: process_creation
+      field: ImageFileName
+      indicates: passive_signal_observation
+    - id: no_prior_listener_on_port
+      name: No history of this bind on the host
+      description: >-
+        Neither this port nor this process has held a listening bind on the host during the
+        baseline window, so the exposure is new rather than intermittent.
+      source: baseline
+      field: LocalPort
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: sanctioned_service_deployment
+      name: Sanctioned service deployed on this host
+      description: >-
+        The asset record shows a server or application host where this port is part of the
+        deployed service set, so listening on it is the machine doing its job.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: recorded_firewall_change
+      name: Firewall change covered by a record
+      description: >-
+        A change record covers the rule and the port, tying the exposure to planned work
+        rather than to a signal arriving from outside.
+      source: change_management
+      field: RegStringValue
+      indicates: legitimate_administrative_action
+    - id: engineering_diagnostic_toolset
+      name: Diagnostic tooling on an engineering host
+      description: >-
+        The host belongs to a network or support function where capture tools and port probing
+        are established, long-running parts of ordinary work.
+      source: baseline
+      field: ImageFileName
+      indicates: expected_user_behavior
+
+  risk_logic:
+    required:
+      - dormant_port_became_listening
+
+    supporting:
+      any:
+        - inbound_rule_added_for_port
+        - firewall_changed_from_a_shell
+        - outbound_knock_sequence
+        - capture_capability_present
+        - no_prior_listener_on_port
+      all:
+        - inbound_rule_added_for_port
+        - firewall_changed_from_a_shell
+
+    contradicting:
+      any:
+        - sanctioned_service_deployment
+        - recorded_firewall_change
+        - engineering_diagnostic_toolset
+      all: []
+
+  verdict:
+    low_risk_when:
+      - dormant_port_became_listening
+      - sanctioned_service_deployment
+      - recorded_firewall_change
+      - engineering_diagnostic_toolset
+    suspicious_when:
+      - dormant_port_became_listening
+      - no_prior_listener_on_port
+    high_risk_when:
+      - dormant_port_became_listening
+      - inbound_rule_added_for_port
+      - firewall_changed_from_a_shell
+      - capture_capability_present
+      - no_prior_listener_on_port
+
+  false_positive:
+    - condition: An installer adds an inbound firewall rule and starts a service.
+      explanation: >-
+        Software deployment produces the rule and the listener together, which is the strongest
+        supporting combination in this hunt. The writer is the discriminator: an installer or
+        the management agent, running under the system account, against a product path, and on
+        many hosts rather than one.
+    - condition: A monitoring or discovery tool probes several ports on a host.
+      explanation: >-
+        Discovery reproduces the outbound sequence shape closely. It probes the same short port
+        list against many addresses rather than a single one, it runs on a schedule the
+        baseline has learned, and it comes from an installed product path.
+    - condition: An engineer runs a packet capture during troubleshooting.
+      explanation: >-
+        Capture tooling is ordinary diagnostic work and on its own means nothing here. It only
+        matters alongside a new listener, and on engineering hosts the baseline carries months
+        of it.
+    - condition: An application binds a high port for clustering or peer-to-peer features.
+      explanation: >-
+        Some products open listeners dynamically as part of normal operation, which satisfies
+        the required evidence. These binds recur across the estate wherever the product runs
+        and are not preceded by a firewall rule written from a shell.

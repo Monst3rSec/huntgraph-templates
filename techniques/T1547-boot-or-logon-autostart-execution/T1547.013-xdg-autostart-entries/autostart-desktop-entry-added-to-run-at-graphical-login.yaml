@@ -1,0 +1,329 @@
+type: detection
+
+id: hg-lin-autostart-desktop-entry-added-to-run-at-graphical-login-t1547-013
+
+version: 1.0.0
+
+info:
+  name: Autostart desktop entry added to run at graphical login
+  description: >-
+    Any XDG-compliant desktop launches every .desktop file it finds in the autostart
+    directories when the session starts, so a file dropped into ~/.config/autostart runs the
+    user's payload at each graphical login with no privilege beyond write access to their
+    own home. Nothing about the mechanism is unusual — update notifiers, sync clients, input
+    method daemons and tray applets all live there — which is exactly why it hides well.
+    The discriminator is not the file's presence but two things about it: what the Exec
+    directive points at, and who wrote the file. Applications install their autostart entry
+    through packaging, at install time, with an Exec line naming a binary in a system path;
+    persistence is written by a shell or a downloaded script and points at an interpreter,
+    a temporary directory or a hidden path in the user's home.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - autostart
+    - xdg-autostart
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1547/013
+    - https://attack.mitre.org/detectionstrategies/DET0390
+    - https://attack.mitre.org/techniques/T1547
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1547
+  sub_techniques:
+    - T1547.013
+  detection_strategies:
+    - DET0390
+  analytics:
+    - AN1096
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+    - auditd:EXECVE
+  data_components:
+    - File Creation
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may write a .desktop entry into an XDG autostart directory so that the
+    desktop environment launches their payload at graphical login, obtaining user-level
+    persistence through a mechanism ordinary applications use and that survives reboot.
+  attacker_behavior:
+    - Writes a .desktop file into ~/.config/autostart with an Exec line naming their payload.
+    - Names the entry after a familiar application so it blends into the session's startup list.
+    - Points Exec at a shell one-liner or an interpreter rather than at an installed binary.
+    - Drops the entry into /etc/xdg/autostart when root, so it runs for every user who logs in.
+    - Sets NoDisplay or Hidden so the entry does not appear in the session's startup manager.
+  legitimate_behavior:
+    - Application packages install autostart entries for updaters, sync clients and tray applets.
+    - Users enable startup applications through their desktop's own settings interface.
+    - Input methods, accessibility tools and clipboard managers register themselves at install.
+    - Configuration management deploys standard session entries across managed desktops.
+  risk_indicator:
+    - The Exec line invokes a shell or interpreter instead of a packaged binary.
+    - The Exec target sits under /tmp, /var/tmp, /dev/shm or a hidden directory in a home.
+    - The entry was written by a downloaded script or a non-desktop process.
+    - The entry exists on one workstation and nowhere else in the estate.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: user-autostart-entry-written
+        name: Desktop entry written into a user autostart directory
+        purpose: >-
+          Surface the per-user route. Applications install their autostart entries through
+          packaging, so a .desktop file being created in a home directory by a redirect,
+          copy or in-place edit is the persistence being installed by hand.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\.config\/autostart|\$\{?XDG_CONFIG_HOME\}?\/autostart)/
+          | CommandLine=/(>>|>\s*|tee\b|cp\b|mv\b|install\b|sed\s+-i|cat\s*<<|printf\b|echo\b)/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=writes), collect([CommandLine], limit=5)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Desktop session settings tools that add startup applications on the user's behalf"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: system-autostart-entry-written
+        name: Desktop entry written into the system autostart directory
+        purpose: >-
+          Cover the privileged route separately, because an entry in /etc/xdg/autostart runs
+          for every account that logs in graphically and therefore has a far larger blast
+          radius than a per-user file.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\/etc\/xdg\/autostart\//
+          | CommandLine=/(>>|>\s*\/|tee\b|cp\b|mv\b|install\b|sed\s+-i|cat\s*<<|printf\b|echo\b)/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=writes), collect([CommandLine], limit=5)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of dpkg, rpm, apt, yum, dnf and the configuration-management agent"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: autostart-exec-line-not-a-packaged-binary
+        name: Exec directive naming an interpreter or a writable path
+        purpose: >-
+          Apply the real discriminator. The presence of an autostart entry says nothing; an
+          Exec line that runs a shell, an interpreter or a file under a temporary or hidden
+          directory is not how an installed application starts itself.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/Exec\s*=/
+          | CommandLine=/(autostart|\.desktop)/i
+          | CommandLine=/(\/tmp\/|\/var\/tmp\/|\/dev\/shm\/|\/\.[a-z0-9_-]+\/|bash\s+-c|sh\s+-c|python[0-9.]*\s|perl\s|curl\s|wget\s|base64\s)/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=entries), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: session-child-from-a-writable-path
+        name: Desktop session starting a process from a writable path
+        purpose: >-
+          Confirm the entry fired. A process parented by the session manager whose image
+          lives in a temporary directory or a hidden folder in a home is the autostart
+          payload running, rather than a packaged startup application.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(gnome-session-binary|gnome-session|xfce4-session|mate-session|lxsession|plasmashell|ksmserver|startplasma-x11|cinnamon-session|xdg-autostart-generator)$/i
+          | ImageFileName=/^\/(tmp|var\/tmp|dev\/shm)\/|^\/home\/[^\/]+\/(\.[^\/]+\/|Downloads\/|tmp\/)/
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "User-installed applications kept deliberately under ~/.local, where that is a supported pattern"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - path
+
+evidence:
+  required:
+    - id: autostart_entry_written
+      name: Autostart desktop entry created outside packaging
+      description: >-
+        A .desktop file was written into a user or system XDG autostart directory by a
+        shell, a script or a copy rather than by an application installer, so the desktop
+        environment will launch it at the next graphical login.
+      source: process_creation
+      field: CommandLine
+      indicates: logon_persistence_installed
+
+  supporting:
+    - id: exec_line_untrusted
+      name: Exec directive points at an interpreter or writable path
+      description: >-
+        The entry's Exec line runs a shell one-liner, an interpreter or a file under a
+        temporary or hidden directory, which is not how a packaged startup application
+        launches itself.
+      source: process_creation
+      field: CommandLine
+      indicates: suspicious_launch_target
+    - id: system_wide_autostart
+      name: Entry affects every graphical user
+      description: >-
+        The .desktop file was placed in /etc/xdg/autostart, so it executes for every account
+        that starts a desktop session rather than for one user.
+      source: process_creation
+      field: CommandLine
+      indicates: broad_persistence_scope
+    - id: session_started_untrusted_child
+      name: Session manager launched a process from a writable path
+      description: >-
+        A child of the desktop session manager executed from a temporary directory or a
+        hidden folder in a home, confirming the autostart entry runs and what it runs.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: execution_chain_progression
+    - id: autostart_rare_in_fleet
+      name: Entry absent from comparable workstations
+      description: >-
+        The same autostart entry does not appear on peer desktops during the baseline
+        window, unlike application and managed session entries which land wherever the
+        software is deployed.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: application_installed_entry
+      name: Entry installed by an application package
+      description: >-
+        The .desktop file was written by the package manager while installing an updater,
+        sync client or tray applet, which is the ordinary reason autostart directories
+        change.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: packaged_exec_target
+      name: Exec directive names an installed binary
+      description: >-
+        The program the entry launches is an installed binary in a system path belonging to
+        a known package, which is what a genuine startup application looks like.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: autostart_fleetwide
+      name: Same entry across comparable workstations
+      description: >-
+        The identical autostart entry is present on peer desktops throughout the baseline
+        window, which is a managed session standard rather than targeted persistence.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - autostart_entry_written
+
+    supporting:
+      any:
+        - exec_line_untrusted
+        - system_wide_autostart
+        - session_started_untrusted_child
+        - autostart_rare_in_fleet
+      all:
+        - exec_line_untrusted
+        - session_started_untrusted_child
+
+    contradicting:
+      any:
+        - application_installed_entry
+        - packaged_exec_target
+        - autostart_fleetwide
+      all: []
+
+  verdict:
+    low_risk_when:
+      - autostart_entry_written
+      - application_installed_entry
+      - packaged_exec_target
+      - autostart_fleetwide
+    suspicious_when:
+      - autostart_entry_written
+      - autostart_rare_in_fleet
+    high_risk_when:
+      - autostart_entry_written
+      - exec_line_untrusted
+      - session_started_untrusted_child
+      - system_wide_autostart
+
+  false_positive:
+    - condition: An application installs its own autostart entry.
+      explanation: >-
+        Updaters, cloud sync clients, input methods and tray applets all register themselves
+        in the autostart directories at install time, which reproduces the required evidence.
+        The writer is the package manager or the vendor installer, and the Exec line names an
+        installed binary in a system path.
+    - condition: A user adds a startup application through desktop settings.
+      explanation: >-
+        Every major desktop offers a startup-applications panel that writes a .desktop file
+        into the user's autostart directory. The writing process is the settings tool of the
+        running session, and the Exec target is normally an installed application the user
+        picked from a list.
+    - condition: A developer autostarts a script they wrote themselves.
+      explanation: >-
+        Scripts under a home directory launched at login are a common personal workflow and
+        will match the Exec discriminator. The distinguishing detail is the provenance of the
+        script and the account: it belongs to the logged-in user, has a history on the host,
+        and does not arrive with a download or a remote fetch.
+    - condition: Configuration management deploys a managed session entry.
+      explanation: >-
+        Standard desktop builds distribute autostart entries for VPN clients, monitoring
+        agents and lock policy. These are written by the management agent and appear
+        identically across the managed workstation fleet in a single window.

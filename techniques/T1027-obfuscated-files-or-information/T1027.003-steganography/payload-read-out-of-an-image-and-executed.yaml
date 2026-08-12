@@ -1,0 +1,357 @@
+type: detection
+
+id: hg-win-payload-read-out-of-an-image-and-executed-t1027-003
+version: 1.0.0
+
+info:
+  name: Payload read out of an image and executed
+  description: >-
+    Steganography works because the carrier is not a disguise — it is a real image. A PNG
+    with shellcode in its low-order bits opens in any viewer, renders correctly, has a valid
+    header and passes every structural check, because none of those things are broken. There
+    is nothing for a gateway to reject and nothing for a file-type check to catch. The
+    encoding itself is invisible from an endpoint: no event says a bitmap's least significant
+    bits were harvested, and the pixel arithmetic happens inside a process's own memory. What
+    an endpoint does see is the pairing either side of that arithmetic — a scripting engine
+    whose arguments name an image file, and then execution or egress from that same process.
+    An image is data that nothing should execute; the moment a script engine is reading one
+    by byte or by pixel and something runs afterwards, the file has stopped being a picture.
+    That pairing is the finding, and it is what separates this from an image being opened,
+    converted or resized, which happens constantly and never ends in a child process.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - obfuscation
+    - steganography
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1027/003
+    - https://attack.mitre.org/detectionstrategies/DET0119
+    - https://attack.mitre.org/techniques/T1027
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1027
+  sub_techniques:
+    - T1027.003
+  detection_strategies:
+    - DET0119
+  analytics:
+    - AN0331
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may hide a payload inside a valid image or media file so that delivery and
+    inspection see only a working picture, then read the concealed bytes back out on the
+    endpoint and execute them, obtaining code that never crossed the network in an
+    executable form.
+  attacker_behavior:
+    - Fetches a genuine image from a web host or repository that also carries the payload.
+    - Reads the file into memory by byte array or by pixel and rebuilds code from it.
+    - Executes the reconstructed content in the same process rather than writing it to disk.
+    - Uses an image viewer or document handler as the launching parent so the chain looks visual.
+    - Keeps the carrier in place afterwards, since it is still a valid image.
+  legitimate_behavior:
+    - Applications read images to resize, convert, watermark or thumbnail them.
+    - Reporting and document tooling embeds images into generated output.
+    - Designers and marketing users run batch conversions over large image sets.
+    - Installers and updaters download branding assets alongside their payloads.
+    - Backup and sync clients read every file on disk, images included.
+  risk_indicator:
+    - A script interpreter rather than an imaging application is reading the image.
+    - The read uses byte or pixel access instead of an image API for display.
+    - The reading process spawns a child or connects outbound immediately afterwards.
+    - The carrier was fetched from a host with no relationship to the applications installed.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - RemoteAddressIP4
+        - RemotePort
+        - ContextProcessId
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - DomainName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: image-read-by-an-interpreter
+        name: Script engine reading an image by byte or pixel
+        purpose: >-
+          Surface the pairing that matters: an interpreter naming a media file together with
+          the access primitives used to take data out of it. Displaying an image needs none
+          of these; harvesting bytes or pixels from one needs all of them.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(powershell|pwsh|wscript|cscript|mshta|python(3|\d\.\d+)?|node|rundll32)\.exe$/i
+          | CommandLine=/\.(png|jpe?g|bmp|gif|tiff?|webp|ico|wav|mp3|mp4)\b/i
+          | CommandLine=/(System\.Drawing|Bitmap|GetPixel|LockBits|ReadAllBytes|OpenRead|FromBase64String|Invoke-PSImage|-band\s+0x|-bxor|Substring\s*\(\s*\d+)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Image processing scripts on design, marketing and reporting hosts"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: image-handler-spawned-an-interpreter
+        name: Image viewer or editor launching a script engine
+        purpose: >-
+          Catch the chain from the other end. Applications whose whole job is to render or
+          edit pictures have no reason to start an interpreter, so this parent-child pair is
+          the visual half of the technique giving way to the executing half.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(mspaint|photos|photoviewer|dllhost|wmplayer|irfanview|gimp-\d|photoshop|snippingtool|explorer)\.exe$/i
+          | FileName=/^(powershell|pwsh|wscript|cscript|mshta|cmd|rundll32|regsvr32)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Explorer launching interpreters through ordinary user double-clicks, if that is common in the estate"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - process
+
+      - id: carrier-image-fetched-by-a-script-host
+        name: Image retrieved by a script host or transfer utility
+        purpose: >-
+          Identify the delivery of the carrier. A picture arriving through an interpreter or
+          a download LOLBin rather than a browser or an application's own updater is being
+          fetched for its contents, not to be looked at.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Invoke-WebRequest|Invoke-RestMethod|DownloadFile|DownloadData|DownloadString|WebClient|curl(\.exe)?\s|certutil(\.exe)?\s+[^|]*-urlcache|bitsadmin(\.exe)?\s+[^|]*\/transfer)/i
+          | CommandLine=/https?:\/\/[^\s"']+\.(png|jpe?g|bmp|gif|tiff?|webp|ico|wav)\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Update and branding asset retrieval by approved application updaters"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - domain
+
+      - id: egress-from-the-process-that-read-the-image
+        name: Outbound connection from the process that read the image
+        purpose: >-
+          Confirm the decode had a purpose. Correlating the interpreter that touched the media
+          file with its own outbound connections converts a suspicious argument list into an
+          observed second stage — retrieval of more content, or contact with a controller.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | FileName=/^(powershell|pwsh|wscript|cscript|mshta|python(3|\d\.\d+)?|node|rundll32)\.exe$/i
+                | CommandLine=/\.(png|jpe?g|bmp|gif|tiff?|webp|ico|wav)\b/i
+                | decoder_pid := TargetProcessId ;
+              #event_simpleName=NetworkConnectIP4
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/ ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([CommandLine, FileName, RemoteAddressIP4, RemotePort]),
+                              count(as=events)])
+          | decoder_pid = ContextProcessId
+        filters:
+          include: []
+          exclude:
+            - "RemoteAddressIP4 within approved content delivery and vendor ranges"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: image_read_by_interpreter
+      name: Media file read by a script engine
+      description: >-
+        A scripting host named an image or audio file together with byte-level or pixel-level
+        access, which is how concealed content is taken out of a carrier and is not how a
+        picture is displayed.
+      source: process_creation
+      field: CommandLine
+      indicates: payload_extraction
+
+  supporting:
+    - id: visual_application_parent
+      name: Launched by an image viewer or editor
+      description: >-
+        The interpreter's parent is an application that exists to render or edit pictures,
+        which has no legitimate reason to start a script engine.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: carrier_retrieved
+      name: Carrier fetched from a remote host
+      description: >-
+        A domain was resolved by the process handling the media file, indicating the carrier
+        was pulled in rather than being a local asset the user already had.
+      source: dns_request
+      field: DomainName
+      indicates: payload_retrieval
+    - id: egress_from_decoder
+      name: The decoding process connected outbound
+      description: >-
+        The process that read the image opened an external connection, showing the extracted
+        content led somewhere rather than the file merely being inspected.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: execution_chain_progression
+    - id: unusual_for_host
+      name: No history of image handling by interpreters here
+      description: >-
+        Script engines have not read media files on this host during the baseline window, so
+        the behaviour is new rather than part of a routine workflow.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: media_processing_role
+      name: Host whose role is image processing
+      description: >-
+        The host belongs to design, marketing, reporting or a media pipeline, where scripted
+        batch handling of images is the normal daily workload.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_business_activity
+    - id: conversion_toolchain
+      name: Recognised conversion or thumbnail toolchain
+      description: >-
+        The reading process is part of an installed imaging or document toolchain performing
+        conversion, resizing or thumbnail generation.
+      source: process_creation
+      field: FileName
+      indicates: legitimate_application_component
+    - id: fleetwide_identical_invocation
+      name: Same invocation across the estate
+      description: >-
+        The identical command line appears on many hosts, which makes it product behaviour
+        distributed by software rather than an operator working on one machine.
+      source: baseline
+      field: CommandLine
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - image_read_by_interpreter
+
+    supporting:
+      any:
+        - visual_application_parent
+        - carrier_retrieved
+        - egress_from_decoder
+        - unusual_for_host
+      all:
+        - egress_from_decoder
+        - carrier_retrieved
+
+    contradicting:
+      any:
+        - media_processing_role
+        - conversion_toolchain
+        - fleetwide_identical_invocation
+      all: []
+
+  verdict:
+    low_risk_when:
+      - image_read_by_interpreter
+      - media_processing_role
+      - conversion_toolchain
+      - fleetwide_identical_invocation
+    suspicious_when:
+      - image_read_by_interpreter
+      - unusual_for_host
+    high_risk_when:
+      - image_read_by_interpreter
+      - visual_application_parent
+      - carrier_retrieved
+      - egress_from_decoder
+
+  false_positive:
+    - condition: A script resizes, converts or watermarks images in bulk.
+      explanation: >-
+        Batch image work reads media files by byte and pixel and is genuinely common on
+        design, marketing and reporting hosts. It writes image output rather than spawning a
+        child process, and the same script runs on a schedule with a stable command line.
+    - condition: A reporting or document generator embeds images into its output.
+      explanation: >-
+        Report tooling loads pictures into memory to place them in a document. The reading
+        process belongs to an installed product, its parent is that product rather than a
+        shell, and the run ends in a document being written.
+    - condition: An application updater downloads branding or icon assets.
+      explanation: >-
+        Updaters fetch images over HTTPS as part of ordinary content refresh. These go to the
+        vendor's own domains, run under the product's updater process, and repeat identically
+        across every host with the product installed.
+    - condition: A user opens an image and then launches a shell from the same window.
+      explanation: >-
+        Explorer and viewer applications can appear as the parent of an interpreter purely
+        because a user did two things in sequence. The distinguishing detail is whether the
+        interpreter's arguments reference the image at all — a coincidental parent does not.
+    - condition: A developer prototypes steganography or image analysis work.
+      explanation: >-
+        Research and coursework produce exactly this telemetry on engineering hosts. It runs
+        interactively under a developer's account inside a project directory, and the carrier
+        files are local rather than fetched from an unfamiliar host.

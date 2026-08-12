@@ -1,0 +1,349 @@
+type: detection
+
+id: hg-win-sleep-and-lock-timeouts-disabled-to-keep-a-host-reachable-t1653
+
+version: 1.0.0
+
+info:
+  name: Sleep and lock timeouts disabled to keep a host reachable
+  description: >-
+    An implant on a laptop has one recurring problem: the machine goes to sleep. Standby
+    suspends the process, hibernation writes it out and drops the network, and the lock
+    screen ends the interactive session that a session-scoped foothold depends on. Turning
+    those timeouts off converts an intermittently reachable host into a permanently
+    reachable one, and it does so through a supported utility with no exploit and no
+    privilege beyond what the logged-on user already has. The problem for the defender is
+    that the same commands are genuinely everywhere: presentation software, media players,
+    conferencing clients, kiosk builds and build agents all suppress sleep as a matter of
+    course, and every managed estate ships a power policy of its own. Nothing about the
+    setting itself is suspicious. What carries the signal is who asked and how far they
+    went - a scripting host or an office application spawning a power utility is not the
+    same as a policy agent doing it, and setting every timeout to never on battery as well
+    as mains is not a comfort adjustment, it is making sure the machine never stops
+    answering.
+  severity: medium
+  author: huntgraph
+  tags:
+    - persistence
+    - host-state
+    - power-settings
+    - defense-evasion
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1653
+    - https://attack.mitre.org/detectionstrategies/DET0417
+    - https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/powercfg-command-line-options
+
+mitre:
+  tactics:
+    - TA0003
+  techniques:
+    - T1653
+  sub_techniques: []
+  detection_strategies:
+    - DET0417
+  analytics:
+    - AN1174
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may disable standby, hibernation and the lock timeout on a compromised host
+    so that the machine never suspends, obtaining a foothold that stays reachable and a
+    long-running collection or mining task that is never interrupted by the system going
+    dormant.
+  attacker_behavior:
+    - Sets the standby and hibernate timeouts to never on both mains and battery power.
+    - Turns hibernation off entirely so the host cannot write out and drop its session.
+    - Extends the display and console lock timeouts so the interactive session persists.
+    - Writes the governing power values directly into the registry to bypass the utility.
+    - Applies the change from a script host or a remote execution channel rather than a console.
+  legitimate_behavior:
+    - Presentation, media and conferencing software suppresses sleep while in use.
+    - Kiosk, signage and lab builds are configured never to sleep by design.
+    - Managed power policy is distributed across the estate by the configuration platform.
+    - Engineers keep build and test machines awake for long-running jobs.
+    - Users extend the display timeout for their own comfort through settings.
+  risk_indicator:
+    - Timeouts are set to never rather than lengthened to a working value.
+    - The change covers battery as well as mains power on a portable machine.
+    - A script host or an office application is the parent of the power utility.
+    - The lock and display timeouts are extended in the same window as the sleep timeouts.
+    - Neither the host nor the account has changed power configuration before.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: standby-and-hibernate-disabled
+        name: Standby and hibernate timeouts set to never
+        purpose: >-
+          The primary observable. Match power configuration changes that set the sleep or
+          hibernate timeout to zero, which means never rather than longer, or that disable
+          hibernation outright. A value of zero is the tell: someone adjusting for comfort
+          picks a longer interval, someone keeping a foothold alive removes the interval.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/powercfg(\.exe)?/i
+          | CommandLine=/(standby-timeout-(ac|dc)\s+0|hibernate-timeout-(ac|dc)\s+0|(-|\/)(hibernate|h)\s+off|SUB_SLEEP\s+\S+\s+0|setacvalueindex.*SUB_SLEEP|setdcvalueindex.*SUB_SLEEP)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Configuration platform applying the managed power policy at build time"
+            - "Kiosk, signage and lab asset groups configured never to sleep by design"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: display-and-lock-timeouts-extended
+        name: Display and console lock timeouts extended or removed
+        purpose: >-
+          Cover the half of the technique that keeps the interactive session alive rather
+          than the machine. Extending the console lock and display timeouts keeps a
+          session-scoped foothold usable and keeps the screen from demanding credentials, and
+          it is a different subgroup of settings from the sleep timeouts.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/powercfg(\.exe)?/i
+          | CommandLine=/(monitor-timeout-(ac|dc)\s+0|disk-timeout-(ac|dc)\s+0|VIDEOCONLOCK|CONSOLELOCK|SUB_VIDEO)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Managed lock and display standards distributed to the estate"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: power-values-written-directly
+        name: Power and inactivity values written straight into the registry
+        purpose: >-
+          Catch the route that never touches the utility. The same outcome is available by
+          writing the power and inactivity policy values directly, which evades any hunt
+          anchored on the name of the tool and is a deliberate choice rather than the obvious
+          way to change a setting.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(HibernateEnabled|HiberFileSizePercent|Control\\+Power|PowerSettings|InactivityTimeoutSecs|AwayModeEnabled|ACSettingIndex|DCSettingIndex)/i
+          | CommandLine=/(reg(\.exe)?\s+add|Set-ItemProperty|New-ItemProperty|powercfg(\.exe)?\s+(-|\/)setactive)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Group policy processing writing the governed power configuration"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: power-utility-spawned-by-an-unexpected-parent
+        name: Power utility invoked by a script host or document application
+        purpose: >-
+          This is the discriminator. Presentation and media software suppresses sleep through
+          the API without ever launching a utility, and the configuration platform launches
+          it from its own agent, so a power tool parented by a scripting engine, a macro host
+          or a mail and document application is the case worth reading regardless of which
+          setting it changed.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(powercfg(\.exe)?|Set-CimInstance.*Win32_PowerPlan|SetSuspendState)/i
+          | ParentBaseFileName=/^(powershell\.exe|pwsh\.exe|wscript\.exe|cscript\.exe|mshta\.exe|rundll32\.exe|regsvr32\.exe|winword\.exe|excel\.exe|powerpnt\.exe|outlook\.exe|wmiprvse\.exe)$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=invocations), collect([CommandLine], limit=5)])
+          | sort(invocations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Estate management scripts run from the configuration platform's own agent"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - parent_process
+            - organization
+
+evidence:
+  required:
+    - id: dormancy_prevented
+      name: The host was configured not to go dormant
+      description: >-
+        A power configuration change disabled standby, hibernation or the inactivity
+        timeouts, so the machine will stay running and reachable rather than suspending when
+        it is not being used.
+      source: process_creation
+      field: CommandLine
+      indicates: host_state_manipulation
+
+  supporting:
+    - id: timeouts_set_to_never
+      name: Timeouts set to never rather than lengthened
+      description: >-
+        The values were set to zero, which disables the timeout entirely, rather than being
+        extended to a longer but finite interval as a comfort or workflow adjustment would.
+      source: process_creation
+      field: CommandLine
+      indicates: complete_control_removal
+    - id: battery_and_mains_both_covered
+      name: The change covers battery as well as mains power
+      description: >-
+        Both the mains and battery profiles were changed, so the host stays awake when
+        unplugged as well, which serves availability of the foothold rather than any user
+        need.
+      source: process_creation
+      field: CommandLine
+      indicates: persistent_availability_intent
+    - id: unexpected_requester
+      name: Requested by a script host or document application
+      description: >-
+        The power utility was launched by a scripting engine, macro host or document
+        application rather than by the configuration platform or an interactive console.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: session_kept_unlocked
+      name: Lock and display timeouts extended in the same window
+      description: >-
+        The console lock or display timeout was extended alongside the sleep settings, which
+        keeps the interactive session alive and unchallenged as well as the machine awake.
+      source: process_creation
+      field: ImageFileName
+      indicates: session_persistence_support
+    - id: first_power_change_here
+      name: No history of power configuration on this host or account
+      description: >-
+        Neither the host nor the account has changed power configuration during the baseline
+        window, so this is not a recurring build step or an established user habit.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: always_on_asset_role
+      name: Host is a kiosk, lab or build machine
+      description: >-
+        The asset belongs to a group that is configured never to sleep by design, such as
+        signage, kiosk, laboratory or continuous integration hardware.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_asset_configuration
+    - id: managed_power_policy
+      name: Delivered by the configuration platform
+      description: >-
+        The change was applied by group policy processing or the management agent as part of
+        the governed power standard for the estate.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: recorded_long_running_work
+      name: Recorded maintenance or long-running job
+      description: >-
+        A change record covers a migration, imaging run or long-running job on this host that
+        requires the machine to stay awake for its duration.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - dormancy_prevented
+
+    supporting:
+      any:
+        - timeouts_set_to_never
+        - battery_and_mains_both_covered
+        - unexpected_requester
+        - session_kept_unlocked
+        - first_power_change_here
+      all:
+        - timeouts_set_to_never
+        - unexpected_requester
+
+    contradicting:
+      any:
+        - always_on_asset_role
+        - managed_power_policy
+        - recorded_long_running_work
+      all: []
+
+  verdict:
+    low_risk_when:
+      - dormancy_prevented
+      - always_on_asset_role
+      - managed_power_policy
+      - recorded_long_running_work
+    suspicious_when:
+      - dormancy_prevented
+      - first_power_change_here
+    high_risk_when:
+      - dormancy_prevented
+      - timeouts_set_to_never
+      - battery_and_mains_both_covered
+      - unexpected_requester
+      - session_kept_unlocked
+
+  false_positive:
+    - condition: Presentation or media software keeps the machine awake while playing.
+      explanation: >-
+        This is constant and entirely normal, but those applications hold the machine awake
+        through the API for the duration of playback rather than rewriting the power scheme.
+        They leave no configuration change behind and the host sleeps normally afterwards.
+    - condition: Managed power policy is applied across the estate.
+      explanation: >-
+        Every managed environment distributes a power standard, and it does set these exact
+        values. It arrives from policy processing or the management agent, applies the same
+        values to many hosts in one window, and normally lengthens timeouts rather than
+        removing them on battery.
+    - condition: A kiosk, signage or laboratory machine is built never to sleep.
+      explanation: >-
+        These builds legitimately disable every timeout. The distinguishing feature is that
+        the setting is part of the build and applies to a whole asset group, rather than
+        appearing once on a user's laptop mid-session.
+    - condition: An engineer keeps a machine awake for a long migration or build.
+      explanation: >-
+        Long-running work does justify suppressing sleep, and it is often done from a console
+        with powercfg. It usually appears alongside a change record, comes from an
+        interactive administrative session, and is reversed when the work completes.

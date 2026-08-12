@@ -1,0 +1,325 @@
+type: detection
+
+id: hg-win-powershell-console-history-suppressed-or-redirected-t1690
+
+version: 1.0.0
+
+info:
+  name: PowerShell console history suppressed or redirected
+  description: >-
+    PSReadLine keeps a flat text file of every command typed at a PowerShell prompt, per user
+    and per host, and it survives reboots and log rotation. It is often the only surviving
+    record of interactive operator activity on a host where script block logging was never
+    enabled or where the operational channels have already rolled over, which is why
+    responders reach for ConsoleHost_history.txt early. Setting HistorySaveStyle to
+    SaveNothing, or pointing HistorySavePath at a scratch file, stops new lines being written
+    without producing an error, without changing the prompt, and without touching any service
+    or channel a monitoring team watches. Nothing appears broken: the shell behaves normally,
+    in-session up-arrow recall still works, and the file simply stops growing. The
+    discriminator is that a legitimate change to these options is a durable configuration
+    decision made in a profile by an administrator, while the adversary's version is issued
+    inside a live session immediately before the commands they want unrecorded.
+  severity: high
+  author: huntgraph
+  tags:
+    - defense-impairment
+    - anti-forensics
+    - powershell
+    - command-history
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1690
+    - https://attack.mitre.org/detectionstrategies/DET0563
+    - https://attack.mitre.org/techniques/T1059/001
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1690
+  sub_techniques: []
+  detection_strategies:
+    - DET0563
+  analytics:
+    - AN1557
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:PowerShell
+    - WinEventLog:Sysmon
+  data_components:
+    - Command Execution
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may turn off PSReadLine history saving or redirect the history file inside a
+    live PowerShell session so that the commands they run next are never written to disk,
+    obtaining an interactive shell that leaves no durable record for a responder to recover.
+  attacker_behavior:
+    - Runs Set-PSReadLineOption with HistorySaveStyle set to SaveNothing early in a session.
+    - Redirects HistorySavePath to a temporary file, a null device or an unrelated path.
+    - Deletes the existing history file resolved through Get-PSReadLineOption.
+    - Writes the suppression into the PowerShell profile so every future session is silent.
+  legitimate_behavior:
+    - Administrators disable history on hosts where credentials are typed at the prompt.
+    - Configuration management distributes a standard PowerShell profile across the estate.
+    - Users redirect history to a roaming or shared path so it follows them between machines.
+    - Developers trim or clear their own history file while tidying a workstation.
+  risk_indicator:
+    - The option is set inside a live session rather than read from a profile at startup.
+    - The history path is redirected into a temporary or null location instead of a real file.
+    - The existing history file is deleted rather than simply stopped from growing.
+    - The same user has no prior history of touching PSReadLine options on any host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: history-saving-turned-off
+        name: PSReadLine history saving set to save nothing
+        purpose: >-
+          Surface the direct switch that stops the history file receiving any further lines.
+          This is the whole technique in one option, and it produces no error, no warning and
+          no visible change to the shell.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/Set-PSReadLine(Option)?/i
+          | CommandLine=/-HistorySaveStyle\s+SaveNothing/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Managed PowerShell profiles distributed to credential-handling jump hosts"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: history-path-redirected
+        name: History save path pointed away from the default file
+        purpose: >-
+          Catch the quieter variant. Redirection leaves history saving switched on, so a check
+          of the option alone looks healthy, while ConsoleHost_history.txt silently stops
+          receiving lines and the real record lands somewhere the operator will delete.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/Set-PSReadLine(Option)?/i
+          | CommandLine=/-HistorySavePath/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Roaming or redirected profile standards that relocate history to a share"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: history-file-deleted
+        name: Existing history file removed through the PSReadLine option
+        purpose: >-
+          Separate suppression of future records from destruction of past ones. Resolving the
+          path through Get-PSReadLineOption before deleting it is a deliberate anti-forensic
+          step, not something a user does while tidying a machine.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Remove-Item|del\b|erase\b|Clear-Content|\[System\.IO\.File\]::Delete)/i
+          | CommandLine=/(Get-PSReadLineOption|ConsoleHost_history\.txt|PSReadLine\\+ConsoleHost)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=deletions), collect([CommandLine], limit=5)])
+          | sort(deletions, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: suppression-written-into-profile
+        name: History suppression persisted into a PowerShell profile
+        purpose: >-
+          Identify the durable form, where the option is written into a profile so every
+          future session on that host starts with history already off. This outlasts the
+          intrusion and is the version most likely to be mistaken for a local preference.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Add-Content|Set-Content|Out-File|>>|Tee-Object)/i
+          | CommandLine=/(\$PROFILE|Microsoft\.PowerShell_profile\.ps1|profile\.ps1)/i
+          | CommandLine=/(HistorySaveStyle|HistorySavePath|Set-PSReadLine)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=writes), collect([CommandLine], limit=5)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Configuration management agents deploying a standard profile"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+evidence:
+  required:
+    - id: psreadline_history_disabled
+      name: PSReadLine history saving switched off or diverted
+      description: >-
+        A PSReadLine option was set that stops commands being written to the console history
+        file, so interactive activity from this point onwards leaves no durable record on the
+        host.
+      source: process_creation
+      field: CommandLine
+      indicates: defensive_control_degradation
+
+  supporting:
+    - id: history_path_redirected
+      name: History path pointed at a scratch or null location
+      description: >-
+        The save path was moved to a temporary file, a null device or a location the operator
+        controls, which keeps the option looking enabled while the default file stops growing.
+      source: process_creation
+      field: CommandLine
+      indicates: targeted_evidence_destruction
+    - id: history_file_removed
+      name: Existing history file deleted
+      description: >-
+        The history file was removed as well as stopped, which destroys the record of commands
+        already run rather than only preventing new ones.
+      source: process_creation
+      field: FileName
+      indicates: anti_forensic_cleanup
+    - id: suppression_persisted_in_profile
+      name: Suppression written into a PowerShell profile
+      description: >-
+        The option was persisted into a profile so that every future session on the host
+        starts with history saving already disabled.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: persistent_control_degradation
+    - id: unprecedented_for_user
+      name: No prior PSReadLine configuration by this user
+      description: >-
+        This account has not adjusted PSReadLine options anywhere in the estate during the
+        baseline window, so the change is a deviation as well as a suppression.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_user
+
+  contradicting:
+    - id: managed_profile_deployment
+      name: Delivered by a configuration management agent
+      description: >-
+        The option arrived through a deployed PowerShell profile pushed by the management
+        platform rather than being typed into a live session.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_enterprise_activity
+    - id: credential_handling_host
+      name: Host where history is deliberately disabled
+      description: >-
+        The host is a jump box or vault-adjacent system where secrets are typed at the prompt
+        and history suppression is part of the standard build.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: recorded_hardening
+      name: Recorded hardening or privacy change
+      description: >-
+        A change record covers disabling or relocating console history for a documented
+        privacy or compliance reason.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - psreadline_history_disabled
+
+    supporting:
+      any:
+        - history_path_redirected
+        - history_file_removed
+        - suppression_persisted_in_profile
+        - unprecedented_for_user
+      all:
+        - history_file_removed
+        - unprecedented_for_user
+
+    contradicting:
+      any:
+        - managed_profile_deployment
+        - credential_handling_host
+        - recorded_hardening
+      all: []
+
+  verdict:
+    low_risk_when:
+      - psreadline_history_disabled
+      - managed_profile_deployment
+      - credential_handling_host
+      - recorded_hardening
+    suspicious_when:
+      - psreadline_history_disabled
+      - unprecedented_for_user
+    high_risk_when:
+      - psreadline_history_disabled
+      - history_path_redirected
+      - history_file_removed
+      - suppression_persisted_in_profile
+
+  false_positive:
+    - condition: A standard profile disables history on credential-handling hosts.
+      explanation: >-
+        Disabling console history where passwords are pasted at the prompt is a reasonable
+        control and produces the identical option. It arrives from a profile at session start
+        on a defined class of hosts, appears on every one of them, and is not followed by
+        deletion of the existing file.
+    - condition: A user relocates history to a roaming or shared path.
+      explanation: >-
+        Redirecting the save path so history follows the user between machines is a real
+        preference. The destination is a durable per-user location such as a home drive rather
+        than a temporary directory or a null device, and it persists across sessions.
+    - condition: A developer clears their own history file while tidying a workstation.
+      explanation: >-
+        Deleting the file on its own is untidy housekeeping rather than evasion. The
+        discriminator is whether the option was also changed to stop the file being rebuilt,
+        and whether the deletion resolved the path through Get-PSReadLineOption.
+    - condition: Configuration management deploys a new PowerShell profile estate-wide.
+      explanation: >-
+        A profile rollout writes these options to many hosts in a short window under a
+        management agent as the parent process. Adversary use is a single host, inside an
+        interactive session, with a shell or remote-execution channel as the parent.

@@ -1,0 +1,342 @@
+type: detection
+
+id: hg-mac-launch-daemon-installed-to-run-as-root-at-boot-t1543-004
+version: 1.0.0
+
+info:
+  name: Launch daemon installed to run as root at boot
+  description: >-
+    A launch daemon is the same file format as a launch agent and a completely different
+    outcome. It lives in /Library/LaunchDaemons, it loads before anybody logs in, it runs
+    as root, and it keeps running whether or not a session exists. Installing one therefore
+    costs the adversary something — they must already hold administrative rights — and buys
+    them a lot: privilege that survives the user logging out, a process with no window, no
+    dock icon and no session to close, and a restart guarantee if the payload is killed.
+    The install has a mechanical fingerprint that an agent install does not have. launchd
+    refuses to load a daemon plist unless it is owned by root and not group- or
+    world-writable, so a daemon placed by hand is almost always followed by a chown to
+    root:wheel and a chmod, and then a bootstrap into the system domain rather than a gui
+    one. Packages achieve the same ownership inside the payload without ever shelling out,
+    which is what makes those two commands worth watching.
+  severity: critical
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - launchd
+    - root
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1543/004
+    - https://attack.mitre.org/detectionstrategies/DET0401
+    - https://attack.mitre.org/techniques/T1543
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1543
+  sub_techniques:
+    - T1543.004
+  detection_strategies:
+    - DET0401
+  analytics:
+    - AN1126
+  platforms:
+    - macOS
+  data_sources:
+    - "macos:unifiedlog"
+    - "fs:launchdaemons"
+  data_components:
+    - Process Creation
+    - File Modification
+    - Service Creation
+
+hypothesis:
+  statement: >-
+    An adversary holding administrative rights may install a plist in /Library/LaunchDaemons
+    so that launchd starts their payload as root before any user logs in, obtaining
+    persistence that survives logout, needs no session and returns with elevated privilege
+    after every reboot.
+  attacker_behavior:
+    - Writes a plist into /Library/LaunchDaemons using sudo or an already-root process.
+    - Sets the plist ownership to root and tightens its mode so launchd will accept it.
+    - Bootstraps or loads the daemon into the system domain to start it without rebooting.
+    - Names the daemon after an Apple or vendor service so it reads as part of the platform.
+    - Points Program or ProgramArguments at a payload outside any application bundle.
+  legitimate_behavior:
+    - Signed packages install daemons for updaters, VPNs, endpoint agents and drivers.
+    - Management platforms deploy daemon plists as part of the standard build.
+    - Administrators install command-line tooling that ships a background service.
+    - Vendor uninstallers and upgrades unload, rewrite and reload their own daemons.
+  risk_indicator:
+    - The plist is written into /Library/LaunchDaemons from an interactive shell rather than by a package.
+    - Ownership and mode are corrected by hand immediately after the write.
+    - The daemon is bootstrapped into the system domain in the same short window as the write.
+    - A root process started by launchd runs from a home, temporary or removable path.
+    - The daemon label resembles an Apple service but its program path does not.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - SHA256HashData
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: daemon-plist-written-into-the-system-directory
+        name: Plist written into /Library/LaunchDaemons from a command line
+        purpose: >-
+          Surface the install at the point it happens. /System/Library/LaunchDaemons is
+          protected by system integrity protection and is excluded here, so what remains is
+          the writable system daemon directory being populated by a shell, an interpreter or
+          the defaults utility rather than by installer machinery.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\/Library\/LaunchDaemons/i
+          | CommandLine!=/\/System\/Library\/LaunchDaemons/i
+          | CommandLine=/\.plist/i
+          | FileName=/^(defaults|plutil|PlistBuddy|cp|mv|tee|ditto|install|bash|sh|zsh|python3?|osascript|perl|ruby|curl|sudo)$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=writes), collect([CommandLine], limit=5)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Configuration management runs that template daemon plists across the estate"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: daemon-plist-ownership-normalised
+        name: Ownership or mode corrected on a daemon plist
+        purpose: >-
+          launchd will not load a daemon plist that is not owned by root or that is writable
+          by group or others, so an operator who copied a file into place must fix it. A
+          package sets those attributes inside its payload and never calls chown or chmod on
+          this path, which makes this a cheap and specific separator between the two.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(chown|chmod|chflags)$/i
+          | CommandLine=/\/Library\/LaunchDaemons/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Vendor uninstall and repair scripts that reset permissions on their own daemon"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: daemon-bootstrapped-into-the-system-domain
+        name: Daemon loaded into the system domain without a reboot
+        purpose: >-
+          Distinguish a daemon that is merely on disk from one that is running. Bootstrapping
+          into the system domain, rather than a gui domain, is the step that makes this a
+          root service now instead of at next boot, and it is also the clearest statement in
+          the telemetry that the target is system-wide rather than a single session.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^launchctl$/i
+          | CommandLine=/\s(bootstrap|load|enable|kickstart)\s/i
+          | CommandLine=/(system\/|\/Library\/LaunchDaemons)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=registrations), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Vendor upgrade scripts that unload and reload their own service"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: root-daemon-process-from-a-non-vendor-path
+        name: launchd starting a root process from a scratch path
+        purpose: >-
+          Confirm the daemon executed and confirm the privilege outcome that separates this
+          from a launch agent. No vendor ships a root service that lives in a home directory,
+          a temporary path or a mounted volume, so a root child of launchd running from one
+          of those is the payload the plist pointed at.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^launchd$/i
+          | UserName=/^root$/i
+          | ImageFileName=/^\/(Users|tmp|var\/tmp|var\/root|private\/tmp|private\/var\/tmp|Volumes)\//i
+          | groupBy([ComputerName, ImageFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3),
+                              collect([SHA256HashData], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Administrator tooling deliberately installed under /usr/local by change request"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+evidence:
+  required:
+    - id: daemon_plist_written_by_hand
+      name: Daemon plist written into the system directory by hand
+      description: >-
+        A plist was placed into /Library/LaunchDaemons by a shell, an interpreter or the
+        defaults utility, meaning a root-privileged service was registered outside the
+        packaging machinery that normally installs one.
+      source: process_creation
+      field: CommandLine
+      indicates: root_persistence_established
+
+  supporting:
+    - id: ownership_normalised_for_launchd
+      name: Ownership or mode fixed so launchd will accept the plist
+      description: >-
+        chown or chmod was run against the daemon plist path, which is the step a hand
+        install needs and a package install does not, because launchd rejects a daemon plist
+        that is not owned by root and tightly moded.
+      source: process_creation
+      field: FileName
+      indicates: persistence_made_loadable
+    - id: bootstrapped_into_system_domain
+      name: Daemon started in the system domain immediately
+      description: >-
+        launchctl loaded or bootstrapped the daemon into the system domain, so the payload
+        began running as root without waiting for a reboot.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_activated_without_reboot
+    - id: root_payload_executed
+      name: Root process started by launchd from a scratch path
+      description: >-
+        launchd started a root process whose image lives in a home, temporary or removable
+        location, confirming both that the daemon ran and that it ran with full privilege.
+      source: process_creation
+      field: UserName
+      indicates: privileged_execution_confirmed
+    - id: unusual_for_host
+      name: No history of daemon installation on this host
+      description: >-
+        No comparable write into /Library/LaunchDaemons has been seen on this host during
+        the baseline window, so the install is a deviation as well as a privilege event.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: installer_owned_write
+      name: Written by package installer machinery
+      description: >-
+        The plist was placed by installd, a package post-install script or the software
+        update service, which is how a signed package delivers its own root service.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_software_installation
+    - id: approved_management_service
+      name: Daemon belongs to an approved platform service
+      description: >-
+        The daemon label and program path match a management, security or VPN product
+        recorded as deployed to this host as part of the standard build.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_application_component
+    - id: planned_deployment
+      name: Install matches an approved change
+      description: >-
+        A change record covers the installation or upgrade of this service on this host in
+        the same window, which accounts for the manual install path.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_change
+
+  risk_logic:
+    required:
+      - daemon_plist_written_by_hand
+
+    supporting:
+      any:
+        - ownership_normalised_for_launchd
+        - bootstrapped_into_system_domain
+        - root_payload_executed
+        - unusual_for_host
+      all:
+        - ownership_normalised_for_launchd
+        - bootstrapped_into_system_domain
+        - root_payload_executed
+
+    contradicting:
+      any:
+        - installer_owned_write
+        - approved_management_service
+        - planned_deployment
+      all: []
+
+  verdict:
+    low_risk_when:
+      - daemon_plist_written_by_hand
+      - installer_owned_write
+      - approved_management_service
+      - planned_deployment
+    suspicious_when:
+      - daemon_plist_written_by_hand
+      - unusual_for_host
+    high_risk_when:
+      - daemon_plist_written_by_hand
+      - ownership_normalised_for_launchd
+      - bootstrapped_into_system_domain
+      - root_payload_executed
+
+  false_positive:
+    - condition: A signed package installs a background service.
+      explanation: >-
+        Endpoint agents, VPN clients, printer drivers and updaters all install daemons. The
+        plist arrives through installd or a package script, ownership is already correct
+        inside the payload, and the program path points into the product's own install
+        location.
+    - condition: An administrator installs command-line tooling that ships a service.
+      explanation: >-
+        Homebrew and similar tooling do write daemon plists and do call chown and chmod on
+        them, which reproduces the strongest supporting evidence here. The program path
+        points at a package-manager prefix, the same pattern repeats across many packages on
+        that host, and a change record usually exists.
+    - condition: A vendor upgrade unloads and reloads its own daemon.
+      explanation: >-
+        Upgrades rewrite the plist and bootstrap it again, producing writes and launchctl
+        calls together. The label and program path are unchanged from the previous version
+        and the sequence appears on every host running that product.
+    - condition: Provisioning writes daemon plists during first host setup.
+      explanation: >-
+        Build automation installs several services in one burst, often from a script running
+        as root. The activity is concentrated in the provisioning window, covers many
+        products at once, and is identical on every newly built machine.

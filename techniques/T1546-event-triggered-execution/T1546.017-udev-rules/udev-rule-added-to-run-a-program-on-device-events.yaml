@@ -1,0 +1,328 @@
+type: detection
+
+id: hg-lin-udev-rule-added-to-run-a-program-on-device-events-t1546-017
+
+version: 1.0.0
+
+info:
+  name: Udev rule added to run a program on device events
+  description: >-
+    Udev is the kernel device manager, and its rule files decide what happens when a device
+    appears, disappears or is accessed. A rule carrying a RUN+= or IMPORT{program} action
+    executes that program as root, in a subsystem that almost no estate audits and that no
+    autostart, service or timer enumeration will list. The trigger is hardware or
+    pseudo-device activity rather than a login or a schedule, so the payload can be tied to
+    something as mundane as an application reading /dev/random, and systemd-udevd's sandbox
+    is routinely escaped by having the rule detach a background process. The observable is a
+    rule file being written or reloaded outside package management, and the confirmation is
+    a child of systemd-udevd whose image lives outside the small set of helper paths that
+    packaged rules invoke.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - event-triggered-execution
+    - udev
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1546/017
+    - https://attack.mitre.org/detectionstrategies/DET0375
+    - https://attack.mitre.org/techniques/T1546
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1546
+  sub_techniques:
+    - T1546.017
+  detection_strategies:
+    - DET0375
+  analytics:
+    - AN1056
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+    - auditd:CONFIG_CHANGE
+  data_components:
+    - Command Execution
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may add a udev rule whose action key runs a program so that device events
+    execute their payload as root, obtaining persistence that fires on hardware activity and
+    that no service, timer or autostart inventory will reveal.
+  attacker_behavior:
+    - Writes a rule file into /etc/udev/rules.d or another rules directory with a RUN+= action.
+    - Matches on a pseudo-device such as /dev/random so ordinary application activity triggers it.
+    - Detaches the invoked command into the background to escape the systemd-udevd sandbox.
+    - Reloads the rules and triggers events so the persistence takes effect without a reboot.
+    - Prefixes the filename with a low priority digit so the rule is evaluated early.
+  legitimate_behavior:
+    - Packages install udev rules for the hardware and devices they support.
+    - Configuration management deploys rules for storage, network and USB device naming.
+    - Administrators write rules to set permissions or symlinks for lab and appliance hardware.
+    - Driver and container tooling reloads and triggers udev during installation.
+  risk_indicator:
+    - The rule file is written from an interactive shell rather than by a package manager.
+    - The action key invokes a shell, an interpreter or a binary under a writable directory.
+    - The rule is reloaded and triggered immediately after being written.
+    - A child of systemd-udevd executes from a path no packaged rule references.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: udev-rule-file-written
+        name: Rule file written into a udev rules directory
+        purpose: >-
+          Surface rule files arriving outside package management. On a steady-state host the
+          rules directories change only when software is installed, so a shell writing into
+          them is the installation step of the persistence.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\/(etc|run|lib|usr\/lib|usr\/local\/lib)\/udev\/rules\.d\//
+          | CommandLine=/(>>|>\s*\/|tee\b|cp\b|mv\b|install\b|sed\s+-i|cat\s*<<|printf\b|echo\b)/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=writes), collect([CommandLine], limit=5)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of dpkg, rpm, apt, yum, dnf and the configuration-management agent"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: udev-rule-with-an-action-key
+        name: Rule content carrying a RUN or IMPORT action
+        purpose: >-
+          Narrow to the rules that actually execute something. Most udev rules only name,
+          symlink or set permissions on a device; an action key that launches a program is
+          the small subset that can carry a payload at all.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(RUN\s*\+?=|IMPORT\s*\{\s*program\s*\}|PROGRAM\s*=)/
+          | CommandLine=/(udev|\.rules)/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=rules), collect([CommandLine], limit=5)])
+          | sort(rules, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Packaging and driver installers that render rule templates at install time"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: udev-rules-reloaded-and-triggered
+        name: Rules reloaded and events replayed
+        purpose: >-
+          Catch activation. A new rule does nothing until udevd reloads it, so an operator
+          who wants persistence now rather than at the next boot reloads and triggers by
+          hand — a command that installers issue rarely and interactively almost never.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/udevadm\s+(control\s+--reload(-rules)?|trigger)/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=reloads), collect([CommandLine], limit=5)])
+          | sort(reloads, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Driver, container runtime and package installers that reload udev during setup"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - parent_process
+            - organization
+
+      - id: udevd-child-from-an-untrusted-path
+        name: systemd-udevd executing a binary outside the helper paths
+        purpose: >-
+          Confirm the rule fired and show what it runs. Packaged rules invoke helpers under
+          /usr/lib/udev, /lib/udev and the system binary directories, so a udevd child from
+          a temporary, home or hidden path is the planted program running as root.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^systemd-udevd$/i
+          | ImageFileName!=/^\/(usr\/)?(lib|lib64|libexec)\/udev\//
+          | ImageFileName!=/^\/(usr\/)?(bin|sbin)\/[^\/]+$/
+          | groupBy([ComputerName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+evidence:
+  required:
+    - id: udev_rule_installed
+      name: Udev rule written outside package management
+      description: >-
+        Rule content was written into a udev rules directory by a shell or a service account
+        rather than by packaging, so a device event will execute whatever that rule names.
+      source: process_creation
+      field: CommandLine
+      indicates: event_triggered_persistence
+
+  supporting:
+    - id: rule_carries_action_key
+      name: Rule uses RUN, PROGRAM or IMPORT to execute something
+      description: >-
+        The rule contains an action key that launches a program, which distinguishes an
+        executing rule from the naming and permission rules that make up almost all of the
+        rule set.
+      source: process_creation
+      field: CommandLine
+      indicates: execution_capability_configured
+    - id: rules_reloaded_immediately
+      name: Rules reloaded and triggered by hand
+      description: >-
+        udevadm was used to reload the rule set and replay device events, bringing the new
+        rule into effect without waiting for a reboot.
+      source: process_creation
+      field: ImageFileName
+      indicates: persistence_made_operational
+    - id: udevd_untrusted_child
+      name: systemd-udevd started a process from an unexpected path
+      description: >-
+        A child of the device manager executed from outside the packaged udev helper
+        directories, confirming a rule is invoking attacker-supplied content as root.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: execution_chain_progression
+    - id: udev_change_rare_in_fleet
+      name: Rule absent from comparable hosts
+      description: >-
+        The same rule does not appear on peer systems during the baseline window, unlike
+        hardware support rules which land wherever the package or driver is deployed.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: package_installed_rule
+      name: Rule delivered by package management
+      description: >-
+        The rule file was written by dpkg, rpm or a driver installer as part of hardware or
+        device support, which is the ordinary reason a rules directory changes.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: packaged_helper_invoked
+      name: Action key points at a packaged udev helper
+      description: >-
+        The program the rule runs lives under /usr/lib/udev or /lib/udev and belongs to an
+        installed package, which is what device naming, firmware loading and permission
+        helpers look like.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: udev_change_fleetwide
+      name: Same rule across comparable hosts
+      description: >-
+        The identical rule is present on peer systems throughout the baseline window, which
+        is hardware enablement rather than targeted persistence.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - udev_rule_installed
+
+    supporting:
+      any:
+        - rule_carries_action_key
+        - rules_reloaded_immediately
+        - udevd_untrusted_child
+        - udev_change_rare_in_fleet
+      all:
+        - rule_carries_action_key
+        - udevd_untrusted_child
+
+    contradicting:
+      any:
+        - package_installed_rule
+        - packaged_helper_invoked
+        - udev_change_fleetwide
+      all: []
+
+  verdict:
+    low_risk_when:
+      - udev_rule_installed
+      - package_installed_rule
+      - packaged_helper_invoked
+      - udev_change_fleetwide
+    suspicious_when:
+      - udev_rule_installed
+      - udev_change_rare_in_fleet
+    high_risk_when:
+      - udev_rule_installed
+      - rule_carries_action_key
+      - rules_reloaded_immediately
+      - udevd_untrusted_child
+
+  false_positive:
+    - condition: A driver or hardware package installs its own rules.
+      explanation: >-
+        Graphics, storage, printer and peripheral packages ship rule files and reload udev
+        during installation, which reproduces both the write and the reload. The writer is
+        the package manager or its post-install script, and the same rule appears wherever
+        that package is installed.
+    - condition: An administrator writes a rule to set device permissions or a symlink.
+      explanation: >-
+        Lab, appliance and industrial hosts routinely need a rule to give a group access to
+        a serial or USB device. Those rules use OWNER, GROUP, MODE and SYMLINK keys and
+        carry no RUN or PROGRAM action, so the supporting evidence does not fire.
+    - condition: Container and virtualisation tooling reloads udev during setup.
+      explanation: >-
+        Runtimes that expose devices into containers reload and trigger udev as part of
+        installation, which matches the activation case on its own. It arrives alongside the
+        product's installation activity and without a new rule written from a shell.
+    - condition: Configuration management renders a rules file on every agent run.
+      explanation: >-
+        A templated rule rewritten periodically looks like a repeated hand-installed rule.
+        The writer is the management agent, the content is stable, and the same file lands
+        across the fleet in one window.

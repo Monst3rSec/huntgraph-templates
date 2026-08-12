@@ -1,0 +1,326 @@
+type: detection
+
+id: hg-win-domain-trust-added-or-repointed-to-attacker-authority-t1484-002
+
+version: 1.0.0
+
+info:
+  name: Domain trust added or repointed to an attacker-controlled authority
+  description: >-
+    A trust relationship is a standing decision to believe another authority's assertions
+    about who a user is. Adding a trust, changing its direction, or converting a domain from
+    managed to federated moves the decision about identity somewhere the adversary controls,
+    and after that no credential theft is necessary: they issue the assertion and the victim
+    domain honours it. This is the quietest form of persistence in a directory, because
+    everything that follows looks like a normal authentication. On Windows the change is made
+    through netdom, through the directory attributes on a trustedDomain object, or through
+    the federation service, and the tooling for the federation route is publicly packaged.
+    Trust changes are rare and consequential in every estate, which makes volume a poor
+    discriminator and identity a good one: this is directory engineering work performed by a
+    handful of named people from management hosts under change control. The finding is a
+    trust change that does not fit that shape — a new trust from a workstation, an
+    unfamiliar account, or a federation conversion nobody scheduled.
+  severity: critical
+  author: huntgraph
+  tags:
+    - defense-impairment
+    - privilege-escalation
+    - active-directory
+    - domain-trust
+    - federation
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1484/002
+    - https://attack.mitre.org/detectionstrategies/DET0458
+    - https://attack.mitre.org/techniques/T1484
+
+mitre:
+  tactics:
+    - TA0112
+    - TA0004
+  techniques:
+    - T1484
+  sub_techniques:
+    - T1484.002
+  detection_strategies:
+    - DET0458
+  analytics:
+    - AN1259
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may create a domain trust, alter the properties of an existing one, or
+    convert a domain to federated authentication so that an authority they control can
+    assert any identity, giving them access that survives password resets and produces only
+    ordinary authentication events afterwards.
+  attacker_behavior:
+    - Creates a new trust to a domain they control using command-line trust tooling.
+    - Alters the direction, type or attributes of an existing trustedDomain object.
+    - Converts a managed domain to federated and installs their own signing certificate.
+    - Adds or rewrites federation claim rules so any credential maps to a chosen identity.
+  legitimate_behavior:
+    - Mergers and acquisitions create genuine new trusts between directories.
+    - Directory engineers adjust trust attributes such as selective authentication or filtering.
+    - Federation is legitimately configured and its signing certificates rotate on a cycle.
+    - Migration projects create and remove trusts repeatedly over a defined window.
+  risk_indicator:
+    - The trust change is made from a workstation rather than a management host.
+    - The acting account has no history of directory engineering work.
+    - Publicly packaged federation backdoor tooling appears alongside the change.
+    - Claim rules or signing certificates are changed outside a scheduled rotation.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: trust-created-or-altered-from-command-line
+        name: Trust created or altered with trust administration tooling
+        purpose: >-
+          Surface the direct route. Creating a trust from the command line supplies the
+          partner domain and its credentials in the arguments, so the command line names the
+          authority being trusted as well as the act of trusting it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(netdom|ksetup|nltest)\b/i
+          | CommandLine=/(trust.{0,40}\/(add|d(irection)?|realm|passwordt)|\/addkdc|\/setrealm|\/domain_trusts.{0,20}\/v)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Directory administration jump hosts during change-controlled trust work"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: trust-object-attributes-written
+        name: Trust object attributes written through the directory
+        purpose: >-
+          Cover the route that bypasses the trust tooling entirely, where the trustedDomain
+          object and its attributes are written directly. The attribute names are specific
+          enough that referencing them is the intent.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(trustedDomain|trustAttributes|trustDirection|trustPartner|trustType|msDS-TrustForestTrustInfo|securityIdentifier|SeEnableDelegationPrivilege)/i
+          | CommandLine=/(New-ADObject|Set-ADObject|New-ADTrust|Set-ADTrust|ldifde|dsadd|dsmod|adsiedit|System\.DirectoryServices)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=writes), collect([CommandLine], limit=5)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Scheduled migration scripts that maintain trust attributes under change control"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: domain-converted-to-federated
+        name: Domain converted to federated authentication
+        purpose: >-
+          Catch the federation route, where the domain stops validating credentials itself
+          and starts accepting assertions from an external authority. Conversion is a rare,
+          deliberate act and the cmdlets that perform it are unambiguous.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Set-MsolDomainAuthentication|Set-MgDomainFederationConfiguration|New-MgDomainFederationConfiguration|Update-MsolFederatedDomain|Convert-MsolDomainToFederated|Set-AADIntDomainAuthentication|ConvertTo-AADIntBackdoor|New-AADIntBackdoor|AADInternals)/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=conversions), collect([CommandLine], limit=5)])
+          | sort(conversions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Identity engineering hosts during a scheduled federation project"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: federation-claim-rules-or-certificate-changed
+        name: Federation claim rules or signing material changed
+        purpose: >-
+          Confirm the trust was made usable. Converting a domain is only half the work: the
+          claim rules decide which assertions are honoured and the signing certificate
+          decides who can produce them, so a change to either is where the backdoor becomes
+          operational.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Set-AdfsRelyingPartyTrust|Add-AdfsRelyingPartyTrust|Set-AdfsClaimsProviderTrust|IssuanceTransformRules|IssuanceAuthorizationRules|Set-AdfsCertificate|Add-AdfsCertificate|Set-AdfsProperties)/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Scheduled token-signing certificate rotation on the federation servers"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+evidence:
+  required:
+    - id: trust_configuration_changed
+      name: Trust created, repointed or converted
+      description: >-
+        A domain trust was created, its direction, type or attributes were rewritten, or the
+        domain was converted to federated authentication, moving identity decisions to
+        another authority.
+      source: process_creation
+      field: CommandLine
+      indicates: authentication_authority_change
+
+  supporting:
+    - id: federation_backdoor_tooling
+      name: Packaged federation backdoor tooling present
+      description: >-
+        A tool whose purpose is to convert a domain to federated and install an
+        attacker-held signing certificate was executed on the host.
+      source: process_creation
+      field: FileName
+      indicates: identity_backdoor_tool
+    - id: claim_or_certificate_change
+      name: Claim rules or signing material altered
+      description: >-
+        The rules that decide which assertions are honoured, or the certificate that signs
+        them, were changed, which is what makes an altered trust usable for authentication.
+      source: process_creation
+      field: ImageFileName
+      indicates: token_issuance_manipulation
+    - id: workstation_origin
+      name: Change made from a host that does not administer the directory
+      description: >-
+        The change originated on a workstation or ordinary member server rather than on a
+        management host or federation server where this work belongs.
+      source: process_creation
+      field: ComputerName
+      indicates: unexpected_administrative_origin
+    - id: unfamiliar_actor
+      name: Account with no directory engineering history
+      description: >-
+        The acting account has no baseline history of trust or federation administration, so
+        the authority being exercised is new for that identity.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: approved_trust_change
+      name: Change under change control
+      description: >-
+        A change record covers a planned trust creation, attribute adjustment or federation
+        project in this window.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: known_directory_engineer
+      name: Directory engineer acting from a management host
+      description: >-
+        The account belongs to the small set with standing authority over trusts and is
+        working from a recognised administration host.
+      source: identity_context
+      field: UserName
+      indicates: legitimate_administrative_action
+    - id: scheduled_certificate_rotation
+      name: Scheduled signing certificate rotation
+      description: >-
+        The certificate change is part of the federation service's regular rollover, which
+        replaces signing material on a fixed cycle.
+      source: baseline
+      field: CommandLine
+      indicates: routine_maintenance_cycle
+
+  risk_logic:
+    required:
+      - trust_configuration_changed
+
+    supporting:
+      any:
+        - federation_backdoor_tooling
+        - claim_or_certificate_change
+        - workstation_origin
+        - unfamiliar_actor
+      all:
+        - federation_backdoor_tooling
+        - claim_or_certificate_change
+
+    contradicting:
+      any:
+        - approved_trust_change
+        - known_directory_engineer
+        - scheduled_certificate_rotation
+      all: []
+
+  verdict:
+    low_risk_when:
+      - trust_configuration_changed
+      - approved_trust_change
+      - known_directory_engineer
+      - scheduled_certificate_rotation
+    suspicious_when:
+      - trust_configuration_changed
+      - unfamiliar_actor
+    high_risk_when:
+      - trust_configuration_changed
+      - federation_backdoor_tooling
+      - claim_or_certificate_change
+      - workstation_origin
+
+  false_positive:
+    - condition: A merger or acquisition creates a genuine new trust.
+      explanation: >-
+        Corporate integration produces exactly this activity, including trusts to directories
+        the estate has never seen before. It is planned, carries a change record, and is
+        performed by directory engineers from management hosts over a known window.
+    - condition: A directory engineer adjusts trust attributes such as selective authentication.
+      explanation: >-
+        Tightening or loosening an existing trust rewrites the same attributes as repointing
+        one. The distinguishing feature is that the trust partner does not change and the
+        actor has a history of this work.
+    - condition: The federation service rotates its token-signing certificate.
+      explanation: >-
+        Signing certificates roll over on a schedule and the rollover touches the same
+        commands an adversary uses to install their own. Rotation happens on the federation
+        servers themselves, on a predictable cycle, under the service's own account.
+    - condition: A migration project creates and removes trusts repeatedly.
+      explanation: >-
+        Directory consolidation work can produce many trust changes in a short period, which
+        looks like a burst of high-risk activity. The changes are scripted from a known host,
+        the accounts are consistent, and the project window is documented.

@@ -1,0 +1,338 @@
+type: detection
+
+id: hg-mac-login-hook-set-to-run-a-script-as-root-at-logon-t1037-002
+version: 1.0.0
+
+info:
+  name: Login hook set to run a script as root at logon
+  description: >-
+    A login hook is a single key in com.apple.loginwindow.plist naming a script that
+    loginwindow executes as root whenever any user logs in. Apple deprecated it in favour of
+    launchd more than a decade ago, and that is precisely why it is still useful to an
+    adversary: the mechanism still works, but almost nothing in a modern macOS estate looks
+    at it. Persistence review, endpoint tooling and human triage all gravitate to
+    LaunchAgents and LaunchDaemons, so a hook installed here inherits the invisibility of a
+    forgotten interface while delivering root execution on every logon. There is exactly one
+    login hook and one logout hook per system, which shapes the tradecraft in a way worth
+    hunting: an operator who does not want to break an existing hook reads the current value
+    before overwriting it, and that read is a distinctive precursor. The discriminator is
+    that nothing in a current build has any reason to touch this key at all. Legitimate use
+    is confined to old management scripts and hardware that predates the deprecation, so the
+    write itself is the finding rather than a step towards one.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - legacy-mechanism
+    - plist
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1037/002
+    - https://attack.mitre.org/detectionstrategies/DET0244
+    - https://attack.mitre.org/techniques/T1037
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1037
+  sub_techniques:
+    - T1037.002
+  detection_strategies:
+    - DET0244
+  analytics:
+    - AN0682
+  platforms:
+    - macOS
+  data_sources:
+    - "macos:unifiedlog"
+    - "fs:plist"
+  data_components:
+    - Process Creation
+    - File Modification
+
+hypothesis:
+  statement: >-
+    An adversary with administrative rights may set the LoginHook or LogoutHook value in
+    com.apple.loginwindow.plist so that a script of their choosing runs as root at every
+    logon, obtaining privileged persistence through an interface old enough that nothing in
+    the estate inspects it.
+  attacker_behavior:
+    - Sets LoginHook or LogoutHook with the defaults utility against com.apple.loginwindow.
+    - Reads the existing hook value first so an installed one can be chained rather than lost.
+    - Edits com.apple.loginwindow.plist directly with PlistBuddy, an interpreter or a copy.
+    - Stages the hook script in a temporary or shared directory and makes it executable.
+    - Relies on the hook being outside the LaunchAgents and LaunchDaemons paths that get reviewed.
+  legitimate_behavior:
+    - Long-lived management scripts inherited from before the mechanism was deprecated.
+    - Imaging or lab workflows that still mount volumes or set state at each logon.
+    - Administrators reading loginwindow settings while troubleshooting a logon problem.
+    - Removal of an obsolete hook during cleanup or platform migration.
+  risk_indicator:
+    - The hook is written on a host with no history of loginwindow hook configuration.
+    - The referenced script sits in a temporary, shared or hidden directory.
+    - The current hook is read moments before it is overwritten.
+    - loginwindow spawns a shell or interpreter as root at logon.
+    - The write comes from a session that also touched other persistence locations.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: login-hook-value-set-with-defaults
+        name: LoginHook or LogoutHook written to com.apple.loginwindow
+        purpose: >-
+          Catch the canonical install. The defaults utility is the documented way to set this
+          key and the way every published procedure uses, and on a current macOS build there
+          is no supported reason for anything to write it, so the command line naming both
+          the domain and the hook key is the finding.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(defaults|PlistBuddy|plutil)$/i
+          | CommandLine=/(com\.apple\.loginwindow|loginwindow\.plist)/i
+          | CommandLine=/(LoginHook|LogoutHook)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Legacy management scripts known to maintain a logon hook on specific hosts"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: loginwindow-plist-edited-directly
+        name: com.apple.loginwindow.plist rewritten outside the defaults utility
+        purpose: >-
+          Cover the route that avoids the utility everyone watches. The hook can be installed
+          by replacing or editing the plist file itself, in either the system or the root
+          user's preferences directory, which produces no defaults invocation at all but does
+          name the file on a command line.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/Library\/Preferences\/com\.apple\.loginwindow\.plist/i
+          | FileName=/^(cp|mv|tee|sed|ditto|install|python3?|perl|ruby|osascript|bash|sh|zsh|curl)$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=writes), collect([CommandLine], limit=5)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Backup and migration tooling copying preference files wholesale"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: existing-hook-read-before-overwrite
+        name: Current hook value read from loginwindow
+        purpose: >-
+          Surface the precursor that the one-hook-per-system limit forces. An operator who
+          overwrites an existing hook breaks whatever it did and risks being noticed, so the
+          careful ones read the value first in order to chain onto it. A read of this domain
+          is cheap to collect and rare enough to be worth pairing with a later write.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^defaults$/i
+          | CommandLine=/\sread(-type)?\s/i
+          | CommandLine=/com\.apple\.loginwindow/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=reads), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Inventory and compliance scripts that enumerate loginwindow settings on a schedule"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: root-shell-spawned-by-loginwindow
+        name: loginwindow starting a shell or interpreter as root
+        purpose: >-
+          Confirm the hook fired. loginwindow's normal children are session components such
+          as the Dock, Finder and SystemUIServer, and they run as the logging-in user. A
+          shell or interpreter parented by loginwindow and running as root is the hook
+          executing, and it is also the clearest statement of the privilege this technique
+          delivers.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^loginwindow$/i
+          | FileName=/^(sh|bash|zsh|python3?|perl|ruby|osascript|curl|nc)$/i
+          | UserName=/^root$/i
+          | groupBy([ComputerName, FileName, ImageFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+evidence:
+  required:
+    - id: login_hook_value_written
+      name: Login or logout hook configured
+      description: >-
+        The LoginHook or LogoutHook value in com.apple.loginwindow was set, or the plist that
+        holds it was rewritten directly, registering a script that loginwindow will execute
+        as root at the next logon.
+      source: process_creation
+      field: CommandLine
+      indicates: privileged_logon_persistence_established
+
+  supporting:
+    - id: hook_read_before_write
+      name: Existing hook enumerated first
+      description: >-
+        The current hook value was read from the loginwindow domain, which is what an
+        operator does before overwriting the single available slot so that an existing hook
+        can be chained rather than destroyed.
+      source: process_creation
+      field: FileName
+      indicates: preparatory_enumeration
+    - id: hook_executed_as_root
+      name: loginwindow started a root shell at logon
+      description: >-
+        A shell or interpreter running as root was started by loginwindow, which is not part
+        of normal session startup and confirms the configured hook actually ran.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: privileged_execution_confirmed
+    - id: hook_script_in_scratch_path
+      name: Hook script lives outside any managed directory
+      description: >-
+        The executed image sits in a temporary, shared or hidden directory rather than in a
+        management or vendor path, which is where an inherited legacy hook would live.
+      source: process_creation
+      field: ImageFileName
+      indicates: payload_staged_in_writable_path
+    - id: unusual_for_host
+      name: No history of hook configuration on this host
+      description: >-
+        The loginwindow hook keys have not been touched on this host during the baseline
+        window, which matters more here than elsewhere because a deprecated interface should
+        show no activity at all.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: legacy_management_script
+      name: Written by an inherited management script
+      description: >-
+        The write comes from a management agent or long-standing administrative script that
+        has maintained this hook on this host since before the mechanism was deprecated.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: known_estate_hook
+      name: Hook is a recorded estate standard
+      description: >-
+        The configured script path matches a hook documented for this host class, so the
+        value is a maintained legacy setting rather than a new one.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: hook_removal_change
+      name: Change record covers hook removal or migration
+      description: >-
+        An approved change covers clearing or migrating the logon hook on this host in the
+        same window, which accounts for the key being written.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_change
+
+  risk_logic:
+    required:
+      - login_hook_value_written
+
+    supporting:
+      any:
+        - hook_read_before_write
+        - hook_executed_as_root
+        - hook_script_in_scratch_path
+        - unusual_for_host
+      all:
+        - hook_executed_as_root
+        - hook_script_in_scratch_path
+
+    contradicting:
+      any:
+        - legacy_management_script
+        - known_estate_hook
+        - hook_removal_change
+      all: []
+
+  verdict:
+    low_risk_when:
+      - login_hook_value_written
+      - legacy_management_script
+      - known_estate_hook
+      - hook_removal_change
+    suspicious_when:
+      - login_hook_value_written
+      - unusual_for_host
+    high_risk_when:
+      - login_hook_value_written
+      - hook_read_before_write
+      - hook_executed_as_root
+      - hook_script_in_scratch_path
+
+  false_positive:
+    - condition: An inherited management script still maintains a logon hook.
+      explanation: >-
+        Estates that predate the deprecation sometimes still ship a hook for volume mounts or
+        printer setup. It is written by the same management agent on every enrolment, points
+        at a script inside a management directory, and has a long baseline history on the
+        host.
+    - condition: An administrator inspects loginwindow settings while troubleshooting.
+      explanation: >-
+        Reading the domain is harmless on its own, which is why the read is only supporting
+        evidence. Without a subsequent write to the hook key there is no persistence, and
+        troubleshooting reads usually cover several unrelated loginwindow values.
+    - condition: Cleanup or migration clears an obsolete hook.
+      explanation: >-
+        Removing a hook writes the same key as installing one. The distinguishing detail is
+        the value: a removal deletes the key or empties it rather than naming a script, and
+        no root shell appears under loginwindow afterwards.
+    - condition: Backup or migration tooling copies preference files wholesale.
+      explanation: >-
+        Restoring a user or system preferences directory can overwrite
+        com.apple.loginwindow.plist as one file among hundreds. The write appears inside a
+        bulk copy of many preference files rather than as a targeted edit of one.

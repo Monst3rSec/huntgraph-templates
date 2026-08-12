@@ -1,0 +1,329 @@
+type: detection
+
+id: hg-lin-rc-script-modified-to-run-a-payload-at-boot-t1037-004
+
+version: 1.0.0
+
+info:
+  name: RC script modified to run a payload at boot
+  description: >-
+    The rc scripts are a backwards-compatibility path that most modern Linux estates keep
+    enabled and nobody reads. A single line appended to /etc/rc.local, or a script dropped
+    into /etc/init.d or /etc/rc.d, is executed as root by the compatibility unit on every
+    boot, with no service definition, no timer and no autostart entry to enumerate. It is
+    quiet precisely because the mechanism is deprecated: configuration reviews look at
+    systemd units, and rc.local is often an empty stub that has not been touched since the
+    image was built. The observable is that stub being written to, or an init script
+    appearing outside package management, and the discriminator is the writer — packaging
+    and configuration management own these paths, so a redirect from an interactive shell
+    or a service account is the finding.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - boot-initialization
+    - rc-scripts
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1037/004
+    - https://attack.mitre.org/detectionstrategies/DET0237
+    - https://attack.mitre.org/techniques/T1037
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1037
+  sub_techniques:
+    - T1037.004
+  detection_strategies:
+    - DET0237
+  analytics:
+    - AN0658
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+    - linux:syslog
+  data_components:
+    - Process Creation
+    - Script Execution
+
+hypothesis:
+  statement: >-
+    An adversary may append a command to an rc script or drop a new init script so that the
+    boot compatibility path executes it as root on every restart, obtaining privileged
+    persistence in a subsystem that modern configuration reviews no longer inspect.
+  attacker_behavior:
+    - Appends a payload invocation to /etc/rc.local using a redirect, tee or sed.
+    - Drops a new script into /etc/init.d, /etc/rc.d or /etc/rc.local.d and marks it executable.
+    - Points the added line at a binary under a temporary or hidden directory.
+    - Restores the file's original timestamp so the change does not stand out in a listing.
+  legitimate_behavior:
+    - Package installation writes init scripts for software that still ships sysvinit support.
+    - Configuration management deploys a governed rc.local across a fleet.
+    - Administrators add a legacy tuning or mount command to rc.local during host build.
+    - Appliance and image build tooling writes rc scripts as part of first-boot setup.
+  risk_indicator:
+    - The rc script is written by an interactive shell or a service account rather than packaging.
+    - The added command references a temporary directory or retrieves content over the network.
+    - The script is made executable in the same activity as it is written.
+    - The change is present on one host and absent from comparable systems.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: rc-script-written
+        name: Script written into an rc or init directory
+        purpose: >-
+          Surface the arrival of boot-time script content in the compatibility paths, which
+          on a steady-state host is a rare event and the point at which the persistence is
+          actually installed.
+        query: |
+          #event_simpleName=NewScriptWritten
+          | TargetFileName=/^\/etc\/(rc\.local(\.d\/.*)?|rc\.common|rc\.sysinit|init\.d\/[^\/]+|rc[0-9S]\.d\/[^\/]+|rc\.d\/(rc\.local|init\.d\/[^\/]+))$/
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of the package manager and the configuration-management agent"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: rc-local-appended-from-a-shell
+        name: rc.local appended to from a command line
+        purpose: >-
+          Separate the writer from the write. Packaging replaces these files wholesale,
+          whereas an operator installing persistence appends to them with a redirect, tee
+          or in-place edit from whatever shell they already have.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\/etc\/(rc\.local|rc\.common|rc\.sysinit|init\.d\/|rc\.d\/|rc\.local\.d\/)/
+          | CommandLine=/(>>|>\s*\/etc|tee\b|sed\s+-i|ed\s|printf\b|echo\b|cp\b|mv\b|install\b)/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=edits), collect([CommandLine], limit=5)])
+          | sort(edits, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of dpkg, rpm, apt, yum, dnf and the configuration-management agent"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: rc-edit-carrying-a-payload
+        name: rc script edit embedding a fetch or a temporary path
+        purpose: >-
+          Isolate the edits whose content cannot be explained as legacy tuning: a boot line
+          that retrieves remote content or executes from a world-writable directory is
+          persistence, not a mount or a sysctl.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\/etc\/(rc\.local|rc\.common|init\.d\/|rc\.d\/|rc\.local\.d\/)/
+          | CommandLine=/(curl|wget|nc\b|ncat|base64|python[0-9.]*|perl|\/tmp\/|\/dev\/shm\/|\/var\/tmp\/|\/\.[a-z0-9_-]+\/)/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=edits), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: rc-script-spawned-a-child
+        name: Process started by an rc script from a writable path
+        purpose: >-
+          Confirm the persistence took effect. A process whose parent is an rc or init
+          script and whose image sits in a temporary, home or hidden directory is the
+          planted payload running as root at boot.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(rc\.local|rc\.common|rc\.sysinit|rc|S[0-9]{2}[a-z0-9_.-]+)$/i
+          | ImageFileName=/^\/(tmp|var\/tmp|dev\/shm|home|root|opt\/\.[^\/]+)\//
+          | groupBy([ComputerName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+evidence:
+  required:
+    - id: rc_script_modified
+      name: RC or init script created or rewritten
+      description: >-
+        Boot-time script content was written into /etc/rc.local, /etc/rc.local.d,
+        /etc/init.d or an rc run-level directory, so its contents will execute as root on
+        the next restart.
+      source: file_creation
+      field: TargetFileName
+      indicates: boot_persistence_installed
+
+  supporting:
+    - id: shell_written_edit
+      name: Change made from a command line rather than packaging
+      description: >-
+        The rc script was appended to or edited in place from an interactive shell or a
+        service account, which is how an operator installs a boot line and not how software
+        is deployed.
+      source: process_creation
+      field: CommandLine
+      indicates: abnormal_execution_chain
+    - id: payload_reference_in_edit
+      name: Added line fetches content or runs from a writable path
+      description: >-
+        The edit references a network retrieval utility or a payload under /tmp, /var/tmp,
+        /dev/shm or a hidden directory, none of which legacy boot tuning requires.
+      source: process_creation
+      field: CommandLine
+      indicates: possible_payload_retrieval
+    - id: rc_spawned_untrusted_child
+      name: RC script executed a binary from a writable directory
+      description: >-
+        A process parented by an rc or init script started from a temporary, home or hidden
+        path, confirming the boot line runs and what it runs.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: execution_chain_progression
+    - id: rc_change_rare_in_fleet
+      name: Change absent from comparable hosts
+      description: >-
+        The same rc script write does not appear on peer systems during the baseline
+        window, unlike governed boot configuration which lands fleet-wide.
+      source: baseline
+      field: TargetFileName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: package_installed_init_script
+      name: Written by package management
+      description: >-
+        The init script was placed by the package manager while installing software that
+        still ships sysvinit compatibility, which is the ordinary reason these files change.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_enterprise_activity
+    - id: config_management_rc
+      name: Deployed by configuration management
+      description: >-
+        The rc script content was written by the approved configuration-management agent as
+        part of a governed host definition.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: software_deployment_wave
+    - id: rc_change_fleetwide
+      name: Identical change across comparable hosts
+      description: >-
+        The same rc script content is present on peer systems throughout the baseline
+        window, which is a build standard rather than targeted persistence.
+      source: baseline
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - rc_script_modified
+
+    supporting:
+      any:
+        - shell_written_edit
+        - payload_reference_in_edit
+        - rc_spawned_untrusted_child
+        - rc_change_rare_in_fleet
+      all:
+        - shell_written_edit
+        - payload_reference_in_edit
+
+    contradicting:
+      any:
+        - package_installed_init_script
+        - config_management_rc
+        - rc_change_fleetwide
+      all: []
+
+  verdict:
+    low_risk_when:
+      - rc_script_modified
+      - package_installed_init_script
+      - config_management_rc
+      - rc_change_fleetwide
+    suspicious_when:
+      - rc_script_modified
+      - shell_written_edit
+    high_risk_when:
+      - rc_script_modified
+      - shell_written_edit
+      - payload_reference_in_edit
+      - rc_spawned_untrusted_child
+
+  false_positive:
+    - condition: A package installs an init script for legacy service support.
+      explanation: >-
+        Software that still ships sysvinit compatibility drops files into /etc/init.d at
+        install time, which reproduces the required evidence exactly. The writing process is
+        dpkg or rpm, the file matches the package payload, and it appears on every host
+        where that package is deployed.
+    - condition: An administrator adds a mount, sysctl or tuning command to rc.local.
+      explanation: >-
+        rc.local remains the pragmatic place to put a one-off boot command on hosts that
+        have not been fully converted to systemd units. The command references system paths
+        and system utilities rather than a retrieval tool or a temporary directory.
+    - condition: Configuration management renders rc.local from a template.
+      explanation: >-
+        A governed rc.local rewritten on every agent run looks identical to a targeted edit
+        at the file level. The writer is the management agent and the same content lands
+        across the fleet in one window.
+    - condition: Image build tooling writes first-boot scripts.
+      explanation: >-
+        Appliance and golden-image pipelines populate rc scripts during provisioning. This
+        happens before the host enters service and produces identical files on every machine
+        built from that image.

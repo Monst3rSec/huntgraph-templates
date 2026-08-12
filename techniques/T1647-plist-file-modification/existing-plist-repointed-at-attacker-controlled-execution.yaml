@@ -1,0 +1,341 @@
+type: detection
+
+id: hg-mac-existing-plist-repointed-at-attacker-controlled-execution-t1647
+version: 1.0.0
+
+info:
+  name: Existing plist repointed at attacker-controlled execution
+  description: >-
+    Every hunt for macOS persistence starts by looking for a new plist appearing somewhere
+    it should not. This is the answer to that hunt. Instead of creating a file that has no
+    history, no owner and no reason to exist, the adversary edits one that is already there
+    and already trusted — changing the Program or ProgramArguments of an agent a real vendor
+    installed, or setting keys in an application's Info.plist so the app runs invisibly or
+    loads a library it did not ship with. The persistence entry is not new, so an inventory
+    of launchd items looks unchanged; the file's label, path and surrounding metadata all
+    still belong to the legitimate product. What changed is one value inside it. The
+    observable is therefore not the existence of a plist but the act of editing one, and the
+    discriminator is ownership: a plist is normally written only by the installer that
+    delivered it or by the application that owns it. plutil, PlistBuddy or defaults reaching
+    into a file some other product owns is the thing worth surfacing, and an Info.plist
+    inside an installed bundle being edited by anything other than installer machinery is
+    the sharpest version of it, because a modified bundle also breaks the signature the
+    system checked at install time.
+  severity: high
+  author: huntgraph
+  tags:
+    - defense-impairment
+    - plist
+    - configuration-tampering
+    - persistence-hijack
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1647
+    - https://attack.mitre.org/detectionstrategies/DET0109
+    - https://attack.mitre.org/techniques/T1543/001
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1647
+  sub_techniques: []
+  detection_strategies:
+    - DET0109
+  analytics:
+    - AN0306
+  platforms:
+    - macOS
+  data_sources:
+    - "macos:unifiedlog"
+  data_components:
+    - Command Execution
+    - File Modification
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may edit a plist that already exists and is already trusted, rather than
+    creating a new one, so that a legitimate launchd entry or application bundle carries
+    their execution instead, obtaining persistence and evasion that survive an inventory of
+    what is installed because nothing new was installed.
+  attacker_behavior:
+    - Replaces the Program or ProgramArguments value in an agent or daemon plist a vendor owns.
+    - Uses plutil -replace or PlistBuddy Set to change one key while leaving the file intact.
+    - Sets LSUIElement or LSBackgroundOnly so an application runs with no dock icon or window.
+    - Inserts LSEnvironment keys so a bundled application loads a library of their choosing.
+    - Edits Info.plist inside an installed bundle from a shell rather than through the installer.
+  legitimate_behavior:
+    - Installers and updaters rewrite their own plists during install and upgrade.
+    - Management platforms set application and system preferences with the defaults utility.
+    - Developers edit Info.plist in projects and build output as a normal part of building.
+    - Users change application preferences, which the application writes to its own plist.
+  risk_indicator:
+    - The editing process is not the installer or the application that owns the file.
+    - The changed key controls execution or visibility rather than a user preference.
+    - The edit targets an Info.plist inside an installed application bundle.
+    - A single key in a long-standing launchd plist changes without the package version changing.
+    - The same session touched several plists belonging to different products.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: existing-plist-key-replaced-in-place
+        name: plutil replacing or inserting a key in an existing plist
+        purpose: >-
+          Surface in-place edits specifically. The replace, insert and remove verbs only make
+          sense against a file that already exists, which is exactly the distinction this
+          technique turns on — a create would use a different mechanism entirely, and a
+          conversion between formats uses a different verb.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^plutil$/i
+          | CommandLine=/\s-(replace|insert|remove)\s/i
+          | CommandLine=/\.plist/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=edits), collect([CommandLine], limit=5)])
+          | sort(edits, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Build tooling on developer hosts that stamps versions into project plists"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: launchd-execution-keys-rewritten
+        name: Program or ProgramArguments changed in a launchd plist
+        purpose: >-
+          Catch the hijack of an existing persistence entry, which is the highest-value form
+          of this technique. The entry keeps its vendor label and path, so an inventory of
+          launchd items shows nothing added, while the value that decides what actually runs
+          has been replaced.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(plutil|PlistBuddy|defaults)$/i
+          | CommandLine=/(ProgramArguments|Program\s|RunAtLoad|KeepAlive|WatchPaths|StartInterval)/i
+          | CommandLine=/(Library\/Launch(Agents|Daemons)|\.plist)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=edits), collect([CommandLine], limit=5)])
+          | sort(edits, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Vendor upgrade scripts rewriting the plist of their own service"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: visibility-and-loader-keys-inserted
+        name: Evasion keys written into an application plist
+        purpose: >-
+          Cover the defence-impairment half of the technique. LSUIElement and LSBackgroundOnly
+          remove an application from the dock and the window list, and LSEnvironment lets a
+          bundle carry loader variables, so these keys change what a user and an analyst can
+          see rather than what the program does.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(LSUIElement|LSBackgroundOnly|LSEnvironment|DYLD_INSERT_LIBRARIES|CFBundleIdentifier|CFBundleDisplayName)/i
+          | CommandLine=/\.plist/i
+          | FileName=/^(plutil|PlistBuddy|defaults|python3?|perl|ruby|sed|osascript|bash|sh|zsh)$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=edits), collect([CommandLine], limit=5)])
+          | sort(edits, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Developer builds that set bundle identifiers and display names during packaging"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: bundle-info-plist-edited-outside-an-installer
+        name: Info.plist inside an installed bundle edited by a non-installer
+        purpose: >-
+          Name the ownership violation directly. An Info.plist inside an application bundle is
+          written by the packaging that delivered it and by nothing else afterwards, so an
+          edit whose parent is not installer machinery is both a tampered bundle and a broken
+          signature.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\.app\/Contents\/Info\.plist/i
+          | ParentBaseFileName!=/^(installd|package_script_service|Installer|softwareupdated|appstoreagent|Xcode|xcodebuild)$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=edits), collect([CommandLine], limit=5)])
+          | sort(edits, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Repackaging and notarisation workflows on build hosts"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+evidence:
+  required:
+    - id: existing_plist_edited_in_place
+      name: Existing plist edited rather than created
+      description: >-
+        A plist utility was invoked with a verb that only applies to a file that already
+        exists, changing one value inside a configuration file that the system and any
+        inventory already consider legitimate.
+      source: process_creation
+      field: CommandLine
+      indicates: trusted_configuration_modified
+
+  supporting:
+    - id: execution_keys_changed
+      name: Keys that decide what runs were the target
+      description: >-
+        The edited keys control execution or scheduling rather than a user preference, so the
+        change repoints an existing launchd entry at different code.
+      source: process_creation
+      field: FileName
+      indicates: persistence_hijacked
+    - id: visibility_keys_changed
+      name: Keys that control visibility or library loading were set
+      description: >-
+        Values such as LSUIElement, LSBackgroundOnly or LSEnvironment were written, which hide
+        a running application or influence what it loads at launch.
+      source: process_creation
+      field: ImageFileName
+      indicates: defence_impairment
+    - id: edited_outside_owning_installer
+      name: Editor is not the installer that owns the file
+      description: >-
+        The parent of the edit is a shell or interpreter rather than installer machinery or
+        the application itself, which is the ownership violation that separates tampering
+        from maintenance.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: unusual_for_host
+      name: No history of plist editing on this host
+      description: >-
+        Plist utilities have not been used against these paths on this host during the
+        baseline window, so the edit is a deviation as well as a modification.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: installer_maintenance
+      name: Edit performed by installer machinery
+      description: >-
+        The parent is installd, a package script or the software update service, which is how
+        a product rewrites its own plists during install or upgrade.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_software_installation
+    - id: managed_preference_push
+      name: Managed preference applied by policy
+      description: >-
+        The value was written by the management platform as part of a configuration profile or
+        preference baseline applied across the estate.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: developer_build_activity
+      name: Edit is part of building software
+      description: >-
+        The host is a development or build machine and the edited plist sits in a project or
+        build output tree rather than in an installed bundle or launchd directory.
+      source: asset_inventory
+      field: ComputerName
+      indicates: development_activity
+
+  risk_logic:
+    required:
+      - existing_plist_edited_in_place
+
+    supporting:
+      any:
+        - execution_keys_changed
+        - visibility_keys_changed
+        - edited_outside_owning_installer
+        - unusual_for_host
+      all:
+        - execution_keys_changed
+        - edited_outside_owning_installer
+
+    contradicting:
+      any:
+        - installer_maintenance
+        - managed_preference_push
+        - developer_build_activity
+      all: []
+
+  verdict:
+    low_risk_when:
+      - existing_plist_edited_in_place
+      - installer_maintenance
+      - managed_preference_push
+      - developer_build_activity
+    suspicious_when:
+      - existing_plist_edited_in_place
+      - unusual_for_host
+    high_risk_when:
+      - existing_plist_edited_in_place
+      - execution_keys_changed
+      - visibility_keys_changed
+      - edited_outside_owning_installer
+
+  false_positive:
+    - condition: An updater rewrites its own launchd plist during an upgrade.
+      explanation: >-
+        Products do change their own Program and ProgramArguments values between versions,
+        which reproduces the strongest supporting evidence here. The edit runs under installer
+        machinery, the new path stays inside the product's own directory, and the same change
+        appears on every host running that version.
+    - condition: A management platform pushes application preferences.
+      explanation: >-
+        Configuration profiles and preference baselines write plist values across the estate
+        using the defaults utility. The keys are user-facing preferences rather than execution
+        or visibility keys, and the same write lands on many hosts in one window.
+    - condition: Developers edit Info.plist while building an application.
+      explanation: >-
+        Build scripts stamp versions, bundle identifiers and display names into plists
+        constantly. The files live in a project or build output tree rather than inside an
+        installed bundle, and the activity is continuous rather than a single edit.
+    - condition: A user changes a setting and the application saves it.
+      explanation: >-
+        Applications write their own preference plists whenever a setting changes. The writing
+        process is the application binary rather than a plist utility invoked from a shell, so
+        the required evidence does not fire at all.

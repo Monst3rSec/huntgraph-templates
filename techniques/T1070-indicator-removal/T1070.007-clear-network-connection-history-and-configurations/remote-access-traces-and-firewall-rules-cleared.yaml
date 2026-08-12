@@ -1,0 +1,361 @@
+type: detection
+
+id: hg-win-remote-access-traces-and-firewall-rules-cleared-t1070-007
+
+version: 1.0.0
+
+info:
+  name: Remote access traces and firewall rules cleared together
+  description: >-
+    Almost everything an adversary does across the network leaves a record on the client
+    side rather than only on the wire: the RDP client keeps the servers it connected to in
+    the user's hive and caches bitmaps of the sessions, the SSH and PuTTY clients keep host
+    keys for every endpoint they trusted, the ARP and NetBIOS caches hold the addresses that
+    were actually spoken to, and any firewall rule opened to let a tool through stays behind
+    as a named object. Each of those can be removed with one short command, and each removal
+    on its own has an ordinary explanation - a helpdesk engineer flushing a stale ARP entry,
+    a user clearing a saved connection, an installer tidying its own firewall rule. What has
+    no ordinary explanation is several of them in the same session by the same account: the
+    categories are unrelated to each other operationally, and only someone reconstructing
+    what a defender would look at has a reason to touch all of them. The discriminator is
+    therefore breadth in one window, not any single deletion.
+  severity: medium
+  author: huntgraph
+  tags:
+    - stealth
+    - anti-forensics
+    - indicator-removal
+    - network-history
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1070/007
+    - https://attack.mitre.org/detectionstrategies/DET0049
+    - https://attack.mitre.org/techniques/T1070
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1070
+  sub_techniques:
+    - T1070.007
+  detection_strategies:
+    - DET0049
+  analytics:
+    - AN0133
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - EDR:cli
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+    - Command Execution
+    - Firewall Rule Modification
+
+hypothesis:
+  statement: >-
+    An adversary may delete the client-side records of the network connections they made and
+    remove the firewall rules they opened, so that the hosts they reached, the credentials
+    they trusted and the ports they used cannot be reconstructed from the machine they
+    operated from.
+  attacker_behavior:
+    - Deletes the RDP server list and default connection file from the user's profile.
+    - Removes the RDP bitmap cache so session contents cannot be recovered.
+    - Flushes the ARP, NetBIOS and DNS caches that hold the addresses actually contacted.
+    - Deletes named firewall rules that were added to let a tool or listener through.
+    - Removes SSH known_hosts entries or PuTTY host key values for the systems reached.
+  legitimate_behavior:
+    - Helpdesk staff flush ARP and DNS caches while diagnosing connectivity faults.
+    - Users clear saved RDP connections after a server is decommissioned.
+    - Installers and uninstallers add and remove their own firewall rules.
+    - Build and imaging scripts reset network caches before capturing a machine image.
+    - Administrators prune stale host key entries after a server is rebuilt.
+  risk_indicator:
+    - Several unrelated categories of network record are cleared in one short window.
+    - The RDP server list or bitmap cache is deleted rather than a single stale entry.
+    - A firewall rule is deleted by a shell rather than by the uninstaller that created it.
+    - The commands are issued by a script host or a remote execution channel.
+    - The account has no history of running network maintenance on this host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: rdp-connection-history-removed
+        name: RDP server list, default profile or bitmap cache deleted
+        purpose: >-
+          Surface removal of the artefacts that name which servers this machine connected to
+          over RDP. The server list and the bitmap cache are the two records an investigator
+          uses to rebuild lateral movement from a jump point, and neither is cleared by any
+          routine maintenance.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Terminal Server Client|Default\.rdp)/i
+          | CommandLine=/(reg(\.exe)?\s+delete|del\s|erase\s|Remove-Item|rd\s+\/s|rmdir\s+\/s|Remove-ItemProperty)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=removals), collect([CommandLine], limit=5)])
+          | sort(removals, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Profile cleanup tooling that resets user hives on shared or kiosk hosts"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: network-caches-flushed
+        name: ARP, NetBIOS and DNS caches flushed
+        purpose: >-
+          Catch removal of the volatile records that hold the addresses this host actually
+          spoke to. Individually these are ordinary troubleshooting commands, so the value
+          here is establishing that the cleanup touched network state as well as saved
+          history, and identifying who issued it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(arp(\.exe)?\s+-d|netsh(\.exe)?\s+interface\s+ip\s+delete\s+arpcache|nbtstat(\.exe)?\s+-R|ipconfig(\.exe)?\s+\/flushdns|Clear-DnsClientCache|Remove-NetNeighbor)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=flushes), collect([CommandLine], limit=5)])
+          | sort(flushes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Network diagnostic scripts run by the service desk against reported faults"
+            - "Image capture and sysprep sequences that reset network state"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: firewall-rule-deleted-by-a-shell
+        name: Named firewall rule removed outside an installer
+        purpose: >-
+          Isolate deletion of the firewall rules an adversary opens to let a listener or a
+          tool through. Products create and remove their own rules through their installer,
+          so the writer matters more than the deletion: a rule removed from a command shell
+          or script host is a cleanup step rather than a package operation.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(netsh(\.exe)?\s+(advfirewall\s+)?firewall\s+delete\s+rule|Remove-NetFirewallRule|Set-NetFirewallProfile.*-Enabled\s+False)/i
+          | ParentBaseFileName!=/^(msiexec\.exe|trustedinstaller\.exe|setup\.exe|ccmexec\.exe)$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=deletions), collect([CommandLine], limit=5)])
+          | sort(deletions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Software deployment platforms that install and remove rules on the estate"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: several-network-record-types-cleared-together
+        name: Unrelated categories of network record cleared in one session
+        purpose: >-
+          This is the discriminator for the whole hypothesis. Tag each command by the kind of
+          record it destroys and collapse them per host and account, so that a session which
+          removed saved RDP history, flushed caches, deleted a firewall rule and pruned host
+          keys stands out from the many sessions that did exactly one of those for a reason.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(Terminal Server Client|Default\.rdp)/i
+                | record := "rdp_history" ;
+              CommandLine=/(arp(\.exe)?\s+-d|nbtstat(\.exe)?\s+-R|ipconfig(\.exe)?\s+\/flushdns|Clear-DnsClientCache|Remove-NetNeighbor)/i
+                | record := "network_cache" ;
+              CommandLine=/(netsh(\.exe)?\s+(advfirewall\s+)?firewall\s+delete\s+rule|Remove-NetFirewallRule)/i
+                | record := "firewall_rule" ;
+              CommandLine=/(known_hosts|SshHostKeys|PuTTY\\+Sessions)/i
+                | record := "host_key_record" ;
+            }
+          | record=/.+/
+          | groupBy([ComputerName, UserName],
+                    function=[count(as=actions), collect([record, CommandLine], limit=12)])
+          | actions>=2
+          | sort(actions, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Scheduled housekeeping scripts that run the same set on every host nightly"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+evidence:
+  required:
+    - id: network_record_cleared
+      name: A client-side record of network activity was destroyed
+      description: >-
+        A command removed saved RDP connection history, a cached network record, a stored
+        host key or a firewall rule, destroying evidence of which systems this host reached
+        and on which ports.
+      source: process_creation
+      field: CommandLine
+      indicates: indicator_removal
+
+  supporting:
+    - id: multiple_record_types
+      name: Several unrelated record types cleared in one window
+      description: >-
+        More than one category of network record was destroyed by the same account on the
+        same host in a short window. The categories have no shared operational reason to be
+        touched together, which is what raises this above routine maintenance.
+      source: process_creation
+      field: UserName
+      indicates: coordinated_cleanup_sequence
+    - id: rdp_history_targeted
+      name: RDP server list or bitmap cache removed
+      description: >-
+        The cleanup reached the artefacts that name which servers were connected to and
+        cache what was displayed during those sessions, which is the record most directly
+        used to reconstruct movement from a jump host.
+      source: process_creation
+      field: CommandLine
+      indicates: remote_access_trace_removal
+    - id: firewall_rule_removed_by_shell
+      name: Firewall rule deleted from a shell rather than an installer
+      description: >-
+        A named firewall rule was removed by a command shell or script host instead of by
+        the package that created it, which is the pattern left by an adversary closing an
+        opening they made themselves.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: interpreter_issued_cleanup
+      name: Cleanup issued through a script host or remote channel
+      description: >-
+        The commands came from an interpreter or a remote execution channel rather than an
+        interactive administrative shell or a management agent.
+      source: process_creation
+      field: ImageFileName
+      indicates: remote_operator_activity
+    - id: no_cleanup_history_here
+      name: No history of network cleanup on this host or account
+      description: >-
+        Neither the host nor the account has run these commands during the baseline window,
+        so the activity is a deviation as well as a destruction of evidence.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: recorded_network_fault
+      name: Recorded connectivity fault or maintenance
+      description: >-
+        A ticket or change record covers connectivity troubleshooting or a server rebuild on
+        this host in the same window, which explains cache flushes and stale entry removal.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: package_managed_rule
+      name: Firewall rule removed as part of a package operation
+      description: >-
+        The rule deletion was performed by an installer, uninstaller or the deployment agent
+        as part of removing the product that created the rule.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: fleetwide_housekeeping
+      name: Identical commands across many hosts
+      description: >-
+        The same command lines appear on a large share of the estate inside one window,
+        which is a scheduled housekeeping or imaging job rather than a targeted cleanup.
+      source: baseline
+      field: CommandLine
+      indicates: scheduled_maintenance_wave
+
+  risk_logic:
+    required:
+      - network_record_cleared
+
+    supporting:
+      any:
+        - multiple_record_types
+        - rdp_history_targeted
+        - firewall_rule_removed_by_shell
+        - interpreter_issued_cleanup
+        - no_cleanup_history_here
+      all:
+        - multiple_record_types
+        - interpreter_issued_cleanup
+
+    contradicting:
+      any:
+        - recorded_network_fault
+        - package_managed_rule
+        - fleetwide_housekeeping
+      all: []
+
+  verdict:
+    low_risk_when:
+      - network_record_cleared
+      - recorded_network_fault
+      - package_managed_rule
+      - fleetwide_housekeeping
+    suspicious_when:
+      - network_record_cleared
+      - no_cleanup_history_here
+    high_risk_when:
+      - network_record_cleared
+      - multiple_record_types
+      - rdp_history_targeted
+      - firewall_rule_removed_by_shell
+      - interpreter_issued_cleanup
+
+  false_positive:
+    - condition: A service desk engineer flushes ARP and DNS caches to fix connectivity.
+      explanation: >-
+        This is the standard first step for a reported network fault and produces exactly the
+        commands in the cache case. It arrives alone, from an interactive session, and there
+        is usually a ticket covering the same host at the same time.
+    - condition: An uninstaller removes the firewall rule it created at install time.
+      explanation: >-
+        Products that open a port clean up after themselves during removal. The deletion is
+        parented by the installer or the deployment agent rather than a shell, and it names
+        the rule the same product created.
+    - condition: A user clears saved RDP connections after a server is retired.
+      explanation: >-
+        People do prune the server list, but they do it through the client or by removing one
+        entry, not by deleting the whole key together with the bitmap cache, and not
+        alongside cache flushes and firewall changes.
+    - condition: An imaging or sysprep sequence resets network state before capture.
+      explanation: >-
+        Image preparation deliberately clears caches and saved profiles so the captured build
+        is clean. It runs on build hosts, from the imaging toolchain, and the identical
+        sequence appears on every machine that goes through the same pipeline.

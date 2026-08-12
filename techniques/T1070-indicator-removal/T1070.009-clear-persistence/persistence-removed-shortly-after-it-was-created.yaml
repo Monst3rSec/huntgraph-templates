@@ -1,0 +1,369 @@
+type: detection
+
+id: hg-win-persistence-removed-shortly-after-it-was-created-t1070-009
+
+version: 1.0.0
+
+info:
+  name: Persistence removed shortly after it was created
+  description: >-
+    Removing a service, a scheduled task, an autostart value or a local account is completely
+    ordinary work, and any hunt built on the deletion alone drowns. What is not ordinary is
+    the lifetime. Legitimate persistence objects are created by an installer or an
+    administrator and live for weeks or years before anyone removes them; the deletion is
+    separated from the creation by so much time that the two never appear in the same window
+    of telemetry. An adversary clearing their own persistence produces the opposite shape -
+    the object that is being removed was itself created minutes or hours earlier, often by
+    the same process tree and always by the same account. Loaders make this worse for
+    themselves by deleting the task from a previous run before installing the new one, so
+    the create and delete of the same task name appear back to back. The hunt is therefore
+    for the pairing, not the deletion: a task, service, run value or account whose entire
+    existence fits inside one operator session.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - anti-forensics
+    - indicator-removal
+    - persistence-cleanup
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1070/009
+    - https://attack.mitre.org/detectionstrategies/DET0040
+    - https://attack.mitre.org/techniques/T1070
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1070
+  sub_techniques:
+    - T1070.009
+  detection_strategies:
+    - DET0040
+  analytics:
+    - AN0113
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:Security
+    - WinEventLog:TaskScheduler
+  data_components:
+    - Process Creation
+    - Scheduled Job Creation
+    - User Account Deletion
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An adversary may delete the scheduled task, service, autostart value or account they
+    created for persistence once it has served its purpose, so that the mechanism which kept
+    them on the host leaves nothing for an investigator to find and no artefact to attribute.
+  attacker_behavior:
+    - Deletes the scheduled task it registered once the payload has been launched.
+    - Removes the service it created with sc delete after the implant is resident.
+    - Deletes the run or run-once value it wrote, sometimes rewriting it after each boot.
+    - Removes the local account it added once other access has been established.
+    - Clears image file execution options entries used to hijack a legitimate binary.
+  legitimate_behavior:
+    - Uninstallers remove the services, tasks and autostart values they installed.
+    - Administrators retire scheduled tasks and services that are no longer needed.
+    - Joiners and leavers processing removes local accounts when staff depart.
+    - Software updaters replace a task or service by deleting and recreating it.
+    - Build and test automation creates and tears down tasks and services repeatedly.
+  risk_indicator:
+    - The object removed was created within the same window rather than long before.
+    - Creation and removal are issued by the same account and the same process tree.
+    - The removal targets a run key, run-once value or image file execution options entry.
+    - A local account exists for only a short period between creation and deletion.
+    - The commands come from a script host rather than an installer or management agent.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: registry
+      event_types:
+        - AsepValueUpdate
+        - RegGenericValueUpdate
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - RegObjectName
+        - RegValueName
+        - RegStringValue
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: persistence-object-removal-commands
+        name: Service, task, autostart value or account deleted
+        purpose: >-
+          Establish the base population of persistence removals so the correlation cases have
+          something to escalate from. Rarity does the work here: this query is only useful
+          sorted so that command lines seen once in the estate surface ahead of the
+          uninstall and retirement traffic that repeats everywhere.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(sc(\.exe)?\s+delete\s|Remove-Service|schtasks(\.exe)?\s+\/delete|Unregister-ScheduledTask|reg(\.exe)?\s+delete\s+.*\\+(Run|RunOnce|RunServices|Image File Execution Options|Winlogon)|Remove-ItemProperty.*\\+(Run|RunOnce)|net(1|\.exe)?\s+user\s+\S+\s+\/delete|Remove-LocalUser)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=removals), collect([CommandLine], limit=5)])
+          | sort(removals, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Software deployment and patching agents removing their own components"
+            - "Identity lifecycle automation removing local accounts for departed staff"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: scheduled-task-created-and-deleted-under-one-name
+        name: The same scheduled task name is registered and removed
+        purpose: >-
+          This is the strongest single expression of the technique. Pull the task name out of
+          the command line and collapse creation and deletion onto it, so a task whose whole
+          life is a create followed by a delete stands apart from the thousands of tasks that
+          were created once and never touched again.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/schtasks(\.exe)?\s+\/(?<TaskAction>create|delete)\b/i
+          | CommandLine=/\/tn\s+"?(?<TaskName>[^"\s]+)/i
+          | groupBy([ComputerName, TaskName],
+                    function=[count(as=events), collect([TaskAction, UserName, CommandLine], limit=8)])
+          | events>=2
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Updater tasks that are recreated on every product upgrade by their installer"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: autostart-value-written-then-deleted
+        name: An autostart value is written and then removed
+        purpose: >-
+          Cover the registry route by joining the write, which is visible as an autostart
+          value update, to the deletion, which is only visible as a command line. A run value
+          that appears and is then removed inside the same window is a persistence mechanism
+          that was used and retired, not a product configuring itself.
+        query: |
+          #event_simpleName=/^(AsepValueUpdate|RegGenericValueUpdate|ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              RegObjectName=/\\+(Run|RunOnce|RunServices|RunServicesOnce|Image File Execution Options|Winlogon)\b/i
+                | autostart_written := RegValueName ;
+              CommandLine=/(reg(\.exe)?\s+delete|Remove-ItemProperty)\s+.*\\+(Run|RunOnce|RunServices|Image File Execution Options|Winlogon)/i
+                | autostart_removed := CommandLine ;
+            }
+          | autostart_written=/.+/ or autostart_removed=/.+/
+          | groupBy([ComputerName, UserName],
+                    function=[count(as=events),
+                              collect([autostart_written, autostart_removed, RegStringValue], limit=10)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Run-once values written and consumed by the operating system during setup"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: local-account-added-and-removed
+        name: A local account is created and deleted on the same host
+        purpose: >-
+          Separate account cleanup from account lifecycle. Leaver processing deletes accounts
+          that have existed for a long time and does it centrally; an adversary deletes an
+          account they created themselves, so both halves appear on the same host under the
+          same session.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(net(1|\.exe)?\s+user\s|New-LocalUser|Remove-LocalUser|net(1|\.exe)?\s+localgroup\s)/i
+          | CommandLine=/(\/add|\/delete|New-LocalUser|Remove-LocalUser)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=8)])
+          | events>=2
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Local administrator password rotation tooling that recreates managed accounts"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+evidence:
+  required:
+    - id: persistence_object_removed
+      name: A persistence object was deleted
+      description: >-
+        A scheduled task, service, autostart value or local account of the kind used to hold
+        access on a host was removed, destroying the artefact that would show how the host
+        was kept.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_artefact_removal
+
+  supporting:
+    - id: created_then_removed
+      name: The removed object was created in the same window
+      description: >-
+        The same task name, service, value or account was registered and then deleted inside
+        one window rather than being retired long after installation, which is the lifetime
+        of an operator artefact rather than an estate one.
+      source: process_creation
+      field: CommandLine
+      indicates: short_lived_persistence_object
+    - id: autostart_value_lifecycle
+      name: An autostart value appeared and was then removed
+      description: >-
+        A run, run-once or image file execution options value was written and subsequently
+        deleted on the same host, joining the registry write to the removal that follows it.
+      source: registry
+      field: RegObjectName
+      indicates: autostart_persistence_retired
+    - id: same_actor_both_halves
+      name: Creation and removal share an account and process tree
+      description: >-
+        The account and parent process behind the creation are the same ones behind the
+        removal, which rules out an administrator retiring something an installer had left.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: single_session_lifecycle
+    - id: interpreter_issued_removal
+      name: Removal issued from a script host or remote channel
+      description: >-
+        The deletion came from an interpreter or remote execution channel rather than an
+        uninstaller, a patching agent or an interactive administrative session.
+      source: process_creation
+      field: ImageFileName
+      indicates: abnormal_execution_chain
+    - id: object_unknown_to_estate
+      name: The removed object is unknown elsewhere in the estate
+      description: >-
+        The task, service or account name does not appear on other hosts during the baseline
+        window, so it was not part of a standard build being retired.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: uninstall_in_progress
+      name: Removal is part of a package uninstall
+      description: >-
+        The deletion is parented by an installer, uninstaller or deployment agent that is
+        removing the same product which created the object.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: recorded_decommission
+      name: Recorded decommission or leaver activity
+      description: >-
+        A change or identity record covers retiring this service, task or account on this
+        host in the same window.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: long_lived_object
+      name: The object existed long before it was removed
+      description: >-
+        The task, service, value or account has been present across the baseline window, so
+        its removal is a retirement rather than the end of a short operator lifecycle.
+      source: baseline
+      field: CommandLine
+      indicates: established_estate_component
+
+  risk_logic:
+    required:
+      - persistence_object_removed
+
+    supporting:
+      any:
+        - created_then_removed
+        - autostart_value_lifecycle
+        - same_actor_both_halves
+        - interpreter_issued_removal
+        - object_unknown_to_estate
+      all:
+        - created_then_removed
+        - same_actor_both_halves
+
+    contradicting:
+      any:
+        - uninstall_in_progress
+        - recorded_decommission
+        - long_lived_object
+      all: []
+
+  verdict:
+    low_risk_when:
+      - persistence_object_removed
+      - uninstall_in_progress
+      - recorded_decommission
+      - long_lived_object
+    suspicious_when:
+      - persistence_object_removed
+      - object_unknown_to_estate
+    high_risk_when:
+      - persistence_object_removed
+      - created_then_removed
+      - autostart_value_lifecycle
+      - same_actor_both_halves
+      - interpreter_issued_removal
+
+  false_positive:
+    - condition: An uninstaller removes the service and task its product installed.
+      explanation: >-
+        Package removal deletes exactly these objects and is the single largest source of
+        this activity. It is parented by the installer or deployment agent, and the object
+        being removed has usually existed since the product was first deployed.
+    - condition: A product updater deletes and recreates its own scheduled task.
+      explanation: >-
+        Some updaters replace rather than modify their task, so a create and a delete of one
+        task name appear together. The task name is the vendor's own, it recurs on every host
+        that runs the product, and the same pairing appears at every version bump.
+    - condition: Leaver processing removes a local account.
+      explanation: >-
+        Account deletion is routine, but the account has normally existed for months and the
+        deletion is driven centrally by identity tooling rather than from a shell on one
+        machine minutes after the same account was created.
+    - condition: Build or test automation tears down tasks and services it created.
+      explanation: >-
+        Test rigs genuinely create and destroy persistence objects inside one session, which
+        matches the correlation exactly. These hosts are identifiable as build agents, the
+        pattern repeats on a schedule, and the object names come from the pipeline rather
+        than being unique to one host.

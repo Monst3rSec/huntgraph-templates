@@ -1,0 +1,340 @@
+type: detection
+
+id: hg-win-dhcp-assigned-resolver-or-gateway-replaced-t1557-003
+
+version: 1.0.0
+
+info:
+  name: DHCP-assigned resolver or gateway replaced on a client
+  description: >-
+    A rogue DHCP server is a fabric event: the race between the real server's OFFER and the
+    adversary's happens on a broadcast domain no endpoint agent watches, and nothing about
+    winning that race is recorded on the machine that loses it. What the endpoint does record
+    is the consequence, and for DHCP the consequence is unusually concrete — unlike ARP
+    poisoning, a spoofed lease rewrites configuration the client stores and acts on. The DHCP
+    client writes the resolver list, the gateway and the identity of the server that answered
+    into the interface parameters, and the host's own resolver traffic then goes wherever it
+    was told. So the hunt is for a client whose assigned name servers or default gateway
+    changed to something the estate does not run, confirmed by the host actually resolving
+    against the new address. The hard part is that this is also exactly what happens when a
+    laptop joins a coffee shop network. Breadth is the discriminator: one host taking a
+    strange lease is roaming, twenty hosts on one subnet taking the same strange lease within
+    minutes is a server that should not be there.
+  severity: high
+  author: huntgraph
+  tags:
+    - credential-access
+    - collection
+    - adversary-in-the-middle
+    - dhcp-spoofing
+    - dns-redirection
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1557/003
+    - https://attack.mitre.org/detectionstrategies/DET0468
+    - https://attack.mitre.org/techniques/T1557
+
+mitre:
+  tactics:
+    - TA0006
+    - TA0009
+  techniques:
+    - T1557
+  sub_techniques:
+    - T1557.003
+  detection_strategies:
+    - DET0468
+  analytics:
+    - AN1290
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:System
+    - NSM:Flow
+  data_components:
+    - Application Log Content
+    - Network Traffic Content
+
+hypothesis:
+  statement: >-
+    An adversary may answer DHCP requests on a segment from a server they control so that
+    clients accept a resolver or default gateway of the adversary's choosing, obtaining a
+    position from which name lookups and onward traffic can be observed, redirected or
+    modified without any change to the client's software.
+  attacker_behavior:
+    - Answers DISCOVER and INFORMATION-REQUEST messages faster than the authorised server.
+    - Hands clients a resolver address under their own control while leaving the rest intact.
+    - Sets a default gateway that routes client traffic through a system they own.
+    - Repeats the answer across a subnet so a share of its clients take the lease.
+  legitimate_behavior:
+    - Laptops take leases from home, hotel and public networks with unfamiliar resolvers.
+    - Network teams migrate DHCP scopes and resolver addresses as planned work.
+    - VPN clients, hypervisors and container networks create adapters with their own settings.
+    - A failover or newly commissioned DHCP server issues leases under a new server identity.
+  risk_indicator:
+    - The assigned resolver or gateway is outside the addresses the estate operates.
+    - The lease came from a server identity the subnet has never issued from before.
+    - The host then resolves names against the new address rather than the corporate resolver.
+    - Several hosts on one subnet take the same unfamiliar assignment inside a short window.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: registry
+      event_types:
+        - RegSystemConfigValueUpdate
+        - RegGenericValueUpdate
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - RegObjectName
+        - RegValueName
+        - RegStringValue
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - ContextBaseFileName
+        - RemoteAddressIP4
+        - RemotePort
+        - Protocol
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: assigned-resolver-or-gateway-changed
+        name: DHCP-assigned resolver or default gateway rewritten
+        purpose: >-
+          This is where a spoofed lease lands on the endpoint. The DHCP client records the
+          name servers and gateway it was handed in the interface parameters, so a change to
+          those values is the client-side record of the offer that won, whoever sent it.
+        query: |
+          #event_simpleName=/^(RegSystemConfigValueUpdate|RegGenericValueUpdate)$/
+          | RegObjectName=/\\Services\\Tcpip6?\\Parameters\\Interfaces\\/i
+          | RegValueName=/^(DhcpNameServer|DhcpDefaultGateway)$/i
+          | groupBy([ComputerName, RegValueName, RegStringValue],
+                    function=[count(as=assignments)])
+          | sort(assignments, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "The estate's own resolver and gateway addresses for each site"
+            - "VPN, hypervisor and container adapters that carry their own settings"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - organization
+
+      - id: lease-from-an-unfamiliar-server
+        name: Lease accepted from a DHCP server the host has not used
+        purpose: >-
+          Separate a resolver change made by the authorised server from one made by a
+          different answerer. The client records which server it accepted the lease from, and
+          that identity is the closest an endpoint gets to naming the rogue.
+        query: |
+          #event_simpleName=/^(RegSystemConfigValueUpdate|RegGenericValueUpdate)$/
+          | RegObjectName=/\\Services\\Tcpip6?\\Parameters\\Interfaces\\/i
+          | RegValueName=/^(DhcpServer|DhcpIPAddress|DhcpSubnetMask)$/i
+          | groupBy([ComputerName, RegValueName, RegStringValue],
+                    function=[count(as=leases)])
+          | sort(leases, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Authorised DHCP server addresses for each site and subnet"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - organization
+
+      - id: resolver-traffic-follows-the-new-address
+        name: Host resolving names against the newly assigned server
+        purpose: >-
+          Confirm the assignment took effect rather than merely being written. The DNS Client
+          service sending queries to an address the estate does not operate is the point at
+          which a configuration change becomes an interception.
+        query: |
+          #event_simpleName=/^NetworkConnectIP4$/
+          | RemotePort in (53, 5353)
+          | ContextBaseFileName=/^(svchost\.exe|System|dns\.exe)$/i
+          | groupBy([ComputerName, RemoteAddressIP4, RemotePort],
+                    function=[count(as=queries), collect([Protocol], limit=3)])
+          | sort(queries, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "The estate's corporate resolvers and any sanctioned public resolver fallback"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - remote_address
+            - organization
+
+      - id: same-assignment-across-many-hosts
+        name: One unfamiliar assignment appearing across many hosts
+        purpose: >-
+          This is the discriminator that separates a roaming laptop from a rogue server. A
+          strange resolver on one machine is a coffee shop; the same strange resolver written
+          to twenty machines inside one window is something answering on a corporate segment.
+        query: |
+          #event_simpleName=/^(RegSystemConfigValueUpdate|RegGenericValueUpdate)$/
+          | RegValueName=/^(DhcpNameServer|DhcpDefaultGateway|DhcpServer)$/i
+          | groupBy([RegValueName, RegStringValue],
+                    function=[count(field=ComputerName, distinct=true, as=hosts),
+                              collect([ComputerName], limit=25)])
+          | hosts >= 5
+          | sort(hosts, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Planned scope or resolver migrations covered by a change record"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - organization
+
+evidence:
+  required:
+    - id: assigned_resolver_or_gateway_changed
+      name: Assigned resolver or gateway replaced
+      description: >-
+        The DHCP client recorded a name server list or default gateway that differs from the
+        addresses the estate operates, meaning the host accepted network configuration from
+        whichever server answered its request.
+      source: registry
+      field: RegStringValue
+      indicates: network_configuration_redirected
+
+  supporting:
+    - id: lease_from_unfamiliar_server
+      name: Lease came from an unrecognised DHCP server
+      description: >-
+        The server identity recorded with the lease is not one the host or the subnet has
+        accepted from before, which is the endpoint's closest view of a different answerer.
+      source: registry
+      field: RegValueName
+      indicates: unauthorised_configuration_source
+    - id: resolver_traffic_to_new_address
+      name: Name resolution now goes to the new address
+      description: >-
+        The DNS Client service sent queries to the newly assigned resolver, confirming the
+        assignment is in effect and that lookups are now answered by it.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: name_resolution_under_adversary_control
+    - id: resolver_outside_estate_range
+      name: Assigned address is outside the operated ranges
+      description: >-
+        The resolver or gateway handed to the client does not belong to any address range the
+        organisation runs, so no internal service explains the assignment.
+      source: asset_inventory
+      field: RegStringValue
+      indicates: untrusted_infrastructure_address
+    - id: several_hosts_changed_together
+      name: Several hosts took the same assignment at once
+      description: >-
+        The same unfamiliar value was written on multiple hosts within a short window, which
+        points at a server answering on the segment rather than at one machine roaming.
+      source: baseline
+      field: ComputerName
+      indicates: segment_wide_effect
+
+  contradicting:
+    - id: roaming_to_an_untrusted_network
+      name: Host is roaming off the corporate network
+      description: >-
+        A portable machine attached to a home, hotel or public network, where an unfamiliar
+        resolver and gateway are exactly what a legitimate lease looks like.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_user_behavior
+    - id: planned_network_change
+      name: Recorded scope, resolver or gateway migration
+      description: >-
+        A change record covers a DHCP scope move, a resolver renumbering or a new server being
+        brought into service across the affected subnets.
+      source: change_management
+      field: RegStringValue
+      indicates: legitimate_administrative_action
+    - id: virtual_adapter_assignment
+      name: Assignment belongs to a virtual adapter
+      description: >-
+        A VPN client, hypervisor or container network created an adapter carrying its own
+        resolver and gateway, which writes the same values without any external server.
+      source: baseline
+      field: RegObjectName
+      indicates: legitimate_application_component
+
+  risk_logic:
+    required:
+      - assigned_resolver_or_gateway_changed
+
+    supporting:
+      any:
+        - lease_from_unfamiliar_server
+        - resolver_traffic_to_new_address
+        - resolver_outside_estate_range
+        - several_hosts_changed_together
+      all:
+        - resolver_traffic_to_new_address
+        - several_hosts_changed_together
+
+    contradicting:
+      any:
+        - roaming_to_an_untrusted_network
+        - planned_network_change
+        - virtual_adapter_assignment
+      all: []
+
+  verdict:
+    low_risk_when:
+      - assigned_resolver_or_gateway_changed
+      - roaming_to_an_untrusted_network
+      - planned_network_change
+      - virtual_adapter_assignment
+    suspicious_when:
+      - assigned_resolver_or_gateway_changed
+      - resolver_outside_estate_range
+    high_risk_when:
+      - assigned_resolver_or_gateway_changed
+      - lease_from_unfamiliar_server
+      - resolver_traffic_to_new_address
+      - several_hosts_changed_together
+
+  false_positive:
+    - condition: A laptop takes a lease from a home or public network.
+      explanation: >-
+        Off-network leases assign unfamiliar resolvers and gateways every time, which is the
+        required evidence in full. The separation is breadth and location: one host, one
+        network, no other machine on any corporate subnet takes the same assignment.
+    - condition: A network team migrates a DHCP scope or renumbers the resolvers.
+      explanation: >-
+        Planned work rewrites the same values across many hosts at once, which reproduces the
+        strongest supporting evidence deliberately. It is covered by a change record and the
+        new addresses belong to ranges the organisation operates.
+    - condition: A VPN client or hypervisor creates an adapter with its own settings.
+      explanation: >-
+        Virtual adapters write resolver and gateway values under their own interface keys
+        without any DHCP exchange on the physical segment. The interface the values were
+        written under identifies them.
+    - condition: A failover or newly built DHCP server begins issuing leases.
+      explanation: >-
+        A legitimate server that has not issued to these hosts before looks exactly like an
+        unfamiliar answerer. The resolver and gateway it hands out are unchanged, which is the
+        difference that matters: a rogue server exists in order to change them.

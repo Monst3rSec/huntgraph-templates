@@ -1,0 +1,353 @@
+type: detection
+
+id: hg-win-executable-run-with-no-identifying-metadata-t1027-008
+version: 1.0.0
+
+info:
+  name: Executable run with no identifying metadata
+  description: >-
+    Every legitimate binary in an estate says what it is. It carries a company name, a
+    product name, a version resource, an import table that matches its function, and a hash
+    that turns up on hundreds of machines because the same installer put it there. A stripped
+    payload says nothing: symbols removed at link time, strings compiled out, debug
+    information discarded, and nothing left for a reverse engineer or a triage analyst to
+    anchor on. The tell is therefore an absence, and absence is awkward to hunt — endpoint
+    events do not publish version resources or import tables, so a query cannot ask for a
+    binary that lacks them. What the same absence produces downstream is very visible: a
+    binary nobody can identify is also a binary with no history, no distribution and no
+    reason to be where it is. This hunt takes the two halves that are observable. The
+    stripping itself when it happens on the host, because removing symbols requires a linker
+    flag or a strip utility and those appear verbatim in a command line; and the profile of
+    the result, an executable that was written locally minutes before it ran, whose name
+    carries no product identity, and whose hash exists on exactly one machine.
+  severity: medium
+  author: huntgraph
+  tags:
+    - stealth
+    - obfuscation
+    - stripped-payload
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1027/008
+    - https://attack.mitre.org/detectionstrategies/DET0019
+    - https://attack.mitre.org/techniques/T1027
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1027
+  sub_techniques:
+    - T1027.008
+  detection_strategies:
+    - DET0019
+  analytics:
+    - AN0055
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - EDR:file
+  data_components:
+    - Process Creation
+    - File Creation
+    - File Metadata
+
+hypothesis:
+  statement: >-
+    An adversary may remove symbols, strings and version information from a payload so that
+    static triage and reverse engineering yield nothing, obtaining a binary that resists
+    identification and delays any analysis that would otherwise name it.
+  attacker_behavior:
+    - Builds the payload with linker flags that discard symbol and debug information.
+    - Runs a strip utility over a compiled binary before deploying it.
+    - Drops the resulting executable under a meaningless or randomly generated name.
+    - Executes it from the directory it was written to, minutes after it lands.
+    - Avoids any installer or distribution path that would give the file provenance.
+  legitimate_behavior:
+    - Release builds routinely strip symbols to reduce binary size.
+    - Build agents produce fresh, unsigned, short-lived artefacts constantly.
+    - Installers write temporary helper executables with generated names.
+    - Development hosts run compilers, linkers and packaging utilities all day.
+    - Some products compile components on first run and execute them immediately.
+  risk_indicator:
+    - The executable was written and run on a host with no development role.
+    - Its hash appears on one machine in the whole estate.
+    - The file name carries no product identity, only a random or generic string.
+    - The writing process is a script host rather than a compiler or installer.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - SHA256HashData
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: symbols-stripped-at-build-time
+        name: Binary built or post-processed with symbols removed
+        purpose: >-
+          Catch the stripping where it is explicit. Linker and utility flags that discard the
+          symbol table, the debug directory or the program database are unambiguous about
+          intent, and on a host that does not build software they have no other explanation.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(-ldflags[^|]*-[sw]\b|\bstrip(\.exe)?\s+[^|]*\S|objcopy[^|]*--strip-all|--strip-debug|\/PDB:NONE|\/DEBUG:NONE|-Xlinker\s+-s\b|pyinstaller[^|]*--strip|\bupx(\.exe)?\s+[^|]*-\d)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Build agents and engineering hosts where release builds are expected"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: executable-written-then-run
+        name: Executable written and executed under the same hash
+        purpose: >-
+          Tie the artefact to its use. Matching a file write to a later execution on the same
+          hash shows the binary was produced on this host rather than delivered to it, which
+          is what makes the missing provenance meaningful instead of merely unrecorded.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten|ProcessRollup2)$/
+          | case {
+              #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+                | TargetFileName=/\\(AppData|Temp|ProgramData|Users|Public|Downloads|PerfLogs)\\/i
+                | written := TargetFileName ;
+              #event_simpleName=ProcessRollup2
+                | ran := ImageFileName ;
+            }
+          | groupBy([ComputerName, SHA256HashData],
+                    function=[collect([written, ran, ContextProcessId, ParentBaseFileName]),
+                              count(as=events)])
+          | written=/.+/
+          | ran=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Software distribution agents unpacking and launching vendor packages"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: anonymous-file-name-executed
+        name: Executable whose name carries no product identity
+        purpose: >-
+          Approach the missing metadata through the one piece of identity that is visible in
+          process telemetry. A stripped payload dropped by a loader is usually named by a
+          random or generated string, because there is no product to name it after.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/\\(AppData|Temp|ProgramData|Users|Public|Downloads|PerfLogs)\\/i
+          | ImageFileName=/\\([a-f0-9]{8,}|[A-Za-z0-9]{1,3}|[a-z]{5,10}\d{3,}|\{[0-9a-fA-F-]{36}\})\.exe$/
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Installer bootstrappers that legitimately use generated temporary names"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: locally-produced-binary-unique-in-the-estate
+        name: Executed binary with no presence anywhere else
+        purpose: >-
+          Use distribution as the proxy for identity. Software that can name itself also
+          appears on many machines; a binary that exists on exactly one host has neither a
+          package behind it nor a population to compare against.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/\\(AppData|Temp|ProgramData|Users|Public|Downloads|PerfLogs)\\/i
+          | ImageFileName!=/\\(ccmcache|SoftwareDistribution|Package Cache|WinSxS)\\/i
+          | groupBy([SHA256HashData],
+                    function=[count(ComputerName, distinct=true, as=hosts),
+                              count(as=executions),
+                              collect([ComputerName, UserName, ImageFileName, ParentBaseFileName], limit=5)])
+          | hosts <= 1
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Per-installation compiled components of approved products"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+            - organization
+
+evidence:
+  required:
+    - id: unattributed_executable_executed
+      name: Executable ran with nothing identifying it
+      description: >-
+        A process started from a user-writable directory under a name that carries no product
+        identity, with no distribution behind it, which is the endpoint-visible shape of a
+        payload whose symbols and strings were removed.
+      source: process_creation
+      field: ImageFileName
+      indicates: unattributed_binary_execution
+
+  supporting:
+    - id: strip_flags_used
+      name: Symbols removed by an explicit flag
+      description: >-
+        A build or post-processing command discarded the symbol table, debug directory or
+        program database, which is the stripping step itself rather than an inference from it.
+      source: process_creation
+      field: CommandLine
+      indicates: indicator_removal
+    - id: written_then_executed
+      name: Produced locally and run shortly after
+      description: >-
+        The same hash was written to disk and then executed on this host, so the binary was
+        assembled here rather than installed, and its lack of provenance is a property of the
+        file rather than a gap in collection.
+      source: file_creation
+      field: SHA256HashData
+      indicates: payload_staging
+    - id: script_host_writer
+      name: Written by a script host rather than a compiler
+      description: >-
+        The process that dropped the executable is an interpreter or loader rather than a
+        compiler, linker or distribution agent.
+      source: file_creation
+      field: ContextProcessId
+      indicates: abnormal_execution_chain
+    - id: hash_unknown_in_estate
+      name: Hash seen on one host only
+      description: >-
+        The executed binary has no presence elsewhere during the baseline window, which is
+        expected of a payload built for one intrusion and unusual for anything installed.
+      source: baseline
+      field: SHA256HashData
+      indicates: unusual_binary_in_environment
+
+  contradicting:
+    - id: development_host
+      name: Host that builds software
+      description: >-
+        The machine belongs to engineering or is a build agent, where compiling, stripping and
+        running fresh unsigned binaries is the job rather than an anomaly.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+    - id: installer_temporary_binary
+      name: Installer helper with a generated name
+      description: >-
+        The executable was written and launched by a recognised installer or distribution
+        agent, which routinely uses randomly named temporary binaries during setup.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_enterprise_activity
+    - id: widely_distributed_hash
+      name: Same binary present across the estate
+      description: >-
+        The hash appears on many hosts, so whatever it lacks in readable metadata it makes up
+        for in provenance — it arrived through a distribution mechanism.
+      source: baseline
+      field: ComputerName
+      indicates: legitimate_application_component
+
+  risk_logic:
+    required:
+      - unattributed_executable_executed
+
+    supporting:
+      any:
+        - strip_flags_used
+        - written_then_executed
+        - script_host_writer
+        - hash_unknown_in_estate
+      all:
+        - written_then_executed
+        - hash_unknown_in_estate
+
+    contradicting:
+      any:
+        - development_host
+        - installer_temporary_binary
+        - widely_distributed_hash
+      all: []
+
+  verdict:
+    low_risk_when:
+      - unattributed_executable_executed
+      - development_host
+      - installer_temporary_binary
+      - widely_distributed_hash
+    suspicious_when:
+      - unattributed_executable_executed
+      - hash_unknown_in_estate
+    high_risk_when:
+      - unattributed_executable_executed
+      - strip_flags_used
+      - written_then_executed
+      - script_host_writer
+
+  false_positive:
+    - condition: A release build strips symbols as a normal final step.
+      explanation: >-
+        Stripping is standard practice for shipping binaries and appears in almost every
+        release pipeline. It runs on build agents and engineering hosts under a compiler or
+        build tool parent, inside a workspace directory, and repeats on a schedule.
+    - condition: An installer runs a randomly named temporary executable.
+      explanation: >-
+        Setup bootstrappers extract helper binaries into temporary directories with generated
+        names and execute them, producing a unique path and often a unique hash. The writing
+        process is a recognised installer and the sequence ends with a product being
+        installed rather than with network activity or further staging.
+    - condition: A product compiles a component on first use.
+      explanation: >-
+        Some runtimes generate and execute native images per machine, which yields a binary
+        that genuinely exists on one host. These live under the product's own directories and
+        are produced by the runtime's compiler rather than by a script host.
+    - condition: A packer is used to shrink a legitimate internal tool.
+      explanation: >-
+        Compression utilities strip and repack binaries for size, and internal tooling is
+        sometimes shipped this way. Such files are distributed to many hosts, so the hash
+        population separates them from a payload built for a single target.

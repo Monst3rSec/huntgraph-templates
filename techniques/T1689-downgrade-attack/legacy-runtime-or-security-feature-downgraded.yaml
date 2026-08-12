@@ -1,0 +1,346 @@
+type: detection
+
+id: hg-win-legacy-runtime-or-security-feature-downgraded-t1689
+
+version: 1.0.0
+
+info:
+  name: Legacy runtime or security feature downgraded
+  description: >-
+    Windows keeps its old versions around for compatibility, and the old versions predate the
+    telemetry. Launching powershell.exe with the version 2 engine gives a fully functional
+    shell in which script block logging, module logging, transcription and the AMSI hook do
+    not exist — not disabled, simply absent, because that engine was built before they were.
+    Nothing is turned off, no policy is edited, no service is stopped, and the security
+    console keeps showing PowerShell logging as enforced by policy because it still is, for
+    every session except this one. The same shape applies to re-enabling SMBv1 so traffic
+    falls back to a protocol with no signing, or clearing the hypervisor-enforced code
+    integrity flag so unsigned drivers load again after the next boot. In each case the
+    control is intact on paper and the estate's compliance reporting agrees. The
+    discriminator is that legitimate downgrades are driven by a named dependency — a vendor
+    installer, a legacy application, a documented compatibility ticket — and stay in place,
+    while an adversary's downgrade is invoked for the duration of one task by a shell.
+  severity: high
+  author: huntgraph
+  tags:
+    - defense-impairment
+    - downgrade-attack
+    - powershell
+    - registry
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1689
+    - https://attack.mitre.org/detectionstrategies/DET0350
+    - https://attack.mitre.org/techniques/T1059/001
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1689
+  sub_techniques: []
+  detection_strategies:
+    - DET0350
+  analytics:
+    - AN0995
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An adversary may invoke a legacy interpreter version or re-enable a superseded protocol or
+    integrity control so that their activity runs through a code path that predates the
+    logging and enforcement, obtaining execution that is invisible without any control being
+    switched off.
+  attacker_behavior:
+    - Launches PowerShell with an explicit version 2 argument to reach an engine without script block logging.
+    - Re-installs or enables the PowerShell version 2 optional feature so the old engine is available.
+    - Clears the hypervisor-enforced code integrity flag so unsigned drivers load after a reboot.
+    - Re-enables SMBv1 so lateral traffic falls back to an unsigned, unencrypted protocol.
+  legitimate_behavior:
+    - Legacy line-of-business applications require the version 2 engine and ship installers that enable it.
+    - Compatibility testing runs scripts under an older interpreter deliberately.
+    - Old storage appliances and print servers still require SMBv1 in some estates.
+    - Integrity features are toggled during driver development and hardware certification.
+  risk_indicator:
+    - The downgraded engine is invoked with an encoded or hidden command rather than a script path.
+    - The feature is enabled and used within the same short window rather than at install time.
+    - The change is issued by a shell or remote-execution channel rather than a vendor installer.
+    - Several independent controls are downgraded on the same host in one window.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: registry
+      event_types:
+        - RegSystemConfigValueUpdate
+        - RegGenericValueUpdate
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - RegObjectName
+        - RegValueName
+        - RegStringValue
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: powershell-v2-engine-invoked
+        name: PowerShell started with the version 2 engine
+        purpose: >-
+          Surface the single argument that moves a session onto an engine with no script block
+          logging, no module logging and no AMSI. The command runs normally and the policy
+          that mandates logging remains in force, so nothing but this argument distinguishes a
+          recorded session from an unrecorded one.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^powershell(\.exe)?$/i
+          | CommandLine=/\s-(v|ve|ver|vers|versi|versio|version)\s+2(\.0)?\b/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=launches), collect([CommandLine], limit=5)])
+          | sort(launches, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Legacy application launchers with a documented version 2 dependency"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: powershell-v2-feature-enabled
+        name: PowerShell version 2 optional feature re-enabled
+        purpose: >-
+          Catch the preparation step on a host where the old engine was removed. Re-adding the
+          feature restores an unlogged execution path and, unlike the launch itself, it is a
+          durable change that survives until someone notices it in a feature inventory.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Enable-WindowsOptionalFeature|dism(\.exe)?\s+.*\/enable-feature|Install-WindowsFeature)/i
+          | CommandLine=/(MicrosoftWindowsPowerShellV2|PowerShell-V2|SMB1Protocol|NetFx3)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Vendor installers enabling a prerequisite feature during application deployment"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: code-integrity-flag-cleared
+        name: Code integrity or credential isolation flag cleared
+        purpose: >-
+          Identify a downgrade that takes effect only after the next boot, which is exactly why
+          it is easy to miss. The security console reports the feature as configured by policy
+          while the running kernel no longer enforces it, so unsigned drivers load and
+          credential isolation is absent.
+        query: |
+          #event_simpleName=/^(RegSystemConfigValueUpdate|RegGenericValueUpdate)$/
+          | RegObjectName=/\\Control\\DeviceGuard(\\Scenarios\\(HypervisorEnforcedCodeIntegrity|CredentialGuard|SystemGuard))?/i
+          | RegValueName=/^(Enabled|EnableVirtualizationBasedSecurity|RequirePlatformSecurityFeatures|LsaCfgFlags)$/i
+          | RegStringValue=/^0$/
+          | groupBy([ComputerName, UserName, RegObjectName, RegValueName],
+                    function=[count(as=changes), collect([RegStringValue], limit=3)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Driver development and hardware certification hosts"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: legacy-protocol-reenabled
+        name: Superseded network protocol re-enabled in configuration
+        purpose: >-
+          Cover the protocol form of the same idea. Turning SMBv1 back on, or re-enabling an
+          obsolete TLS version, forces later traffic onto a code path with no signing or weak
+          cryptography, which enables interception and relay without touching the firewall or
+          any security service.
+        query: |
+          #event_simpleName=/^(RegSystemConfigValueUpdate|RegGenericValueUpdate)$/
+          | RegObjectName=/(\\Services\\LanmanServer\\Parameters|\\Services\\LanmanWorkstation\\Parameters|SecurityProviders\\SCHANNEL\\Protocols\\(SSL|TLS)\s*[123]\.[012])/i
+          | RegValueName=/^(SMB1|SMB2|Enabled|DisabledByDefault|RequireSecuritySignature)$/i
+          | groupBy([ComputerName, UserName, RegObjectName, RegValueName],
+                    function=[count(as=changes), collect([RegStringValue], limit=3)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Hosts with a recorded dependency on legacy storage or print appliances"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+evidence:
+  required:
+    - id: legacy_runtime_invoked
+      name: Superseded interpreter version invoked
+      description: >-
+        A process was started on an interpreter version that predates the logging and
+        integrity features the estate relies on, so its activity runs through a code path
+        where those features do not exist rather than one where they are disabled.
+      source: process_creation
+      field: CommandLine
+      indicates: defensive_control_bypassed_by_version
+
+  supporting:
+    - id: legacy_engine_restored
+      name: Legacy engine or protocol feature re-enabled
+      description: >-
+        An optional feature providing the superseded engine or protocol was installed or
+        enabled, restoring an execution path that the build had deliberately removed.
+      source: process_creation
+      field: FileName
+      indicates: impairment_prepared
+    - id: integrity_control_downgraded
+      name: Code integrity or credential isolation weakened
+      description: >-
+        A kernel integrity or credential isolation flag was cleared, which takes effect after
+        the next boot while policy reporting continues to show the feature as configured.
+      source: registry
+      field: RegObjectName
+      indicates: defensive_control_degradation
+    - id: legacy_protocol_reenabled
+      name: Superseded network protocol turned back on
+      description: >-
+        A protocol version with weaker or absent signing was re-enabled, forcing later traffic
+        onto a path that supports interception and relay.
+      source: registry
+      field: RegValueName
+      indicates: protocol_security_downgrade
+    - id: unprecedented_for_host
+      name: No comparable downgrade in the baseline
+      description: >-
+        This host has not invoked the legacy engine or altered these controls during the
+        baseline window, so the change is a deviation as well as a downgrade.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: legacy_application_dependency
+      name: Recorded dependency on the legacy component
+      description: >-
+        The host runs an application or connects to an appliance with a known requirement for
+        the older engine or protocol, recorded against its role in inventory.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_application_component
+    - id: recorded_compatibility_change
+      name: Recorded compatibility or certification change
+      description: >-
+        A change record covers enabling the legacy feature or relaxing an integrity control
+        for compatibility testing, driver work or hardware certification.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: vendor_installer_actor
+      name: Change made by a vendor installer
+      description: >-
+        The feature was enabled by a signed application installer as a declared prerequisite
+        rather than by a shell or remote-execution channel.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - legacy_runtime_invoked
+
+    supporting:
+      any:
+        - legacy_engine_restored
+        - integrity_control_downgraded
+        - legacy_protocol_reenabled
+        - unprecedented_for_host
+      all:
+        - legacy_engine_restored
+        - unprecedented_for_host
+
+    contradicting:
+      any:
+        - legacy_application_dependency
+        - recorded_compatibility_change
+        - vendor_installer_actor
+      all: []
+
+  verdict:
+    low_risk_when:
+      - legacy_runtime_invoked
+      - legacy_application_dependency
+      - recorded_compatibility_change
+      - vendor_installer_actor
+    suspicious_when:
+      - legacy_runtime_invoked
+      - unprecedented_for_host
+    high_risk_when:
+      - legacy_runtime_invoked
+      - legacy_engine_restored
+      - integrity_control_downgraded
+      - legacy_protocol_reenabled
+
+  false_positive:
+    - condition: A legacy application requires the PowerShell version 2 engine.
+      explanation: >-
+        Some old management and backup products genuinely pin to the version 2 engine and
+        launch it the same way. The parent is the application's own binary, the invocation
+        names a script path rather than an encoded command, and it repeats on schedule across
+        every host running that product.
+    - condition: An estate still depends on SMBv1 for old storage or print appliances.
+      explanation: >-
+        SMBv1 remains in service in some environments and is re-enabled deliberately. The
+        change appears at build time on the specific hosts that talk to those appliances, is
+        recorded against a known dependency, and is not accompanied by an interpreter
+        downgrade on the same host.
+    - condition: Integrity features are relaxed for driver development or certification.
+      explanation: >-
+        Developers and hardware labs genuinely clear these flags to load test-signed drivers.
+        Those hosts are identifiable by role, the change persists rather than being reverted
+        after a task, and it is normally made from an interactive administrative session.
+    - condition: Compatibility testing runs scripts under an older interpreter.
+      explanation: >-
+        Test estates deliberately exercise old engines. The activity concentrates on hosts
+        designated for testing, runs under build automation, and executes script files from a
+        repository path rather than encoded commands typed into a live session.

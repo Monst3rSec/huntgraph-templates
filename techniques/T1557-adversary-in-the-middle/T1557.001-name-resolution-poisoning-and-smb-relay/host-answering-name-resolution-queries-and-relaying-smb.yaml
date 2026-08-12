@@ -1,0 +1,380 @@
+type: detection
+
+id: hg-win-host-answering-name-resolution-queries-and-relaying-smb-t1557-001
+
+version: 1.0.0
+
+info:
+  name: Host answering name resolution queries and relaying SMB
+  description: >-
+    LLMNR, NBT-NS and mDNS are the fallbacks Windows uses when DNS cannot answer a name, and
+    any host on the segment is allowed to reply. A poisoner exploits that by answering every
+    query affirmatively, which means it has to bind and hold the multicast name-resolution
+    ports and respond to traffic nobody addressed to it. That gives the endpoint an unusually
+    clean observable: Windows answers these queries from the DNS Client service and the NetBT
+    driver, so the ports are always open, but they are always owned by svchost or the kernel.
+    A user-mode process — a Python interpreter, a PowerShell session, a dropped binary —
+    binding UDP 5355, 137 or 5353 is not something a workstation does for any legitimate
+    reason. The theft that follows is the relay: the same host opens SMB, LDAP or MSSQL
+    sessions to a spread of internal peers using the NTLM material the poisoned clients just
+    handed it, and it often installs a service so the position survives logoff and reboot.
+    The discriminator is the process that owns the listener, never the port itself.
+  severity: high
+  author: huntgraph
+  tags:
+    - credential-access
+    - collection
+    - adversary-in-the-middle
+    - name-resolution-poisoning
+    - ntlm-relay
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1557/001
+    - https://attack.mitre.org/detectionstrategies/DET0462
+    - https://attack.mitre.org/techniques/T1557
+
+mitre:
+  tactics:
+    - TA0006
+    - TA0009
+  techniques:
+    - T1557
+  sub_techniques:
+    - T1557.001
+  detection_strategies:
+    - DET0462
+  analytics:
+    - AN1274
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - NSM:Flow
+  data_components:
+    - Network Traffic Content
+    - Network Traffic Flow
+    - Service Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An adversary may answer LLMNR, NBT-NS and mDNS queries from a host they control so that
+    clients searching for a mistyped or unavailable name authenticate to them instead,
+    obtaining NTLM material they can crack offline or relay directly into SMB, LDAP or MSSQL
+    sessions on other systems.
+  attacker_behavior:
+    - Binds the multicast name-resolution ports from a user-mode tool and answers every query.
+    - Re-enables LLMNR or NetBIOS over TCP/IP where hardening had turned them off.
+    - Installs the poisoner or relay as a service so it survives logoff and reboot.
+    - Relays the captured NTLM material into SMB or LDAP sessions on a spread of internal hosts.
+    - Runs the poisoner from an interpreter or a portable binary rather than an installed product.
+  legitimate_behavior:
+    - The DNS Client service and the NetBT driver hold these ports on every Windows host.
+    - Bonjour, printing and media-sharing products bind UDP 5353 to advertise services.
+    - Administrators re-enable NetBIOS to support an application that still needs it.
+    - Backup, scanning and management products open SMB sessions to many hosts by design.
+  risk_indicator:
+    - A user-mode process rather than svchost or the kernel owns the name-resolution listener.
+    - The listener appears on a host that has never had one during the baseline window.
+    - Multicast name resolution is re-enabled shortly before or after the listener appears.
+    - The same host opens SMB or LDAP sessions to a large number of internal peers.
+    - A service is installed whose image path points at an interpreter or a user-writable path.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: network_connection
+      event_types:
+        - NetworkListenIP4
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - ContextBaseFileName
+        - LocalAddressIP4
+        - LocalPort
+        - RemoteAddressIP4
+        - RemotePort
+        - Protocol
+    - source: registry
+      event_types:
+        - RegGenericValueUpdate
+        - RegSystemConfigValueUpdate
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - RegObjectName
+        - RegValueName
+        - RegStringValue
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: name-resolution-listener-owned-by-user-process
+        name: Multicast name-resolution port bound by a user-mode process
+        purpose: >-
+          Isolate the one thing a poisoner cannot avoid doing. Windows already answers LLMNR,
+          NBT-NS and mDNS from svchost and the NetBT driver, so the finding is not that the
+          port is open but that a user-mode process took a bind on it.
+        query: |
+          #event_simpleName=/^NetworkListenIP4$/
+          | LocalPort in (5355, 137, 5353)
+          | ContextBaseFileName!=/^(svchost\.exe|services\.exe|System|lsass\.exe|Idle)$/i
+          | groupBy([ComputerName, ContextBaseFileName, LocalPort],
+                    function=[count(as=binds), collect([LocalAddressIP4, Protocol], limit=5)])
+          | sort(binds, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Bonjour, printing and media-sharing agents that legitimately bind UDP 5353"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: multicast-name-resolution-reenabled
+        name: LLMNR or NetBIOS name resolution turned back on
+        purpose: >-
+          Catch the preparation step. Estates that have hardened these protocols off must have
+          them back on for poisoning to yield anything, and the policy values that control
+          them are otherwise written once at build time.
+        query: |
+          #event_simpleName=/^(RegGenericValueUpdate|RegSystemConfigValueUpdate)$/
+          | RegObjectName=/(\\Policies\\Microsoft\\Windows NT\\DNSClient|\\Services\\NetBT\\Parameters|\\Services\\Tcpip\\Parameters\\Interfaces)/i
+          | RegValueName=/^(EnableMulticast|EnableMDNS|NetbiosOptions|EnableLMHOSTS)$/i
+          | groupBy([ComputerName, UserName, RegObjectName, RegValueName, RegStringValue],
+                    function=[count(as=changes)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Group Policy refresh writing the estate's standing DNSClient and NetBT values"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - organization
+
+      - id: relay-tooling-installed-as-a-service
+        name: Service installed to host a poisoner or relay
+        purpose: >-
+          Surface the persistence the analytic calls out, from both sides it is visible: the
+          service registration itself and the image path it points at. A relay installed as a
+          service keeps the position across logoff, which is what makes it worth doing.
+        query: |
+          #event_simpleName=/^(RegSystemConfigValueUpdate|ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              #event_simpleName=RegSystemConfigValueUpdate
+                | RegObjectName=/\\CurrentControlSet\\Services\\[^\\]+$/i
+                | RegValueName=/^ImagePath$/i
+                | RegStringValue=/(python|pwsh|powershell|responder|inveigh|ntlmrelayx|smbrelay|impacket|\\Users\\|\\AppData\\|\\Temp\\|\\ProgramData\\|\\Public\\)/i
+                | service_image := RegStringValue ;
+              #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+                | CommandLine=/(sc(\.exe)?\s+create|New-Service|Install-Service|Register-ScheduledTask.*ntlm)/i
+                | service_command := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[count(as=events),
+                              collect([service_image, service_command, FileName, ParentBaseFileName], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Software deployment agents registering their own product services"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: authenticated-session-fanout-from-one-process
+        name: One process opening authenticated sessions to many internal peers
+        purpose: >-
+          Confirm the relay rather than the poisoning. Harvested NTLM material is only useful
+          when it is spent, and a relay spends it by walking a list of internal hosts on SMB,
+          LDAP or MSSQL from a single process in a short window.
+        query: |
+          #event_simpleName=/^NetworkConnectIP4$/
+          | RemotePort in (445, 139, 389, 636, 1433, 3268)
+          | ContextBaseFileName!=/^(System|svchost\.exe|explorer\.exe|lsass\.exe|SearchIndexer\.exe)$/i
+          | RemoteAddressIP4=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/
+          | groupBy([ComputerName, ContextBaseFileName],
+                    function=[count(field=RemoteAddressIP4, distinct=true, as=peers),
+                              count(as=sessions), collect([RemotePort], limit=10)])
+          | peers >= 10
+          | sort(peers, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Backup, vulnerability scanning and inventory agents that contact every host by design"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+evidence:
+  required:
+    - id: name_service_listener_bound
+      name: Name-resolution port bound outside the system services
+      description: >-
+        A process took a listening bind on UDP 5355, 137 or 5353 on a host where those ports
+        belong to the DNS Client service and the NetBT driver, which is the position from
+        which queries can be answered falsely.
+      source: network_connection
+      field: LocalPort
+      indicates: rogue_name_service_responder
+
+  supporting:
+    - id: listener_process_untrusted
+      name: Listener owned by an interpreter or a dropped binary
+      description: >-
+        The process holding the bind is a script host, an interpreter or a binary outside the
+        installed software set rather than a system service, which is what separates a
+        poisoner from the operating system's own responder.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: untrusted_listener_owner
+    - id: multicast_resolution_reenabled
+      name: LLMNR or NetBIOS re-enabled on the host
+      description: >-
+        A policy or interface value that governs multicast name resolution was written to turn
+        the protocol back on, restoring the queries the poisoner needs to answer.
+      source: registry
+      field: RegValueName
+      indicates: protection_disabled
+    - id: relay_service_installed
+      name: Service registered for the poisoner or relay
+      description: >-
+        A service was created, or a service image path was written pointing at an interpreter
+        or a user-writable location, giving the position persistence across logoff and reboot.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_for_interception
+    - id: authenticated_session_fanout
+      name: Authenticated sessions opened to many internal peers
+      description: >-
+        A single process opened SMB, LDAP or MSSQL sessions to a broad set of internal
+        addresses, which is how captured NTLM material is spent rather than merely collected.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: credential_relay_attempt
+    - id: no_prior_listener_on_host
+      name: No history of this bind on the host
+      description: >-
+        This process has not held a name-resolution bind on this host during the baseline
+        window, so the listener is a change in what the host does on the segment.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: service_advertising_product
+      name: Installed product that advertises over mDNS
+      description: >-
+        Bonjour, print discovery and media-sharing agents legitimately bind UDP 5353 in user
+        mode and are present wherever the product is deployed.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_application_component
+    - id: authorised_security_test
+      name: Recorded penetration test or tooling validation
+      description: >-
+        An authorised assessment ran a poisoner against the segment during a recorded window,
+        which reproduces every observable in this hunt exactly.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: fleetwide_policy_change
+      name: Name-resolution setting changed across the estate
+      description: >-
+        The same DNSClient or NetBT value changed on many hosts in one window, which is policy
+        distribution rather than a change targeted at one segment.
+      source: baseline
+      field: RegValueName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - name_service_listener_bound
+
+    supporting:
+      any:
+        - listener_process_untrusted
+        - multicast_resolution_reenabled
+        - relay_service_installed
+        - authenticated_session_fanout
+        - no_prior_listener_on_host
+      all:
+        - listener_process_untrusted
+        - authenticated_session_fanout
+
+    contradicting:
+      any:
+        - service_advertising_product
+        - authorised_security_test
+        - fleetwide_policy_change
+      all: []
+
+  verdict:
+    low_risk_when:
+      - name_service_listener_bound
+      - service_advertising_product
+      - authorised_security_test
+      - fleetwide_policy_change
+    suspicious_when:
+      - name_service_listener_bound
+      - listener_process_untrusted
+      - no_prior_listener_on_host
+    high_risk_when:
+      - name_service_listener_bound
+      - listener_process_untrusted
+      - authenticated_session_fanout
+      - relay_service_installed
+      - multicast_resolution_reenabled
+
+  false_positive:
+    - condition: A discovery or printing agent binds UDP 5353 on a workstation.
+      explanation: >-
+        Bonjour, print discovery and several media products answer mDNS in user mode, so they
+        produce the required evidence exactly. They are installed software with a stable image
+        path, they appear on every host carrying the product, and they never follow the bind
+        with authenticated sessions to a spread of internal peers.
+    - condition: An administrator re-enables NetBIOS for a legacy application.
+      explanation: >-
+        Some applications still resolve names over NetBIOS, and enabling it is a deliberate
+        support action. It arrives without a new listener owner and usually accompanies a
+        change record for the application concerned.
+    - condition: A backup or vulnerability scanner opens SMB sessions to every host.
+      explanation: >-
+        Scanning and backup agents reproduce the session fan-out perfectly. They run from
+        installed product paths, they run on a schedule the baseline has seen for months, and
+        they are not the process holding a name-resolution bind.
+    - condition: An authorised penetration test runs a poisoner on the segment.
+      explanation: >-
+        A sanctioned assessment is indistinguishable from the real thing at the telemetry
+        level, which is why it is contradicting evidence rather than a tuning exclusion. The
+        test window and the source host should be confirmed against the engagement record.

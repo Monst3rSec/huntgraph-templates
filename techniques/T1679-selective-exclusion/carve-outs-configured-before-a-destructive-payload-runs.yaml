@@ -1,0 +1,334 @@
+type: detection
+
+id: hg-win-carve-outs-configured-before-a-destructive-payload-runs-t1679
+
+version: 1.0.0
+
+info:
+  name: Carve-outs configured before a destructive payload runs
+  description: >-
+    A wiper or encryptor that touches everything kills the host it is running on, and a dead
+    host stops producing the ransom note, stops answering the operator's beacon and gets
+    rebuilt from image within the hour. Skipping .dll, .exe, .sys, Windows, Program Files and
+    the boot directories keeps the machine bootable and interactive while the user's documents
+    are destroyed, and it also keeps the endpoint agent's own binaries intact so nothing
+    crashes loudly enough to page anyone. The same carve-out logic appears earlier as
+    scanner exclusions: a path or extension added to the antivirus exclusion list does not
+    disable scanning, it makes one directory invisible to it, and the product console still
+    reports real-time protection as on and healthy. Neither move produces an alert or a
+    failure. The discriminator is intent expressed as a list — exclusions and enumeration
+    filters that name the operating system's own load-bearing components, or a payload
+    invoked with skip arguments, rather than the single-application exclusions a support team
+    adds to fix a false positive.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - selective-exclusion
+    - scanner-exclusions
+    - ransomware
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1679
+    - https://attack.mitre.org/detectionstrategies/DET0897
+    - https://attack.mitre.org/techniques/T1083
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1679
+  sub_techniques: []
+  detection_strategies:
+    - DET0897
+  analytics:
+    - AN2030
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:PowerShell
+    - WinEventLog:Security
+  data_components:
+    - Command Execution
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may configure exclusions or skip lists that carve their working directory and
+    the operating system's own components out of scanning and out of destruction, obtaining a
+    host that stays bootable, stays quiet and keeps reporting itself as protected while the
+    payload runs.
+  attacker_behavior:
+    - Adds a path, extension or process exclusion covering the staging directory before dropping the payload.
+    - Enumerates the file system while filtering out system directories and executable extensions.
+    - Invokes the payload with arguments naming files, extensions or folders to skip.
+    - Writes exclusion entries directly into the scanner's configuration keys rather than through its cmdlets.
+  legitimate_behavior:
+    - Support teams exclude a line-of-business application directory to resolve a false positive.
+    - Backup and imaging agents skip system and pagefile paths by design.
+    - Developers exclude build output directories to speed up compilation.
+    - Vendor documentation prescribes exclusions for database and hypervisor workloads.
+  risk_indicator:
+    - The exclusion covers a user-writable staging directory such as Temp, AppData or ProgramData.
+    - The excluded extensions are executable or driver types rather than data types.
+    - Exclusion configuration and file enumeration happen within the same short window.
+    - The configuring process has no history on the host and is not a management agent.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: scanner-exclusion-added-for-writable-path
+        name: Scanner exclusion added covering a user-writable directory
+        purpose: >-
+          Surface the carve-out that makes one directory invisible to scanning while the
+          product keeps reporting protection as enabled. Adding the staging path before the
+          payload lands is the cheapest way to run a known-bad binary without touching the
+          scanner itself.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Add-MpPreference|Set-MpPreference)/i
+          | CommandLine=/-Exclusion(Path|Extension|Process|IpAddress)/i
+          | CommandLine=/(\\Users\\|\\AppData\\|\\Temp\\|\\ProgramData\\|\\Public\\|\\Downloads\\|C:\\\\?$)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=exclusions), collect([CommandLine], limit=5)])
+          | sort(exclusions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Documented vendor exclusions for database, build and hypervisor workloads"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: exclusion-written-into-scanner-keys
+        name: Exclusion entries written straight into the scanner configuration
+        purpose: >-
+          Catch the route that bypasses the management cmdlets entirely. Writing exclusion
+          entries directly into the product's configuration keys achieves the same carve-out
+          without appearing in the cmdlet history a responder would check first.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(reg(\.exe)?\s+add|New-ItemProperty|Set-ItemProperty)/i
+          | CommandLine=/Windows Defender\\+Exclusions\\+(Paths|Extensions|Processes)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=writes), collect([CommandLine], limit=5)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Management platform tasks that provision exclusion policy during build"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: enumeration-that-skips-system-components
+        name: File enumeration filtered to avoid system directories and executables
+        purpose: >-
+          Identify the survey that precedes destruction. Ordinary discovery looks for
+          something; this looks for everything except the components whose loss would stop the
+          host booting, which is the shape of a target list being built rather than a search.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Get-ChildItem\s+.*-Recurse|dir\s+.*\/s\b|robocopy|forfiles)/i
+          | CommandLine=/(-Exclude\b|\/XD\b|\/XF\b|-notmatch|!=)/i
+          | CommandLine=/(\.dll|\.exe|\.sys|\.lnk|Program Files|Windows\\+System32|\$Recycle|PerfLogs|Boot)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=scans), collect([CommandLine], limit=5)])
+          | sort(scans, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Backup and indexing agents whose skip lists are part of their normal operation"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: payload-invoked-with-skip-arguments
+        name: Binary from a writable path invoked with skip or exclusion arguments
+        purpose: >-
+          Confirm the carve-out reached execution. An encryptor or wiper carries its exclusion
+          list on the command line so the operator can tune what survives, and the combination
+          of an unmanaged path and a skip argument is the point at which intent stops being
+          ambiguous.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/\\(Users|AppData|Temp|ProgramData|Public|Downloads|PerfLogs)\\/i
+          | CommandLine=/(\-\-?(exclude|skip|nofile|nodir|whitelist|wl|ignore)\b|\-\-exclude\-)/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Developer tooling and archivers run from user directories with exclude flags"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+evidence:
+  required:
+    - id: exclusion_scope_defined
+      name: Exclusion or skip list configured
+      description: >-
+        A scanner exclusion, enumeration filter or payload skip list was defined that removes
+        a specific set of paths, extensions or components from scanning or from the payload's
+        reach, while leaving the tool itself reporting as fully operational.
+      source: process_creation
+      field: CommandLine
+      indicates: selective_visibility_reduction
+
+  supporting:
+    - id: writable_staging_path_excluded
+      name: Exclusion covers a user-writable staging directory
+      description: >-
+        The carved-out location is a directory an unprivileged process can write to, which is
+        where a payload is staged rather than where a business application lives.
+      source: process_creation
+      field: ImageFileName
+      indicates: payload_staging_prepared
+    - id: system_components_avoided
+      name: Operating system components deliberately avoided
+      description: >-
+        The list names executables, drivers, shortcuts or the system and program directories,
+        which is what a payload skips to keep the host bootable and the intrusion quiet rather
+        than what a support team excludes to fix a false positive.
+      source: process_creation
+      field: FileName
+      indicates: host_kept_operational_during_impact
+    - id: unmanaged_configuring_process
+      name: Exclusion configured by a process with no history
+      description: >-
+        The process that defined the exclusion is not a management agent or a known
+        administrative tool and has not run on this host before.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: unprecedented_for_host
+      name: No comparable exclusion activity in the baseline
+      description: >-
+        Exclusions and skip lists of this shape have not been configured on this host during
+        the baseline window, so the change is a deviation as well as a carve-out.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: documented_vendor_exclusion
+      name: Vendor-prescribed exclusion for a supported workload
+      description: >-
+        The excluded path or extension matches a published vendor exclusion list for a
+        database, build system or hypervisor role that the host actually runs.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_application_component
+    - id: recorded_false_positive_fix
+      name: Recorded exclusion to resolve a false positive
+      description: >-
+        A change or ticket record covers adding this exclusion to stop a scanner interfering
+        with a named business application.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: backup_agent_actor
+      name: Configured by a backup or management agent
+      description: >-
+        The skip list belongs to a backup, imaging or indexing agent whose normal operation
+        involves excluding system and volatile paths.
+      source: process_creation
+      field: UserName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - exclusion_scope_defined
+
+    supporting:
+      any:
+        - writable_staging_path_excluded
+        - system_components_avoided
+        - unmanaged_configuring_process
+        - unprecedented_for_host
+      all:
+        - writable_staging_path_excluded
+        - system_components_avoided
+
+    contradicting:
+      any:
+        - documented_vendor_exclusion
+        - recorded_false_positive_fix
+        - backup_agent_actor
+      all: []
+
+  verdict:
+    low_risk_when:
+      - exclusion_scope_defined
+      - documented_vendor_exclusion
+      - recorded_false_positive_fix
+      - backup_agent_actor
+    suspicious_when:
+      - exclusion_scope_defined
+      - unprecedented_for_host
+    high_risk_when:
+      - exclusion_scope_defined
+      - writable_staging_path_excluded
+      - system_components_avoided
+      - unmanaged_configuring_process
+
+  false_positive:
+    - condition: A support team excludes an application directory to stop a false positive.
+      explanation: >-
+        This is the common and legitimate use of exclusions. It names one installed
+        application's own directory under Program Files, is raised against a ticket, and does
+        not cover user-writable staging paths or executable extensions across the whole disk.
+    - condition: A backup or imaging agent skips system and volatile paths.
+      explanation: >-
+        Backup software genuinely excludes pagefiles, shadow copies and system state, and the
+        command lines look similar. The acting binary is the agent itself, running on schedule
+        under a service account, on every host it protects.
+    - condition: A developer excludes build output to speed up compilation.
+      explanation: >-
+        Excluding an object or build directory is routine on engineering workstations. It
+        covers a project path under the developer's own tree, persists across months, and is
+        not followed by recursive enumeration of the wider file system.
+    - condition: Vendor documentation prescribes exclusions for a database or hypervisor role.
+      explanation: >-
+        Published exclusion lists for these workloads are broad and can look alarming. They
+        match the host's actual role in asset inventory, are applied at build time by the
+        management platform, and appear identically on every host in that role.

@@ -1,0 +1,362 @@
+type: detection
+
+id: hg-lin-setuid-bit-set-on-a-binary-outside-the-standard-set-t1548-001
+
+version: 1.0.0
+
+info:
+  name: Setuid bit set on a binary outside the standard set
+  description: >-
+    A binary carrying the setuid bit runs as its owner rather than as the caller, so setting
+    that bit on a root-owned file hands any user on the host a way back to root that needs no
+    sudoers entry, no password and no exploit — just running the file. The mechanism is
+    ordinary; the population is not. Every distribution ships a small, stable set of setuid
+    programs (passwd, sudo, su, mount, ping and a handful more), that set is fixed at
+    installation and changes only when packages are updated, and nothing in normal operation
+    adds to it. The observable is therefore the bit being set, not the bit existing: a chmod
+    with u+s or a leading 4, 2 or 6 in the mode, applied to a path outside the packaged set.
+    Baselining that set per distribution and per image is what makes this precise, because
+    the difference between a routine package update and an installed backdoor is entirely
+    which file changed and who changed it.
+  severity: high
+  author: huntgraph
+  tags:
+    - privilege-escalation
+    - elevation-control
+    - setuid
+    - file-permissions
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1548/001
+    - https://attack.mitre.org/detectionstrategies/DET0110
+    - https://attack.mitre.org/techniques/T1548
+
+mitre:
+  tactics:
+    - TA0004
+  techniques:
+    - T1548
+  sub_techniques:
+    - T1548.001
+  detection_strategies:
+    - DET0110
+  analytics:
+    - AN0307
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+  data_components:
+    - Command Execution
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may set the setuid or setgid bit on a binary they control so that any later
+    execution runs with the owner's privileges, obtaining a durable route back to root that
+    requires no credentials, no sudoers change and no repeat of the original access.
+  attacker_behavior:
+    - Runs chmod u+s or a numeric mode beginning 4, 2 or 6 against a binary they own or planted.
+    - Copies a shell or interpreter to a private path and flags the copy rather than the original.
+    - Uses install with an explicit mode so the file is placed and flagged in one command.
+    - Enumerates existing setuid binaries with find -perm to locate one that can be abused.
+    - Leaves the flagged file under a temporary, home or application directory that nobody audits.
+  legitimate_behavior:
+    - Package installation and updates set the bits on the distribution's own setuid programs.
+    - Configuration management enforces permissions on a governed list of binaries.
+    - Vendor installers flag their own privileged helpers during setup.
+    - Administrators grant a group access to a privileged helper on lab or appliance hosts.
+  risk_indicator:
+    - The target sits outside the small set of packaged setuid programs for the distribution.
+    - The target is a shell, interpreter or copy of one rather than a purpose-built helper.
+    - The binary was written into a writable directory shortly before the bit was set.
+    - The change appears on one host and on no comparable system.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: setuid-bit-set-with-chmod
+        name: Permission change adding the setuid or setgid bit
+        purpose: >-
+          Surface every occurrence of the bit being set, symbolically or numerically. On a
+          host in steady state this fires only when packaging touches permissions, so the
+          rare-first ordering puts the unexplained changes at the top.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(chmod|install)\b/
+          | CommandLine=/([ugo,+]s\b|[+]s\b|\s[46][0-7]{3}\b|\s[26][0-7]{3}\b|\smode=[46246][0-7]{3}\b)/
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of dpkg, rpm, apt, yum, dnf and the configuration-management agent"
+            - "The distribution's own packaged setuid programs, baselined per image"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: setuid-bit-set-outside-system-paths
+        name: Setuid bit set on a file in a writable directory
+        purpose: >-
+          Apply the discriminator. No packaged setuid program lives under /tmp, /var/tmp,
+          /dev/shm or a home directory, so a bit set on a path there cannot be explained by
+          a package update regardless of who ran the command.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(chmod|install)\b/
+          | CommandLine=/([ugo,+]s\b|[+]s\b|\s[46][0-7]{3}\b|\s[26][0-7]{3}\b)/
+          | CommandLine=/(\/tmp\/|\/var\/tmp\/|\/dev\/shm\/|\/home\/|\/root\/|\/var\/www\/|\/\.[a-z0-9_-]+\/)/
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: setuid-bit-set-on-a-shell-or-interpreter
+        name: Setuid bit set on a shell or interpreter
+        purpose: >-
+          Isolate the case with no benign reading at all. A setuid helper exists to do one
+          narrow privileged job; a setuid shell, interpreter or copy of one is a general
+          root primitive and nothing in a distribution ships that way.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(chmod|install)\b/
+          | CommandLine=/([ugo,+]s\b|[+]s\b|\s[46][0-7]{3}\b|\s[26][0-7]{3}\b)/
+          | CommandLine=/\b(ba|da|k|z|c|tc)?sh\b|\b(python[0-9.]*|perl|ruby|php|lua|awk|find|nmap|vim?|nano|env|busybox)\b/
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: executable-planted-in-a-writable-path
+        name: Executable written into a writable directory
+        purpose: >-
+          Provide the other half of the correlation. A binary appearing in a temporary or
+          home directory shortly before a setuid change on the same host is the plant that
+          the permission change turns into a privilege-escalation route.
+        query: |
+          #event_simpleName=NewExecutableWritten
+          | TargetFileName=/^\/(tmp|var\/tmp|dev\/shm)\/|^\/home\/[^\/]+\/|^\/var\/www\//
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Build, compilation and test directories where binaries are produced routinely"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: setuid-binaries-enumerated
+        name: Search for existing setuid or setgid binaries
+        purpose: >-
+          Catch the reconnaissance that precedes abuse of an already-flagged binary, which
+          is the variant that never sets a bit at all and would otherwise leave no trace in
+          the permission-change cases.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\bfind\b/
+          | CommandLine=/-perm\s+[-\/+]?[0-7]?[46267]000\b/
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=searches), collect([CommandLine], limit=5)])
+          | sort(searches, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Vulnerability scanners and compliance agents that inventory setuid binaries on a schedule"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - organization
+
+evidence:
+  required:
+    - id: setuid_bit_set
+      name: Setuid or setgid bit applied to a file
+      description: >-
+        A permission change added the setuid or setgid bit, symbolically or through a
+        numeric mode, so the file will execute with its owner's privileges rather than the
+        caller's from that point on.
+      source: process_creation
+      field: CommandLine
+      indicates: privilege_elevation_configured
+
+  supporting:
+    - id: target_outside_packaged_set
+      name: Target sits in a writable directory
+      description: >-
+        The flagged path is under a temporary, home, web or hidden directory, where no
+        distribution places a setuid program, so a package update cannot account for it.
+      source: process_creation
+      field: CommandLine
+      indicates: nonstandard_privileged_binary
+    - id: target_is_a_shell_or_interpreter
+      name: Target is a shell, interpreter or a copy of one
+      description: >-
+        The bit was applied to a general-purpose shell or interpreter rather than a narrow
+        privileged helper, which yields an unrestricted root primitive.
+      source: process_creation
+      field: ImageFileName
+      indicates: root_primitive_created
+    - id: binary_planted_before_change
+      name: Executable written into a writable path
+      description: >-
+        A binary was created in a temporary, home or web directory on the same host, which
+        pairs with the permission change as plant-then-flag rather than a permissions fix.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staged
+    - id: setuid_search_performed
+      name: Existing setuid binaries enumerated
+      description: >-
+        The host was searched for files already carrying the setuid or setgid bits, which is
+        how an adversary finds an abusable binary instead of creating one.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: privilege_escalation_reconnaissance
+    - id: setuid_change_rare_in_fleet
+      name: Change absent from comparable hosts
+      description: >-
+        The same permission change does not appear on peer systems during the baseline
+        window, unlike package updates and enforced permission policy which land fleet-wide.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: package_permission_change
+      name: Applied by package management
+      description: >-
+        The permission change was made by dpkg, rpm or a package post-install script while
+        installing or updating the distribution's own privileged programs.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: packaged_setuid_target
+      name: Target is a known packaged setuid program
+      description: >-
+        The flagged file is one of the small stable set the distribution ships setuid, such
+        as passwd, sudo, su, mount or ping, in its packaged system path.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_application_component
+    - id: setuid_change_fleetwide
+      name: Same change across comparable hosts
+      description: >-
+        The identical permission change appears on peer systems throughout the baseline
+        window, which is an update wave or an enforced permissions policy rather than a
+        targeted backdoor.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - setuid_bit_set
+
+    supporting:
+      any:
+        - target_outside_packaged_set
+        - target_is_a_shell_or_interpreter
+        - binary_planted_before_change
+        - setuid_search_performed
+        - setuid_change_rare_in_fleet
+      all:
+        - target_outside_packaged_set
+        - target_is_a_shell_or_interpreter
+
+    contradicting:
+      any:
+        - package_permission_change
+        - packaged_setuid_target
+        - setuid_change_fleetwide
+      all: []
+
+  verdict:
+    low_risk_when:
+      - setuid_bit_set
+      - package_permission_change
+      - packaged_setuid_target
+      - setuid_change_fleetwide
+    suspicious_when:
+      - setuid_bit_set
+      - setuid_change_rare_in_fleet
+    high_risk_when:
+      - setuid_bit_set
+      - target_outside_packaged_set
+      - target_is_a_shell_or_interpreter
+      - binary_planted_before_change
+
+  false_positive:
+    - condition: A package update reapplies permissions to its own setuid programs.
+      explanation: >-
+        Updating packages that own setuid binaries reruns the permission step, which
+        reproduces the required evidence exactly. The parent is the package manager, the
+        target is a packaged system path, and the same change appears across every host
+        taking that update.
+    - condition: Configuration management enforces a permissions policy.
+      explanation: >-
+        Hardening baselines routinely assert modes on a governed list of binaries, including
+        the setuid ones, on every agent run. The writer is the management agent and the
+        targets come from a fixed, reviewable list rather than arbitrary paths.
+    - condition: A vendor installer flags its own privileged helper.
+      explanation: >-
+        Backup agents, VPN clients and hardware tools ship small setuid helpers and set the
+        bit during installation. The file lives in the product's installation directory, is
+        owned by the package, and appears wherever the product is deployed.
+    - condition: A compliance scanner enumerates setuid binaries on a schedule.
+      explanation: >-
+        Inventory and vulnerability agents run find with -perm to report the setuid
+        population, which matches the enumeration case. It recurs on a fixed schedule under
+        the scanner's own account and is never followed by a permission change.

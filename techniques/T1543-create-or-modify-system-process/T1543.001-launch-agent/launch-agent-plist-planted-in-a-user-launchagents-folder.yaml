@@ -1,0 +1,347 @@
+type: detection
+
+id: hg-mac-launch-agent-plist-planted-for-login-persistence-t1543-001
+version: 1.0.0
+
+info:
+  name: Launch agent plist planted in a user LaunchAgents folder
+  description: >-
+    A launch agent is a plist that the per-user launchd reads when someone logs in, and it
+    runs whatever the ProgramArguments key names, in that user's session, at that user's
+    privilege. That is the whole appeal: the directory under the user's own home is
+    writable without any prompt, without sudo and without touching a system path, so an
+    adversary who only has the user's own rights can still be resident on every login. The
+    file itself is unremarkable — a few dozen bytes of XML with a reverse-DNS label chosen
+    to look like Apple or a familiar vendor — so the plist is not where the discrimination
+    lives. What separates a planted agent from an installed one is the writer and the
+    target of the reference: legitimate agents arrive inside a package, written by the
+    installer that owns them, and point at a signed binary in the application bundle or
+    Application Support directory that the same package delivered. A planted agent is
+    written by a shell, an interpreter or defaults, and points at something in a scratch
+    path the installer machinery would never use.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - launchd
+    - plist
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1543/001
+    - https://attack.mitre.org/detectionstrategies/DET0434
+    - https://attack.mitre.org/techniques/T1543
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1543
+  sub_techniques:
+    - T1543.001
+  detection_strategies:
+    - DET0434
+  analytics:
+    - AN1208
+  platforms:
+    - macOS
+  data_sources:
+    - "macos:unifiedlog"
+    - "fs:fsusage"
+  data_components:
+    - Command Execution
+    - File Creation
+    - File Modification
+
+hypothesis:
+  statement: >-
+    An adversary may write a launch agent plist into a LaunchAgents directory so that the
+    per-user launchd starts their payload every time that account logs in, obtaining
+    session-scoped persistence that needs no administrative rights and leaves no service or
+    scheduled job behind.
+  attacker_behavior:
+    - Writes a plist into ~/Library/LaunchAgents or /Library/LaunchAgents from a shell or interpreter.
+    - Sets RunAtLoad or KeepAlive true so the payload starts at login and restarts if killed.
+    - Labels the agent with a reverse-DNS name borrowed from Apple or an installed product.
+    - Registers the agent with launchctl so it starts immediately instead of at next login.
+    - Points ProgramArguments at a binary staged under the user's home or a temporary path.
+  legitimate_behavior:
+    - Application installers place launch agents for updaters, sync clients and helper tools.
+    - Management platforms deploy agent plists as part of a standard software baseline.
+    - Developers write and reload their own agents while building or testing tooling.
+    - Applications register a helper agent the first time a user enables a background feature.
+  risk_indicator:
+    - The plist is written by a shell, defaults or an interpreter rather than by installer machinery.
+    - The referenced program lives in a temporary or user-writable directory outside any bundle.
+    - The agent label imitates an Apple or vendor identifier that does not match the referenced path.
+    - launchd starts a process from a scratch path in the user's session shortly after the write.
+    - The agent appears on one host in the estate rather than wherever the product is deployed.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: agent-plist-written-by-a-shell-or-interpreter
+        name: LaunchAgents plist written from a command line
+        purpose: >-
+          Surface the write itself and, more importantly, who performed it. Packages deliver
+          agent plists through installer machinery, which does not shell out to place them,
+          so a plist landing in a LaunchAgents directory by way of defaults, cp, tee or an
+          interpreter is the install path an operator uses rather than the one a vendor does.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/Library\/LaunchAgents/i
+          | CommandLine=/\.plist/i
+          | FileName=/^(defaults|plutil|PlistBuddy|cp|mv|tee|ditto|install|bash|sh|zsh|python3?|osascript|perl|ruby|curl)$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=writes), collect([CommandLine], limit=5)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Configuration management runs that template agent plists across the estate"
+            - "Developer accounts that build and reload their own agents continuously"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: agent-registered-in-the-user-gui-domain
+        name: Agent loaded into a logged-in user session with launchctl
+        purpose: >-
+          Separate an agent that will start at the next login from one that is running now.
+          Bootstrapping into the gui domain of a specific uid, or loading the plist path
+          directly, is how an operator avoids waiting for a logout, and it also confirms the
+          agent targets a user session rather than the system.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^launchctl$/i
+          | CommandLine=/\s(load|bootstrap|enable|kickstart)\s/i
+          | CommandLine=/(gui\/\d+|Library\/LaunchAgents)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=registrations), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Application first-run flows that load their own helper agent"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: payload-binary-written-to-a-user-writable-path
+        name: Executable written into a path an agent would not normally reference
+        purpose: >-
+          Catch the payload rather than the pointer. A launch agent is only as persistent as
+          the file it names, and vendor agents name binaries inside an application bundle or
+          Application Support. An executable arriving in a home directory, a temporary path
+          or a shared folder is the file a planted agent points at.
+        query: |
+          #event_simpleName=/^(NewExecutableWritten)$/
+          | TargetFileName=/^\/(Users|tmp|var\/tmp|private\/tmp|private\/var\/tmp|Volumes)\//i
+          | TargetFileName!=/\/(Applications|Library\/Application Support|Xcode|DerivedData)\//i
+          | groupBy([ComputerName, TargetFileName],
+                    function=[count(as=writes), collect([SHA256HashData], limit=3)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Build output directories on developer and CI hosts"
+            - "Disk images mounted under /Volumes during ordinary software installation"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: agent-payload-launched-by-launchd-in-a-user-session
+        name: launchd starting a user-session process from a scratch path
+        purpose: >-
+          Confirm the persistence fired and that it fired as the user rather than as root,
+          which is what makes this an agent and not a daemon. A launchd child running as a
+          normal account from a home or temporary directory is the agent doing its job.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^launchd$/i
+          | UserName!=/^(root|_[a-z]+)$/i
+          | ImageFileName=/^\/(Users|tmp|var\/tmp|private\/tmp|private\/var\/tmp|Volumes)\//i
+          | groupBy([ComputerName, UserName, ImageFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Home-directory installs of sanctioned developer tooling"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - path
+
+evidence:
+  required:
+    - id: agent_plist_written_by_hand
+      name: LaunchAgents plist written from a command line
+      description: >-
+        A plist was placed into a LaunchAgents directory by a shell, an interpreter or the
+        defaults utility, which is the install route an operator uses and not the route a
+        package uses.
+      source: process_creation
+      field: CommandLine
+      indicates: login_persistence_established
+
+  supporting:
+    - id: agent_registered_in_gui_domain
+      name: Agent bootstrapped into a live user session
+      description: >-
+        launchctl was used to load or bootstrap the agent into a logged-in user's gui
+        domain, so the payload starts immediately rather than at the next login.
+      source: process_creation
+      field: FileName
+      indicates: persistence_activated_without_reboot
+    - id: payload_staged_in_writable_path
+      name: Executable staged where an agent should not point
+      description: >-
+        A new executable was written into a home, temporary or removable path, which is
+        where a planted agent's ProgramArguments target lives and where a vendor's does not.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staged_in_writable_path
+    - id: agent_ran_at_login
+      name: launchd started the payload in a user session
+      description: >-
+        A process running as an ordinary account was started by launchd from a scratch
+        path, confirming the agent loaded and executed rather than merely being present.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: execution_chain_progression
+    - id: unusual_for_host
+      name: No history of agent installation on this host
+      description: >-
+        No comparable write to a LaunchAgents directory has been seen on this host during
+        the baseline window, so the install is a deviation as well as a persistence event.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: installer_owned_write
+      name: Written by installer machinery
+      description: >-
+        The plist was placed by installd, a package post-install script or the software
+        update service, which is how a signed package delivers its own agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_software_installation
+    - id: managed_application_component
+      name: Agent belongs to a deployed product
+      description: >-
+        The agent label and referenced path match a product recorded as deployed to this
+        host, so the plist is part of that product rather than an addition to it.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_application_component
+    - id: fleetwide_agent
+      name: Same agent across the estate
+      description: >-
+        The identical plist path and program reference appear on many hosts in one window,
+        which is a deployment wave rather than a targeted install.
+      source: baseline
+      field: CommandLine
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - agent_plist_written_by_hand
+
+    supporting:
+      any:
+        - agent_registered_in_gui_domain
+        - payload_staged_in_writable_path
+        - agent_ran_at_login
+        - unusual_for_host
+      all:
+        - payload_staged_in_writable_path
+        - agent_ran_at_login
+
+    contradicting:
+      any:
+        - installer_owned_write
+        - managed_application_component
+        - fleetwide_agent
+      all: []
+
+  verdict:
+    low_risk_when:
+      - agent_plist_written_by_hand
+      - installer_owned_write
+      - managed_application_component
+      - fleetwide_agent
+    suspicious_when:
+      - agent_plist_written_by_hand
+      - unusual_for_host
+    high_risk_when:
+      - agent_plist_written_by_hand
+      - agent_registered_in_gui_domain
+      - payload_staged_in_writable_path
+      - agent_ran_at_login
+
+  false_positive:
+    - condition: An application installs its own launch agent during a package install.
+      explanation: >-
+        Updaters, sync clients and helper tools all ship agents. The write comes from
+        installd or a package script rather than from an interactive shell, and the
+        referenced program lives inside the bundle or Application Support directory the
+        same package created.
+    - condition: A management platform templates agent plists onto managed Macs.
+      explanation: >-
+        Configuration tooling does write plists from a script, which looks exactly like the
+        required evidence. It produces the same file on many hosts inside one window and the
+        referenced program is a managed binary, so the baseline comparison separates it.
+    - condition: A developer writes and reloads an agent while building tooling.
+      explanation: >-
+        Development work produces repeated writes and launchctl loads of the same label,
+        often pointing into a build directory. The pattern is iterative and confined to the
+        developer's own account, where an operator's install happens once.
+    - condition: An application registers a helper agent when a background feature is enabled.
+      explanation: >-
+        Enabling sync, screen sharing or a menu-bar helper causes the app itself to write an
+        agent under the user's home. The writing process is the application binary rather
+        than a shell, and the program it references is inside the same application bundle.

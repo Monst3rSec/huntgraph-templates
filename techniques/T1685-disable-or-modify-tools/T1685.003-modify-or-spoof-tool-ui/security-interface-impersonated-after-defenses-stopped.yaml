@@ -1,0 +1,335 @@
+type: detection
+
+id: hg-win-security-interface-impersonated-after-defenses-stopped-t1685-003
+
+version: 1.0.0
+
+info:
+  name: Security interface impersonated after defenses stopped
+  description: >-
+    Most tampering with endpoint defenses is noticed through the interface rather than the
+    telemetry: a red shield in the tray, a health widget reporting real-time protection as off,
+    a user calling the service desk. Spoofing that interface removes the signal a human would
+    have acted on. The adversary stops the protection service and then runs a process that
+    presents the expected tray icon and status window reading healthy, so the desk sees a
+    protected machine, the user has nothing to report, and the absence of alerts from that
+    host is interpreted as quiet rather than as blind. What actually stopped working is the
+    scanning engine and the sensor's own reporting; what keeps working is the picture of them.
+    The discriminator is location and identity: the genuine security interface binaries load
+    from the system directories and the vendor's installation path under a fixed name and
+    hash, so the same filename executing from a user-writable directory, or with a hash seen
+    on only one host in the estate, is an impersonation rather than an update.
+  severity: critical
+  author: huntgraph
+  tags:
+    - defense-impairment
+    - tool-ui-spoofing
+    - masquerading
+    - endpoint-protection
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1685/003
+    - https://attack.mitre.org/detectionstrategies/DET0311
+    - https://attack.mitre.org/techniques/T1685
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1685
+  sub_techniques:
+    - T1685.003
+  detection_strategies:
+    - DET0311
+  analytics:
+    - AN0868
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may stop endpoint protection and then run a process that impersonates its
+    interface, obtaining a host that reports itself as protected to every human who looks at
+    it while no scanning, blocking or reporting is actually taking place.
+  attacker_behavior:
+    - Stops or disables the protection service, then launches a stand-in that draws its tray icon.
+    - Runs a binary using the security interface's filename from a user-writable directory.
+    - Replaces the vendor's interface executable so the same path serves a fabricated status.
+    - Suppresses the health notification component so no warning is raised about the stopped service.
+  legitimate_behavior:
+    - Product upgrades briefly restart services and replace interface executables.
+    - Vendors ship diagnostic and support tools that mimic the main console layout.
+    - Some products install to non-default paths chosen at deployment time.
+    - Software distribution systems stage installers and their components under temporary paths.
+  risk_indicator:
+    - The interface binary runs from a user-writable path rather than the vendor's install directory.
+    - The protection service is stopped in the same window the interface process appears.
+    - The binary's hash is unique to one host while the filename is common across the estate.
+    - The interface process is launched by a shell or script host rather than by the system.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - SHA256HashData
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: security-ui-binary-from-writable-path
+        name: Security interface filename executing outside its install directory
+        purpose: >-
+          Surface the impersonation directly. The genuine health, tray and console binaries
+          load from the system directories or the vendor's installation path, so the same
+          filename running from a user-writable directory is a stand-in presenting a status it
+          has no way of knowing.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(SecurityHealthSystray|SecurityHealthService|SecurityHealthHost|MSASCui|MSASCuiL|MpCmdRun|MsMpEng|NisSrv|WSCollect|SecHealthUI)\.exe$/i
+          | ImageFileName!=/\\Windows\\+(System32|SysWOW64|SystemApps)\\+/i
+          | ImageFileName!=/\\Program Files( \(x86\))?\\+Windows Defender\\+/i
+          | ImageFileName!=/\\ProgramData\\+Microsoft\\+Windows Defender\\+Platform\\+/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName],
+                    function=[count(as=executions), collect([SHA256HashData], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Platform update staging directories used during a product version rollout"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: protection-stopped-then-ui-appears
+        name: Protection service stopped and an interface process started together
+        purpose: >-
+          Bind the two halves that make the technique work. Stopping the service alone is
+          noisy because the interface complains; presenting an interface alone proves nothing.
+          The pairing inside one window is the point at which the host stops defending itself
+          and starts lying about it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(net(\.exe)?\s+stop|sc(\.exe)?\s+(stop|config)|Stop-Service|Set-Service|Set-MpPreference\s+.*-DisableRealtimeMonitoring\s+\$?true)/i
+                and CommandLine=/(WinDefend|Sense|WdNisSvc|SecurityHealthService|MsMpEng|wscsvc|SgrmBroker)/i
+                | defense_stopped := CommandLine ;
+              FileName=/^(SecurityHealthSystray|SecurityHealthHost|MSASCui|MSASCuiL|SecHealthUI)\.exe$/i
+                | ui_process := ImageFileName ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([defense_stopped, ui_process]), count(as=events)])
+          | defense_stopped=/.+/
+          | ui_process=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Maintenance windows in which the product is being upgraded or reinstalled"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: security-ui-launched-by-shell
+        name: Security interface process launched by a shell or script host
+        purpose: >-
+          Isolate the launcher. The real tray and health components are started by the shell
+          session or the service control manager at logon, never by an interpreter, an
+          archiver or a remote-execution channel, so the parent alone separates the genuine
+          component from a planted one.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(SecurityHealthSystray|SecurityHealthService|SecurityHealthHost|MSASCui|MSASCuiL|MsMpEng|SecHealthUI)\.exe$/i
+          | ParentBaseFileName=/^(cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|winrshost|wmiprvse|7z|winrar|python)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=launches), collect([CommandLine], limit=5)])
+          | sort(launches, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Support scripts that legitimately invoke the vendor command-line utility"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: rare-hash-for-common-ui-binary
+        name: Interface binary whose hash appears on a single host
+        purpose: >-
+          Catch replacement in place, where the path is correct and only the contents changed.
+          Vendor components are identical across the estate at any given patch level, so a
+          filename that is common everywhere but carries a hash seen on one machine is a
+          substituted binary rather than a version skew.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(SecurityHealthSystray|SecurityHealthService|SecurityHealthHost|MSASCui|MSASCuiL|MsMpEng|NisSrv|SecHealthUI)\.exe$/i
+          | groupBy([FileName, SHA256HashData],
+                    function=[count(as=executions), collect([ComputerName, ImageFileName], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Hosts mid-rollout during a staged product update, where two hashes coexist"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - organization
+            - process
+            - path
+
+evidence:
+  required:
+    - id: spoofed_security_interface
+      name: Security interface binary running from an unexpected location or hash
+      description: >-
+        A process carrying the filename of an endpoint protection interface component executed
+        from outside the vendor's installation path, or with contents unique to this host, so
+        the status it presents is not being produced by the protection product.
+      source: process_creation
+      field: ImageFileName
+      indicates: security_status_misrepresented
+
+  supporting:
+    - id: protection_stopped_in_window
+      name: Protection service stopped in the same window
+      description: >-
+        A protection or health service was stopped, disabled or had real-time scanning turned
+        off close in time to the interface process appearing, which is the loss the spoofed
+        interface exists to conceal.
+      source: process_creation
+      field: CommandLine
+      indicates: defensive_control_degradation
+    - id: launched_by_script_host
+      name: Interface process launched by a shell or script host
+      description: >-
+        The process was started by an interpreter, archiver or remote-execution channel rather
+        than by the service control manager or the logon shell, which is how the genuine
+        component is always started.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: unique_binary_contents
+      name: Binary contents unique within the estate
+      description: >-
+        The executable's hash appears on a single host while the filename is common across the
+        estate, indicating a substituted binary rather than a version difference.
+      source: process_creation
+      field: SHA256HashData
+      indicates: masquerading_binary
+    - id: unprecedented_for_host
+      name: No prior execution of this component from this path
+      description: >-
+        This component has not run from this location on this host during the baseline window,
+        so its appearance is a deviation as well as a mismatch.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: product_upgrade_window
+      name: Product upgrade or reinstall in progress
+      description: >-
+        The protection product is being upgraded or reinstalled, which restarts services and
+        runs interface components from staging directories for the duration.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: non_default_install_path
+      name: Product installed to a non-default path
+      description: >-
+        The estate deploys the protection product to a path chosen at deployment time, so the
+        component's location differs from the vendor default by design.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_application_component
+    - id: vendor_support_utility
+      name: Signed vendor support or diagnostic utility
+      description: >-
+        The executable is a vendor-signed support tool that reproduces the console layout for
+        diagnostics, distributed by the security team rather than planted.
+      source: process_creation
+      field: FileName
+      indicates: legitimate_application_component
+
+  risk_logic:
+    required:
+      - spoofed_security_interface
+
+    supporting:
+      any:
+        - protection_stopped_in_window
+        - launched_by_script_host
+        - unique_binary_contents
+        - unprecedented_for_host
+      all:
+        - protection_stopped_in_window
+        - unique_binary_contents
+
+    contradicting:
+      any:
+        - product_upgrade_window
+        - non_default_install_path
+        - vendor_support_utility
+      all: []
+
+  verdict:
+    low_risk_when:
+      - spoofed_security_interface
+      - product_upgrade_window
+      - non_default_install_path
+      - vendor_support_utility
+    suspicious_when:
+      - spoofed_security_interface
+      - unprecedented_for_host
+    high_risk_when:
+      - spoofed_security_interface
+      - protection_stopped_in_window
+      - launched_by_script_host
+      - unique_binary_contents
+
+  false_positive:
+    - condition: A product upgrade restarts services and runs components from a staging path.
+      explanation: >-
+        Upgrades genuinely stop the protection service and execute interface binaries from a
+        temporary platform directory, which looks identical for a few minutes. The staging
+        path belongs to the vendor's own update mechanism, the activity appears across a wave
+        of hosts, and the service returns on its own.
+    - condition: The product is deployed to a non-default installation directory.
+      explanation: >-
+        Some estates relocate installations, so the path test alone will fire on every host.
+        The discriminator is consistency: a relocated install produces the same path and the
+        same hash everywhere, whereas an impersonation is one host and one unique binary.
+    - condition: A vendor diagnostic tool reproduces the console interface.
+      explanation: >-
+        Support utilities deliberately mimic the main console so a technician can compare
+        states. They are vendor-signed, are run alongside an open support case, and do not
+        coincide with the protection service being stopped.
+    - condition: A support script invokes the vendor command-line utility.
+      explanation: >-
+        Running the product's own command-line tool from a script is normal for scans and
+        signature updates, and it will match on the parent process alone. It executes from the
+        vendor installation path with the expected hash, which the other cases separate out.

@@ -1,0 +1,335 @@
+type: detection
+
+id: hg-win-replication-source-registered-for-a-host-that-is-not-a-dc-t1207
+
+version: 1.0.0
+
+info:
+  name: Replication source registered for a host that is not a domain controller
+  description: >-
+    Active Directory trusts replication. A change that arrives over the replication channel
+    is accepted as authoritative and is not written to the security log of the domain
+    controller that receives it, which is what makes registering a rogue replication source
+    so valuable: the adversary stops modifying the directory through auditable interfaces and
+    starts pushing changes into it instead. Group memberships, SID history, delegation rights
+    and key material can all be injected this way, and the receiving controller records
+    replication rather than modification. Registering the source is the part that has to
+    happen on a machine the defender can see. It requires creating server and nTDSDSA objects
+    in the Configuration partition and adding the directory replication service principal
+    names to a computer object, and the registration is usually torn down within seconds of
+    the push completing. The discriminator is the identity of the host: real domain
+    controllers acquire these service principal names during promotion, from the promotion
+    tooling, and keep them. A workstation or member server that acquires them briefly, from a
+    shell, has no legitimate reason to be a replication partner.
+  severity: critical
+  author: huntgraph
+  tags:
+    - defense-impairment
+    - active-directory
+    - replication
+    - dcshadow
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1207
+    - https://attack.mitre.org/detectionstrategies/DET0276
+    - https://attack.mitre.org/techniques/T1003/006
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1207
+  sub_techniques: []
+  detection_strategies:
+    - DET0276
+  analytics:
+    - AN0770
+  platforms:
+    - Windows
+  data_sources:
+    - NSM:Flow
+  data_components:
+    - Network Traffic Content
+
+hypothesis:
+  statement: >-
+    An adversary with directory administrator rights may register a machine they control as
+    a replication source and push changes into Active Directory over the replication
+    channel, so that object modifications are accepted as authoritative without appearing as
+    modifications in the security log of any domain controller.
+  attacker_behavior:
+    - Adds the directory replication service principal names to a computer object it controls.
+    - Creates server and nTDSDSA objects for that host in the Configuration partition.
+    - Triggers a replication push carrying the object changes it wants accepted.
+    - Removes the registration immediately afterwards so the rogue partner does not persist.
+  legitimate_behavior:
+    - Promoting a new domain controller creates exactly these objects and service principal names.
+    - Demoting a controller removes them again, touching the same objects.
+    - Directory migration and forest recovery work rewrites replication topology deliberately.
+    - Monitoring products query replication metadata and talk to controllers over RPC constantly.
+  risk_indicator:
+    - Replication service principal names are added to a host that is not in the Domain Controllers group.
+    - The registration is made from a shell or script host rather than by promotion tooling.
+    - The objects appear and disappear within minutes rather than persisting.
+    - Replication-style traffic reaches a controller from a host with no history of it.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - RemoteAddressIP4
+        - RemotePort
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: replication-spn-registered
+        name: Directory replication service principal name added to a computer object
+        purpose: >-
+          Surface the registration itself. The DRS interface identifier and the global
+          catalog prefix are what make a host addressable as a replication partner, and
+          outside promotion nothing writes them onto a computer object.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(E3514235-4B06-11D1-AB04-00C04FC2DCD2|\bGC\/|servicePrincipalName|setspn)/i
+          | CommandLine=/(setspn(\.exe)?\s+-[as]|Set-ADComputer|Set-ADObject|New-ADObject|ldifde|adsiedit|dsmod)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=registrations), collect([CommandLine], limit=5)])
+          | sort(registrations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Hosts inside the Domain Controllers organisational unit during a planned promotion"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: configuration-partition-object-written
+        name: Server or nTDSDSA object created in the Configuration partition
+        purpose: >-
+          Catch the directory-side half of the registration, where the objects that describe
+          a controller are written for a host that is not one. These objects are created by
+          promotion and by nothing else in normal operation.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(nTDSDSA|CN=Sites,CN=Configuration|CN=Servers,CN=|msDS-Behavior-Version|dMDLocation)/i
+          | CommandLine=/(New-ADObject|Set-ADObject|ldifde|dsadd|adsiedit|System\.DirectoryServices)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=writes), collect([CommandLine], limit=5)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Planned promotion, demotion and forest recovery work under change control"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: rogue-dc-tooling-invoked
+        name: Rogue controller tooling invoked
+        purpose: >-
+          Identify the packaged form. The modules that automate this perform registration,
+          push and teardown in one run, so the tool name is a stronger signal than any of
+          the individual directory writes it makes.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(lsadump::dcshadow|dcshadow::|\bdcshadow\b|misc::memssp|privilege::debug.{0,60}lsadump)/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=runs), collect([CommandLine], limit=5)])
+          | sort(runs, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Authorised directory security-assessment hosts"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: replication-rpc-from-unusual-host
+        name: Replication-style RPC to a controller from a host without a history of it
+        purpose: >-
+          Confirm the push crossed the wire. The replication call itself is not visible in
+          endpoint telemetry, but the endpoint-mapper conversation that carries it is, so
+          scope this to the hosts that reach a controller that way for the first time and
+          correlate it with the registration window rather than reading it alone.
+        query: |
+          #event_simpleName=/^NetworkConnectIP4$/
+          | RemotePort=135
+          | groupBy([ComputerName, RemoteAddressIP4, RemotePort, ContextProcessId],
+                    function=[count(as=connections)])
+          | sort(connections, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Domain controllers and the authorised replication partner set"
+            - "Directory monitoring and management servers that poll controllers over RPC"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - remote_address
+            - organization
+
+evidence:
+  required:
+    - id: replication_registration_for_non_dc
+      name: Replication identity written for a host that is not a controller
+      description: >-
+        The directory replication service principal names, or the server and nTDSDSA objects
+        that describe a controller, were written for a machine that is not a domain
+        controller, making it addressable as a replication partner.
+      source: process_creation
+      field: CommandLine
+      indicates: rogue_replication_partner
+
+  supporting:
+    - id: rogue_dc_tooling
+      name: Rogue controller tooling present
+      description: >-
+        A module whose only purpose is to register a machine as a controller and push
+        changes over replication was executed on the host.
+      source: process_creation
+      field: ImageFileName
+      indicates: directory_manipulation_tool
+    - id: replication_rpc_from_non_dc
+      name: Replication-style traffic to a controller
+      description: >-
+        The host opened the RPC conversation used to carry replication calls to a domain
+        controller, which a member server or workstation has no reason to do.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: replication_channel_use
+    - id: shell_origin
+      name: Registration made from a shell rather than promotion tooling
+      description: >-
+        The directory writes were made by a command shell, script host or remote-execution
+        service instead of the promotion process that normally creates these objects.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: hands_on_keyboard_activity
+    - id: first_seen_partner
+      name: Host has never been a replication partner
+      description: >-
+        The machine has no baseline history of holding a replication identity or of reaching
+        controllers over the replication channel.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: genuine_promotion
+      name: Genuine controller promotion or demotion
+      description: >-
+        The objects were created or removed by the promotion tooling as part of installing or
+        retiring a real domain controller, which writes exactly these attributes.
+      source: process_creation
+      field: FileName
+      indicates: legitimate_administrative_action
+    - id: approved_topology_change
+      name: Approved topology or recovery work
+      description: >-
+        A change record covers planned replication topology work, a migration or a forest
+        recovery exercise in this window.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: host_is_a_controller
+      name: The host is a domain controller
+      description: >-
+        Asset records place the machine in the domain controller population, where holding a
+        replication identity and talking to peers over replication is its normal function.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_role_behaviour
+
+  risk_logic:
+    required:
+      - replication_registration_for_non_dc
+
+    supporting:
+      any:
+        - rogue_dc_tooling
+        - replication_rpc_from_non_dc
+        - shell_origin
+        - first_seen_partner
+      all:
+        - rogue_dc_tooling
+        - replication_rpc_from_non_dc
+
+    contradicting:
+      any:
+        - genuine_promotion
+        - approved_topology_change
+        - host_is_a_controller
+      all: []
+
+  verdict:
+    low_risk_when:
+      - replication_registration_for_non_dc
+      - genuine_promotion
+      - approved_topology_change
+      - host_is_a_controller
+    suspicious_when:
+      - replication_registration_for_non_dc
+      - first_seen_partner
+    high_risk_when:
+      - replication_registration_for_non_dc
+      - rogue_dc_tooling
+      - replication_rpc_from_non_dc
+      - shell_origin
+
+  false_positive:
+    - condition: A new domain controller is promoted.
+      explanation: >-
+        Promotion creates the server and nTDSDSA objects and registers the replication
+        service principal names, which is the required evidence in full. It is performed by
+        the promotion tooling on a machine that then remains a controller, rather than from
+        a shell on a host that reverts minutes later.
+    - condition: A domain controller is demoted or forcibly removed.
+      explanation: >-
+        Demotion and metadata cleanup rewrite the same objects. The distinguishing feature is
+        direction: attributes are being removed from a machine that held them, not added to
+        one that never did.
+    - condition: A directory migration or forest recovery exercise rebuilds replication topology.
+      explanation: >-
+        Recovery work legitimately creates and repoints replication objects, sometimes by
+        script. These changes are scheduled, carry a change record and affect the real
+        controller population rather than a single member server.
+    - condition: A monitoring product polls controllers over RPC.
+      explanation: >-
+        Directory monitoring tools open endpoint-mapper connections to every controller
+        continually, which is why the network case is a correlation input rather than a
+        finding. Those hosts have a long, stable history of the same conversation.

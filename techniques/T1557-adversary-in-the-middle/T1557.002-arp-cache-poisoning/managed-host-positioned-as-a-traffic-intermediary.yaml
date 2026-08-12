@@ -1,0 +1,326 @@
+type: detection
+
+id: hg-win-managed-host-positioned-as-a-traffic-intermediary-t1557-002
+
+version: 1.0.0
+
+info:
+  name: Managed host positioned as a traffic intermediary on its segment
+  description: >-
+    ARP poisoning happens below the layer an endpoint sensor watches. The forged replies are
+    link-layer frames the agent never sees, the cache they corrupt is kernel state with no
+    event attached, and the poisoning changes no address the victim connects to — the client
+    still opens a session to the same server IP, the packets simply travel through someone
+    else. Any hunt that claims to see the poisoning itself from endpoint telemetry is
+    inventing evidence. What an endpoint can witness is a managed host behaving as the
+    intermediary the poisoning created: a workstation that binds ports servers serve so it can
+    terminate redirected sessions, and a single process on it that then reaches a spread of
+    peers on its own subnet over protocols that carry credentials in the clear. That makes
+    this a hunt for the interception node, not for the poisoning, and it is worth stating
+    plainly that it sees nothing at all when the poisoner is an unmanaged device on the
+    segment, which is the common case. The discriminator is role: a client that starts serving.
+  severity: medium
+  author: huntgraph
+  tags:
+    - credential-access
+    - collection
+    - adversary-in-the-middle
+    - arp-poisoning
+    - network-interception
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1557/002
+    - https://attack.mitre.org/detectionstrategies/DET0387
+    - https://attack.mitre.org/techniques/T1557
+
+mitre:
+  tactics:
+    - TA0006
+    - TA0009
+  techniques:
+    - T1557
+  sub_techniques:
+    - T1557.002
+  detection_strategies:
+    - DET0387
+  analytics:
+    - AN1091
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:Security
+  data_components:
+    - Network Connection Creation
+    - Network Traffic Flow
+
+hypothesis:
+  statement: >-
+    An adversary may poison the ARP caches of hosts on a local segment so that traffic between
+    those hosts and their gateway passes through a system they control, obtaining a position
+    from which credentials sent over unencrypted protocols can be read or altered without
+    touching either endpoint.
+  attacker_behavior:
+    - Runs an interception tool on a compromised host so it can terminate redirected sessions.
+    - Binds ports that servers serve on a machine that has no server role.
+    - Reaches many peers on the local subnet from one process while mapping the segment.
+    - Draws credential-bearing cleartext protocols through the host it controls.
+  legitimate_behavior:
+    - Developers run local web, database and proxy services on their own workstations.
+    - Management, backup and inventory agents contact every host on a subnet by design.
+    - Some hosts genuinely hold a server role and are expected to listen and be reached.
+    - Virtualisation and container runtimes bind service ports on ordinary desktops.
+  risk_indicator:
+    - A host with no server role binds ports associated with serving rather than consuming.
+    - The listener belongs to a portable binary or an interpreter, not to installed software.
+    - One process reaches a large share of the local subnet in a short window.
+    - The sessions the host carries use protocols that pass credentials in the clear.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: network_connection
+      event_types:
+        - NetworkListenIP4
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - ContextBaseFileName
+        - LocalAddressIP4
+        - LocalPort
+        - RemoteAddressIP4
+        - RemotePort
+        - Protocol
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: client-host-binds-service-ports
+        name: A client machine starts listening on ports servers serve
+        purpose: >-
+          An interception node has to terminate the sessions it redirects, which means binding
+          the ports those sessions are addressed to. A workstation that starts listening on
+          web, SMB, directory or proxy ports has changed role, and role change is the only
+          part of this technique the endpoint genuinely records.
+        query: |
+          #event_simpleName=/^NetworkListenIP4$/
+          | LocalPort in (80, 443, 445, 389, 636, 1080, 3128, 8080, 8443)
+          | ContextBaseFileName!=/^(System|svchost\.exe|services\.exe|lsass\.exe|Idle)$/i
+          | groupBy([ComputerName, ContextBaseFileName, LocalPort],
+                    function=[count(as=binds), collect([LocalAddressIP4, Protocol], limit=5)])
+          | sort(binds, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Developer workstations running local web, proxy and database services"
+            - "Container and virtualisation runtimes that bind service ports on desktops"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: local-subnet-peer-fanout
+        name: One process reaching a large share of its own subnet
+        purpose: >-
+          Positioning on a segment is preceded and accompanied by touching the segment. A
+          single process talking to a wide set of neighbours on the same private range is the
+          endpoint's view of a host that is working the subnet rather than using it.
+        query: |
+          #event_simpleName=/^NetworkConnectIP4$/
+          | RemoteAddressIP4=/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/
+          | ContextBaseFileName!=/^(System|svchost\.exe|lsass\.exe|SearchIndexer\.exe|OneDrive\.exe|Teams\.exe|chrome\.exe|msedge\.exe)$/i
+          | groupBy([ComputerName, ContextBaseFileName],
+                    function=[count(field=RemoteAddressIP4, distinct=true, as=peers),
+                              count(as=sessions), collect([RemotePort], limit=10)])
+          | peers >= 25
+          | sort(peers, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Management, backup, patching and inventory agents that contact every host"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: cleartext-credential-protocols-carried
+        name: Cleartext credential protocols carried by an unexpected process
+        purpose: >-
+          Interception is only worth the risk when what passes through is readable. Sessions on
+          protocols that still send credentials in the clear, opened by a process that is not
+          the client software those protocols belong to, is what makes the position profitable.
+        query: |
+          #event_simpleName=/^NetworkConnectIP4$/
+          | RemotePort in (21, 23, 25, 80, 110, 143, 389, 1433, 3306, 5432)
+          | RemoteAddressIP4=/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/
+          | ContextBaseFileName!=/^(System|svchost\.exe|chrome\.exe|msedge\.exe|firefox\.exe|outlook\.exe|OneDrive\.exe|Teams\.exe)$/i
+          | groupBy([ComputerName, ContextBaseFileName, RemotePort],
+                    function=[count(as=sessions), collect([RemoteAddressIP4], limit=15)])
+          | sort(sessions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Line-of-business clients that legitimately speak these protocols internally"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - remote_address
+
+evidence:
+  required:
+    - id: client_bound_service_port
+      name: A client machine bound a port servers serve
+      description: >-
+        A host with no serving role took a listening bind on a port that carries web,
+        file, directory or proxy sessions, which is the position an interception node needs
+        in order to terminate traffic redirected to it.
+      source: network_connection
+      field: LocalPort
+      indicates: unexpected_service_role
+
+  supporting:
+    - id: untrusted_listener_process
+      name: Listener owned by a portable binary or interpreter
+      description: >-
+        The process holding the bind is not part of the host's installed software set, which
+        separates an interception tool from a developer service or a product component.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: untrusted_listener_owner
+    - id: subnet_peer_fanout
+      name: A large share of the local subnet contacted from one process
+      description: >-
+        One process reached many distinct neighbours on the host's own private range in a
+        short window, which is a host working its segment rather than using it.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: local_segment_enumeration
+    - id: cleartext_protocol_sessions
+      name: Credential-bearing cleartext sessions carried
+      description: >-
+        The host carried sessions on protocols that still pass credentials unencrypted,
+        opened by a process that is not the ordinary client for them.
+      source: network_connection
+      field: RemotePort
+      indicates: credential_exposure_opportunity
+    - id: host_has_no_server_role
+      name: Asset record shows no serving role
+      description: >-
+        The inventory classifies this host as a client endpoint, so nothing about its
+        function explains why it would be listening for or carrying other systems' sessions.
+      source: asset_inventory
+      field: ComputerName
+      indicates: role_inconsistent_with_behaviour
+    - id: no_prior_listener_on_port
+      name: No history of this bind on the host
+      description: >-
+        The host has not listened on this port during the baseline window, so the bind marks
+        the point at which its behaviour on the segment changed.
+      source: baseline
+      field: LocalPort
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: sanctioned_server_or_proxy
+      name: Host genuinely serves or proxies by design
+      description: >-
+        The asset record shows a server, a build agent or a sanctioned proxy, for which
+        listening on these ports and being reached by many peers is the expected function.
+      source: asset_inventory
+      field: ContextBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: developer_local_service
+      name: Developer or container runtime service
+      description: >-
+        Local web servers, databases, container runtimes and test proxies bind exactly these
+        ports on engineering workstations as part of ordinary work.
+      source: baseline
+      field: ContextBaseFileName
+      indicates: expected_user_behavior
+    - id: approved_assessment_window
+      name: Recorded assessment or network test
+      description: >-
+        An authorised penetration test or a network validation exercise covered this host and
+        window, which reproduces the interception behaviour deliberately.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - client_bound_service_port
+
+    supporting:
+      any:
+        - untrusted_listener_process
+        - subnet_peer_fanout
+        - cleartext_protocol_sessions
+        - host_has_no_server_role
+        - no_prior_listener_on_port
+      all:
+        - untrusted_listener_process
+        - subnet_peer_fanout
+        - host_has_no_server_role
+
+    contradicting:
+      any:
+        - sanctioned_server_or_proxy
+        - developer_local_service
+        - approved_assessment_window
+      all: []
+
+  verdict:
+    low_risk_when:
+      - client_bound_service_port
+      - sanctioned_server_or_proxy
+      - developer_local_service
+      - approved_assessment_window
+    suspicious_when:
+      - client_bound_service_port
+      - no_prior_listener_on_port
+      - host_has_no_server_role
+    high_risk_when:
+      - client_bound_service_port
+      - untrusted_listener_process
+      - subnet_peer_fanout
+      - cleartext_protocol_sessions
+      - host_has_no_server_role
+
+  false_positive:
+    - condition: A developer runs a local web server, proxy or database on their workstation.
+      explanation: >-
+        This produces the required evidence exactly and is extremely common on engineering
+        estates. The separation is that the listener belongs to installed tooling with a
+        stable path and a long baseline, it binds the loopback address as often as the
+        segment address, and it is not accompanied by fan-out across the local subnet.
+    - condition: A management, backup or vulnerability agent contacts every host on the subnet.
+      explanation: >-
+        These agents reproduce the peer fan-out perfectly and by design. They run from
+        installed product paths on a schedule the baseline has seen for months, and they do
+        not also bind serving ports on a client machine.
+    - condition: A container or virtualisation runtime publishes ports on a desktop.
+      explanation: >-
+        Container runtimes bind published ports on the host, which looks like a workstation
+        acquiring a server role. The owning process is the runtime itself, and the binds
+        follow the developer's own workload rather than the segment's traffic.
+    - condition: The host is genuinely a server that the asset record has not caught up with.
+      explanation: >-
+        Stale inventory turns a legitimate role into a role inconsistency. Confirm the host's
+        function before escalating, because everything else in this hunt is consistent with a
+        server doing its job.

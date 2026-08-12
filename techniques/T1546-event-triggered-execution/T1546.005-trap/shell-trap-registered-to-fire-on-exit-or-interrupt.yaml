@@ -1,0 +1,322 @@
+type: detection
+
+id: hg-lin-shell-trap-registered-to-fire-on-exit-or-interrupt-t1546-005
+
+version: 1.0.0
+
+info:
+  name: Shell trap registered to fire on exit or interrupt
+  description: >-
+    A trap tells the shell to run a command list when it receives a particular signal, and
+    the signals that matter are the ones an operator generates while trying to stop or leave
+    something: EXIT when the shell closes, INT when someone presses ctrl+c, HUP when a
+    session drops. Registered in a startup file, the trap re-arms in every shell the user
+    opens, so the payload runs on the ordinary act of logging out. It is quiet because the
+    keyword is short, appears inside legitimate scripts as cleanup, and leaves no file, no
+    unit and no scheduled job behind — the whole persistence lives in one line of shell. The
+    observable is a trap being written into a shell startup file, and the discriminator is
+    the command list: cleanup traps remove temporary files, whereas a persistence trap
+    fetches, decodes or launches something.
+  severity: medium
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - event-triggered-execution
+    - shell-trap
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1546/005
+    - https://attack.mitre.org/detectionstrategies/DET0369
+    - https://attack.mitre.org/techniques/T1546
+
+mitre:
+  tactics:
+    - TA0004
+    - TA0003
+  techniques:
+    - T1546
+  sub_techniques:
+    - T1546.005
+  detection_strategies:
+    - DET0369
+  analytics:
+    - AN1038
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+  data_components:
+    - Process Creation
+    - File Modification
+
+hypothesis:
+  statement: >-
+    An adversary may register a shell trap on exit or an interrupt signal so that their
+    command list runs when a session ends or is interrupted, obtaining persistence that
+    leaves no file or scheduled job and that fires on the operator's own attempt to leave.
+  attacker_behavior:
+    - Appends a trap on EXIT, INT or HUP to a shell startup file so every session re-arms it.
+    - Uses the trap command list to fetch, decode or launch a payload rather than to clean up.
+    - Registers a DEBUG or ERR trap so the command list runs on every command the shell reads.
+    - Places the trap in a root-owned startup file so it arms for privileged sessions too.
+    - Hides the registration in a long startup file among genuine environment settings.
+  legitimate_behavior:
+    - Scripts trap EXIT to remove temporary files and release locks on completion.
+    - Installers trap INT and TERM so an interrupted install can roll back cleanly.
+    - Build and deployment tooling traps ERR to report which step failed.
+    - Developers use DEBUG traps while instrumenting or profiling a script.
+  risk_indicator:
+    - The trap is written into a shell startup file rather than declared inside a script.
+    - The command list retrieves content, decodes data or spawns an interpreter.
+    - The registration is made by a service account or a non-interactive process.
+    - The same trap does not appear on comparable hosts.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: trap-appended-to-a-startup-file
+        name: Trap written into a shell startup file
+        purpose: >-
+          Surface the persistence step. A trap inside a script is scoped to that script's
+          run; a trap appended to .bashrc, .profile or an /etc/profile.d drop-in re-arms in
+          every shell the account opens, which is the difference between cleanup and
+          persistence.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\btrap\b/
+          | CommandLine=/(\.bashrc|\.bash_profile|\.bash_login|\.bash_logout|\.profile|\.zshrc|\.zprofile|\.zlogin|\.zlogout|\/etc\/profile|\/etc\/bash\.bashrc|\/etc\/zsh\/|\/etc\/profile\.d\/)/
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=registrations), collect([CommandLine], limit=5)])
+          | sort(registrations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the configuration-management agent and package post-install scripts"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: trap-on-a-session-ending-signal
+        name: Trap registered on exit, interrupt or hangup
+        purpose: >-
+          Cover the signals that make this technique attractive. A trap bound to EXIT, INT,
+          HUP, QUIT or TERM fires when the operator closes the shell or tries to stop what
+          is running, so the trigger is the response to the activity rather than the
+          activity itself.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\btrap\s+['"]/
+          | CommandLine=/['"]\s+(-?\s*)?(EXIT|INT|HUP|QUIT|TERM|SIGINT|SIGHUP|SIGTERM|SIGQUIT|0|1|2|3|15)\b/
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=registrations), collect([CommandLine], limit=5)])
+          | sort(registrations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Packaged installer and build scripts that trap for rollback and cleanup"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: trap-command-list-carrying-a-payload
+        name: Trap whose command list fetches or executes content
+        purpose: >-
+          Apply the discriminator directly. Cleanup traps delete temporary files and remove
+          locks; a trap that retrieves remote content, decodes a blob or launches an
+          interpreter from a writable path is doing something no cleanup handler needs to do.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\btrap\b/
+          | CommandLine=/(curl|wget|nc\b|ncat|socat|base64|openssl\s+enc|python[0-9.]*\s|perl\s|\/tmp\/|\/dev\/shm\/|\/var\/tmp\/|\/\.[a-z0-9_-]+\/|bash\s+-i|sh\s+-i|>&\s*\/dev\/tcp)/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=registrations), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: trap-on-debug-or-err
+        name: Trap registered on DEBUG or ERR
+        purpose: >-
+          Isolate the rarest and most abusable form. A DEBUG trap runs before every command
+          the shell reads, which makes it a general interception point rather than a
+          handler; outside active script debugging it is almost never legitimate in an
+          interactive session.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\btrap\b.*\b(DEBUG|ERR|RETURN)\b/
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=registrations), collect([CommandLine], limit=5)])
+          | sort(registrations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Build, test and deployment tooling that traps ERR for failure reporting"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - organization
+
+evidence:
+  required:
+    - id: trap_registered
+      name: Shell trap registered against a signal
+      description: >-
+        A trap command bound a command list to a signal, so the shell will execute that list
+        when the signal arrives rather than at any point the operator initiates.
+      source: process_creation
+      field: CommandLine
+      indicates: event_triggered_persistence
+
+  supporting:
+    - id: trap_persisted_in_startup_file
+      name: Trap written into a shell startup file
+      description: >-
+        The registration was appended to a login or interactive startup file, so the trap
+        re-arms in every shell the account opens instead of living for one script run.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_established
+    - id: trap_payload_in_command_list
+      name: Command list fetches, decodes or spawns
+      description: >-
+        The trapped command list retrieves remote content, decodes data or launches an
+        interpreter or shell from a writable path, which no cleanup handler requires.
+      source: process_creation
+      field: CommandLine
+      indicates: possible_payload_retrieval
+    - id: trap_registered_noninteractively
+      name: Registered by a service account or non-shell process
+      description: >-
+        The trap was installed by a web service, application account or downloaded script
+        rather than by a person working in their own shell.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: trap_rare_in_fleet
+      name: Trap absent from comparable hosts
+      description: >-
+        The same trap registration does not appear on peer systems during the baseline
+        window, unlike the cleanup traps that ship inside packaged and managed scripts.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: packaged_script_cleanup
+      name: Trap declared inside a packaged script
+      description: >-
+        The registration belongs to an installed or vendor-supplied script that traps EXIT
+        to remove its temporary files, which is standard defensive shell practice.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: build_tooling_trap
+      name: Trap set by build or deployment tooling
+      description: >-
+        The trap was registered by a build, packaging or deployment process that reports or
+        rolls back on failure, which is why ERR and INT handlers exist in that tooling.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: trap_fleetwide
+      name: Same trap across comparable hosts
+      description: >-
+        The identical registration appears on peer systems throughout the baseline window,
+        which is a shared script or managed profile rather than targeted persistence.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - trap_registered
+
+    supporting:
+      any:
+        - trap_persisted_in_startup_file
+        - trap_payload_in_command_list
+        - trap_registered_noninteractively
+        - trap_rare_in_fleet
+      all:
+        - trap_persisted_in_startup_file
+        - trap_payload_in_command_list
+
+    contradicting:
+      any:
+        - packaged_script_cleanup
+        - build_tooling_trap
+        - trap_fleetwide
+      all: []
+
+  verdict:
+    low_risk_when:
+      - trap_registered
+      - packaged_script_cleanup
+      - build_tooling_trap
+      - trap_fleetwide
+    suspicious_when:
+      - trap_registered
+      - trap_rare_in_fleet
+    high_risk_when:
+      - trap_registered
+      - trap_persisted_in_startup_file
+      - trap_payload_in_command_list
+      - trap_registered_noninteractively
+
+  false_positive:
+    - condition: A script traps EXIT to clean up its temporary files.
+      explanation: >-
+        This is the intended and most common use of trap, and it matches the required
+        evidence on its own. The registration lives inside a script rather than a startup
+        file, and the command list removes paths the same script created.
+    - condition: An installer traps INT and TERM to roll back an interrupted install.
+      explanation: >-
+        Package post-install scripts and vendor installers commonly guard against being
+        interrupted halfway. The parent is the package manager or the installer, and the
+        trap disappears with the process that set it.
+    - condition: Build and CI tooling traps ERR to report a failing step.
+      explanation: >-
+        Shell-based pipelines use ERR handlers for diagnostics, which reproduces the DEBUG
+        and ERR case. These run under build agents on build hosts and recur identically on
+        every job.
+    - condition: A developer instruments a script with a DEBUG trap.
+      explanation: >-
+        Tracing a script's execution with a DEBUG trap is a legitimate debugging technique.
+        It is short-lived, appears in the developer's own interactive session, and is not
+        written into a startup file where it would persist across shells.
