@@ -1,0 +1,329 @@
+type: detection
+
+id: hg-win-screensaver-configured-to-run-a-planted-binary-t1546-002
+
+version: 1.0.0
+
+info:
+  name: Screensaver configured to run a planted binary
+  description: >-
+    A screensaver is an ordinary executable that Windows launches on the user's behalf after
+    a period of inactivity, and which program runs is held in four writable values under the
+    current user's desktop configuration. Pointing those values at a payload gives an
+    adversary a trigger nobody watches: it fires when the desk is empty, it needs no
+    scheduled task or service, and the launch is attributed to the desktop session rather
+    than to anything the user did. The values are rarely touched outside personalisation, so
+    a change that repoints the screensaver at a path outside the system directories is the
+    finding rather than a precursor to one.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - event-triggered-execution
+    - registry
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1546/002
+    - https://attack.mitre.org/detectionstrategies/DET0154
+    - https://attack.mitre.org/techniques/T1546
+
+mitre:
+  tactics:
+    - TA0004
+    - TA0003
+  techniques:
+    - T1546
+  sub_techniques:
+    - T1546.002
+  detection_strategies:
+    - DET0154
+  analytics:
+    - AN0441
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An adversary may repoint the screensaver configuration at an executable of their own so
+    that user inactivity launches it, obtaining persistence with no scheduled task, service
+    or autostart entry and a trigger that fires when nobody is watching the screen.
+  attacker_behavior:
+    - Writes the path of a payload into the screensaver program value.
+    - Enables the screensaver and shortens the inactivity timeout so it fires sooner.
+    - Clears the secure-screensaver setting so no password is needed on resume.
+    - Places the payload outside the system directories, often under a user-writable path.
+  legitimate_behavior:
+    - Users change screensaver settings through desktop personalisation.
+    - Managed policy distributes screensaver and lock settings across the estate.
+    - Some products install their own branded or corporate screensavers.
+    - Power and lock standards adjust the inactivity timeout deliberately.
+  risk_indicator:
+    - The screensaver program is set to a path outside the system directories.
+    - The value is written by a script host or a command shell rather than the control panel.
+    - The timeout is shortened and the secure setting is cleared in the same window.
+    - A screensaver executable runs from a user-writable location.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: registry
+      event_types:
+        - AsepValueUpdate
+        - RegGenericValueUpdate
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - RegObjectName
+        - RegValueName
+        - RegStringValue
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: screensaver-program-repointed
+        name: Screensaver program value set to a non-system path
+        purpose: >-
+          Surface the configuration change that decides which executable inactivity launches,
+          which is the whole technique rather than a step towards it.
+        query: |
+          #event_simpleName=/^(AsepValueUpdate|RegGenericValueUpdate)$/
+          | RegObjectName=/\\Control Panel\\Desktop$/i
+          | RegValueName=/^SCRNSAVE\.EXE$/i
+          | RegStringValue!=/^([A-Z]:)?\\+Windows\\+(System32|SysWOW64)\\+[^\\]+\.scr$/i
+          | groupBy([ComputerName, UserName, RegStringValue],
+                    function=[count(as=changes)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Corporate screensaver paths distributed by managed policy"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: screensaver-settings-weakened
+        name: Screensaver enabled, shortened and unsecured together
+        purpose: >-
+          Catch the supporting settings being tuned so the trigger fires sooner and resumes
+          without a password, which is what makes the persistence usable rather than latent.
+        query: |
+          #event_simpleName=/^(AsepValueUpdate|RegGenericValueUpdate)$/
+          | RegObjectName=/\\Control Panel\\Desktop$/i
+          | case {
+              RegValueName=/^ScreenSaveActive$/i and RegStringValue=/^1$/
+                | enabled := RegValueName ;
+              RegValueName=/^ScreenSaverIsSecure$/i and RegStringValue=/^0$/
+                | unsecured := RegValueName ;
+              RegValueName=/^ScreenSaveTimeout$/i
+                | timeout := RegStringValue ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([enabled, unsecured, timeout]), count(as=changes)])
+          | enabled=/.+/ or unsecured=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Managed policy distributing lock and inactivity standards"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: screensaver-settings-written-by-shell
+        name: Screensaver configuration written from a command line
+        purpose: >-
+          Isolate the writer, since personalisation goes through the control panel while an
+          adversary sets the same values from a shell or script host.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(SCRNSAVE\.EXE|ScreenSaveActive|ScreenSaverIsSecure|ScreenSaveTimeout|Control Panel\\+Desktop)/i
+          | CommandLine=/(reg(\.exe)?\s+add|Set-ItemProperty|New-ItemProperty|rundll32.*desk\.cpl)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: screensaver-executed-from-user-path
+        name: Screensaver executable running from a user-writable path
+        purpose: >-
+          Confirm the trigger fired and the planted program is what ran, which separates a
+          configured payload from one that is merely configured.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/\.scr$/i
+          | ImageFileName=/\\(Users|AppData|Temp|ProgramData|Public|Downloads)\\/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+evidence:
+  required:
+    - id: screensaver_program_repointed
+      name: Screensaver program set to a non-system executable
+      description: >-
+        The value naming the screensaver program was written with a path outside the system
+        directories, so user inactivity will launch that executable instead.
+      source: registry
+      field: RegStringValue
+      indicates: event_triggered_persistence
+
+  supporting:
+    - id: trigger_tuned
+      name: Trigger enabled, shortened or unsecured
+      description: >-
+        The screensaver was enabled, its inactivity timeout reduced, or the password
+        requirement on resume cleared, which makes the trigger fire sooner and resume
+        without challenge.
+      source: registry
+      field: RegValueName
+      indicates: persistence_made_operational
+    - id: shell_written_configuration
+      name: Configuration written from a shell or script host
+      description: >-
+        The values were set from a command line rather than through desktop personalisation,
+        which is how the setting is normally changed.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: payload_executed
+      name: Screensaver executable ran from a user-writable path
+      description: >-
+        A screensaver process started from a location a user or adversary can write to,
+        confirming the configured payload actually ran.
+      source: process_creation
+      field: ImageFileName
+      indicates: execution_chain_progression
+    - id: unusual_for_host
+      name: No history of screensaver configuration on this host
+      description: >-
+        These values have not been written on this host during the baseline window, so the
+        change is a deviation as well as a repointing.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: managed_policy_setting
+      name: Delivered through managed policy
+      description: >-
+        The configuration arrived through Group Policy or the management platform as part of
+        a corporate lock and personalisation standard.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: corporate_screensaver
+      name: Approved corporate or product screensaver
+      description: >-
+        The configured program is a sanctioned branded screensaver installed as part of the
+        standard build.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_application_component
+    - id: fleetwide_setting
+      name: Same setting across the estate
+      description: >-
+        The identical value appears on many hosts within one window, which is a distributed
+        standard rather than a targeted change.
+      source: baseline
+      field: RegStringValue
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - screensaver_program_repointed
+
+    supporting:
+      any:
+        - trigger_tuned
+        - shell_written_configuration
+        - payload_executed
+        - unusual_for_host
+      all:
+        - shell_written_configuration
+        - payload_executed
+
+    contradicting:
+      any:
+        - managed_policy_setting
+        - corporate_screensaver
+        - fleetwide_setting
+      all: []
+
+  verdict:
+    low_risk_when:
+      - screensaver_program_repointed
+      - managed_policy_setting
+      - corporate_screensaver
+      - fleetwide_setting
+    suspicious_when:
+      - screensaver_program_repointed
+      - unusual_for_host
+    high_risk_when:
+      - screensaver_program_repointed
+      - trigger_tuned
+      - shell_written_configuration
+      - payload_executed
+
+  false_positive:
+    - condition: A user changes their screensaver through personalisation.
+      explanation: >-
+        Ordinary personalisation writes exactly these values, which is why the configured
+        path rather than the write carries the escalation. Personalisation selects programs
+        from the system directories and goes through the control panel.
+    - condition: Managed policy distributes screensaver and lock settings.
+      explanation: >-
+        Corporate lock standards set the timeout, the secure flag and sometimes a branded
+        screensaver across the estate. This arrives through policy processing and produces
+        the same values on many hosts at once.
+    - condition: A product installs its own screensaver.
+      explanation: >-
+        Some software ships a screensaver and configures it at install time. The program
+        lives in the product's installation path and is present wherever it is deployed.
+    - condition: A power or lock standard shortens the inactivity timeout.
+      explanation: >-
+        Reducing the timeout is a hardening measure in many estates, and on its own it does
+        not repoint the program. The required evidence is the program value, not the timeout.
