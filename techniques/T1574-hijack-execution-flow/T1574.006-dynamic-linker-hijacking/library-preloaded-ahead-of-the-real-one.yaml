@@ -1,0 +1,346 @@
+type: detection
+
+id: hg-lin-library-preloaded-ahead-of-the-real-one-t1574-006
+
+version: 1.0.0
+
+info:
+  name: Library preloaded ahead of the real one
+  description: >-
+    The dynamic linker will load a library named in LD_PRELOAD before any system library, so
+    whatever it defines wins. That gives an adversary code execution inside a process they do
+    not own, running as whatever that process runs as, with no new binary on the process list
+    and no service or scheduled task to find. Because the hooked functions are the ones
+    everything uses — execve, readdir, open — the same library that provides the access also
+    removes its own files, processes and connections from anything that asks the C library a
+    question, which is why preloading is the standard footing for Linux rootkits. There are
+    two routes and they are not equally interesting. Setting the variable for one command
+    affects one process tree and has real debugging and allocator uses. Writing
+    /etc/ld.so.preload applies to every process the host starts from that moment on, needs no
+    variable, and survives reboot; almost nothing legitimate writes that file, so its
+    modification is close to a finding on its own.
+  severity: critical
+  author: huntgraph
+  tags:
+    - execution
+    - stealth
+    - hijack-execution-flow
+    - dynamic-linker
+    - ld-preload
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1574/006
+    - https://attack.mitre.org/detectionstrategies/DET0435
+    - https://attack.mitre.org/techniques/T1574
+
+mitre:
+  tactics:
+    - TA0002
+    - TA0005
+  techniques:
+    - T1574
+  sub_techniques:
+    - T1574.006
+  detection_strategies:
+    - DET0435
+  analytics:
+    - AN1209
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+    - auditd:PATH
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary may name their own shared object in the dynamic linker's preload variable or
+    in the system-wide preload file so that it is loaded into processes ahead of the real
+    library, obtaining execution inside trusted processes and the ability to hide their own
+    artefacts from every tool that asks the C library.
+  attacker_behavior:
+    - Writes the path of a shared object into the system-wide preload file.
+    - Sets the preload variable to a library under a temporary or hidden directory.
+    - Drops a shared object somewhere writable rather than into a package-managed library path.
+    - Persists the variable in a shell profile, environment file or service unit.
+  legitimate_behavior:
+    - Developers preload allocators, profilers and sanitisers while testing.
+    - Compatibility shims are preloaded to override a single library function.
+    - Some monitoring and tracing agents inject through the same mechanism.
+    - Build systems preload helper libraries to intercept filesystem calls.
+  risk_indicator:
+    - The system-wide preload file is written, which affects every process on the host.
+    - The preloaded object sits in a temporary, hidden or user-writable directory.
+    - The shared object was written by a shell or a downloader rather than a package.
+    - The setting is persisted into startup files so it applies to future sessions.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: system-wide-preload-file-written
+        name: System-wide preload file modified
+        purpose: >-
+          Surface the highest-consequence route first. This one file makes the linker load a
+          library into every process the host starts, including the ones that would otherwise
+          report on it, and unlike the environment variable it has essentially no routine
+          administrative use, so any write to it deserves attention on its own.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\/etc\/ld\.so\.preload/
+          | CommandLine=/(>>|>|tee\b|sed\s+-i|perl\s+-p?i|printf\b|echo\b|\bcp\b|\bmv\b|\binstall\b|\bvi\b|\bvim\b|\bnano\b)/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=writes), collect([CommandLine], limit=5)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Tracing or memory-instrumentation agents that install a preload entry at deployment"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: preload-variable-pointed-at-a-writable-path
+        name: Preload variable set to a library in a writable location
+        purpose: >-
+          Separate the benign use of the variable from the malicious one by where the library
+          lives. Allocators, profilers and shims are preloaded from package-managed library
+          directories; a preload target under a temporary directory, shared memory, a home
+          directory or a dot-directory is one the adversary put there.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(LD_PRELOAD|LD_AUDIT|LD_LIBRARY_PATH)\s*=/
+          | CommandLine=/=\S*\/(tmp|var\/tmp|dev\/shm|run\/user\/\d+|home\/[^\/]+|\.[a-z0-9_-]+)\//i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=uses), collect([CommandLine], limit=5)])
+          | sort(uses, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Development and CI hosts where sanitisers and shims are preloaded from build directories"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: shared-object-written-outside-package-paths
+        name: Shared object written to a non-library location
+        purpose: >-
+          Catch the payload itself landing. Libraries that the linker should load arrive in
+          package-managed directories; a shared object written into a temporary, shared-memory
+          or home directory is a candidate preload target and dates the intrusion even if the
+          preload configuration is set later or elsewhere.
+        query: |
+          #event_simpleName=NewExecutableWritten
+          | TargetFileName=/\.so(\.\d+)*$/
+          | TargetFileName=/^\/(tmp|var\/tmp|dev\/shm|run\/user\/\d+|home\/[^\/]+|root)\//
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of build and packaging tooling that stages shared objects in temporary directories"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: preload-persisted-in-startup-or-unit-files
+        name: Preload setting written into startup or service files
+        purpose: >-
+          Cover the step that turns a one-shot injection into persistence. Writing the variable
+          into a profile script, the environment file or a service unit means it applies to
+          every future login or to a daemon on every restart, without ever touching the
+          system-wide preload file that a defender is more likely to check.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(LD_PRELOAD|LD_AUDIT)/
+          | CommandLine=/(\/etc\/environment|\/etc\/profile|\/etc\/profile\.d\/|\/etc\/bash\.bashrc|\.bashrc|\.bash_profile|\.zshrc|\/etc\/systemd\/system\/|\/lib\/systemd\/system\/|Environment\s*=)/
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Configuration management distributing an approved instrumentation variable"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+evidence:
+  required:
+    - id: preload_directive_written
+      name: Preload directive set
+      description: >-
+        A dynamic linker preload directive was written, either as an environment variable on
+        an execution or into a file that the linker reads, causing an attacker-named library to
+        be loaded ahead of the real one.
+      source: process_creation
+      field: CommandLine
+      indicates: execution_flow_hijack
+
+  supporting:
+    - id: host_wide_preload_file
+      name: System-wide preload file targeted
+      description: >-
+        The change was made to the file that applies to every process the host starts, rather
+        than to a single command, which is both the broadest form and the one with almost no
+        legitimate use.
+      source: process_creation
+      field: ImageFileName
+      indicates: host_wide_code_injection
+    - id: library_planted_in_writable_path
+      name: Shared object written outside the library directories
+      description: >-
+        A shared object was created in a temporary, shared-memory or home directory, which is
+        where a preload payload is staged and not where package-managed libraries live.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staged
+    - id: preload_persisted_in_startup_files
+      name: Setting persisted into startup or service files
+      description: >-
+        The preload variable was written into a profile script, environment file or service
+        unit, so it applies to future logins or to a daemon on every restart.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: persistence_established
+    - id: no_precedent_on_host
+      name: No comparable preload activity in the baseline
+      description: >-
+        Preload configuration has not been touched on this host during the baseline window,
+        unlike the development and instrumentation hosts where it is routine.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: known_instrumentation_agent
+      name: Approved instrumentation or allocator preload
+      description: >-
+        The preloaded library is a sanctioned allocator, profiler, tracing agent or
+        compatibility shim recorded against this host's software inventory.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_application_component
+    - id: package_or_config_management
+      name: Written by package or configuration management
+      description: >-
+        The change was made beneath the package manager or the approved configuration-management
+        agent, which is how governed preload entries are distributed.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: build_or_test_context
+      name: Development, build or test host
+      description: >-
+        A change or asset record places this host in a development or continuous-integration
+        role where sanitisers and interception shims are preloaded from build directories as a
+        matter of course.
+      source: change_management
+      field: ComputerName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - preload_directive_written
+
+    supporting:
+      any:
+        - host_wide_preload_file
+        - library_planted_in_writable_path
+        - preload_persisted_in_startup_files
+        - no_precedent_on_host
+      all:
+        - host_wide_preload_file
+        - library_planted_in_writable_path
+
+    contradicting:
+      any:
+        - known_instrumentation_agent
+        - package_or_config_management
+        - build_or_test_context
+      all: []
+
+  verdict:
+    low_risk_when:
+      - preload_directive_written
+      - known_instrumentation_agent
+      - package_or_config_management
+      - build_or_test_context
+    suspicious_when:
+      - preload_directive_written
+      - no_precedent_on_host
+    high_risk_when:
+      - preload_directive_written
+      - host_wide_preload_file
+      - library_planted_in_writable_path
+      - preload_persisted_in_startup_files
+
+  false_positive:
+    - condition: A developer preloads an allocator, profiler or sanitiser while testing.
+      explanation: >-
+        This is the mechanism used as intended and it sets the same variable. The preloaded
+        object comes from a package-managed library directory or a build tree that belongs to
+        the developer, the host is an engineering machine, and nothing is persisted.
+    - condition: A compatibility shim overrides a single library function.
+      explanation: >-
+        Shims that fake the clock, relax synchronisation or patch a broken symbol are deployed
+        by preloading them, occasionally system-wide. They are named in the software inventory
+        and arrive through a package rather than a shell redirect.
+    - condition: A monitoring or tracing agent injects through the same mechanism.
+      explanation: >-
+        Some application-performance and tracing products preload a library into instrumented
+        processes, and a few write the system-wide file at install time. The install is a
+        package transaction, the library lives under the product's directory, and the same
+        entry exists on every instrumented host.
+    - condition: Build systems preload helper libraries to intercept filesystem calls.
+      explanation: >-
+        Packaging and dependency-tracking tools preload interception libraries from temporary
+        build directories, which reproduces both the writable-path evidence and the shared
+        object write. The context is a build host, the parent is the build tool, and the files
+        disappear with the build tree.

@@ -1,0 +1,322 @@
+type: detection
+
+id: hg-lin-kerberos-ticket-cache-taken-from-another-user-t1558-005
+
+version: 1.0.0
+
+info:
+  name: Kerberos ticket cache taken from another user
+  description: >-
+    A Kerberos credential cache is a file that holds live, usable tickets. Reading one does
+    not yield a password or a hash that has to be cracked — it yields the authenticated
+    identity itself, valid until the ticket expires, usable against every service that trusts
+    the realm. On Linux the caches sit in the temporary directories under predictable names
+    built from the owner's numeric user id, and root or any account that can read another
+    user's cache inherits that user's access without ever touching a credential. Because the
+    resulting authentications are real Kerberos exchanges with a real ticket, nothing
+    downstream looks wrong. The observable is on the host that holds the cache: a process
+    reading, copying or pointing itself at a cache whose owning user id is not the user id it
+    is running as, and then using it. Ordinary Kerberos clients only ever touch their own.
+  severity: high
+  author: huntgraph
+  tags:
+    - credential-access
+    - kerberos
+    - ticket-theft
+    - credential-cache
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1558/005
+    - https://attack.mitre.org/detectionstrategies/DET0024
+    - https://attack.mitre.org/techniques/T1558
+
+mitre:
+  tactics:
+    - TA0006
+  techniques:
+    - T1558
+  sub_techniques:
+    - T1558.005
+  detection_strategies:
+    - DET0024
+  analytics:
+    - AN0069
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+  data_components:
+    - File Access
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may read or copy another user's Kerberos credential cache and point their own
+    tooling at it, obtaining that user's authenticated identity and access to every service in
+    the realm without ever handling a password or a hash.
+  attacker_behavior:
+    - Copies or archives a cache file from the temporary directories to somewhere they control.
+    - Sets the cache location variable to a cache whose owning user id is not their own.
+    - Runs tooling that enumerates, extracts or converts tickets held in a cache.
+    - Authenticates to a service with the borrowed cache still selected.
+  legitimate_behavior:
+    - Users list their own tickets while diagnosing a failed authentication.
+    - Service accounts obtain tickets from a keytab and set the cache path for themselves.
+    - Batch jobs export the cache location so a child process inherits the same session.
+    - Backup and cleanup agents sweep the temporary directories where caches live.
+  risk_indicator:
+    - The numeric user id in the cache name does not match the account using it.
+    - The cache is copied, encoded or archived rather than read in place.
+    - Ticket extraction or conversion tooling appears on the host.
+    - A network client runs with the borrowed cache selected on its command line.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: ccache-file-copied-or-encoded
+        name: Credential cache copied, encoded or archived
+        purpose: >-
+          Surface caches being taken rather than used. Kerberos clients read their own cache
+          through the library and never need a shell utility, so a copy, archive or encoding
+          step applied to a cache file is collection, and the file is worth as much to the
+          adversary off the host as on it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(krb5cc_\d+|krb5cc_[A-Za-z0-9]+|krb5\.ccache|\.ccache\b)/
+          | CommandLine=/\b(cp|mv|scp|rsync|dd|cat|base64|xxd|tar|gzip|openssl|nc|ncat|curl)\b/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=reads), collect([CommandLine], limit=5)])
+          | sort(reads, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Backup and temporary-directory cleanup agents that sweep /tmp on a schedule"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: cache-location-pointed-at-a-foreign-cache
+        name: Cache location variable set to an explicit path
+        purpose: >-
+          Isolate the selection step. A user's session already has its cache selected, so
+          naming one explicitly is choosing a cache other than the default — the numeric user
+          id embedded in the path is what should be compared against the account running the
+          command, and a mismatch is the technique.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/KRB5CCNAME\s*=\s*(FILE:|DIR:)?\/(tmp|var\/tmp|dev\/shm|run\/user\/\d+|home\/[^\/]+)\//i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=uses), collect([CommandLine], limit=5)])
+          | sort(uses, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Batch and service wrappers that export a dedicated cache path for their own keytab session"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: ticket-extraction-or-conversion-tooling
+        name: Ticket extraction or format conversion tooling run
+        purpose: >-
+          Catch the processing step. Converting a cache to another ticket format, or running
+          the toolkits built to manipulate tickets, has no operational purpose on a normal
+          server and is a much narrower observation than reading a file in the temporary
+          directory.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(ticketConverter|ticket_converter|getST\.py|getTGT\.py|ticketer\.py|secretsdump|\bkekeo\b|\bimpacket\b|\.kirbi\b|klist\s+-c\s+\/)/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Security testing hosts where Kerberos tooling is approved and scoped"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: borrowed-cache-used-to-authenticate
+        name: Network client run with an explicit cache selected
+        purpose: >-
+          Confirm the stolen identity was actually spent. A cache is only worth taking if it
+          is then presented to a service, so a client invoked in the same breath as an explicit
+          cache path turns collection into impersonation and names the systems reached.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/KRB5CCNAME\s*=/i
+          | CommandLine=/\b(ssh|scp|sftp|smbclient|rpcclient|ldapsearch|kvno|curl|psql|mysql|beeline|hdfs)\b/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=uses), collect([CommandLine], limit=5)])
+          | sort(uses, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Scheduled data-platform jobs that authenticate with their own keytab-derived cache"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+evidence:
+  required:
+    - id: ccache_accessed_out_of_context
+      name: Credential cache handled outside its own session
+      description: >-
+        A Kerberos credential cache was copied, encoded or explicitly selected on a command
+        line rather than being used implicitly by its owner's session, which is how live
+        tickets are taken rather than used.
+      source: process_creation
+      field: CommandLine
+      indicates: credential_material_capture
+
+  supporting:
+    - id: cross_uid_cache
+      name: Cache owner differs from the account using it
+      description: >-
+        The numeric user id embedded in the cache path does not match the account running the
+        process, so the tickets being handled belong to somebody else.
+      source: process_creation
+      field: UserName
+      indicates: identity_impersonation
+    - id: ticket_tooling_present
+      name: Ticket extraction or conversion tooling on the host
+      description: >-
+        A toolkit for extracting, forging or converting Kerberos tickets was executed, which
+        has no place in normal operation of the host.
+      source: process_creation
+      field: ImageFileName
+      indicates: credential_tooling_present
+    - id: ticket_reused_for_authentication
+      name: Borrowed cache presented to a service
+      description: >-
+        A network client was invoked with an explicit cache selected, meaning the collected
+        tickets were spent against a real service as the cache's owner.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: credential_use_progression
+    - id: unprecedented_cache_access
+      name: No comparable cache handling in the baseline
+      description: >-
+        This account has not handled credential caches this way on this host during the
+        baseline window, unlike the service wrappers that do it on every run.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: cache_owner_is_the_caller
+      name: Cache belongs to the account using it
+      description: >-
+        Identity context confirms the cache's owning user id and the account running the
+        process are the same principal, which is a user working with their own tickets.
+      source: identity_context
+      field: UserName
+      indicates: expected_user_activity
+    - id: keytab_service_session
+      name: Service session established from a keytab
+      description: >-
+        The cache was created by the same job from its own keytab and exported so its children
+        inherit the session, which is the standard pattern for scheduled Kerberos work.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_enterprise_activity
+    - id: temp_directory_sweep
+      name: Backup or cleanup sweep of the temporary directory
+      description: >-
+        The access belongs to an approved agent whose sweep of the temporary directories
+        necessarily touches whatever caches happen to be there.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - ccache_accessed_out_of_context
+
+    supporting:
+      any:
+        - cross_uid_cache
+        - ticket_tooling_present
+        - ticket_reused_for_authentication
+        - unprecedented_cache_access
+      all:
+        - cross_uid_cache
+        - ticket_reused_for_authentication
+
+    contradicting:
+      any:
+        - cache_owner_is_the_caller
+        - keytab_service_session
+        - temp_directory_sweep
+      all: []
+
+  verdict:
+    low_risk_when:
+      - ccache_accessed_out_of_context
+      - cache_owner_is_the_caller
+      - keytab_service_session
+      - temp_directory_sweep
+    suspicious_when:
+      - ccache_accessed_out_of_context
+      - unprecedented_cache_access
+    high_risk_when:
+      - ccache_accessed_out_of_context
+      - cross_uid_cache
+      - ticket_tooling_present
+      - ticket_reused_for_authentication
+
+  false_positive:
+    - condition: A user lists their own tickets while diagnosing a failed authentication.
+      explanation: >-
+        Inspecting a cache is the first thing anyone does when Kerberos breaks, and it names
+        the cache path. The owning user id matches the account, and no copy, archive or onward
+        authentication follows.
+    - condition: A service account obtains tickets from a keytab and sets its own cache path.
+      explanation: >-
+        Scheduled jobs routinely run kinit with a keytab and export a dedicated cache so their
+        children inherit it, which produces both the explicit path and the subsequent client
+        invocation. The cache is created by the same job seconds earlier and belongs to it.
+    - condition: A batch job exports the cache location for its children.
+      explanation: >-
+        Data-platform tooling passes the cache down the process tree by environment variable,
+        so the path appears on many command lines. It recurs identically on every run and the
+        owner never changes.
+    - condition: A backup or cleanup agent sweeps the temporary directories.
+      explanation: >-
+        Anything that walks /tmp will encounter credential caches and may copy or delete them.
+        The acting process is an approved agent on a fixed schedule and it treats caches no
+        differently from any other file it finds.
