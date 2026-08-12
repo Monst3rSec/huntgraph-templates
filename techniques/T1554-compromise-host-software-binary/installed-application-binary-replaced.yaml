@@ -1,0 +1,294 @@
+type: detection
+
+id: hg-win-installed-application-binary-replaced-t1554
+version: 1.0.0
+
+info:
+  name: Installed application binary replaced with a modified copy
+  description: >-
+    Backdooring software the user already runs gives an adversary persistence with no
+    autostart entry, no new process name, and a trigger the victim supplies themselves by
+    doing their job. Everything downstream is attributed to an application that belongs on
+    the machine. Because the file replaces one that was already there, the observable is
+    not a new binary appearing but an existing one changing outside the process that owns
+    it — its updater, its installer, or a deployment agent.
+  severity: critical
+  author: huntgraph
+  tags:
+    - persistence
+    - supply-path
+    - binary-tampering
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1554
+    - https://attack.mitre.org/detectionstrategies/DET0336
+    - https://attack.mitre.org/techniques/T1195
+
+mitre:
+  tactics:
+    - TA0003
+  techniques:
+    - T1554
+  sub_techniques: []
+  detection_strategies:
+    - DET0336
+  analytics:
+    - AN0949
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - File Modification
+
+hypothesis:
+  statement: >-
+    An adversary may replace or modify the binary of an application the user already runs,
+    obtaining persistence that the victim triggers through ordinary work and that produces
+    no process or autostart entry a review would find unfamiliar.
+  attacker_behavior:
+    - Overwrites an executable inside an installed application directory.
+    - Modifies a supporting library the application loads at start.
+    - Leaves the application working so nothing appears broken to the user.
+    - Relies on the user launching the application rather than on any scheduled trigger.
+  legitimate_behavior:
+    - Updaters replace application binaries when patching.
+    - Deployment agents upgrade software across the estate.
+    - Repair operations restore files from an installer cache.
+    - Developers rebuild application binaries in place on engineering hosts.
+  risk_indicator:
+    - The binary is overwritten by something other than its own updater.
+    - The writer is a script host, archive tool or delivery application.
+    - The replacement hash is unknown across the estate.
+    - The application launches from that path shortly afterwards.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: application-binary-overwritten
+        name: Executable overwritten inside an application directory
+        purpose: >-
+          Surface changes to binaries in installed application trees, where the file already
+          existed and something rewrote it.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+          | TargetFileName=/\\Program Files( \(x86\))?\\/i
+          | TargetFileName=/\.(exe|dll)$/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId, SHA256HashData],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of approved updaters, installers and deployment agents"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: overwrite-by-delivery-application
+        name: Application binary written by a script host or delivery tool
+        purpose: >-
+          Isolate writers that have no business modifying installed software, which is the
+          clearest separation from patching.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\\Program Files( \(x86\))?\\[^",]+\.(exe|dll)\b/i
+          | CommandLine=/\b(copy|xcopy|robocopy|Copy-Item|move|Move-Item|certutil|Invoke-WebRequest)\b/i
+          | ParentBaseFileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|7zfm|winrar|explorer|chrome|msedge|outlook)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: modified-binary-executed
+        name: Modified application binary executed
+        purpose: >-
+          Confirm the replacement is in use, which is what turns a file change into
+          persistence the user triggers.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/\\Program Files( \(x86\))?\\/i
+          | groupBy([ImageFileName, SHA256HashData],
+                    function=[count(ComputerName, distinct=true, as=host_count),
+                              collect([ComputerName], limit=10)])
+          | host_count <= 2
+        filters:
+          include: []
+          exclude:
+            - "Applications legitimately present on only a few hosts"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - organization
+            - path
+
+evidence:
+  required:
+    - id: application_binary_modified
+      name: Installed application binary rewritten
+      description: >-
+        An executable or library inside an installed application directory was overwritten,
+        replacing software the user already runs rather than adding anything new.
+      source: file_creation
+      field: TargetFileName
+      indicates: trusted_software_tampering
+
+  supporting:
+    - id: non_updater_writer
+      name: Written by something other than the product's updater
+      description: >-
+        The writing process is a script host, archive utility or delivery application
+        rather than the product's own updater, an installer or a deployment agent.
+      source: file_creation
+      field: ContextProcessId
+      indicates: abnormal_execution_chain
+    - id: unknown_hash_for_path
+      name: Replacement hash unknown across the estate
+      description: >-
+        The binary at that path now has a hash present on very few hosts, whereas a patched
+        version is uniform wherever the product is deployed.
+      source: baseline
+      field: SHA256HashData
+      indicates: unusual_binary_in_environment
+    - id: modified_binary_running
+      name: Modified binary in use
+      description: >-
+        A process started from the rewritten path, so the replacement is what the user is
+        actually running.
+      source: process_creation
+      field: ImageFileName
+      indicates: execution_chain_progression
+    - id: delivery_parent
+      name: Delivery-style parent for the write
+      description: >-
+        The copy was performed under a document handler, archive tool, browser or mail
+        client, placing the modification immediately after delivered content.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: user_execution_foothold
+
+  contradicting:
+    - id: product_updater
+      name: Product updater patching itself
+      description: >-
+        The write was performed by the application's own updater replacing its binaries
+        with a new version.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_enterprise_activity
+    - id: fleetwide_patch
+      name: Same replacement across the estate
+      description: >-
+        The identical hash appears at that path on many hosts within one window, which is a
+        patch wave rather than a targeted modification.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+    - id: engineering_rebuild
+      name: Engineering host rebuilding in place
+      description: >-
+        The host is an engineering system where application binaries are rebuilt and
+        replaced as routine development work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - application_binary_modified
+
+    supporting:
+      any:
+        - non_updater_writer
+        - unknown_hash_for_path
+        - modified_binary_running
+        - delivery_parent
+      all:
+        - non_updater_writer
+        - unknown_hash_for_path
+
+    contradicting:
+      any:
+        - product_updater
+        - fleetwide_patch
+        - engineering_rebuild
+      all: []
+
+  verdict:
+    low_risk_when:
+      - application_binary_modified
+      - product_updater
+      - fleetwide_patch
+      - engineering_rebuild
+    suspicious_when:
+      - application_binary_modified
+      - unknown_hash_for_path
+    high_risk_when:
+      - application_binary_modified
+      - non_updater_writer
+      - modified_binary_running
+      - delivery_parent
+
+  false_positive:
+    - condition: An updater patches its own product.
+      explanation: >-
+        Patching overwrites application binaries constantly, which is why the writing
+        process rather than the write carries the escalation. Patched versions share a hash
+        across every host receiving them.
+    - condition: A deployment agent upgrades software across the estate.
+      explanation: >-
+        Managed upgrades rewrite the same paths on many machines within a window, producing
+        the required evidence at scale. The agent is the writer and a maintenance record
+        covers it.
+    - condition: A repair operation restores files from the installer cache.
+      explanation: >-
+        Self-healing rewrites binaries to their known-good version. The installer service is
+        the writing process and the restored hash matches the product's release.
+    - condition: A developer rebuilds an application binary in place.
+      explanation: >-
+        In-house development overwrites installed binaries repeatedly with hashes unique to
+        each build, reproducing the rarity evidence. Asset role is the discriminator.

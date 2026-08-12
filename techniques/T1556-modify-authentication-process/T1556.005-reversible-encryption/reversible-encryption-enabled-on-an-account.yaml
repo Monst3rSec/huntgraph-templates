@@ -1,0 +1,277 @@
+type: detection
+
+id: hg-win-reversible-encryption-enabled-on-an-account-t1556-005
+version: 1.0.0
+
+info:
+  name: Reversible encryption enabled on a directory account
+  description: >-
+    Setting the reversible-encryption flag makes the directory store a form of the
+    account's password that can be decrypted back to plaintext rather than only verified.
+    An adversary who sets it and then forces a password change gets the plaintext on the
+    next set, without cracking anything. The flag exists for a small number of legacy
+    authentication protocols and is almost never needed, so enabling it on an account
+    that did not have it is both rare and consequential.
+  severity: critical
+  author: huntgraph
+  tags:
+    - defense-impairment
+    - persistence
+    - credential-access
+    - active-directory
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1556/005
+    - https://attack.mitre.org/detectionstrategies/DET0589
+    - https://attack.mitre.org/techniques/T1556
+
+mitre:
+  tactics:
+    - TA0112
+    - TA0003
+    - TA0006
+  techniques:
+    - T1556
+  sub_techniques:
+    - T1556.005
+  detection_strategies:
+    - DET0589
+  analytics:
+    - AN1621
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:PowerShell
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Command Execution
+    - Active Directory Object Modification
+
+hypothesis:
+  statement: >-
+    An adversary may enable reversible encryption on a directory account so the next
+    password set is stored in a recoverable form, obtaining the plaintext credential
+    without cracking and leaving a configuration change rather than a dump behind.
+  attacker_behavior:
+    - Sets the reversible-encryption flag on a user or service account.
+    - Applies it through a policy so it affects a group of accounts at once.
+    - Forces or waits for a password change so the recoverable form is written.
+    - Chooses privileged or service accounts whose passwords rarely rotate otherwise.
+  legitimate_behavior:
+    - A small number of legacy authentication protocols genuinely require it.
+    - Migration projects occasionally enable it temporarily for compatibility.
+    - Some application integrations documented it as a requirement historically.
+  risk_indicator:
+    - The flag is set on an account that did not previously have it.
+    - It is applied through a policy affecting many accounts rather than one.
+    - A password reset follows shortly afterwards.
+    - The change is made from an endpoint shell rather than an identity workflow.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: reversible-flag-set
+        name: Reversible encryption flag set on an account
+        purpose: >-
+          Surface the flag being enabled, which is rare enough that any occurrence is worth
+          reading regardless of who did it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(AllowReversiblePasswordEncryption|ENCRYPTED_TEXT_PWD_ALLOWED|userAccountControl.*128\b|Set-ADUser\s+.*-AllowReversiblePasswordEncryption\s+\$?true)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: flag-set-then-password-reset
+        name: Flag enabled and a password reset forced
+        purpose: >-
+          Join the configuration change to the reset that actually writes the recoverable
+          form, which is what turns the flag into a usable credential.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(AllowReversiblePasswordEncryption|ENCRYPTED_TEXT_PWD_ALLOWED)/i
+                | flag_set := CommandLine ;
+              CommandLine=/(Set-ADAccountPassword|net(\.exe)?\s+user\s+.*\s+\*|ChangePasswordAtLogon|-Reset)/i
+                | password_reset := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([flag_set, password_reset, ParentBaseFileName]),
+                              count(as=events)])
+          | flag_set=/.+/ and password_reset=/.+/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: policy-level-enablement
+        name: Reversible encryption enabled through policy
+        purpose: >-
+          Catch the form that affects many accounts at once, which is far more consequential
+          than a single account being flagged.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(ClearTextPassword|AllowReversiblePasswordEncryption)/i
+          | CommandLine=/(Set-GPRegistryValue|secedit|gpupdate|Default Domain Policy|New-GPO|Set-ADDefaultDomainPasswordPolicy)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: reversible_encryption_enabled
+      name: Reversible encryption enabled
+      description: >-
+        The reversible-encryption flag was set on an account or through a password policy,
+        so the directory will store a recoverable form of the password at the next set.
+      source: process_creation
+      field: CommandLine
+      indicates: authentication_process_weakened
+
+  supporting:
+    - id: password_reset_followed
+      name: Password reset forced afterwards
+      description: >-
+        A password change was forced or performed after the flag was set, which is what
+        writes the recoverable form and makes the change useful.
+      source: process_creation
+      field: CommandLine
+      indicates: credential_material_capture
+    - id: policy_scope
+      name: Applied through policy rather than to one account
+      description: >-
+        The change was made in a password policy, so it affects every account in scope
+        rather than a single identity.
+      source: process_creation
+      field: CommandLine
+      indicates: estate_wide_impact
+    - id: endpoint_shell_origin
+      name: Change issued from an endpoint shell
+      description: >-
+        The modification came from a command shell or script host rather than through the
+        identity management platform that owns account attributes.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: unusual_administrator
+      name: Actor without directory administration history
+      description: >-
+        The account making the change has no history of directory administration during the
+        baseline window.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: legacy_protocol_requirement
+      name: Documented legacy protocol requirement
+      description: >-
+        The account supports a legacy authentication protocol that genuinely requires
+        reversible encryption, recorded as an accepted exception.
+      source: change_management
+      field: UserName
+      indicates: legitimate_enterprise_activity
+    - id: migration_project
+      name: Recorded migration or compatibility work
+      description: >-
+        A change record covers enabling the flag temporarily during a migration or an
+        application compatibility exercise.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: identity_platform_change
+      name: Change made through the identity platform
+      description: >-
+        The attribute was set by the approved identity management system as part of a
+        governed account workflow.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - reversible_encryption_enabled
+
+    supporting:
+      any:
+        - password_reset_followed
+        - policy_scope
+        - endpoint_shell_origin
+        - unusual_administrator
+      all:
+        - password_reset_followed
+        - endpoint_shell_origin
+
+    contradicting:
+      any:
+        - legacy_protocol_requirement
+        - migration_project
+        - identity_platform_change
+      all: []
+
+  verdict:
+    low_risk_when:
+      - reversible_encryption_enabled
+      - legacy_protocol_requirement
+      - migration_project
+      - identity_platform_change
+    suspicious_when:
+      - reversible_encryption_enabled
+      - unusual_administrator
+    high_risk_when:
+      - reversible_encryption_enabled
+      - password_reset_followed
+      - policy_scope
+      - endpoint_shell_origin
+
+  false_positive:
+    - condition: A legacy authentication protocol genuinely requires reversible encryption.
+      explanation: >-
+        A small number of older protocols need it, and some estates still run them. Those
+        accounts carry the flag continuously as a recorded exception rather than having it
+        newly applied.
+    - condition: A migration project enables it temporarily for compatibility.
+      explanation: >-
+        Compatibility work occasionally requires the flag during a transition. This is
+        planned, documented, scoped to named accounts and reversed afterwards.
+    - condition: An application integration documented it as a requirement historically.
+      explanation: >-
+        Older integration guidance sometimes called for it. Such accounts are service
+        identities with the flag set long before the baseline window began.
