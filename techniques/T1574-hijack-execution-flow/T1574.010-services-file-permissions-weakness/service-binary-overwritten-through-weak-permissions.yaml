@@ -1,0 +1,303 @@
+type: detection
+
+id: hg-win-service-binary-overwritten-through-weak-permissions-t1574-010
+version: 1.0.0
+
+info:
+  name: Service binary overwritten through weak file permissions
+  description: >-
+    A service that runs as SYSTEM but whose executable sits in a directory ordinary users
+    can write to is an escalation waiting to be taken. Replacing the binary means the
+    service control manager runs the adversary's code at SYSTEM on the next start or
+    reboot, with no exploit and no privileged access needed to set it up. The weak
+    permission is a standing condition in many estates; the observable is the moment
+    something actually writes over the binary.
+  severity: critical
+  author: huntgraph
+  tags:
+    - privilege-escalation
+    - execution
+    - service-permissions
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1574/010
+    - https://attack.mitre.org/detectionstrategies/DET0436
+    - https://attack.mitre.org/techniques/T1574
+
+mitre:
+  tactics:
+    - TA0005
+    - TA0002
+  techniques:
+    - T1574
+  sub_techniques:
+    - T1574.010
+  detection_strategies:
+    - DET0436
+  analytics:
+    - AN1211
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:System
+  data_components:
+    - Process Creation
+    - File Creation
+    - File Metadata
+    - Service Creation
+
+hypothesis:
+  statement: >-
+    An adversary may overwrite the executable of a service whose file permissions allow
+    non-privileged writes, so the service control manager launches their code with the
+    service's privilege at the next start or reboot.
+  attacker_behavior:
+    - Replaces a service executable in a directory that grants write access to ordinary users.
+    - Targets a service configured to run as SYSTEM so the replacement escalates privilege.
+    - Restarts the service, or waits for a reboot, to trigger execution.
+    - Relaxes permissions on a service directory first if none are already weak.
+  legitimate_behavior:
+    - Updaters replace service binaries when patching their own products.
+    - Deployment agents overwrite service executables during upgrades.
+    - Developers rebuild service binaries in place on engineering hosts.
+    - Repair operations restore service files from a cache.
+  risk_indicator:
+    - The service binary is overwritten by a process that is not its updater.
+    - The write comes from a script host or a delivery application.
+    - The service is restarted immediately after the write.
+    - The new binary's hash is unknown across the estate.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: service-binary-overwritten
+        name: Executable overwritten in a service directory
+        purpose: >-
+          Surface writes over binaries in the locations services run from, which is the
+          moment a standing permission weakness becomes an actual escalation.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+          | TargetFileName=/\.(exe|dll)$/i
+          | TargetFileName=/\\(Program Files( \(x86\))?|ProgramData)\\/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId, SHA256HashData],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of approved updaters, installers and deployment agents"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: overwrite-then-service-restart
+        name: Binary overwritten and the service restarted
+        purpose: >-
+          Join the replacement to the restart, which is what makes the new binary run
+          rather than waiting for an unrelated reboot.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten|ProcessRollup2)$/
+          | case {
+              #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+                | TargetFileName=/\\(Program Files( \(x86\))?|ProgramData)\\[^\\]+\\.*\.exe$/i
+                | replaced_binary := TargetFileName ;
+              #event_simpleName=ProcessRollup2
+                | CommandLine=/(net(\.exe)?\s+(stop|start)\s|sc(\.exe)?\s+(stop|start)\s|Restart-Service|Start-Service)/i
+                | service_restart := CommandLine ;
+            }
+          | groupBy([ComputerName],
+                    function=[collect([replaced_binary, service_restart, ContextProcessId]),
+                              count(as=events)])
+          | replaced_binary=/.+/ and service_restart=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Approved deployment agents restarting services after an upgrade"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+
+      - id: permissions-relaxed-on-service-path
+        name: Permissions relaxed on a service directory
+        purpose: >-
+          Catch the condition being created rather than inherited, which is the variant
+          that leaves a configuration artefact.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(icacls|cacls|takeown|Set-Acl)/i
+          | CommandLine=/\\(Program Files( \(x86\))?|ProgramData)\\/i
+          | CommandLine=/(\/grant|:F\b|:M\b|everyone|users|authenticated users)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: service_binary_replaced
+      name: Executable in a service directory overwritten
+      description: >-
+        A binary was written over an existing executable in an installation directory that
+        a service runs from, so the service control manager will launch the new file.
+      source: file_creation
+      field: TargetFileName
+      indicates: hijacked_execution_flow
+
+  supporting:
+    - id: service_restarted
+      name: Service restarted after the write
+      description: >-
+        A service was stopped and started shortly after the binary was replaced, which
+        executes the new file rather than waiting for a reboot.
+      source: process_creation
+      field: CommandLine
+      indicates: privilege_escalation_attempt
+    - id: permissions_relaxed
+      name: Permissions widened on the service directory
+      description: >-
+        Access control on the installation path was loosened, which is the escalation
+        condition being created rather than found.
+      source: process_creation
+      field: CommandLine
+      indicates: access_path_creation
+    - id: non_updater_writer
+      name: Written by something other than an updater
+      description: >-
+        The writing process is an interpreter, archive tool or delivery application rather
+        than the product's own updater or a deployment agent.
+      source: file_creation
+      field: ContextProcessId
+      indicates: abnormal_execution_chain
+    - id: unknown_hash
+      name: Replacement binary unknown across the estate
+      description: >-
+        The new file's hash appears on very few hosts, unlike a vendor update which is
+        uniform wherever the product is deployed.
+      source: baseline
+      field: SHA256HashData
+      indicates: unusual_binary_in_environment
+
+  contradicting:
+    - id: vendor_updater
+      name: Product updater replacing its own binary
+      description: >-
+        The write was performed by the product's updater or a deployment agent patching the
+        software it owns.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_enterprise_activity
+    - id: fleetwide_update
+      name: Same replacement across the estate
+      description: >-
+        The identical hash appears at that path on many hosts within one window, which is a
+        patch wave rather than a targeted replacement.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+    - id: engineering_rebuild
+      name: Engineering host rebuilding a service binary
+      description: >-
+        The host is an engineering system where service binaries are rebuilt in place as
+        routine development work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - service_binary_replaced
+
+    supporting:
+      any:
+        - service_restarted
+        - permissions_relaxed
+        - non_updater_writer
+        - unknown_hash
+      all:
+        - service_restarted
+        - non_updater_writer
+
+    contradicting:
+      any:
+        - vendor_updater
+        - fleetwide_update
+        - engineering_rebuild
+      all: []
+
+  verdict:
+    low_risk_when:
+      - service_binary_replaced
+      - vendor_updater
+      - fleetwide_update
+      - engineering_rebuild
+    suspicious_when:
+      - service_binary_replaced
+      - unknown_hash
+    high_risk_when:
+      - service_binary_replaced
+      - service_restarted
+      - non_updater_writer
+      - permissions_relaxed
+
+  false_positive:
+    - condition: An updater replaces a service binary while patching its product.
+      explanation: >-
+        Patching overwrites service executables and restarts them, which reproduces both
+        the required and the strongest supporting evidence. The updater as writer and the
+        fleet-wide hash are the discriminators.
+    - condition: A deployment agent upgrades software across the estate.
+      explanation: >-
+        Managed upgrades write the same paths on many hosts in one window. The agent is the
+        writing process and the change is covered by a maintenance record.
+    - condition: A developer rebuilds a service binary in place.
+      explanation: >-
+        In-house service development involves overwriting the binary and restarting it
+        repeatedly. This is confined to engineering hosts under developer accounts.
+    - condition: A repair operation restores service files from a cache.
+      explanation: >-
+        Self-healing rewrites binaries from the installer cache. The writing process is the
+        installer service and the restored hash matches the product's known version.

@@ -1,0 +1,297 @@
+type: detection
+
+id: hg-win-binary-planted-earlier-in-the-search-order-t1574-008
+version: 1.0.0
+
+info:
+  name: Binary planted earlier in the executable search order
+  description: >-
+    When a program or script invokes another by name rather than by full path, Windows
+    resolves it by walking a search order that begins with the current directory and the
+    early entries of PATH. A file with the right name placed anywhere ahead of the real one
+    is what gets run, and every caller that used the bare name is redirected at once. The
+    condition costs nothing to create and the redirection is invisible to the caller, which
+    is why the file appearing is the observable rather than any later behaviour.
+  severity: high
+  author: huntgraph
+  tags:
+    - privilege-escalation
+    - execution
+    - search-order-hijacking
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1574/008
+    - https://attack.mitre.org/detectionstrategies/DET0564
+    - https://attack.mitre.org/techniques/T1574
+
+mitre:
+  tactics:
+    - TA0005
+    - TA0002
+  techniques:
+    - T1574
+  sub_techniques:
+    - T1574.008
+  detection_strategies:
+    - DET0564
+  analytics:
+    - AN1560
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - File Metadata
+
+hypothesis:
+  statement: >-
+    An adversary may place an executable named after a common system utility somewhere the
+    search order reaches before the real one, so that any script or program invoking it by
+    bare name runs their code instead, at whatever privilege the caller holds.
+  attacker_behavior:
+    - Writes an executable named after a system utility into a working or writable directory.
+    - Relies on scripts and scheduled tasks that invoke utilities by bare name.
+    - Targets a directory a privileged process runs from, so the redirection escalates.
+    - Leaves the real utility untouched so nothing appears missing.
+  legitimate_behavior:
+    - Portable toolchains ship their own copies of common utilities.
+    - Build environments place tool shims ahead of system binaries deliberately.
+    - Some products bundle renamed or replacement utilities in their own directories.
+    - Developers use wrapper scripts with the same names as the tools they wrap.
+  risk_indicator:
+    - An executable named after a system utility appears outside the system directories.
+    - The file lands in a working directory or an early PATH entry.
+    - A process starts from that copy rather than from System32.
+    - The writer is a script host rather than a package manager or build tool.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: utility-name-written-outside-system
+        name: System utility name written outside the system directories
+        purpose: >-
+          Surface files that will win a bare-name resolution, which is the whole
+          precondition for this technique.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+          | TargetFileName=/\\(cmd|powershell|net|net1|whoami|find|findstr|ping|hostname|tasklist|systeminfo|reg|sc|schtasks|nslookup|curl|where|more|sort|cscript|wscript)\.exe$/i
+          | TargetFileName!=/\\Windows\\(System32|SysWOW64|WinSxS)\\/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId, SHA256HashData],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Portable toolchain and build shim directories on engineering hosts"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: utility-executed-from-non-system-path
+        name: System utility running from a non-system path
+        purpose: >-
+          Catch the redirection taking effect, where the copy rather than the real binary
+          is what actually ran.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(cmd|powershell|net|net1|whoami|find|findstr|ping|hostname|tasklist|systeminfo|reg|sc|schtasks|nslookup|where|more|sort|cscript|wscript)\.exe$/i
+          | ImageFileName!=/\\Windows\\(System32|SysWOW64|WinSxS)\\/i
+          | ImageFileName!=/^\\Device\\HarddiskVolume\d+\\Windows\\(System32|SysWOW64)\\/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine, SHA256HashData], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved portable toolchain directories"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - process
+            - organization
+
+      - id: path-prepended-with-writable-directory
+        name: PATH prepended with a writable directory
+        purpose: >-
+          Identify the other half of the technique, where the search order itself is
+          changed rather than a file being placed in an existing early entry.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(setx\s+path|\[Environment\]::SetEnvironmentVariable\s*\(\s*["']path|reg(\.exe)?\s+add.*Environment.*\/v\s+path)/i
+          | CommandLine=/\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: shadowing_binary_present
+      name: Utility-named executable outside the system directories
+      description: >-
+        An executable carrying the name of a common system utility was written to, or
+        executed from, a location outside System32 and SysWOW64, so a bare-name invocation
+        will resolve to it.
+      source: file_creation
+      field: TargetFileName
+      indicates: hijacked_execution_flow
+
+  supporting:
+    - id: executed_instead_of_real
+      name: Copy executed rather than the system binary
+      description: >-
+        A process ran from the non-system copy rather than from the system directory,
+        confirming the search order resolved to the planted file.
+      source: process_creation
+      field: ImageFileName
+      indicates: execution_chain_progression
+    - id: path_prepended
+      name: Search order changed to favour a writable directory
+      description: >-
+        A user-writable directory was placed at the front of PATH, which redirects
+        bare-name resolution without any file needing to sit in an existing early entry.
+      source: process_creation
+      field: CommandLine
+      indicates: access_path_creation
+    - id: script_host_writer
+      name: Written by a script host rather than a toolchain
+      description: >-
+        The file was placed by an interpreter, archive utility or delivery application
+        rather than by a package manager, installer or build tool.
+      source: file_creation
+      field: ContextProcessId
+      indicates: abnormal_execution_chain
+    - id: unknown_hash
+      name: Hash unknown across the estate
+      description: >-
+        The planted file's hash appears on very few hosts, unlike a portable toolchain copy
+        which is uniform across the population using it.
+      source: baseline
+      field: SHA256HashData
+      indicates: unusual_binary_in_environment
+
+  contradicting:
+    - id: portable_toolchain
+      name: Approved portable toolchain
+      description: >-
+        The file belongs to a sanctioned portable toolchain or build environment that
+        ships its own copies of common utilities.
+      source: asset_inventory
+      field: ImageFileName
+      indicates: expected_developer_activity
+    - id: build_shim
+      name: Build shim placed deliberately
+      description: >-
+        The file is a build shim written by a package manager or build tool that places
+        wrappers ahead of system binaries by design.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_enterprise_activity
+    - id: fleetwide_toolchain
+      name: Same copy across the estate
+      description: >-
+        The identical name and hash appear across many hosts, which is a distributed
+        toolchain rather than a planted binary.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - shadowing_binary_present
+
+    supporting:
+      any:
+        - executed_instead_of_real
+        - path_prepended
+        - script_host_writer
+        - unknown_hash
+      all:
+        - executed_instead_of_real
+        - unknown_hash
+
+    contradicting:
+      any:
+        - portable_toolchain
+        - build_shim
+        - fleetwide_toolchain
+      all: []
+
+  verdict:
+    low_risk_when:
+      - shadowing_binary_present
+      - portable_toolchain
+      - build_shim
+      - fleetwide_toolchain
+    suspicious_when:
+      - shadowing_binary_present
+      - unknown_hash
+    high_risk_when:
+      - shadowing_binary_present
+      - executed_instead_of_real
+      - script_host_writer
+      - path_prepended
+
+  false_positive:
+    - condition: A portable toolchain ships its own copies of common utilities.
+      explanation: >-
+        Unix-style toolchains on Windows provide find, sort and similar commands, and they
+        are deliberately placed ahead of the system versions. These appear consistently on
+        engineering hosts with a hash shared across the population.
+    - condition: A build environment places shims ahead of system binaries.
+      explanation: >-
+        Shimming is how several package managers work, and it produces exactly the required
+        evidence. The writing process is a package manager or build tool.
+    - condition: A developer uses a wrapper script with the same name as the tool it wraps.
+      explanation: >-
+        Wrapping a utility to add default arguments is ordinary practice. It occurs in
+        project directories on engineering hosts under the developer's own account.
+    - condition: A product bundles a replacement utility in its own directory.
+      explanation: >-
+        Some software ships alternative versions of common tools. These live in the
+        product's installation path and are present wherever it is deployed.
