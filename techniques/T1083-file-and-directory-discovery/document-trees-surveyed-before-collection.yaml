@@ -1,0 +1,385 @@
+type: detection
+
+id: hg-win-document-trees-surveyed-before-collection-t1083
+
+version: 1.0.0
+
+info:
+  name: Document trees surveyed before collection
+  description: >-
+    This template is for enriching a lead you already have, not for generating one. Say it
+    plainly before deploying: dir is the most executed command on Windows, Get-ChildItem is
+    the most executed cmdlet, and both are run continuously by scripts, installers, backup
+    agents, search indexers and every person who has ever opened a command prompt. There is
+    no standalone form of file and directory discovery that separates from that traffic, and
+    a template claiming to find one would bury the analyst. Severity is low deliberately.
+    The intended use is a lineage, host or account that is already interesting for another
+    reason, where the question is what the operator went looking for.
+    Two shapes make it worth writing anyway. The first is the survey that precedes
+    collection: a recursive walk of the user document tree, filtered by document extension,
+    which is what an operator does to find out whether this endpoint is worth taking from.
+    That is a narrower and more purposeful thing than listing a directory, and it is the
+    strongest case here. The second is breadth under one lineage — the user profile, then
+    the program directories, then a mapped path, then the staging directories, inside a
+    couple of minutes. A backup agent walks one tree thoroughly; an operator samples several
+    unrelated ones quickly.
+    Boundaries this file keeps. It stops at enumeration: the copy, archive and staging verbs
+    that turn a survey into a theft belong to the Collection techniques, and pairing them
+    here would duplicate that ground. Searches keyed on credential file extensions belong to
+    the unsecured credentials in files hypothesis. Enumerating drives, disks and volumes is
+    local storage discovery and a different technique entirely, so drive listing is
+    deliberately absent from the categories below.
+  severity: low
+  author: huntgraph
+  tags:
+    - discovery
+    - file-and-directory-discovery
+    - pre-collection
+    - enrichment
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1083
+    - https://attack.mitre.org/detectionstrategies/DET0370
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1083
+  sub_techniques: []
+  detection_strategies:
+    - DET0370
+  analytics:
+    - AN1040
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may survey the filesystem to decide what a host is worth, walking the user
+    document tree recursively for files of interest or sampling several unrelated areas of
+    the filesystem under one lineage in a short window, before deciding what to collect.
+  attacker_behavior:
+    - Walks the user profile tree recursively looking for documents and spreadsheets.
+    - Filters a recursive listing by document, archive or database file extensions.
+    - Samples several unrelated areas of the filesystem in one short burst.
+    - Searches an entire drive for files matching a pattern rather than listing a directory.
+    - Runs the survey from a process that has no file management role.
+  legitimate_behavior:
+    - Backup and archiving agents walk user document trees on a schedule.
+    - Search indexers traverse the profile continuously by design.
+    - Antivirus and data classification scanners enumerate the same trees recursively.
+    - Build scripts and installers list directories as part of ordinary work.
+    - Users and support engineers search for a file they cannot find.
+  risk_indicator:
+    - A recursive walk of the user document tree is filtered by document extension.
+    - Several unrelated filesystem areas were enumerated under one lineage in one window.
+    - The enumerating process was launched by a document handler, archive tool or script host.
+    - An entire drive was searched for a file pattern rather than a directory being listed.
+    - The lineage is one already implicated by another finding on the same host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: recursive-document-tree-survey
+        name: User document tree walked recursively and filtered by document extension
+        purpose: >-
+          The strongest case in the file, because it carries purpose that a bare directory
+          listing does not. Combining recursion, the user profile tree and a document
+          extension filter describes someone finding out what is worth taking rather than
+          looking for a file they need. Deliberately excludes credential file extensions,
+          which belong to a different hypothesis, and stops short of the copy and archive
+          verbs, which belong to Collection.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\bdir\b.{0,30}\/s|Get-ChildItem.{0,60}-Recurse|\bgci\b.{0,60}-Recurse|\btree\b|\bwhere\b\s+\/r|forfiles.{0,20}\/s|robocopy.{0,30}\/l)/i
+          | CommandLine=/(\\+Users\\+|\\+Documents\b|\\+Desktop\b|\\+Downloads\b|USERPROFILE|\$env:USERPROFILE|\\+OneDrive)/i
+          | CommandLine=/(\*\.doc|\*\.xls|\*\.ppt|\*\.pdf|\*\.csv|\*\.txt|\*\.rtf|\*\.zip|\*\.rar|\*\.7z|\*\.msg|\*\.pst|\*\.sql|\*\.mdb|\*\.accdb)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=searches), collect([CommandLine], limit=10)])
+          | sort(searches, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Backup, archiving and data classification agents that walk document trees on a schedule"
+            - "Search indexing and content discovery products deployed across the estate"
+            - "Migration tooling surveying a profile during a hardware refresh"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: unrelated-filesystem-areas-in-one-burst
+        name: Several unrelated filesystem areas enumerated under one lineage
+        purpose: >-
+          The clustering case, and a ranking device rather than an alert. Tag each listing by
+          which area of the filesystem it addresses and collapse per host, account and
+          parent. Scheduled tooling walks one tree thoroughly and repeatedly; an operator
+          samples the profile, the program directories, a mapped path and the staging
+          directories in quick succession because each answers a different question. Raise
+          the threshold until the result set is readable.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\bdir\b|Get-ChildItem|\bgci\b|\bls\b|\btree\b|forfiles|\bwhere\b\s+\/r)/i
+          | case {
+              CommandLine=/(\\+Users\\+|\\+Documents\b|\\+Desktop\b|\\+Downloads\b|USERPROFILE|\\+OneDrive|\\+Favorites)/i
+                | area := "user_profile_tree" ;
+              CommandLine=/(\\\\[^\\\s]+\\+|\b[D-Z]:\\+\s|Get-PSDrive.{0,20}FileSystem|net\s+use\b)/i
+                | area := "mapped_or_remote_paths" ;
+              CommandLine=/(Program Files|ProgramData\\+[A-Za-z]|\\+Windows\\+System32\\+config|\\+inetpub|\\+wwwroot)/i
+                | area := "program_and_service_directories" ;
+              CommandLine=/(\\+Temp\\+|\\+AppData\\+Local\\+Temp|%temp%|\$env:temp|\\+Public\\+|\\+PerfLogs)/i
+                | area := "temporary_and_staging_paths" ;
+              CommandLine=/(\bC:\\+\s|\bC:\\+\*|\\+Windows\b|\\+Windows\\+\*)/i
+                | area := "system_and_root_directories" ;
+            }
+          | area=/.+/
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(area, distinct=true, as=areas),
+                              count(as=listings),
+                              collect([area, CommandLine], limit=15)])
+          | areas >= 3
+          | sort(areas, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Backup, indexing and antivirus agents that traverse the filesystem by design"
+            - "Build agents and installers whose work is inherently filesystem wide"
+            - "Software packaging and application discovery tooling"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - parent_process
+
+      - id: filesystem-enumeration-from-a-delivery-parent
+        name: Directory enumeration run from a document handler, archive tool or script host
+        purpose: >-
+          Where the command is universal the ancestry is the discriminator, and this case
+          says so rather than pretending dir is suspicious. A spreadsheet, a mail client, an
+          archive utility or a script host listing the user profile recursively is a payload
+          looking around the machine it arrived on. No breadth is required, so this catches
+          the single purposeful listing the clustering case is designed to miss.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\bdir\b.{0,30}\/s|Get-ChildItem.{0,60}-Recurse|\bgci\b.{0,40}-Recurse|\btree\b|forfiles|\bwhere\b\s+\/r)/i
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|onenote|msaccess|visio|acrord32|acrobat|7zfm|7z|winrar|winzip|mshta|wscript|cscript|hh|chrome|msedge|firefox|teams|equation)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=listings), collect([CommandLine], limit=10)])
+          | sort(listings, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Add-in and plugin installers launched from within an office application"
+            - "Archive utilities listing the contents of an archive the user opened"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - parent_process
+            - command_line
+
+      - id: whole-drive-pattern-search
+        name: Entire drive searched for a file pattern
+        purpose: >-
+          Separate searching from listing. Listing a directory means knowing where to look;
+          searching a whole drive for a name pattern means not knowing, which is the position
+          an operator is in and an application never is. Excludes the credential file
+          extensions, which are the unsecured credentials hypothesis rather than this one.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\bwhere\b\s+\/r\s+[a-z]:\\|\bdir\b\s+[a-z]:\\+\s*\*.{0,20}\/s|Get-ChildItem\s+-Path\s+[a-z]:\\+.{0,40}-Recurse|Get-ChildItem.{0,40}-Include.{0,40}-Recurse|forfiles\s+\/p\s+[a-z]:\\)/i
+          | CommandLine!=/(\.kdbx|\.ppk|\.pem|\.pfx|id_rsa|unattend\.xml|web\.config|\.kdb|\.psafe3)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=searches), collect([CommandLine], limit=10)])
+          | sort(searches, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Antivirus, classification and licence audit scanners that search whole drives by design"
+            - "Support scripts locating a product installation during troubleshooting"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+evidence:
+  required:
+    - id: filesystem_enumerated
+      name: Filesystem enumerated
+      description: >-
+        A process listed or searched directories on the host, through a shell listing
+        command, a recursive cmdlet or a whole drive file search.
+      source: process_creation
+      field: CommandLine
+      indicates: filesystem_reconnaissance
+
+  supporting:
+    - id: recursive_document_survey
+      name: Document tree walked and filtered by extension
+      description: >-
+        The user profile tree was walked recursively with a document, archive or database
+        extension filter, which surveys what the host is worth taking from rather than
+        locating a known file.
+      source: process_creation
+      field: CommandLine
+      indicates: pre_collection_survey
+    - id: multiple_areas_enumerated
+      name: Several unrelated filesystem areas in one window
+      description: >-
+        One lineage enumerated three or more unrelated areas of the filesystem inside the
+        window, which is sampling an unfamiliar machine rather than tooling walking its
+        assigned tree.
+      source: process_creation
+      field: CommandLine
+      indicates: broad_filesystem_survey
+    - id: delivery_parent
+      name: Launched from a delivery or script parent
+      description: >-
+        The enumerating process was started by a document handler, mail client, browser,
+        archive utility or script host, none of which have a file management role.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: whole_drive_search
+      name: Whole drive searched for a pattern
+      description: >-
+        An entire drive was searched for a file name pattern rather than a known directory
+        being listed, which is the behaviour of someone who does not know where to look.
+      source: process_creation
+      field: FileName
+      indicates: targeted_file_hunt
+    - id: rare_for_host
+      name: Survey unprecedented on this host
+      description: >-
+        No comparable filesystem survey has run on this host and account during the baseline
+        window, unlike backup and indexing activity which recurs continuously.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: backup_or_indexing_agent
+      name: Backup, indexing or scanning agent
+      description: >-
+        The enumerating process belongs to an approved backup, search indexing, antivirus or
+        data classification product whose deployed function is traversing these trees.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_enterprise_activity
+    - id: support_or_change_activity
+      name: Recorded support or change activity
+      description: >-
+        The survey falls inside a recorded ticket, migration or change window for this host,
+        performed by a named engineer or a provisioning service account.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_administrative_activity
+    - id: fleetwide_recurring_pattern
+      name: Same traversal across the estate on a cycle
+      description: >-
+        The identical enumeration appears on many hosts at a stable interval, which is a
+        deployed product walking the filesystem rather than one operator looking around.
+      source: baseline
+      field: CommandLine
+      indicates: scheduled_automation_job
+
+  risk_logic:
+    required:
+      - filesystem_enumerated
+
+    supporting:
+      any:
+        - recursive_document_survey
+        - multiple_areas_enumerated
+        - delivery_parent
+        - whole_drive_search
+        - rare_for_host
+      all:
+        - recursive_document_survey
+        - delivery_parent
+
+    contradicting:
+      any:
+        - backup_or_indexing_agent
+        - support_or_change_activity
+        - fleetwide_recurring_pattern
+      all: []
+
+  verdict:
+    low_risk_when:
+      - filesystem_enumerated
+      - backup_or_indexing_agent
+      - support_or_change_activity
+      - fleetwide_recurring_pattern
+    suspicious_when:
+      - filesystem_enumerated
+      - recursive_document_survey
+    high_risk_when:
+      - filesystem_enumerated
+      - recursive_document_survey
+      - multiple_areas_enumerated
+      - delivery_parent
+
+  false_positive:
+    - condition: A backup or archiving agent walks the user document tree on a schedule.
+      explanation: >-
+        Backup traversal is recursive, covers exactly the document extensions of interest, and
+        reproduces the strongest evidence in this file. The acting process is the backup
+        product's own binary, the traversal is complete rather than sampled, and it repeats on
+        the same cadence on every protected endpoint in the estate.
+    - condition: A search indexer traverses the profile continuously.
+      explanation: >-
+        Indexing walks the same trees an operator would, permanently and in the background. It
+        runs under the indexing service rather than a shell, and it produces a steady stream
+        across the whole baseline window rather than a burst confined to a few minutes.
+    - condition: An antivirus or data classification scanner enumerates the filesystem.
+      explanation: >-
+        Classification products search whole drives by extension by design, which reproduces
+        both the document survey and the whole drive search evidence. They are deployed
+        fleetwide, run on a published schedule, and their process is a signed product binary.
+    - condition: A user or support engineer searches for a file they cannot find.
+      explanation: >-
+        Genuine file hunts happen constantly and look identical on telemetry. They come from an
+        interactive shell opened by that person, target one name rather than a class of
+        extensions, and are usually a single search rather than several areas in succession.
+    - condition: A build script or installer lists directories during ordinary work.
+      explanation: >-
+        Build and packaging work is inherently filesystem wide and will trip the clustering
+        case on engineering endpoints. The parent is a build agent or installer, the paths sit
+        under a project or package tree, and the pattern recurs with every build.

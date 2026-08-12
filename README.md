@@ -208,6 +208,13 @@ observed.
 There is also no file-**read** and no file-**deletion** event. Reads are inferred from the
 process that opened them; deletions from what appears afterwards.
 
+The same asymmetry applies to the registry: the events carried here
+(`AsepValueUpdate`, `RegGenericValueUpdate`, `RegSystemConfigValueUpdate`, `RegKeyCreate`)
+are all **writes**. Registry reads are not collectable, which matters because a large
+part of Discovery is reading the registry rather than changing it. Templates for those
+techniques rest on the command line that performed the query and therefore see only the
+shelled-out and scripted variants, never a compiled program reading a key directly.
+
 ### Recorded skips
 
 `skipped.yaml` names the targets this project has decided not to cover, each with the
