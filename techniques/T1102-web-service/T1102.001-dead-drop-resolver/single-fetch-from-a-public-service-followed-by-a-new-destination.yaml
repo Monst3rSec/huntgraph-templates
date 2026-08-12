@@ -1,0 +1,410 @@
+type: detection
+
+id: hg-win-single-fetch-from-a-public-service-followed-by-a-new-destination-t1102-001
+
+version: 1.0.0
+
+info:
+  name: One fetch from a public web service followed by a new destination
+  description: >-
+    A dead drop resolver inverts what destination reputation is good for. The implant does
+    not talk to its command and control server directly; it reads a note left on a service
+    the organisation could never block — a paste site, a code repository, a public profile,
+    a document, a forum post — and that note tells it where to go next. The address can be
+    rewritten by the adversary at any time without touching a single victim, and the
+    resolver domain itself is above suspicion, so blocklists, categorisation and reputation
+    feeds all have nothing to say about it. What they cannot hide is the shape. Real use of
+    a code repository or a paste site is a person or a tool doing something sustained: many
+    requests, several hosts of that service, assets and API endpoints alongside the page.
+    Reading a dead drop is one request, to one host, and then the process goes somewhere
+    else entirely — often to a numeric address the machine never looked up, because the
+    address arrived in the note rather than from a resolver. That two-step inside a single
+    process is the whole technique, and it is sharper than anything the destination alone
+    could tell you. Because the resolver domain is legitimate, the discriminator has to be
+    the process: a browser or a developer's toolchain reaching a code-hosting site is
+    unremarkable, a script host or an image running out of a temporary directory doing it
+    is not. Where the pivot instead crosses into a second process, that is a multi-stage
+    channel and a separate template covers it. This template is only useful once the estate
+    has baseline history, since the novelty of the follow-on destination is what carries
+    most of the weight.
+  severity: high
+  author: huntgraph
+  tags:
+    - command-and-control
+    - web-service
+    - dead-drop-resolver
+    - network
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1102/001
+    - https://attack.mitre.org/detectionstrategies/DET0058
+    - https://attack.mitre.org/techniques/T1102
+    - https://attack.mitre.org/techniques/T1104
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1102
+  sub_techniques:
+    - T1102.001
+  detection_strategies:
+    - DET0058
+  analytics:
+    - AN0158
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may host the address of their command and control server as content on a
+    legitimate public web service so that an implant reads the pointer from a destination
+    nobody blocks, obtaining infrastructure they can move at will without ever updating the
+    malware on the victim.
+  attacker_behavior:
+    - Posts an encoded address as a paste, gist, profile field, document or forum comment.
+    - Has the implant make a single short request to that page rather than browsing the service.
+    - Decodes the retrieved pointer and immediately connects to the address it names.
+    - Connects to the resolved address directly, without performing a lookup of its own.
+    - Rewrites the posted content to move infrastructure without redeploying the implant.
+  legitimate_behavior:
+    - Developers and their tooling fetch code, gists and raw files from repository hosts.
+    - Users read pastes, documents, articles and social content through a browser.
+    - Package managers and build agents pull manifests and archives from public services.
+    - Applications fetch configuration, release notes or version manifests from a repository.
+    - Support and diagnostic tools post and retrieve pastes on a user's behalf.
+  risk_indicator:
+    - The process contacting the service is a script host or an image in a staging directory.
+    - Contact with the service is a single request to a single host rather than a session.
+    - Another external destination is contacted by the same process shortly afterwards.
+    - The follow-on address was never resolved on this host.
+    - Neither the service page nor the follow-on address has any history in the estate.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - DomainName
+        - ContextProcessId
+        - ContextBaseFileName
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: content-hosting-service-resolved-by-a-non-browser-process
+        name: Paste, repository or profile service resolved by a process that is not a browser
+        purpose: >-
+          Establish the population honestly. These domains cannot be treated as suspicious
+          on their own — that is exactly why they are chosen — so the only discriminator
+          available at this stage is who is asking. A browser or a developer toolchain
+          reaching a code-hosting or paste service is ordinary; a script host, a signed
+          proxy-execution binary or an unrecognised image doing so is a much smaller and
+          much more interesting population.
+        query: |
+          #event_simpleName=/^DnsRequest$/
+          | DomainName=/(^|\.)(pastebin\.com|paste\.ee|pastes\.io|ghostbin\.com|hastebin\.com|rentry\.co|controlc\.com|justpaste\.it|dpaste\.(com|org)|0bin\.net|privatebin\.net|termbin\.com|ix\.io|gist\.github\.com|raw\.githubusercontent\.com|gitee\.com|bitbucket\.org|gitlab\.com|telegra\.ph|t\.me|api\.telegram\.org|steamcommunity\.com|blogspot\.com|livejournal\.com|imgur\.com|notion\.so|docs\.google\.com|drive\.google\.com)$/i
+          | ContextBaseFileName!=/^(chrome|msedge|firefox|iexplore|brave|opera|vivaldi|git|code|devenv|slack|teams|outlook)\.exe$/i
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName, DomainName],
+                    function=[count(as=lookups)])
+          | sort(lookups, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Developer workstations and build agents where repository access is expected"
+            - "ContextBaseFileName of applications documented to fetch manifests from a repository"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - domain
+            - organization
+
+      - id: read-shaped-contact-rather-than-a-session
+        name: One request to one host of a service that normally produces many
+        purpose: >-
+          The shape discriminator, and the reason this does not collapse into a domain
+          blocklist. Loading a real page from any of these services pulls in assets, API
+          calls and content hosts, so genuine use shows several distinct addresses and a
+          burst of connections. Reading a dead drop is one request to one address. Counting
+          distinct destinations per process per service turns an unusable domain match into
+          something with a usable base rate.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemotePort in (80, 443)
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+          | ContextBaseFileName!=/^(chrome|msedge|firefox|iexplore|brave|opera|vivaldi|svchost|MsMpEng|CcmExec|OneDrive|Teams|outlook)\.exe$/i
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName],
+                    function=[count(field=RemoteAddressIP4, distinct=true, as=distinct_hosts),
+                              count(as=connections),
+                              collect([RemoteAddressIP4, RemotePort], limit=10)])
+          | distinct_hosts <= 2 and connections <= 4
+          | sort(connections, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Single-endpoint agents whose entire purpose is one call to one service"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: service-fetch-then-a-second-external-destination
+        name: Same process contacted a public service and then somewhere new
+        purpose: >-
+          The two-step, which is the technique itself rather than a precursor to it. Holding
+          both connections against a single process identifier is what makes this a pivot
+          and not two unrelated connections that happened to share a host. A process whose
+          entire external footprint is a public content service followed by one other
+          destination is behaving exactly as a resolver-driven implant does, and there is
+          very little legitimate software with that footprint.
+        query: |
+          #event_simpleName=/^(DnsRequest|NetworkConnectIP4|NetworkConnectIP6)$/
+          | case {
+              #event_simpleName=/^DnsRequest$/
+                | DomainName=/(^|\.)(pastebin\.com|paste\.ee|pastes\.io|ghostbin\.com|hastebin\.com|rentry\.co|controlc\.com|justpaste\.it|dpaste\.(com|org)|0bin\.net|privatebin\.net|gist\.github\.com|raw\.githubusercontent\.com|gitee\.com|bitbucket\.org|gitlab\.com|telegra\.ph|t\.me|api\.telegram\.org|steamcommunity\.com|blogspot\.com|livejournal\.com|imgur\.com|notion\.so|docs\.google\.com|drive\.google\.com)$/i
+                | resolver_page := DomainName ;
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+                | follow_on := RemoteAddressIP4 ;
+            }
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName],
+                    function=[collect([resolver_page, follow_on, RemotePort], limit=10),
+                              count(field=follow_on, distinct=true, as=destinations)])
+          | resolver_page=/.+/ and follow_on=/.+/
+          | sort(destinations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Repository clients and package managers that fetch content and then a mirror"
+            - "Content-delivery addresses belonging to the same service as the resolver page"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - domain
+            - remote_address
+            - organization
+
+      - id: follow-on-address-with-no-lookup-behind-it
+        name: Destination contacted without the host ever resolving a name for it
+        purpose: >-
+          Separate an address the machine discovered from one it was handed. A pointer read
+          out of a dead drop is already an address, so the implant connects to it directly
+          and no resolution appears anywhere on the host. Software that reaches an endpoint
+          it was configured with almost always resolves a name first, which makes a process
+          holding external sessions while never querying anything a genuinely narrow
+          population once the well-known probe endpoints are removed.
+        query: |
+          #event_simpleName=/^(DnsRequest|NetworkConnectIP4|NetworkConnectIP6)$/
+          | case {
+              #event_simpleName=/^DnsRequest$/
+                | queried_name := DomainName ;
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|224\.)/
+                | RemotePort in (80, 443, 8080, 8443, 53)
+                | unresolved_destination := RemoteAddressIP4 ;
+            }
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName],
+                    function=[count(field=queried_name, distinct=true, as=names_queried),
+                              collect([unresolved_destination, RemotePort], limit=10)])
+          | unresolved_destination=/.+/ and names_queried = 0
+        filters:
+          include: []
+          exclude:
+            - "Connectivity and captive-portal probes that target fixed public addresses"
+            - "Processes behind a proxy or reusing a resolution performed by another process"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - remote_address
+            - organization
+
+evidence:
+  required:
+    - id: pivot_after_public_service_fetch
+      name: Public content service contacted and then a different destination
+      description: >-
+        One process reached a public paste, repository, profile or document service and
+        then opened a session to an unrelated external address, which is a pointer being
+        read and acted on rather than a service being used.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: dead_drop_resolution
+
+  supporting:
+    - id: non_browser_process_used_the_service
+      name: Service reached by a process with no business there
+      description: >-
+        The process contacting the content service is a script host, a proxy-execution
+        binary or an image in a staging directory rather than a browser or a developer
+        tool, which is the only discriminator available when the destination is by design
+        beyond suspicion.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: unexpected_network_actor
+    - id: service_page_resolved
+      name: Content service resolved by the same process
+      description: >-
+        The process itself queried the content service's name, which identifies the service
+        that was read and gives an analyst something concrete to retrieve and inspect.
+      source: dns_request
+      field: DomainName
+      indicates: dead_drop_page_identified
+    - id: read_shaped_contact
+      name: Single request rather than a browsing session
+      description: >-
+        Contact with the service consisted of very few connections to one address, unlike
+        genuine use which pulls content, assets and API endpoints from several hosts of the
+        same service.
+      source: derived
+      field: distinct_hosts
+      indicates: automated_single_fetch
+    - id: follow_on_never_resolved
+      name: Follow-on address reached with no lookup
+      description: >-
+        No name resolution on the host accounts for the second destination, which is what a
+        pointer supplied as a literal address produces.
+      source: dns_request
+      field: ContextProcessId
+      indicates: hardcoded_destination
+    - id: follow_on_new_to_the_estate
+      name: Follow-on destination unprecedented for the organisation
+      description: >-
+        Nothing in the estate contacted the second address during the baseline window, so
+        it is not an endpoint belonging to software already in use.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: unusual_activity_for_organization
+
+  contradicting:
+    - id: browser_or_developer_tool
+      name: Browser or developer toolchain made the request
+      description: >-
+        The process reaching the service is a browser, a repository client or an editor,
+        for which fetching pastes, gists and raw files is entirely ordinary.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: legitimate_user_activity
+    - id: sustained_service_session
+      name: Contact has the shape of real use
+      description: >-
+        The process made many connections across several hosts of the service, which is a
+        page or a repository actually being used rather than a single note being read.
+      source: derived
+      field: connections
+      indicates: interactive_service_use
+    - id: engineering_host_context
+      name: Host is an engineering or build system
+      description: >-
+        The machine is a developer workstation or build agent where repository and paste
+        access from tooling is part of the normal working day.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_role_behaviour
+
+  risk_logic:
+    required:
+      - pivot_after_public_service_fetch
+
+    supporting:
+      any:
+        - non_browser_process_used_the_service
+        - service_page_resolved
+        - read_shaped_contact
+        - follow_on_never_resolved
+        - follow_on_new_to_the_estate
+      all:
+        - non_browser_process_used_the_service
+        - read_shaped_contact
+        - follow_on_new_to_the_estate
+
+    contradicting:
+      any:
+        - browser_or_developer_tool
+        - sustained_service_session
+        - engineering_host_context
+      all: []
+
+  verdict:
+    low_risk_when:
+      - pivot_after_public_service_fetch
+      - browser_or_developer_tool
+      - sustained_service_session
+      - engineering_host_context
+    suspicious_when:
+      - pivot_after_public_service_fetch
+      - non_browser_process_used_the_service
+      - read_shaped_contact
+    high_risk_when:
+      - pivot_after_public_service_fetch
+      - non_browser_process_used_the_service
+      - read_shaped_contact
+      - follow_on_never_resolved
+      - follow_on_new_to_the_estate
+
+  false_positive:
+    - condition: A developer or build agent fetches a raw file or gist from a repository host.
+      explanation: >-
+        Engineering hosts do this constantly and often follow it with a connection
+        elsewhere, such as a package mirror, which satisfies the pivot. They are separated
+        by the process — a repository client, package manager or editor rather than a
+        script host — and by the host's role, which is why an engineering asset list is
+        worth having before this template is deployed.
+    - condition: An application fetches its version manifest or release notes from a repository.
+      explanation: >-
+        Some software checks for updates by reading a file from a code-hosting service and
+        then downloads from wherever the file points, which is structurally identical to
+        the technique. The distinguishing facts are that the same process, service page and
+        follow-on destination recur on a schedule across many hosts.
+    - condition: A user reads a paste, article or shared document through a browser.
+      explanation: >-
+        This is by far the most common contributor to the domain match. It is excluded on
+        the process rather than the destination, since the destination is precisely what
+        the adversary chose because it cannot be excluded.
+    - condition: A support or diagnostic tool posts and retrieves a paste for a user.
+      explanation: >-
+        Some troubleshooting utilities upload logs to a paste service and read back a
+        result, which is a non-browser process making a small number of requests. These are
+        a short list, are tied to a support interaction, and do not pivot to an address
+        nobody has ever contacted.
+    - condition: A process connects to a cached or proxied address without resolving it.
+      explanation: >-
+        Where one process resolves a name and another uses the cached address, or a proxy
+        resolves on the host's behalf, a connection can appear to have no lookup behind it.
+        This is why the missing resolution is supporting rather than required evidence, and
+        it should be read alongside which process opened the session.

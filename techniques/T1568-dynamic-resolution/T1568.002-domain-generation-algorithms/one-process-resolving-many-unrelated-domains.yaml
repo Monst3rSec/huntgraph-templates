@@ -1,0 +1,406 @@
+type: detection
+
+id: hg-win-one-process-resolving-many-unrelated-domains-t1568-002
+
+version: 1.0.0
+
+info:
+  name: One process resolving many unrelated domains in a short window
+  description: >-
+    A domain generation algorithm is the rare command-and-control technique that leaves a
+    loud, countable trace on the endpoint. The algorithm has to produce candidate names and
+    the implant has to try them, which means the host asks the resolver for dozens or
+    hundreds of names it has never asked for before, in a burst, from a single process. Only
+    one of those names is registered, so nearly all of the lookups come back with no address
+    at all. That failure ratio is the discriminator and it is what separates a DGA from
+    every other reason a process queries a lot of names: a browser resolving a page full of
+    third-party content gets answers, a mail client resolving recipient domains gets answers,
+    a reputation client resolving lookup zones gets answers. A process whose lookups mostly
+    fail is not browsing, it is searching. The names themselves usually help — letter-by-letter
+    algorithms produce consonant-heavy strings no marketing department would register — but
+    word-concatenation algorithms produce perfectly pronounceable names, which is why the
+    lexical case here is a supporting route rather than the spine of the file. The spine is
+    volume, distinctness and failure, measured per process. Note that this reads the answer
+    records the sensor attaches to each query, so a query with no address records is being
+    treated as a failed resolution; where the sensor is deployed without answer capture, the
+    volume and lexical cases still stand on their own.
+  severity: high
+  author: huntgraph
+  tags:
+    - command-and-control
+    - dynamic-resolution
+    - dga
+    - dns
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1568/002
+    - https://attack.mitre.org/detectionstrategies/DET0419
+    - https://attack.mitre.org/techniques/T1568
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1568
+  sub_techniques:
+    - T1568.002
+  detection_strategies:
+    - DET0419
+  analytics:
+    - AN1178
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:Security
+  data_components:
+    - Network Connection Creation
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may generate command-and-control domain names algorithmically and try them
+    in turn until one resolves, so that blocking or seizing any single domain does not cost
+    them the channel and no static indicator can be published against it.
+  attacker_behavior:
+    - Generates a large candidate domain list from a seed such as the current date.
+    - Issues rapid successive lookups for names the host has never queried before.
+    - Accepts that almost every candidate fails to resolve and keeps trying the next.
+    - Connects to the one address returned by the single registered candidate.
+    - Repeats the cycle on the algorithm's period, usually daily or hourly.
+  legitimate_behavior:
+    - Browsers resolve many third-party domains while rendering a single page.
+    - Reputation, anti-spam and content-filtering clients query large lookup zones.
+    - Content delivery and telemetry platforms use generated per-session hostnames.
+    - Misconfigured software retries a dead endpoint and produces failed lookups.
+    - Search suffix lists turn one typed name into several failed queries.
+  risk_indicator:
+    - Most lookups from one process return no address at all.
+    - The queried names share no common parent domain or naming convention.
+    - The querying process is not a browser, mail client or resolver component.
+    - One name in the burst resolves and the same process immediately connects to it.
+    - The process descends from a document application, script host or archive tool.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - DomainName
+        - IP4Records
+        - ContextProcessId
+        - ContextBaseFileName
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - RemoteAddressIP4
+        - RemotePort
+        - ContextProcessId
+        - ContextBaseFileName
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: many-distinct-domains-from-one-process
+        name: One process querying an unusual number of distinct domains
+        purpose: >-
+          Establish the base population by breadth rather than by name. An algorithm is
+          defined by how many different names it tries, so counting distinct domains per
+          process separates a generator from a process that queries the same handful of
+          endpoints repeatedly, which is what almost all legitimate software does.
+        query: |
+          #event_simpleName=DnsRequest
+          | ContextBaseFileName!=/^(msedge|chrome|firefox|iexplore|brave|opera|vivaldi|outlook|teams|onedrive|msedgewebview2)\.exe$/i
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName],
+                    function=[count(DomainName, distinct=true, as=distinct_domains),
+                              count(as=lookups),
+                              collect([DomainName], limit=20)])
+          | distinct_domains >= 40
+          | sort(distinct_domains, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Reputation, anti-spam and web-filtering clients whose lookup zones are query-heavy by design"
+            - "Service host processes carrying resolution on behalf of other components"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: gibberish-labels-queried-in-bulk
+        name: Consonant-heavy generated labels queried in bulk
+        purpose: >-
+          Cover the letter-by-letter form of the algorithm, whose output is lexically
+          unlike anything a human registers. This is deliberately a supporting route, not
+          the spine: word-list algorithms concatenate real words and defeat it entirely,
+          and matching only the registrable label misses generators that vary a subdomain
+          under one fixed parent.
+        query: |
+          #event_simpleName=DnsRequest
+          | DomainName=/^[a-z0-9-]{12,32}\.(com|net|org|info|biz|top|xyz|ru|su|cc|ws|pw|club|online|site)$/i
+          | DomainName=/[bcdfghjklmnpqrstvwxz]{5,}/i
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName],
+                    function=[count(DomainName, distinct=true, as=generated_labels),
+                              collect([DomainName], limit=20)])
+          | generated_labels >= 5
+          | sort(generated_labels, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Content delivery and telemetry platforms that mint per-session hostnames"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: failed-burst-with-one-answer-and-a-connection
+        name: Burst of failed lookups, one answer, then a connection to it
+        purpose: >-
+          Carry the discriminator and the confirmation in one case. A process that produces
+          a run of lookups with no address records, gets exactly one answered name, and
+          then opens a session to the address it received, has done the whole DGA cycle in
+          front of the sensor. This is the strongest single result the file can return.
+        query: |
+          #event_simpleName=/^(DnsRequest|NetworkConnectIP4|NetworkConnectIP6)$/
+          | case {
+              #event_simpleName=DnsRequest
+                | IP4Records!=/.+/
+                | failed_lookup := DomainName ;
+              #event_simpleName=DnsRequest
+                | IP4Records=/.+/
+                | answered_lookup := DomainName ;
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|169\.254\.|224\.)/
+                | peer := RemoteAddressIP4 ;
+            }
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName],
+                    function=[count(failed_lookup, distinct=true, as=unresolved_domains),
+                              collect([failed_lookup, answered_lookup, peer, RemotePort], limit=20),
+                              count(as=events)])
+          | failed_lookup=/.+/ and answered_lookup=/.+/ and peer=/.+/
+          | unresolved_domains >= 20
+          | sort(unresolved_domains, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Hosts behind a resolver that answers every name, where failed lookups never appear"
+            - "Search-suffix expansion, which turns one short name into several failures under the same parent"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - domain
+
+      - id: lookup-burst-from-a-delivery-lineage
+        name: Failed lookup burst on a host running code from a delivery chain
+        purpose: >-
+          Attach the actor to the behaviour. The command set of a DGA is invisible, so the
+          only process context available is what the host was running at the time: an
+          interpreter or proxy-execution binary started by a document application, mail
+          client or archive tool is the shape of code that arrived rather than code that
+          was deployed, and a lookup burst alongside it is worth far more than either alone.
+        query: |
+          #event_simpleName=/^(DnsRequest|ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              #event_simpleName=DnsRequest
+                | IP4Records!=/.+/
+                | unresolved := DomainName ;
+              #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+                | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|mshta|wscript|cscript|7z|winrar|winzip|explorer)\.exe$/i
+                | FileName=/^(powershell|pwsh|python|pythonw|node|rundll32|regsvr32|mshta|wscript|cscript|cmd)\.exe$/i
+                | delivery_parent := ParentBaseFileName ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([unresolved, delivery_parent, FileName, CommandLine], limit=20),
+                              count(unresolved, distinct=true, as=unresolved_domains),
+                              count(as=events)])
+          | unresolved=/.+/ and delivery_parent=/.+/
+          | unresolved_domains >= 10
+        filters:
+          include: []
+          exclude:
+            - "Packaging and automation hosts where interpreters are routinely started by archive tooling"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - process
+
+evidence:
+  required:
+    - id: burst_of_distinct_lookups
+      name: Burst of distinct, unrelated domain lookups from one process
+      description: >-
+        A single process asked the resolver for an unusual number of different names in a
+        short window, with no shared parent domain or naming convention between them, which
+        is what a generator produces and what an ordinary client does not.
+      source: dns_request
+      field: DomainName
+      indicates: algorithmic_domain_generation
+
+  supporting:
+    - id: lookups_without_an_answer
+      name: Most of the lookups returned no address
+      description: >-
+        The queries in the burst came back with no address records, which is the expected
+        result when an algorithm produces hundreds of candidates and only one of them has
+        been registered by the operator.
+      source: dns_request
+      field: IP4Records
+      indicates: failed_resolution_burst
+    - id: random_looking_labels
+      name: Queried labels have generated structure
+      description: >-
+        The names are long, consonant-heavy strings under commodity registrars rather than
+        pronounceable brand or service names, which is the signature of a letter-by-letter
+        generator.
+      source: derived
+      field: label_shape
+      indicates: generated_domain_name
+    - id: non_browser_querier
+      name: Querying process is not a browser or mail client
+      description: >-
+        The lookups came from an interpreter, proxy-execution binary or unnamed process
+        rather than from software whose job is to resolve many third-party names.
+      source: dns_request
+      field: ContextBaseFileName
+      indicates: untrusted_actor
+    - id: one_answer_then_connection
+      name: The one answered name was immediately contacted
+      description: >-
+        The single candidate that resolved was followed by an outbound session from the same
+        process to the address it returned, which closes the loop between generation and use.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: active_command_and_control_attempt
+    - id: delivery_lineage
+      name: Process descends from a delivery chain
+      description: >-
+        The activity sits alongside an interpreter or proxy-execution binary started by a
+        document application, mail client or archive tool, which is the shape of code that
+        arrived rather than code that was installed.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+
+  contradicting:
+    - id: reputation_or_filtering_client
+      name: Reputation, anti-spam or web-filtering client
+      description: >-
+        The querying process is a security or filtering component that resolves names inside
+        a lookup zone as its normal function, which produces both high distinct-name counts
+        and large numbers of negative answers.
+      source: dns_request
+      field: ContextBaseFileName
+      indicates: legitimate_application_component
+    - id: estate_wide_domain_set
+      name: The same names are queried across the estate
+      description: >-
+        Other hosts queried the same names during the baseline window, which points to a
+        content delivery, telemetry or measurement platform rather than a per-victim
+        algorithm seeded for one implant.
+      source: baseline
+      field: DomainName
+      indicates: legitimate_enterprise_activity
+    - id: resolver_or_test_host
+      name: Resolver, gateway or network test system
+      description: >-
+        The host forwards or tests name resolution for others, so the volume and the failure
+        rate belong to its role rather than to anything running on it.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_infrastructure_role
+
+  risk_logic:
+    required:
+      - burst_of_distinct_lookups
+
+    supporting:
+      any:
+        - lookups_without_an_answer
+        - random_looking_labels
+        - non_browser_querier
+        - one_answer_then_connection
+        - delivery_lineage
+      all:
+        - lookups_without_an_answer
+        - one_answer_then_connection
+
+    contradicting:
+      any:
+        - reputation_or_filtering_client
+        - estate_wide_domain_set
+        - resolver_or_test_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - burst_of_distinct_lookups
+      - reputation_or_filtering_client
+      - estate_wide_domain_set
+      - resolver_or_test_host
+    suspicious_when:
+      - burst_of_distinct_lookups
+      - non_browser_querier
+    high_risk_when:
+      - burst_of_distinct_lookups
+      - lookups_without_an_answer
+      - one_answer_then_connection
+      - delivery_lineage
+
+  false_positive:
+    - condition: A reputation or anti-spam client queries a large lookup zone.
+      explanation: >-
+        These products encode the thing being checked into a hostname under a vendor zone,
+        so they generate thousands of distinct names and a high proportion of negative
+        answers — the same two numbers this file keys on. They are distinguishable because
+        every generated name shares one parent domain and the same product behaves
+        identically on every host in the estate.
+    - condition: A browser renders pages that pull content from many third-party domains.
+      explanation: >-
+        Ad, analytics and content networks push a single page load to dozens of distinct
+        lookups. Those lookups overwhelmingly succeed, and they come from a browser process,
+        which is why browsers are outside the base population and the failure ratio carries
+        the file.
+    - condition: DNS search suffixes turn one short name into several failed queries.
+      explanation: >-
+        A host with several search domains will retry an unqualified name under each suffix,
+        producing genuine no-answer results. The failures share a suffix and the underlying
+        label repeats, unlike generated candidates which have nothing in common.
+    - condition: Software retries an endpoint whose domain has lapsed or been decommissioned.
+      explanation: >-
+        Abandoned agents and stale configuration produce persistent unresolved lookups from
+        a non-browser process, which reproduces the failure signal exactly. The giveaway is
+        that the same one or two names repeat rather than a stream of new ones, so distinct
+        domain count stays low even as lookup count climbs.

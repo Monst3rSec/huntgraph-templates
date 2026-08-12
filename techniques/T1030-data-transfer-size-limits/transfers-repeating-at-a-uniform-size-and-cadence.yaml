@@ -1,0 +1,382 @@
+type: detection
+
+id: hg-win-transfers-repeating-at-a-uniform-size-and-cadence-t1030
+
+version: 1.0.0
+
+info:
+  name: Outbound transfers repeating at a uniform size and cadence
+  description: >-
+    Splitting a collection into fixed-size pieces is a decision about a detection threshold,
+    not about the data. A file has whatever size it has; a run of transfers that are all the
+    same size, evenly spaced, to one destination, is a program that was told a number and is
+    obeying it. That artificial regularity is the finding, because nothing produced by a
+    person or by an ordinary application transfers data that evenly — real uploads are
+    ragged, they follow the shape of the file and the network, and they stop when the file
+    ends rather than when a counter is reached. The awkward part is that the size itself is
+    not directly visible: Falcon's connection records carry the peer, the ports and the time,
+    but not a byte count, so this template does not pretend to read one. What it reads is the
+    consequence of a fixed chunk size. Sending in pieces means opening and closing a session
+    per piece, so the split shows up as a long run of separate connections from one process
+    to one peer, each taking a fresh ephemeral local port, arriving at a rate that barely
+    varies from one minute to the next. The benign twin is a polling agent, and it is a
+    strong one — a monitoring client checking in every thirty seconds is also perfectly
+    regular. The discriminator is that a poller is sparse and permanent while a chunked
+    transfer is dense and finite, and that the poller's destination is reached by the whole
+    estate whereas the transfer's is reached by one host. Both of those comparisons need
+    history, so this template is close to useless on a fresh deployment and needs the stated
+    baseline window before it will separate anything.
+  severity: high
+  author: huntgraph
+  tags:
+    - exfiltration
+    - data-transfer-size-limits
+    - chunked-transfer
+    - network
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1030
+    - https://attack.mitre.org/detectionstrategies/DET0213
+    - https://attack.mitre.org/techniques/T1041
+
+mitre:
+  tactics:
+    - TA0010
+  techniques:
+    - T1030
+  sub_techniques: []
+  detection_strategies:
+    - DET0213
+  analytics:
+    - AN0596
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may break a collection into fixed-size pieces and send them one at a time so
+    that no single transfer crosses a volume threshold, obtaining egress of an arbitrarily
+    large body of data while every individual movement stays under whatever number the
+    defender configured.
+  attacker_behavior:
+    - Splits an archive into volumes of a chosen size before sending anything.
+    - Sends one piece per session, closing the connection between pieces.
+    - Paces the pieces so the rate stays flat rather than bursting.
+    - Sends every piece to the same destination over a single sustained run.
+  legitimate_behavior:
+    - Monitoring and telemetry agents check in on a fixed interval indefinitely.
+    - Backup and replication clients transfer on a schedule to a known target.
+    - Software update services poll a vendor endpoint at a steady rate.
+    - Chunked upload is how several sanctioned cloud storage clients work by design.
+  risk_indicator:
+    - The run is dense and finite rather than sparse and permanent.
+    - The destination is reached by exactly one host in the estate.
+    - The destination port matches no service the organisation runs.
+    - The process holding the sessions has no role that involves moving data.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+        - LocalPort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: uniform-rate-run-to-a-single-destination
+        name: Connection rate to one destination that barely varies
+        purpose: >-
+          This is the whole hypothesis in one query. Bucket the connections a process makes
+          to one external peer into one-minute windows, then measure how much the per-minute
+          count moves. Human and application traffic wanders; a loop paying out fixed pieces
+          does not. A long run with a near-zero spread is a program working through a
+          quantity it decided in advance, and it is the only shape here that cannot be
+          produced by someone using their computer normally.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+          | bucket(span=1m, field=[ComputerName, ContextBaseFileName, RemoteAddressIP4],
+                   function=[count(as=per_minute)])
+          | groupBy([ComputerName, ContextBaseFileName, RemoteAddressIP4],
+                    function=[count(as=active_minutes),
+                              avg(per_minute, as=mean_rate),
+                              stdDev(per_minute, as=rate_spread),
+                              min(@timestamp, as=first_seen),
+                              max(@timestamp, as=last_seen)])
+          | active_minutes >= 15
+          | mean_rate >= 2
+          | rate_spread < 1
+          | sort(rate_spread, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Monitoring, telemetry and update agents whose polling interval is documented in the build"
+            - "Backup and replication clients running inside their scheduled window"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: many-short-sessions-to-one-peer
+        name: One destination taking many separate short sessions
+        purpose: >-
+          Separate a transfer that was streamed from one that was paged out. Sending a body
+          of data in one go is one session; sending it in pieces is one session per piece,
+          and each new outbound session takes a fresh ephemeral local port. Counting distinct
+          local ports against a single peer therefore counts the pieces without needing a
+          byte count anywhere.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+          | groupBy([ComputerName, ContextBaseFileName, ContextProcessId, RemoteAddressIP4, RemotePort],
+                    function=[count(field=LocalPort, distinct=true, as=sessions),
+                              count(as=connections),
+                              min(@timestamp, as=first_seen),
+                              max(@timestamp, as=last_seen)])
+          | sessions >= 20
+          | sort(sessions, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Sanctioned cloud storage clients that upload in chunks by design"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: destination-only-one-host-in-the-estate-uses
+        name: Sustained run to a destination no other host contacts
+        purpose: >-
+          Carry the rarity half of the discriminator. A polling agent produces the same even
+          rhythm, but it produces it on every host that runs the product, so its destination
+          is shared. A destination that takes fifty or more connections from exactly one
+          machine and from nowhere else is not a service the organisation uses.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+          | groupBy([RemoteAddressIP4, RemotePort],
+                    function=[count(field=ComputerName, distinct=true, as=hosts),
+                              count(field=ContextBaseFileName, distinct=true, as=processes),
+                              count(as=connections),
+                              collect([ComputerName, ContextBaseFileName], limit=5)])
+          | hosts = 1
+          | connections >= 50
+          | sort(connections, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Single-purpose hosts with a documented one-to-one integration to an external partner"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - remote_address
+            - organization
+
+      - id: even-cadence-from-a-process-with-no-transfer-role
+        name: Even cadence held by a script host or archive utility
+        purpose: >-
+          Combine the shape with the actor. A monitoring agent is entitled to a steady
+          rhythm; a script host, a proxy-execution binary or an archive tool is not entitled
+          to hold an external peer at all, and one doing so at a fixed rate for ten minutes
+          or more has been given a job that has nothing to do with what it is for. Grouping
+          on the process id keeps a single run together rather than merging separate
+          invocations.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | ContextBaseFileName=/^(powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin|curl|wget|python|pythonw|node|rar|winrar|7z|7za|makecab|ftp|tftp)\.exe$/i
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+          | bucket(span=1m, field=[ComputerName, ContextBaseFileName, ContextProcessId, RemoteAddressIP4],
+                   function=[count(as=per_minute)])
+          | groupBy([ComputerName, ContextBaseFileName, ContextProcessId, RemoteAddressIP4],
+                    function=[count(as=active_minutes),
+                              avg(per_minute, as=mean_rate),
+                              stdDev(per_minute, as=rate_spread)])
+          | active_minutes >= 10
+          | rate_spread < 1
+          | sort(active_minutes, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Deployment and automation hosts where scripted transfers are the normal workload"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - remote_address
+
+evidence:
+  required:
+    - id: uniform_transfer_cadence_to_one_peer
+      name: Sustained run of connections to one peer at a near-constant rate
+      description: >-
+        A single process kept contacting one external destination at a rate that barely
+        varied across many consecutive minutes, which is the shape data takes when it is
+        paid out in pieces of a size somebody chose.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: chunked_transfer_cadence
+
+  supporting:
+    - id: many_short_sessions_for_one_destination
+      name: One destination served by many separate sessions
+      description: >-
+        The peer was reached through a large number of distinct ephemeral local ports rather
+        than one long-lived session, so the material was sent as separate pieces rather than
+        streamed.
+      source: network_connection
+      field: LocalPort
+      indicates: transfer_split_into_pieces
+    - id: off_profile_destination_port
+      name: Destination port matches no service the estate runs
+      description: >-
+        The run terminates on a port that is not part of the organisation's service profile,
+        which removes the most common benign explanation for regular outbound contact.
+      source: network_connection
+      field: RemotePort
+      indicates: non_standard_service_port
+    - id: process_with_no_transfer_role
+      name: Sessions held by a process that does not move data
+      description: >-
+        A script host, proxy-execution binary or archive utility owns the run, rather than a
+        browser, agent or transfer client that would ordinarily originate outbound sessions.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: abnormal_network_originator
+    - id: destination_new_to_the_estate
+      name: No history of this destination anywhere in the estate
+      description: >-
+        The peer has not been contacted by any host during the baseline window, so the run
+        is not a standing integration whose rhythm is simply being noticed for the first
+        time.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: unusual_destination
+    - id: single_host_owns_the_destination
+      name: Only one host contacts the destination
+      description: >-
+        The destination is reached by exactly one machine, which is what separates a targeted
+        egress path from a product endpoint that every host running the product also polls.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: managed_agent_polling
+      name: Monitoring, update or telemetry agent polling
+      description: >-
+        The process is a deployed agent whose entire purpose is periodic contact with a
+        service endpoint, which reproduces the even cadence exactly and permanently.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: legitimate_application_component
+    - id: destination_used_across_the_estate
+      name: Destination contacted by many hosts
+      description: >-
+        The same peer is reached by a broad population of machines across the baseline
+        window, which makes it a shared service rather than one host's egress path.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: legitimate_enterprise_activity
+    - id: scheduled_transfer_window
+      name: Recorded backup, replication or migration window
+      description: >-
+        The run falls inside a change record for bulk data movement, which explains both the
+        density and the single destination.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - uniform_transfer_cadence_to_one_peer
+
+    supporting:
+      any:
+        - many_short_sessions_for_one_destination
+        - off_profile_destination_port
+        - process_with_no_transfer_role
+        - destination_new_to_the_estate
+        - single_host_owns_the_destination
+      all:
+        - many_short_sessions_for_one_destination
+        - destination_new_to_the_estate
+        - single_host_owns_the_destination
+
+    contradicting:
+      any:
+        - managed_agent_polling
+        - destination_used_across_the_estate
+        - scheduled_transfer_window
+      all: []
+
+  verdict:
+    low_risk_when:
+      - uniform_transfer_cadence_to_one_peer
+      - managed_agent_polling
+      - destination_used_across_the_estate
+      - scheduled_transfer_window
+    suspicious_when:
+      - uniform_transfer_cadence_to_one_peer
+      - many_short_sessions_for_one_destination
+      - destination_new_to_the_estate
+    high_risk_when:
+      - uniform_transfer_cadence_to_one_peer
+      - many_short_sessions_for_one_destination
+      - destination_new_to_the_estate
+      - single_host_owns_the_destination
+      - process_with_no_transfer_role
+      - off_profile_destination_port
+
+  false_positive:
+    - condition: A monitoring or telemetry agent checks in on a fixed interval.
+      explanation: >-
+        This is the closest benign twin and it reproduces the regularity perfectly, because
+        a poller is also a program obeying a number. It differs in density and in scope: the
+        poll is sparse, it never stops, and its endpoint is contacted by every host running
+        the same agent, which is what the estate-wide comparison in the third case exposes.
+    - condition: A sanctioned cloud storage client uploads a large file in chunks.
+      explanation: >-
+        Chunked upload is how several storage products are built, so they produce both the
+        even cadence and the many short sessions. The destination belongs to a service the
+        organisation uses and other hosts reach it as well, and the client binary is the
+        product's own rather than a script host.
+    - condition: A backup or replication job runs to a single remote target.
+      explanation: >-
+        Replication is dense, regular and aimed at one destination, which matches the shape
+        closely. It is distinguishable by the change record, by the schedule repeating in
+        the baseline window, and by the process being the backup product rather than a
+        general-purpose interpreter.
+    - condition: A long software download or update is retried in ranged requests.
+      explanation: >-
+        Range requests against a content delivery endpoint produce a burst of similar short
+        sessions. The direction is inbound-dominant and the destination is a public content
+        network reached by much of the estate, neither of which fits a single host paying
+        data out to a peer nobody else uses.

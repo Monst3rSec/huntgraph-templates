@@ -1,0 +1,385 @@
+type: detection
+
+id: hg-win-collection-pushed-to-an-external-code-repository-t1567-001
+
+version: 1.0.0
+
+info:
+  name: Collected data pushed to an external code repository
+  description: >-
+    A code repository is an unusually convenient place to put stolen data. It accepts
+    arbitrary content over HTTPS, it is reachable from almost every corporate network
+    because engineering needs it, and a push looks like the most ordinary thing in the world
+    on a host where pushes are ordinary. The whole point of the technique is that the
+    destination is reputable, so the destination on its own is never the finding. What makes
+    it observable is the combination the adversary cannot avoid: the repository tooling
+    writes its intent into the command line. A remote is added, a repository is initialised,
+    everything in a directory is staged, and the result is pushed to a host outside the
+    organisation's own Git service. Where a real engineer's push is one step in a long
+    history of that host doing development, an exfiltration push is usually the first and
+    only repository activity that host has ever produced, frequently follows an archiving
+    step moments earlier, and is often issued by a scripting host rather than by an editor
+    or a build agent. Read against a baseline of which hosts and users legitimately push
+    where, this is one of the few exfiltration behaviours with a genuinely sharp
+    discriminator. Without that baseline it will fire on every developer in the estate, so
+    the estate history is a precondition rather than an enhancement.
+  severity: high
+  author: huntgraph
+  tags:
+    - exfiltration
+    - web-service
+    - code-repository
+    - git
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1567/001
+    - https://attack.mitre.org/detectionstrategies/DET0318
+    - https://attack.mitre.org/techniques/T1567
+    - https://attack.mitre.org/techniques/T1560/001
+    - https://attack.mitre.org/techniques/T1074/001
+
+mitre:
+  tactics:
+    - TA0010
+  techniques:
+    - T1567
+  sub_techniques:
+    - T1567.001
+  detection_strategies:
+    - DET0318
+  analytics:
+    - AN0895
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may push collected data into a code repository they control so that it
+    leaves the network over an HTTPS service the organisation already permits, obtaining a
+    transfer channel that needs no new infrastructure and that blends into the traffic
+    engineering produces every day.
+  attacker_behavior:
+    - Initialises a repository over a staging directory and stages every file in it.
+    - Adds a remote pointing at a personal or attacker-controlled repository host.
+    - Pushes the staged content, often immediately after creating an archive of it.
+    - Uses a token already present on the host so no interactive authentication is needed.
+  legitimate_behavior:
+    - Engineers push work to the organisation's own hosted Git service continuously.
+    - Developers contribute to public open-source projects from managed workstations.
+    - Build agents clone, tag and push as part of the release pipeline.
+    - Tooling mirrors internal repositories to an external host during a migration.
+  risk_indicator:
+    - The remote is a public repository host rather than the organisation's own Git service.
+    - The host has no development role and no history of repository activity.
+    - A repository is created, filled and pushed inside a single short burst.
+    - An archive was produced from user or share data shortly before the push.
+    - The repository API is reached by a scripting host rather than by developer tooling.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - DomainName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: push-to-a-repository-outside-the-organisation
+        name: Repository push or remote addition naming an external host
+        purpose: >-
+          Carry the core observable. The tooling writes the destination into its own command
+          line, so a push aimed at a public repository host rather than the organisation's
+          Git service is visible without reading any traffic.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\bgit(\.exe)?\b/i
+          | CommandLine=/\b(push|remote\s+add|remote\s+set-url|config\s+remote\.)/i
+          | CommandLine=/(github\.com|gitlab\.com|bitbucket\.org|codeberg\.org|gitee\.com|git\.sr\.ht|sourceforge\.net)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=pushes), collect([CommandLine], limit=5)])
+          | sort(pushes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Remotes on the organisation's own enterprise Git host or approved mirrors"
+            - "Build and release agents whose pipeline definitions publish externally"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: repository-created-and-filled-in-one-burst
+        name: Repository initialised, staged and pushed in one sequence
+        purpose: >-
+          Separate an exfiltration container from ongoing development. Engineers push into
+          repositories that already exist; an adversary creates one, adds everything in the
+          directory to it and pushes, all under a single parent within minutes.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\bgit(\.exe)?\b/i
+          | case {
+              CommandLine=/\bgit(\.exe)?\s+init\b/i
+                | created := CommandLine ;
+              CommandLine=/\bgit(\.exe)?\s+add\s+(-A\b|--all\b|\.)/i
+                | staged := CommandLine ;
+              CommandLine=/\bgit(\.exe)?\s+commit\b/i
+                | committed := CommandLine ;
+              CommandLine=/\bgit(\.exe)?\s+push\b/i
+                | pushed := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[collect([created, staged, committed, pushed]),
+                              count(as=steps)])
+          | created=/.+/
+          | pushed=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Scaffolding tooling that initialises and publishes new project templates"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: repository-api-reached-by-a-non-development-process
+        name: Repository API contacted by a scripting host or fetcher
+        purpose: >-
+          Cover the route that never touches the git client at all. A repository API accepts
+          a file upload from any HTTPS caller, so the discriminator becomes which process is
+          making the call rather than what it is calling.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6|DnsRequest)$/
+          | case {
+              #event_simpleName=DnsRequest
+                | DomainName=/(^|\.)(github\.com|gitlab\.com|bitbucket\.org|gitee\.com|codeberg\.org)$/i
+                | repo_domain := DomainName ;
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | ContextBaseFileName=/^(powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin|curl|wget|python|pythonw|node)\.exe$/i
+                | RemotePort in (443, 8443)
+                | peer := RemoteAddressIP4 ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([ContextBaseFileName, repo_domain, peer]),
+                              count(as=events)])
+          | repo_domain=/.+/
+          | peer=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Package managers and dependency resolvers that fetch from public repositories"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - domain
+
+      - id: archive-created-then-pushed
+        name: Archive produced shortly before a repository upload
+        purpose: >-
+          Anchor the push to the collection that fed it. An upload is worth far more as a
+          finding when the same account packaged data into an archive first, which is what
+          separates exfiltration from a developer publishing source.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/\b(7z|7za|rar|winrar|tar|Compress-Archive|makecab)\b/i
+                | archived := CommandLine ;
+              CommandLine=/\bgit(\.exe)?\s+(push|remote\s+add)\b/i
+                | uploaded := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[collect([archived, uploaded, FileName]), count(as=steps)])
+          | archived=/.+/
+          | uploaded=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Release pipelines that package build output and publish it as an artefact"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: push_to_an_external_repository
+      name: Content pushed to a repository outside the organisation
+      description: >-
+        A repository command named a remote on a public repository host rather than the
+        organisation's own Git service, which is the transfer itself rather than a
+        preparation for one.
+      source: process_creation
+      field: CommandLine
+      indicates: data_transfer_to_external_service
+
+  supporting:
+    - id: repository_created_to_receive_data
+      name: Repository initialised and filled in one sequence
+      description: >-
+        A repository was created, everything in the working directory staged and the result
+        pushed within a single lineage, which is a container built to carry data rather than
+        a developer committing to existing work.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: staging_for_exfiltration
+    - id: repository_domain_resolved
+      name: Repository host resolved from this machine
+      description: >-
+        The host looked up a public code repository domain, tying the command line to actual
+        egress rather than to an attempt that never left the machine.
+      source: dns_request
+      field: DomainName
+      indicates: external_service_contacted
+    - id: api_session_from_a_non_development_process
+      name: Repository API session opened by a scripting host
+      description: >-
+        The connection to the repository service came from an interpreter or a command-line
+        fetcher rather than from a git client, an editor or a build agent.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: abnormal_execution_chain
+    - id: archive_preceded_the_push
+      name: Archive produced before the upload
+      description: >-
+        The same account packaged data with an archive utility shortly before pushing, which
+        is the collect-compress-move sequence rather than routine source publication.
+      source: process_creation
+      field: FileName
+      indicates: collection_then_exfiltration
+    - id: no_repository_history_for_this_host
+      name: No repository activity on this host in the baseline window
+      description: >-
+        Neither this host nor this account has pushed to any repository during the baseline
+        window, so the activity is new rather than a change of destination.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: development_asset_role
+      name: Host is a registered development or build system
+      description: >-
+        The machine belongs to an engineering or build asset group where repository activity
+        against external hosts is part of its normal function.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+    - id: organisation_git_service
+      name: Remote is the organisation's own Git service
+      description: >-
+        The destination named in the command line is the enterprise Git host or an approved
+        mirror rather than a public repository outside the organisation.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_enterprise_activity
+    - id: recorded_repository_migration
+      name: Recorded migration or mirroring work
+      description: >-
+        A change record covers moving or mirroring repositories to an external host during
+        the window in which the pushes occurred.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - push_to_an_external_repository
+
+    supporting:
+      any:
+        - repository_created_to_receive_data
+        - repository_domain_resolved
+        - api_session_from_a_non_development_process
+        - archive_preceded_the_push
+        - no_repository_history_for_this_host
+      all:
+        - repository_created_to_receive_data
+        - archive_preceded_the_push
+
+    contradicting:
+      any:
+        - development_asset_role
+        - organisation_git_service
+        - recorded_repository_migration
+      all: []
+
+  verdict:
+    low_risk_when:
+      - push_to_an_external_repository
+      - development_asset_role
+      - organisation_git_service
+      - recorded_repository_migration
+    suspicious_when:
+      - push_to_an_external_repository
+      - no_repository_history_for_this_host
+    high_risk_when:
+      - push_to_an_external_repository
+      - repository_created_to_receive_data
+      - archive_preceded_the_push
+      - api_session_from_a_non_development_process
+
+  false_positive:
+    - condition: A developer pushes work to a personal public repository from a managed workstation.
+      explanation: >-
+        This is common and produces exactly the required evidence. It is separated by asset
+        role and by history: the machine is an engineering asset, the account pushes
+        regularly, and there is no archive of user or share data preceding the push.
+    - condition: A build agent publishes release artefacts to an external repository.
+      explanation: >-
+        Pipelines push tags and artefacts on every release. The parent is a build service
+        rather than a shell, the destination is stable across many runs, and the same
+        sequence appears on every agent in the pool rather than on one host once.
+    - condition: A dependency tool contacts a public repository host over HTTPS.
+      explanation: >-
+        Package managers resolve from repository domains constantly, which is why the API
+        case requires a scripting host or fetcher as the originator rather than treating the
+        destination alone as meaningful.
+    - condition: An approved migration mirrors internal repositories to an external service.
+      explanation: >-
+        A mirroring exercise produces bulk pushes to an outside host. It is planned, covered
+        by a change record, runs from a designated machine, and moves repositories rather
+        than an archive assembled from user directories.

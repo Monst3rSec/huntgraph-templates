@@ -1,0 +1,387 @@
+type: detection
+
+id: hg-win-outbound-traffic-routed-through-an-external-intermediary-t1090-002
+
+version: 1.0.0
+
+info:
+  name: Outbound traffic routed through an external intermediary
+  description: >-
+    An external proxy puts a rented or borrowed machine between the victim and the real C2,
+    so that the address a defender recovers belongs to a hosting provider rather than to the
+    adversary. Nothing about the traffic tells an endpoint sensor this is happening — there
+    is no header and no certificate here — so the hunt rests on the two things that are
+    visible: how the destination is addressed, and which process is doing the addressing. A
+    relay is normally reached by literal address and port, because there is nothing to name,
+    so a process that opens external connections while resolving nothing is contacting
+    infrastructure the way an implant does rather than the way an application does. The same
+    process then holds a great many sessions to one or two endpoints, which is concentration
+    no browser produces. Both signals are comparative, which means this file is worth very
+    little until baseline history exists: the destination has to be new to the estate for
+    either to mean anything, and deployed against an empty baseline it will surface the
+    estate's own software integrations and nothing else.
+  severity: medium
+  author: huntgraph
+  tags:
+    - command-and-control
+    - external-proxy
+    - egress-analysis
+    - beaconing
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1090/002
+    - https://attack.mitre.org/detectionstrategies/DET0325
+    - https://attack.mitre.org/techniques/T1090
+    - https://attack.mitre.org/techniques/T1571
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1090
+  sub_techniques:
+    - T1090.002
+  detection_strategies:
+    - DET0325
+  analytics:
+    - AN0922
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Connection Creation
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may direct a compromised host at an intermediary they rent or control
+    rather than at their real command server, obtaining a destination that survives takedown
+    of the front, an address that resolves to ordinary hosting infrastructure, and an
+    investigation that stops one hop short of them.
+  attacker_behavior:
+    - Points an implant at a relay by literal address and port rather than by name.
+    - Sets a proxy in the system or per-tool configuration so existing clients route through it.
+    - Holds repeated sessions to one or two endpoints rather than browsing many destinations.
+    - Uses a script host or signed system binary as the process that makes the connection.
+    - Selects hosting infrastructure whose reputation is neutral rather than known-bad.
+  legitimate_behavior:
+    - Corporate web proxies and secure gateways receive every client's outbound traffic.
+    - Software integrations connect to vendor endpoints addressed by fixed IP.
+    - Monitoring, telemetry and update agents hold long sessions to a small endpoint set.
+    - Administrators configure proxy settings across the estate through policy or scripts.
+    - Conferencing and VPN clients connect directly to media relays by address.
+  risk_indicator:
+    - A process opens external connections while issuing no name resolution at all.
+    - Sessions concentrate on one or two external addresses with no browsing spread.
+    - The destination has not been contacted by anything in the estate before.
+    - The connecting image is an interpreter or a system binary with no network role.
+    - A proxy was configured from a command line on a single host rather than by policy.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - ContextBaseFileName
+        - RemoteAddressIP4
+        - RemotePort
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - ContextBaseFileName
+        - DomainName
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: external-egress-without-any-resolution
+        name: A process connecting outward while resolving nothing
+        purpose: >-
+          Applications reach services by name because names are what services publish;
+          relays are reached by address because there is nothing to publish. Counting a
+          process's resolutions against its external connections separates the two without
+          needing to know anything about the destination, which is the one part of this
+          hunt that does not depend on reputation data.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6|DnsRequest)$/
+          | ContextBaseFileName!=/^(System|svchost\.exe|MsMpEng\.exe|CcmExec\.exe|OneDrive\.exe|Teams\.exe|chrome\.exe|msedge\.exe|firefox\.exe|outlook\.exe|SearchIndexer\.exe)$/i
+          | case {
+              #event_simpleName=DnsRequest
+                | resolved_name := DomainName ;
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|224\.)/
+                | direct_peer := RemoteAddressIP4 ;
+            }
+          | groupBy([ComputerName, ContextBaseFileName],
+                    function=[count(field=direct_peer, distinct=true, as=external_peers),
+                              count(field=resolved_name, distinct=true, as=names_resolved),
+                              count(as=events),
+                              collect([direct_peer, RemotePort], limit=10)])
+          | names_resolved = 0
+          | external_peers >= 1
+          | sort(events, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Integrations whose vendor endpoints are documented as fixed addresses"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: sessions-concentrated-on-one-endpoint
+        name: Many sessions held against one or two external addresses
+        purpose: >-
+          A relay is a single place traffic keeps going back to, so its shape is the
+          opposite of browsing: high session counts spread across almost no destinations.
+          This is the case that distinguishes an implant talking to its front from a client
+          application talking to the internet, and it needs no knowledge of the destination.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|224\.)/
+          | ContextBaseFileName!=/^(System|svchost\.exe|MsMpEng\.exe|CcmExec\.exe|OneDrive\.exe|Teams\.exe|chrome\.exe|msedge\.exe|firefox\.exe|outlook\.exe)$/i
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName],
+                    function=[count(field=RemoteAddressIP4, distinct=true, as=destinations),
+                              count(as=sessions),
+                              collect([RemoteAddressIP4, RemotePort], limit=10)])
+          | destinations <= 2
+          | sessions >= 50
+          | sort(sessions, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Telemetry, update and monitoring agents that poll a single vendor endpoint"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: proxy-pointed-at-an-intermediary
+        name: Proxy configured from a command line
+        purpose: >-
+          Setting a proxy makes existing clients route through the intermediary without any
+          new network code, which is why it appears in intrusions where the implant is
+          otherwise quiet. The discriminator is that a corporate proxy arrives through policy
+          across the estate, while this arrives as a command on one host.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(netsh(\.exe)?\s+winhttp\s+(set|import)\s+proxy|bitsadmin(\.exe)?\s+\/setproxysettings|--proxy-server=|--proxy\s+\S+|\s-x\s+(socks|http)|\bALL_PROXY=|\bHTTPS?_PROXY=|ProxyServer|ProxyEnable|DefaultWebProxy)/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Managed policy and build scripts distributing the corporate proxy configuration"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: system-binary-egressing-externally
+        name: Interpreter or system binary connecting to an external address
+        purpose: >-
+          Where the destination tells you nothing, the initiator often does. None of these
+          images has a reason to hold a session to the internet on its own account, so the
+          identity of the connecting process carries the weight that the traffic cannot.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | ContextBaseFileName=/^(rundll32|mshta|wscript|cscript|regsvr32|powershell|pwsh|cmd|certutil|bitsadmin|msbuild|installutil|regasm|regsvcs)\.exe$/i
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|224\.)/
+          | groupBy([ComputerName, ContextBaseFileName, RemoteAddressIP4, RemotePort],
+                    function=[count(as=sessions)])
+          | sort(sessions, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Build agents and deployment scripts whose tooling fetches from external endpoints"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - remote_address
+
+evidence:
+  required:
+    - id: external_intermediary_contacted
+      name: Sustained contact with an external address
+      description: >-
+        A process held connections to a routable external address in a pattern that fits an
+        intermediary rather than an application: addressed directly, returned to repeatedly,
+        or reached by a process with no network role of its own.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: external_relay_contacted
+
+  supporting:
+    - id: addressed_without_resolution
+      name: The process resolved no names at all
+      description: >-
+        The connecting process issued no DNS queries in the window, so it is working from
+        hard-coded addresses rather than from anything the network publishes.
+      source: dns_request
+      field: ContextBaseFileName
+      indicates: hardcoded_infrastructure
+    - id: proxy_explicitly_configured
+      name: Proxy configuration written from a command line
+      description: >-
+        A system or per-tool proxy was pointed at a host from a command line, which routes
+        existing clients through an intermediary without new network code being needed.
+      source: process_creation
+      field: CommandLine
+      indicates: traffic_redirection_configured
+    - id: untrusted_initiator
+      name: Connection opened by an interpreter or system binary
+      description: >-
+        The image holding the session is a script host or a signed system binary that has no
+        reason to maintain a connection to the internet on its own account.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: untrusted_actor
+    - id: non_web_egress_port
+      name: Destination port outside ordinary web traffic
+      description: >-
+        The sessions run to a port that is not the estate's normal outbound web or mail
+        traffic, which narrows the population considerably where egress is controlled.
+      source: network_connection
+      field: RemotePort
+      indicates: unusual_egress_port
+    - id: destination_new_to_estate
+      name: Destination unseen across the estate
+      description: >-
+        No host has contacted this address during the baseline window, so it is new
+        infrastructure rather than part of the estate's normal external surface.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: unusual_activity_for_organization
+
+  contradicting:
+    - id: corporate_gateway
+      name: Destination is the sanctioned proxy or gateway
+      description: >-
+        The address is the organisation's own web proxy, secure gateway or egress firewall,
+        which by design receives concentrated traffic from every client.
+      source: asset_inventory
+      field: RemoteAddressIP4
+      indicates: legitimate_egress_infrastructure
+    - id: vendor_integration_endpoint
+      name: Application talking to a documented vendor endpoint
+      description: >-
+        The connecting image is a known agent or integration whose vendor publishes fixed
+        addresses, which reproduces both the concentration and the absence of resolution.
+      source: network_connection
+      field: ContextProcessId
+      indicates: legitimate_application_component
+    - id: recorded_proxy_change
+      name: Proxy change covered by a record
+      description: >-
+        A change record or build task accounts for the proxy configuration, for example a
+        migration between gateways or a scripted setting applied across a group of hosts.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - external_intermediary_contacted
+
+    supporting:
+      any:
+        - addressed_without_resolution
+        - proxy_explicitly_configured
+        - untrusted_initiator
+        - non_web_egress_port
+        - destination_new_to_estate
+      all:
+        - addressed_without_resolution
+        - destination_new_to_estate
+
+    contradicting:
+      any:
+        - corporate_gateway
+        - vendor_integration_endpoint
+        - recorded_proxy_change
+      all: []
+
+  verdict:
+    low_risk_when:
+      - external_intermediary_contacted
+      - corporate_gateway
+      - vendor_integration_endpoint
+      - recorded_proxy_change
+    suspicious_when:
+      - external_intermediary_contacted
+      - destination_new_to_estate
+    high_risk_when:
+      - external_intermediary_contacted
+      - addressed_without_resolution
+      - untrusted_initiator
+      - destination_new_to_estate
+      - non_web_egress_port
+
+  false_positive:
+    - condition: The estate's own web proxy or secure gateway receives all outbound traffic.
+      explanation: >-
+        Where egress is centralised, every client concentrates its sessions on the gateway
+        and reaches it by address, which reproduces the two strongest cases on every host at
+        once. The gateway addresses belong in the exclusion list before deployment, and this
+        is the single change that makes the template usable in a proxied estate.
+    - condition: A software integration connects to vendor endpoints published as fixed addresses.
+      explanation: >-
+        Some vendors publish IP allow-lists rather than names, so their clients legitimately
+        connect without resolving anything. They are recognisable by image and by appearing
+        on many hosts with the same destination, where a relay appears on few.
+    - condition: A telemetry or update agent polls one endpoint continuously.
+      explanation: >-
+        Agents produce very high session counts against one or two destinations, which is the
+        concentration case exactly. The destination is stable across the whole baseline
+        window and shared fleet-wide rather than new and confined to one host.
+    - condition: A deployment or build script fetches content with a system utility.
+      explanation: >-
+        Build tooling drives certutil, bitsadmin and PowerShell outward legitimately, which
+        satisfies the initiator case. These run on build agents under a scheduler, against
+        package repositories, and repeat on a recognisable cadence.
+    - condition: An administrator scripts the corporate proxy setting onto a host.
+      explanation: >-
+        The proxy configuration commands are ordinary administration. The discriminator is
+        the value being set and the spread: a corporate proxy is an internal address applied
+        widely, where an intermediary is an external address applied to one machine.

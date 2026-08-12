@@ -1,0 +1,365 @@
+type: detection
+
+id: hg-win-command-channel-carried-in-dns-queries-t1071-004
+
+version: 1.0.0
+
+info:
+  name: Command channel carried in the structure of DNS queries
+  description: >-
+    DNS is the one protocol in this family where the endpoint sees the payload, because with
+    DNS the payload is the name. A tunnel has to encode its data into labels and ask the
+    resolver to carry them, so the bytes going out are the query strings themselves and those
+    are recorded in host DNS telemetry without any packet capture at all. That makes this the
+    most tractable of the application-layer C2 techniques, and the observables are structural
+    rather than semantic. Encoding a stream into names produces a very large number of unique
+    names under one parent domain, because each request must be unique or the resolver cache
+    would answer it locally and the data would never leave. It produces long names, because
+    the label budget is what determines throughput and an implant uses as much of it as it
+    can. It produces query rates from a single process far above anything a normal program
+    generates, because the channel's bandwidth is queries per second. None of those require
+    reading a packet, and all three are visible per process, which is what separates the
+    channel from the host's ordinary resolution. The benign twins are specific and must be
+    excluded by name rather than by threshold: endpoint security products send file and URL
+    reputation lookups as hash-encoded subdomains under a single vendor domain, and that is
+    genuinely the same shape. So is some content delivery and telemetry infrastructure. The
+    fourth case covers the variant that tries to avoid all of this by talking to an external
+    resolver directly, which on a managed host is its own finding. This template compares
+    against estate history throughout and is not usable until that history exists.
+  severity: high
+  author: huntgraph
+  tags:
+    - command-and-control
+    - application-layer-protocol
+    - dns
+    - tunnelling
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1071/004
+    - https://attack.mitre.org/detectionstrategies/DET0400
+    - https://attack.mitre.org/techniques/T1071
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1071
+  sub_techniques:
+    - T1071.004
+  detection_strategies:
+    - DET0400
+  analytics:
+    - AN1121
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may encode command and control into DNS query names so that the resolver
+    infrastructure carries the channel on their behalf, obtaining egress from a host that has
+    no other outbound path and leaving nothing on the wire that a proxy would inspect.
+  attacker_behavior:
+    - Encodes data into subdomain labels so each query carries a fragment of the stream.
+    - Makes every query name unique so caching cannot suppress the request.
+    - Uses long names to raise the number of bytes carried per query.
+    - Delegates one parent domain to a server they control and queries only beneath it.
+  legitimate_behavior:
+    - Endpoint security products send hash-encoded reputation lookups under one vendor domain.
+    - Content delivery and telemetry services generate many unique host names.
+    - Browsers and update clients resolve large numbers of names during normal use.
+    - Laptops off the corporate network resolve through a public or provider resolver.
+  risk_indicator:
+    - One process resolves hundreds of distinct names under a single parent domain.
+    - Query names are far longer than anything the host otherwise resolves.
+    - A single process sustains a query rate well above the rest of the machine combined.
+    - The host queries an external resolver directly rather than the one it is configured with.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - DomainName
+        - ContextProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+        - Protocol
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: many-distinct-names-under-one-parent-domain
+        name: One process resolving hundreds of unique names under a single parent
+        purpose: >-
+          Carry the primary observable. A tunnel cannot reuse a name, because a repeated query
+          is answered from the resolver cache and never reaches the operator's server, so
+          every unit of data becomes a new name under the delegated domain. Counting distinct
+          names per parent per process measures the channel directly, and no ordinary
+          resolution pattern produces that cardinality against one domain from one process.
+        query: |
+          #event_simpleName=DnsRequest
+          | DomainName=/(?<parent_domain>[a-z0-9-]+\.[a-z0-9-]+)$/i
+          | groupBy([ComputerName, ContextProcessId, parent_domain],
+                    function=[count(DomainName, distinct=true, as=distinct_names),
+                              count(as=queries),
+                              collect([DomainName], limit=5)])
+          | distinct_names > 200
+          | sort(distinct_names, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Reputation and cloud lookup domains belonging to deployed security products"
+            - "Content delivery and telemetry parents already established in the baseline"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - domain
+            - organization
+
+      - id: query-names-carrying-long-encoded-labels
+        name: Query names far longer than the host otherwise resolves
+        purpose: >-
+          Measure throughput rather than cardinality. Every byte a tunnel moves has to fit
+          inside a label, so an implant fills the available length, and the result is names
+          much longer than anything real infrastructure publishes. Length is independent of
+          the cardinality test, which matters because a low and slow channel keeps the name
+          count down but cannot make its names short.
+        query: |
+          #event_simpleName=DnsRequest
+          | length(DomainName, as=name_length)
+          | name_length > 80
+          | DomainName=/^(?<leading_label>[a-z0-9=_-]{40,})\.(?<parent_domain>.+)$/i
+          | groupBy([ComputerName, ContextProcessId, parent_domain],
+                    function=[count(as=queries),
+                              count(DomainName, distinct=true, as=distinct_names),
+                              max(name_length, as=longest_name),
+                              collect([DomainName], limit=3)])
+          | sort(distinct_names, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Security product lookup domains whose queries encode a hash into the first label"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - domain
+            - organization
+
+      - id: sustained-query-rate-from-a-single-process
+        name: One process sustaining an abnormal DNS query rate
+        purpose: >-
+          Catch the channel by its bandwidth. A tunnel's speed is queries per second, so an
+          interactive session or a file moving through it produces a rate from one process
+          that dwarfs the rest of the machine, held up over a long period. Peak rate alone is
+          a browser opening a page; peak rate sustained across many windows is a channel.
+        query: |
+          #event_simpleName=DnsRequest
+          | bucket(span=5m, field=[ComputerName, ContextProcessId], function=[count(as=queries)])
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[max(queries, as=peak_per_window),
+                              avg(queries, as=mean_per_window),
+                              count(as=windows_active)])
+          | peak_per_window > 300
+          | windows_active > 12
+          | sort(mean_per_window, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Resolver, proxy and security scanning services running on the host by design"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+
+      - id: external-resolver-contacted-directly
+        name: Host querying an external resolver instead of its own
+        purpose: >-
+          Cover the variant built to defeat everything above. Sending queries straight to a
+          resolver the operator controls, or to a public one, keeps the names out of the
+          organisation's resolver logs entirely. On a managed host that has a resolver
+          configured, going around it is the finding rather than a supporting detail.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemotePort in (53, 853, 5353)
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/
+          | groupBy([ComputerName, ContextBaseFileName, RemoteAddressIP4, RemotePort],
+                    function=[count(as=queries),
+                              count(ComputerName, distinct=true, as=hosts)])
+          | sort(queries, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Roaming laptops resolving through a provider resolver while off the network"
+            - "Approved public resolvers configured deliberately on named hosts"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - remote_address
+            - organization
+
+evidence:
+  required:
+    - id: many_distinct_names_under_one_parent
+      name: Large number of unique names resolved under a single parent domain
+      description: >-
+        One process resolved hundreds of names that differ only in their leading labels beneath
+        a single parent, which is what encoding a data stream into DNS looks like from the
+        host, because a repeated name would be answered from cache and carry nothing.
+      source: dns_request
+      field: DomainName
+      indicates: dns_tunnelling_channel
+
+  supporting:
+    - id: long_encoded_query_names
+      name: Query names much longer than normal resolution produces
+      description: >-
+        The names carry a leading label long enough to hold encoded data, which is how a tunnel
+        raises the number of bytes it moves per query.
+      source: dns_request
+      field: DomainName
+      indicates: encoded_payload_in_query_name
+    - id: query_volume_from_one_process
+      name: Sustained query rate from one process
+      description: >-
+        A single process held a query rate far above the rest of the host across many windows,
+        which is the bandwidth of a channel rather than the resolution needs of a program.
+      source: dns_request
+      field: ContextProcessId
+      indicates: abnormal_query_volume
+    - id: resolver_bypassed
+      name: Queries sent to an external resolver directly
+      description: >-
+        The host contacted a resolver outside the network on a DNS port instead of the one it
+        is configured to use, which keeps the names out of the organisation's own logs.
+      source: network_connection
+      field: RemotePort
+      indicates: resolver_bypass
+    - id: parent_domain_new_to_the_estate
+      name: Parent domain not resolved anywhere in the estate before
+      description: >-
+        No host in the organisation resolved anything under this parent during the baseline
+        window, so it is not shared infrastructure that many machines use.
+      source: baseline
+      field: DomainName
+      indicates: unusual_destination_for_organization
+
+  contradicting:
+    - id: security_product_lookup_service
+      name: Endpoint security or reputation lookup service
+      description: >-
+        The process is a deployed security product whose file and URL reputation checks encode
+        a hash into the first label under one vendor domain, producing the same cardinality and
+        the same name length.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: legitimate_application_component
+    - id: established_high_cardinality_parent
+      name: Parent domain with a long history of many names
+      description: >-
+        Content delivery, telemetry and cloud service parents legitimately carry thousands of
+        distinct names, and this one has done so across the estate throughout the baseline.
+      source: baseline
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: host_has_a_resolver_role
+      name: Host is a resolver, forwarder or scanning appliance
+      description: >-
+        The machine's recorded role is to resolve on behalf of others or to scan content, which
+        makes a high query rate and external resolver contact its normal workload.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - many_distinct_names_under_one_parent
+
+    supporting:
+      any:
+        - long_encoded_query_names
+        - query_volume_from_one_process
+        - resolver_bypassed
+        - parent_domain_new_to_the_estate
+      all:
+        - long_encoded_query_names
+        - parent_domain_new_to_the_estate
+
+    contradicting:
+      any:
+        - security_product_lookup_service
+        - established_high_cardinality_parent
+        - host_has_a_resolver_role
+      all: []
+
+  verdict:
+    low_risk_when:
+      - many_distinct_names_under_one_parent
+      - security_product_lookup_service
+      - established_high_cardinality_parent
+      - host_has_a_resolver_role
+    suspicious_when:
+      - many_distinct_names_under_one_parent
+      - parent_domain_new_to_the_estate
+    high_risk_when:
+      - many_distinct_names_under_one_parent
+      - long_encoded_query_names
+      - query_volume_from_one_process
+      - parent_domain_new_to_the_estate
+
+  false_positive:
+    - condition: An endpoint security product performs cloud reputation lookups.
+      explanation: >-
+        These encode a file or URL hash into the leading label and query it under one vendor
+        domain, which reproduces the cardinality, the name length and the per-process volume
+        at once. It is the single most important exclusion in this template. The product's
+        domains are stable, present across the whole estate throughout the baseline, and the
+        querying process is the agent itself.
+    - condition: A content delivery or telemetry service generates many unique host names.
+      explanation: >-
+        Some platforms mint per-session or per-node names, so a browser or a cloud client can
+        legitimately resolve hundreds under one parent. These parents are resolved by many
+        hosts and have a long history, whereas a delegated tunnel domain appears on one machine
+        and has none.
+    - condition: A laptop off the corporate network resolves through its provider.
+      explanation: >-
+        Away from the office a managed host talks to whatever resolver the local network hands
+        it, which fires the resolver-bypass case constantly on a mobile fleet. It is separable
+        by whether the host was on the corporate network at the time, and it does not by itself
+        produce the cardinality or the name lengths.
+    - condition: A vulnerability scanner or mail gateway resolves at a high rate.
+      explanation: >-
+        Scanning and filtering appliances resolve enormous numbers of names as their normal
+        work, which defeats the rate case on those hosts. Their role is recorded in the asset
+        inventory and the names they resolve are spread across many parents rather than
+        concentrated under one.
