@@ -1,0 +1,283 @@
+type: detection
+
+id: hg-win-signature-enforcement-policy-weakened-t1553-006
+version: 1.0.0
+
+info:
+  name: Code signing enforcement policy weakened
+  description: >-
+    Driver signature enforcement and script signing policy are what stand between an
+    unsigned component and the kernel or the interpreter. Turning them off is a small
+    configuration change with an outsized consequence: unsigned drivers load, unsigned
+    scripts run, and controls that assumed signature checking was on quietly stop
+    protecting anything. In a managed estate these settings arrive by policy and nobody has
+    a routine reason to relax them locally, which makes a local change a deviation as much
+    as a technique.
+  severity: critical
+  author: huntgraph
+  tags:
+    - defense-impairment
+    - trust-controls
+    - code-signing
+    - driver-signature
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1553/006
+    - https://attack.mitre.org/detectionstrategies/DET0523
+    - https://attack.mitre.org/techniques/T1553
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1553
+  sub_techniques:
+    - T1553.006
+  detection_strategies:
+    - DET0523
+  analytics:
+    - AN1446
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An adversary may disable driver signature enforcement or relax script signing policy so
+    that unsigned components load and run, removing a control that other defences assume is
+    in place.
+  attacker_behavior:
+    - Disables driver signature enforcement through boot configuration or test signing.
+    - Sets the PowerShell execution policy to unrestricted or bypass at machine scope.
+    - Relaxes signature checking so an unsigned driver or module can be loaded next.
+    - Makes the change locally rather than through the policy that governs the setting.
+  legitimate_behavior:
+    - Developers enable test signing while building drivers.
+    - Administrators set execution policy to permit internal scripts.
+    - Managed policy distributes signing configuration across the estate.
+    - Recovery and diagnostic procedures temporarily relax enforcement.
+  risk_indicator:
+    - Driver signature enforcement or test signing is changed on a production host.
+    - Execution policy is relaxed at machine scope rather than for a session.
+    - The change is made by a script host rather than by policy or an installer.
+    - An unsigned driver or component loads shortly afterwards.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: driver-signature-enforcement-disabled
+        name: Driver signature enforcement disabled
+        purpose: >-
+          Surface changes to boot configuration that stop the kernel requiring signed
+          drivers, which is the highest-consequence form of this technique.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(bcdedit(\.exe)?\s+.*(nointegritychecks|testsigning|loadoptions\s+DDISABLE_INTEGRITY_CHECKS)|Set-BcdElement.*integrity)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "ComputerName in the driver development and lab asset groups"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: execution-policy-relaxed-machine-wide
+        name: Script signing policy relaxed at machine scope
+        purpose: >-
+          Isolate policy changes that persist for every session rather than being set for a
+          single invocation, which is a lasting reduction in enforcement.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/Set-ExecutionPolicy/i
+          | CommandLine=/(unrestricted|bypass)/i
+          | CommandLine=/(-Scope\s+(LocalMachine|MachinePolicy|UserPolicy)|ExecutionPolicy\\\\)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Managed policy distributing script execution configuration"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: signing-policy-written-in-registry
+        name: Signing policy written directly in the registry
+        purpose: >-
+          Cover the route that bypasses the cmdlets entirely, writing the governing values
+          directly.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(PowerShell\\\\1\\\\ShellIds\\\\Microsoft\.PowerShell|EnableScripts|ExecutionPolicy|CodeIntegrity|WinVerifyTrust\\\\Config)/i
+          | CommandLine=/(reg(\.exe)?\s+add|Set-ItemProperty|New-ItemProperty)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Managed policy distributing signing and code integrity configuration"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+evidence:
+  required:
+    - id: enforcement_weakened
+      name: Signature enforcement relaxed
+      description: >-
+        Driver signature enforcement was disabled, or script signing policy was relaxed,
+        so unsigned components can load and run where they previously could not.
+      source: process_creation
+      field: CommandLine
+      indicates: trust_control_subversion
+
+  supporting:
+    - id: kernel_level_change
+      name: Driver signature enforcement targeted
+      description: >-
+        The change affects driver signing rather than script policy, which permits unsigned
+        code into the kernel and is the highest-consequence form.
+      source: process_creation
+      field: CommandLine
+      indicates: high_impact_control_removal
+    - id: machine_scope
+      name: Change applied at machine scope
+      description: >-
+        The relaxation persists for every session and user rather than being set for a
+        single invocation, which is a lasting reduction rather than a convenience.
+      source: process_creation
+      field: CommandLine
+      indicates: persistent_control_degradation
+    - id: script_host_actor
+      name: Change made by a script host or remote channel
+      description: >-
+        The modification was issued by an interpreter or a remote-execution channel rather
+        than by policy processing or an installer.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: local_deviation
+      name: Local change against a managed baseline
+      description: >-
+        These settings are otherwise governed by policy in this estate, so a locally issued
+        change is a deviation as well as a weakening.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: driver_development_host
+      name: Driver development or lab system
+      description: >-
+        The host belongs to an asset group where test signing is enabled deliberately as
+        part of driver development work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+    - id: managed_policy_change
+      name: Delivered through managed policy
+      description: >-
+        The configuration arrived through Group Policy or the management platform as part of
+        a governed standard.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: recorded_recovery
+      name: Recorded recovery or diagnostic procedure
+      description: >-
+        A change or incident record covers temporarily relaxing enforcement during recovery
+        or hardware diagnosis.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - enforcement_weakened
+
+    supporting:
+      any:
+        - kernel_level_change
+        - machine_scope
+        - script_host_actor
+        - local_deviation
+      all:
+        - kernel_level_change
+        - script_host_actor
+
+    contradicting:
+      any:
+        - driver_development_host
+        - managed_policy_change
+        - recorded_recovery
+      all: []
+
+  verdict:
+    low_risk_when:
+      - enforcement_weakened
+      - driver_development_host
+      - managed_policy_change
+      - recorded_recovery
+    suspicious_when:
+      - enforcement_weakened
+      - local_deviation
+    high_risk_when:
+      - enforcement_weakened
+      - kernel_level_change
+      - machine_scope
+      - script_host_actor
+
+  false_positive:
+    - condition: A developer enables test signing while building drivers.
+      explanation: >-
+        Driver development requires test signing, and it is set exactly this way. It is
+        confined to engineering and lab hosts, which is why asset role is contradicting
+        evidence rather than only a query filter.
+    - condition: An administrator relaxes execution policy to permit internal scripts.
+      explanation: >-
+        Many estates run unsigned internal scripts and set policy accordingly. That is
+        usually distributed by policy rather than set locally on individual machines.
+    - condition: Managed policy distributes signing configuration.
+      explanation: >-
+        Governed configuration writes these values across the estate. It arrives through
+        policy processing rather than an interactive or scripted command line.
+    - condition: A recovery procedure temporarily disables integrity checks.
+      explanation: >-
+        Boot and driver problems are sometimes diagnosed with enforcement off. This is
+        short-lived, tied to an incident record, and normally reversed.

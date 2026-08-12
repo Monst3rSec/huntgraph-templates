@@ -1,0 +1,284 @@
+type: detection
+
+id: hg-win-default-account-used-to-authenticate-t1078-001
+version: 1.0.0
+
+info:
+  name: Built-in or default account used to authenticate
+  description: >-
+    Built-in accounts exist on every host with names everyone knows, and vendor appliances
+    and applications ship with default identities that survive deployment more often than
+    anyone admits. Using one gives an adversary access with no credential theft and no new
+    account to notice, and the resulting logon is ordinary in every respect except that the
+    account is not supposed to be signing in anywhere. That is the whole discriminator: the
+    built-in Administrator and Guest are meant to be dormant, so any use is worth reading.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - initial-access
+    - default-accounts
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1078/001
+    - https://attack.mitre.org/detectionstrategies/DET0465
+    - https://attack.mitre.org/techniques/T1078
+
+mitre:
+  tactics:
+    - TA0005
+    - TA0003
+    - TA0004
+    - TA0001
+  techniques:
+    - T1078
+  sub_techniques:
+    - T1078.001
+  detection_strategies:
+    - DET0465
+  analytics:
+    - AN1283
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+  data_components:
+    - Logon Session Creation
+
+hypothesis:
+  statement: >-
+    An adversary may authenticate using a built-in or vendor default account, obtaining
+    access without stealing a credential or creating an identity, through accounts that are
+    supposed to be disabled or unused and therefore go unwatched.
+  attacker_behavior:
+    - Signs in as the built-in Administrator or Guest on a host where both should be dormant.
+    - Re-enables a disabled built-in account before using it.
+    - Uses a vendor default identity left in place after deployment.
+    - Works from that account rather than creating a new one, so no account appears.
+  legitimate_behavior:
+    - Recovery and break-glass procedures use the built-in Administrator deliberately.
+    - Imaging and provisioning sign in as built-in accounts before a host is issued.
+    - Some appliances and applications genuinely run under their shipped identity.
+    - Support may enable Guest temporarily for a specific scenario.
+  risk_indicator:
+    - A built-in account is used on a host in live production rather than during build.
+    - The account was enabled shortly before it was used.
+    - The session is remote rather than at the console.
+    - Privileged group membership is granted to the account afterwards.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: builtin-account-activity
+        name: Process activity under a built-in account
+        purpose: >-
+          Surface the dormant identities being used at all, which on a production host is
+          the finding rather than a precursor to one.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | UserName=/^(Administrator|Guest|DefaultAccount|WDAGUtilityAccount|admin|sa)$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of hosts undergoing imaging or provisioning"
+            - "Appliances documented to run under a shipped identity"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: builtin-account-enabled
+        name: Dormant built-in account enabled
+        purpose: >-
+          Catch the account being brought back into use, which is the preparatory step and
+          often the only artefact if the session itself looks ordinary.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(net(\.exe)?\s+user\s+(administrator|guest|defaultaccount)|Enable-LocalUser\s+.*(Administrator|Guest)|net1\s+user\s+(administrator|guest))/i
+          | CommandLine=/(\/active\s*:\s*yes|-Name)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: builtin-account-granted-rights
+        name: Built-in account granted privileged membership
+        purpose: >-
+          Identify a dormant identity being made more useful, which distinguishes deliberate
+          adoption from an account that merely exists.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(net(\.exe)?\s+localgroup|Add-LocalGroupMember|net(\.exe)?\s+group)/i
+          | CommandLine=/(administrator|guest|defaultaccount)/i
+          | CommandLine=/(\/add|-Member)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Provisioning automation configuring built-in accounts at host build"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+evidence:
+  required:
+    - id: default_account_in_use
+      name: Built-in or default account active
+      description: >-
+        Process activity ran under a built-in or vendor default identity, or such an account
+        was enabled, on a host where those accounts are meant to be dormant.
+      source: process_creation
+      field: UserName
+      indicates: dormant_identity_used
+
+  supporting:
+    - id: account_enabled_first
+      name: Account enabled shortly before use
+      description: >-
+        The identity was re-enabled before it was used, which is deliberate adoption of a
+        dormant account rather than one that was already in service.
+      source: process_creation
+      field: CommandLine
+      indicates: access_path_creation
+    - id: privileged_rights_added
+      name: Privileged membership granted to the account
+      description: >-
+        The account was added to an administrative or remote-access group, which makes a
+        dormant identity operationally useful.
+      source: process_creation
+      field: CommandLine
+      indicates: privilege_escalation_attempt
+    - id: live_production_host
+      name: Host is in live production
+      description: >-
+        The machine is a running production system rather than one being imaged, where
+        built-in account use would be expected.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: scripted_context
+      name: Activity from a script host or remote channel
+      description: >-
+        The account's activity was driven by an interpreter or a remote-execution channel
+        rather than an interactive console session.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+
+  contradicting:
+    - id: provisioning_context
+      name: Host being imaged or provisioned
+      description: >-
+        The host is in a build state where signing in as a built-in account is a deliberate
+        step before the machine is issued.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: documented_appliance_identity
+      name: Appliance running under its shipped identity
+      description: >-
+        The system is an appliance or application documented to operate under a default
+        account, which it does continuously.
+      source: asset_inventory
+      field: UserName
+      indicates: legitimate_application_component
+    - id: recorded_break_glass
+      name: Recorded break-glass or recovery use
+      description: >-
+        An incident or change record covers deliberate use of the built-in Administrator
+        for recovery or emergency access.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - default_account_in_use
+
+    supporting:
+      any:
+        - account_enabled_first
+        - privileged_rights_added
+        - live_production_host
+        - scripted_context
+      all:
+        - account_enabled_first
+        - live_production_host
+
+    contradicting:
+      any:
+        - provisioning_context
+        - documented_appliance_identity
+        - recorded_break_glass
+      all: []
+
+  verdict:
+    low_risk_when:
+      - default_account_in_use
+      - provisioning_context
+      - documented_appliance_identity
+      - recorded_break_glass
+    suspicious_when:
+      - default_account_in_use
+      - live_production_host
+    high_risk_when:
+      - default_account_in_use
+      - account_enabled_first
+      - privileged_rights_added
+      - scripted_context
+
+  false_positive:
+    - condition: A recovery procedure uses the built-in Administrator deliberately.
+      explanation: >-
+        Break-glass access exists precisely so this account can be used when normal
+        authentication fails. It is covered by an incident record and is usually a console
+        session rather than a scripted one.
+    - condition: Imaging or provisioning signs in as a built-in account.
+      explanation: >-
+        Host build routinely runs under built-in identities before a machine is issued,
+        including enabling and configuring them. Build state is the discriminator.
+    - condition: An appliance runs under its shipped default identity.
+      explanation: >-
+        Some systems genuinely operate as their default account. These do so continuously
+        and consistently rather than appearing once on a workstation.
+    - condition: Support enables Guest temporarily for a specific scenario.
+      explanation: >-
+        Rare but legitimate, particularly in shared or kiosk settings. It is tied to a named
+        engineer with a request behind it and is normally reversed afterwards.
