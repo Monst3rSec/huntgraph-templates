@@ -1,0 +1,266 @@
+type: detection
+
+id: hg-win-permissions-relaxed-on-a-protected-path-t1222-001
+version: 1.0.0
+
+info:
+  name: Permissions relaxed on a protected path
+  description: >-
+    Windows permission changes become dangerous when they turn a protected path into a
+    writable one. An adversary can use that to stage payloads where a service, a logon
+    mechanism or an administrator will execute them later, or to weaken the control
+    boundary that was stopping them from doing so already.
+  severity: high
+  author: huntgraph
+  tags:
+    - defense-impairment
+    - permissions
+    - acl
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1222/001
+    - https://attack.mitre.org/detectionstrategies/DET0418
+    - https://attack.mitre.org/techniques/T1222
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1222
+  sub_techniques:
+    - T1222.001
+  detection_strategies:
+    - DET0418
+  analytics:
+    - AN1177
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:PowerShell
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+    - WinEventLog:WMI
+  data_components:
+    - Command Execution
+    - File Creation
+    - File Metadata
+    - Process Creation
+    - Active Directory Object Modification
+    - WMI Creation
+
+hypothesis:
+  statement: >-
+    An adversary may relax ACLs on a protected Windows path so a later payload can be
+    written or replaced there by a lower-privileged context, weakening the control boundary
+    that originally prevented execution from that location.
+  attacker_behavior:
+    - Uses icacls, takeown, PowerShell or WMI to grant Users, Everyone or Authenticated Users write rights.
+    - Targets service directories, startup paths, program-install locations or administrative shares.
+    - Relaxes permissions immediately before placing or replacing a payload.
+  legitimate_behavior:
+    - Administrators repair broken software installs by resetting permissions.
+    - Packaging and deployment products may grant write access to application-owned paths.
+    - Development workstations sometimes loosen ACLs on test directories.
+  risk_indicator:
+    - Write permissions are granted on a path Windows or a service later executes from.
+    - The actor uses ad hoc tooling rather than installer or configuration-management software.
+    - A file appears in the path shortly after the permission change.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+        - PeFileWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: icacls-or-takeown-on-protected-path
+        name: ACL tooling targets a protected path
+        purpose: >-
+          Catch ad hoc permission changes against locations that are normally installer- or
+          administrator-owned.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(icacls\.exe|takeown\.exe|powershell\.exe|wmic\.exe)$/i
+          | CommandLine=/(grant|set-acl|takeown|icacls|win32_logicalfilesecuritysetting)/i
+          | CommandLine=/(Program Files|Windows\\\\|System32|SYSVOL|Startup|Admin\\$|C\\$)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved deployment, packaging and installation tooling"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - path
+
+      - id: broad-write-rights-granted
+        name: Broad principals granted write access
+        purpose: >-
+          Surface the cases where a permission change opens a protected path to broad
+          principals instead of a specific service identity.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Everyone|Users|Authenticated Users)/i
+          | CommandLine=/(M|W|F|Modify|Write|FullControl)/i
+          | CommandLine=/(Program Files|Windows\\\\|System32|Startup|Admin\\$|C\\$)/i
+          | groupBy([ComputerName, UserName, FileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Known development or build output directories intentionally writable by users"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - path
+
+      - id: payload-written-after-acl-change
+        name: File written shortly after a permission change
+        purpose: >-
+          Catch the common sequence where a writable permission is granted and then used
+          immediately to place executable content.
+        query: |
+          #event_simpleName=/^(NewScriptWritten|PeFileWritten)$/
+          | TargetFileName=/(Program Files|Windows\\\\|System32|Startup|Admin\\$|C\\$)/
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Expected software installation paths during approved maintenance windows"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - path
+
+evidence:
+  required:
+    - id: protected_path_permissions_changed
+      name: Permissions changed on a protected path
+      description: >-
+        ACL tooling targets a location that Windows, a service or a user logon path later
+        executes from, weakening the boundary that normally keeps ordinary users from
+        writing there.
+      source: process_creation
+      field: CommandLine
+      indicates: control_boundary_weakened
+
+  supporting:
+    - id: broad_principal_granted_write
+      name: Broad principal granted write access
+      description: >-
+        The change grants write or modify rights to Users, Everyone or Authenticated Users
+        rather than to a narrowly scoped service identity.
+      source: process_creation
+      field: CommandLine
+      indicates: widened_write_surface
+    - id: executable_written_after_change
+      name: Executable content written after the ACL change
+      description: >-
+        A script, binary or shortcut appears in the same protected location after the
+        permission change, showing the new write access being used.
+      source: file_creation
+      field: TargetFileName
+      indicates: permission_change_used_for_staging
+    - id: unusual_actor
+      name: Actor without a history of changing protected ACLs
+      description: >-
+        The account making the change has no baseline history of modifying protected
+        Windows paths on this host.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: approved_installer
+      name: Approved installer or deployment tool
+      description: >-
+        The change is made by packaging, deployment or repair tooling during an approved
+        maintenance context.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: known_writable_dev_path
+      name: Known development or build path
+      description: >-
+        The target path is intentionally writable in a developer or build environment and
+        is not used by a privileged execution path.
+      source: baseline
+      field: CommandLine
+      indicates: expected_local_configuration
+
+  risk_logic:
+    required:
+      - protected_path_permissions_changed
+    supporting:
+      any:
+        - broad_principal_granted_write
+        - executable_written_after_change
+        - unusual_actor
+      all:
+        - broad_principal_granted_write
+        - executable_written_after_change
+    contradicting:
+      any:
+        - approved_installer
+        - known_writable_dev_path
+      all: []
+
+  verdict:
+    low_risk_when:
+      - approved_installer
+      - known_writable_dev_path
+    suspicious_when:
+      - protected_path_permissions_changed
+      - broad_principal_granted_write
+    high_risk_when:
+      - protected_path_permissions_changed
+      - broad_principal_granted_write
+      - executable_written_after_change
+
+  false_positive:
+    - condition: Software repair or packaging workflow modifies ACLs
+      explanation: >-
+        Installers and repair tools sometimes change permissions on product-owned paths to
+        complete an upgrade or recover from corruption.
+    - condition: Developer workstation intentionally relaxes permissions on a test path
+      explanation: >-
+        Some local development setups allow broader write access to build directories, but
+        those paths should not overlap with protected execution locations.

@@ -1,0 +1,265 @@
+type: detection
+
+id: hg-win-logon-script-served-from-a-network-share-t1037-003
+version: 1.0.0
+
+info:
+  name: Network logon script served from a share
+  description: >-
+    A network logon script gives an adversary persistence and, often, privilege escalation
+    by moving execution into the normal logon path. The script does not need to be copied
+    to the endpoint at all: Windows will fetch it from the share each time the user signs
+    in, which means there may be nothing on disk to review and nothing in the usual
+    autostart locations.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - logon-script
+    - network-share
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1037/003
+    - https://attack.mitre.org/detectionstrategies/DET0367
+    - https://attack.mitre.org/techniques/T1037
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1037
+  sub_techniques:
+    - T1037.003
+  detection_strategies:
+    - DET0367
+  analytics:
+    - AN1034
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:System
+  data_components:
+    - Network Share Access
+    - Process Creation
+    - Script Execution
+
+hypothesis:
+  statement: >-
+    An adversary may configure a user or system to execute a logon script from a network
+    share so that payload execution occurs at sign-in without placing a persistent file in
+    the standard local autostart locations.
+  attacker_behavior:
+    - Configures a network path as a logon script for a user or machine.
+    - Stores the script on a share the victim can reach at sign-in.
+    - Uses the script to launch an interpreter or a payload from a writable location.
+    - Relies on normal logon activity to trigger execution repeatedly.
+  legitimate_behavior:
+    - Legacy environments still use logon scripts to map drives and printers.
+    - Domain administrators may maintain scripts on central shares.
+    - IT migration projects sometimes move script locations between file servers.
+  risk_indicator:
+    - A logon script path points to a writable or unusual share.
+    - The script launches an interpreter or a payload rather than performing environment setup.
+    - The script is reached from a workstation or account without logon-script administration history.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: network_share_access
+      event_types:
+        - SmbFileOpen
+        - SmbFileCreate
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - ShareName
+        - TargetFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: script-executed-from-unc-path
+        name: UNC path executed during logon
+        purpose: >-
+          Catch logon-triggered processes whose command line points directly at a network
+          share rather than a local script path.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(userinit\.exe|explorer\.exe|winlogon\.exe)$/i
+          | CommandLine=/\\\\[^\\]+\\[^\\]+\\.*\.(bat|cmd|ps1|vbs|js)$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Known approved logon script paths and central administration shares"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - path
+
+      - id: share-hosted-logon-script-launches-interpreter
+        name: Share-hosted script launches an interpreter
+        purpose: >-
+          Surface the cases where the share-backed script is being used to launch a
+          PowerShell, command shell or script host rather than only mapping resources.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(cmd\.exe|powershell\.exe|pwsh\.exe|wscript\.exe|cscript\.exe)$/i
+          | CommandLine=/\\\\[^\\]+\\[^\\]+\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Known environment-setup and printer-mapping script chains"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - parent_process
+
+      - id: first-seen-logon-script-share
+        name: First-seen share accessed at sign-in
+        purpose: >-
+          Highlight a workstation or user reaching a logon-script share they have not used
+          before, which often marks a newly planted or repointed script.
+        query: |
+          #event_simpleName=/^(SmbFileOpen|SmbFileCreate)$/
+          | TargetFileName=/\.(bat|cmd|ps1|vbs|js)$/i
+          | groupBy([ComputerName, UserName, ShareName, TargetFileName],
+                    function=[count(as=opens)])
+          | sort(opens, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Baseline drive-mapping and printer-deployment shares"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - path
+
+evidence:
+  required:
+    - id: logon_script_on_share
+      name: Logon-triggered script reached over a network share
+      description: >-
+        A script on a UNC path is accessed or executed during the sign-in chain, moving
+        execution into a central share rather than a local autostart location.
+      source: network_share_access
+      field: TargetFileName
+      indicates: remote_backed_logon_execution
+
+  supporting:
+    - id: interpreter_launched
+      name: Interpreter launched from the logon-script chain
+      description: >-
+        The share-hosted script launches PowerShell, cmd.exe or a script host, indicating
+        code execution rather than simple environment setup.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: script_driven_execution
+    - id: unusual_share
+      name: First-seen or writable share used as the script source
+      description: >-
+        The logon script path points to a share the user or host has not historically used,
+        or to a location where ordinary users can place content.
+      source: baseline
+      field: ShareName
+      indicates: unusual_activity_for_host
+    - id: unusual_actor
+      name: User without a history of logon-script administration
+      description: >-
+        The account involved has no baseline history of maintaining or consuming this logon
+        script path.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: approved_logon_share
+      name: Approved central logon script share
+      description: >-
+        The share and script path are the estate's documented logon-script locations and
+        have stable, long-running usage across the organization.
+      source: baseline
+      field: ShareName
+      indicates: legitimate_enterprise_activity
+    - id: environment_setup_only
+      name: Script only maps drives, printers or environment variables
+      description: >-
+        The script performs ordinary environment setup and does not launch an interpreter or
+        a payload from a writable path.
+      source: process_creation
+      field: CommandLine
+      indicates: benign_logon_automation
+
+  risk_logic:
+    required:
+      - logon_script_on_share
+    supporting:
+      any:
+        - interpreter_launched
+        - unusual_share
+        - unusual_actor
+      all:
+        - interpreter_launched
+        - unusual_share
+    contradicting:
+      any:
+        - approved_logon_share
+        - environment_setup_only
+      all: []
+
+  verdict:
+    low_risk_when:
+      - approved_logon_share
+      - environment_setup_only
+    suspicious_when:
+      - logon_script_on_share
+      - interpreter_launched
+    high_risk_when:
+      - logon_script_on_share
+      - interpreter_launched
+      - unusual_share
+
+  false_positive:
+    - condition: Legacy domain logon scripts for drive and printer mapping
+      explanation: >-
+        Older Windows estates often centralize logon scripts on a share. Those scripts are
+        benign when the path is stable, documented and the commands only perform resource
+        mapping.
+    - condition: IT migration moving script storage between file servers
+      explanation: >-
+        A one-time move of approved logon scripts to a new share can look first-seen at the
+        path layer until the baseline catches up.

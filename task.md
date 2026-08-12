@@ -17,13 +17,13 @@ A **target** is a leaf: a sub-technique, or a technique with no sub-techniques o
 | Tactic | Covered | In scope | Remaining | Out of scope |
 |---|---:|---:|---:|---:|
 | Execution | 17 (38%) | 45 | 28 | 12 |
-| Persistence | 22 (26%) | 85 | 63 | 14 |
-| Privilege Escalation | 18 (23%) | 78 | 60 | 7 |
+| Persistence | 23 (27%) | 85 | 62 | 14 |
+| Privilege Escalation | 19 (24%) | 78 | 59 | 7 |
 | Stealth | 44 (35%) | 127 | 83 | 5 |
-| Defense Impairment | 7 (23%) | 30 | 23 | 16 |
+| Defense Impairment | 8 (27%) | 30 | 22 | 16 |
 | Credential Access | 14 (28%) | 50 | 36 | 8 |
 | Lateral Movement | 10 (62%) | 16 | 6 | 4 |
-| **unique total** | **105** | **315** | **210** | |
+| **unique total** | **107** | **315** | **208** | |
 
 ## Priority 2
 
