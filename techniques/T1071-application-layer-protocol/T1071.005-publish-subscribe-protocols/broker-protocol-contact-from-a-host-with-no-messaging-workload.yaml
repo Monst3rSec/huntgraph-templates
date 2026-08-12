@@ -1,0 +1,349 @@
+type: detection
+
+id: hg-win-broker-protocol-contact-with-no-messaging-workload-t1071-005
+
+version: 1.0.0
+
+info:
+  name: Message broker protocol spoken by a host with no messaging workload
+  description: >-
+    Pub/sub protocols give an adversary a rendezvous they never have to host. The implant
+    connects out to a broker, subscribes to a topic and waits; the operator publishes to that
+    topic from anywhere. There is no listening port on the victim, no address the operator has
+    to expose, and the broker itself may be a legitimate commercial service. The topics, the
+    payloads and the client identifiers are all inside the session and are invisible to an
+    endpoint sensor, so this template is built on the one thing left, which is that the
+    protocols have characteristic ports and that on a general-purpose Windows estate those
+    ports carry essentially no traffic. This is a thin file and it is worth being blunt about
+    that. It has no behavioural depth: the finding is the presence of the protocol, refined
+    only by which process holds the socket and by how rare the destination is. That is enough
+    to be useful in an office estate where MQTT, AMQP, XMPP and STOMP have no deployed users,
+    because the base rate is close to zero and a handful of results a month is readable. It is
+    worth nothing in an estate that runs IoT, building management, industrial telemetry or a
+    RabbitMQ-based application, where these ports are ordinary and no host-side observable
+    separates the channel from the workload. Decide which of those two estates you have before
+    deploying this, and if it is the second, treat this technique as uncovered rather than
+    covered. The port set also overlaps other software — 5222 and 61616 in particular are
+    reused — so a name-level exclusion list is a prerequisite, not tuning.
+  severity: low
+  author: huntgraph
+  tags:
+    - command-and-control
+    - application-layer-protocol
+    - publish-subscribe
+    - network
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1071/005
+    - https://attack.mitre.org/detectionstrategies/DET0002
+    - https://attack.mitre.org/techniques/T1071
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1071
+  sub_techniques:
+    - T1071.005
+  detection_strategies:
+    - DET0002
+  analytics:
+    - AN0002
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may run command and control through a publish/subscribe broker so that the
+    victim only ever connects outbound and the operator publishes from elsewhere, obtaining a
+    rendezvous with no exposed infrastructure and traffic that resembles device telemetry.
+  attacker_behavior:
+    - Connects out to a broker on an MQTT, AMQP, XMPP or STOMP port and subscribes to a topic.
+    - Uses a commercial or public broker so the destination is not obviously adversarial.
+    - Holds the session open and reconnects on a fixed interval when it drops.
+    - Implements the client inside a script or interpreter rather than a messaging application.
+  legitimate_behavior:
+    - Industrial, building management and IoT software speaks MQTT on deployed hosts.
+    - Applications built on AMQP brokers connect to a message bus as part of their design.
+    - Chat and collaboration clients still using XMPP connect on the client port.
+    - Development and test machines run broker clients against a local or staging broker.
+  risk_indicator:
+    - A broker port is contacted from a host with no messaging or IoT role recorded.
+    - The socket is held by a scripting host or interpreter rather than a messaging application.
+    - The broker address is outside the estate and reached by almost no other host.
+    - Contact recurs at a fixed interval over many hours rather than as one long session.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+        - Protocol
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: broker-port-contacted-from-a-windows-endpoint
+        name: Pub/sub broker port contacted from a Windows endpoint
+        purpose: >-
+          Establish the population, which on a general-purpose estate is the whole finding.
+          These ports carry no traffic on an office workstation, so listing every host and
+          process that touches one, rarest first, produces a set small enough to read rather
+          than an alert stream.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemotePort in (1883, 5222, 5223, 5269, 5671, 5672, 8883, 9001, 61613, 61616)
+          | groupBy([ComputerName, ContextBaseFileName, RemoteAddressIP4, RemotePort],
+                    function=[count(as=sessions),
+                              min(@timestamp, as=first_seen),
+                              max(@timestamp, as=last_seen)])
+          | sort(sessions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Hosts and applications with a recorded messaging, IoT or building management role"
+            - "Products known to reuse these ports for unrelated purposes on this estate"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: broker-port-held-by-a-script-host-or-interpreter
+        name: Broker port held by a scripting host or interpreter
+        purpose: >-
+          Refine the population by actor, which is the only discriminator available once the
+          protocol itself is granted. A messaging client is an application someone installed;
+          a broker session belonging to a script host or a proxy-execution binary means the
+          protocol is being spoken by a library inside something else.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemotePort in (1883, 5222, 5223, 5269, 5671, 5672, 8883, 9001, 61613, 61616)
+          | ContextBaseFileName=/^(powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|python|pythonw|node|java|dotnet|msbuild|installutil)\.exe$/i
+          | groupBy([ComputerName, ContextBaseFileName, ContextProcessId, RemoteAddressIP4, RemotePort],
+                    function=[count(as=sessions),
+                              count(RemoteAddressIP4, distinct=true, as=peers)])
+          | sort(sessions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "In-house applications that embed a broker client in a runtime by design"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: steady-reconnect-cadence-to-one-broker
+        name: Repeated contact with one broker at a fixed interval
+        purpose: >-
+          Separate a client from a channel where both are present. An application attached to
+          a message bus holds one long session and reconnects when the network breaks. An
+          implant that reconnects on a timer produces contact spread evenly across many
+          windows, which is a different shape even though both talk to a broker.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemotePort in (1883, 5222, 5223, 5269, 5671, 5672, 8883, 9001, 61613, 61616)
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/
+          | bucket(span=15m, field=[ComputerName, ContextBaseFileName, RemoteAddressIP4],
+                   function=[count(as=hits)])
+          | groupBy([ComputerName, ContextBaseFileName, RemoteAddressIP4],
+                    function=[count(as=windows_active),
+                              avg(hits, as=mean_hits),
+                              stdDev(hits, as=hits_deviation)])
+          | windows_active > 16
+          | hits_deviation < 1.5
+        filters:
+          include: []
+          exclude:
+            - "Deployed bus clients whose reconnection interval is set by their configuration"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - remote_address
+
+      - id: broker-endpoint-used-by-almost-no-hosts
+        name: Broker endpoint reached by one or two machines in the estate
+        purpose: >-
+          Test the destination against the whole organisation rather than the host. A message
+          bus that an application depends on is reached by every machine running that
+          application. A broker chosen as a rendezvous is reached by the machines that were
+          compromised, which is what the estate-wide host count exposes.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemotePort in (1883, 5222, 5223, 5269, 5671, 5672, 8883, 9001, 61613, 61616)
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/
+          | groupBy([RemoteAddressIP4, RemotePort],
+                    function=[count(ComputerName, distinct=true, as=hosts),
+                              count(as=sessions),
+                              collect([ComputerName, ContextBaseFileName], limit=5)])
+          | hosts <= 2
+          | sort(hosts, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Broker endpoints belonging to services the organisation has deployed"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - remote_address
+            - organization
+
+evidence:
+  required:
+    - id: broker_protocol_port_contact
+      name: Session opened on a publish/subscribe broker port
+      description: >-
+        A Windows host connected out on a port characteristic of MQTT, AMQP, XMPP or STOMP,
+        which on an estate with no messaging workload is traffic that should not exist rather
+        than traffic that needs scoring.
+      source: network_connection
+      field: RemotePort
+      indicates: publish_subscribe_channel
+
+  supporting:
+    - id: interpreter_holding_the_broker_port
+      name: Broker session belongs to a script host or interpreter
+      description: >-
+        The socket is held by a scripting host, runtime or proxy-execution binary rather than
+        by an installed messaging application, so the protocol is being spoken by a library
+        inside something with another purpose.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: unexpected_network_actor
+    - id: broker_outside_the_estate
+      name: Broker is outside the organisation's network
+      description: >-
+        The destination is a public address rather than an internal bus, so the rendezvous is
+        hosted somewhere the organisation does not control.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: external_rendezvous
+    - id: steady_reconnect_cadence
+      name: Contact recurs at a fixed interval
+      description: >-
+        The host returns to the same broker evenly across many windows, which is a client
+        driven by a timer rather than an application holding a session on a message bus.
+      source: network_connection
+      field: ContextProcessId
+      indicates: beaconing_command_and_control
+    - id: broker_new_to_the_estate
+      name: Broker endpoint not used anywhere else in the estate
+      description: >-
+        One or two machines reached this endpoint during the baseline window, which is not the
+        distribution of a bus that a deployed application depends on.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: unusual_destination_for_organization
+
+  contradicting:
+    - id: messaging_or_iot_workload
+      name: Host has a recorded messaging or device role
+      description: >-
+        The machine is an industrial, building management, IoT gateway or application host
+        whose normal work is to speak these protocols.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: broker_used_across_the_estate
+      name: Broker reached by many machines
+      description: >-
+        The same endpoint is contacted by a wide set of hosts throughout the baseline window,
+        which makes it deployed infrastructure rather than a rendezvous.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: legitimate_enterprise_activity
+    - id: port_reused_by_other_software
+      name: Port used by unrelated software on this estate
+      description: >-
+        Several ports in this set are reused by products that have nothing to do with pub/sub,
+        and the process holding the socket is one of them.
+      source: network_connection
+      field: Protocol
+      indicates: port_collision
+
+  risk_logic:
+    required:
+      - broker_protocol_port_contact
+
+    supporting:
+      any:
+        - interpreter_holding_the_broker_port
+        - broker_outside_the_estate
+        - steady_reconnect_cadence
+        - broker_new_to_the_estate
+      all:
+        - interpreter_holding_the_broker_port
+        - broker_new_to_the_estate
+
+    contradicting:
+      any:
+        - messaging_or_iot_workload
+        - broker_used_across_the_estate
+        - port_reused_by_other_software
+      all: []
+
+  verdict:
+    low_risk_when:
+      - broker_protocol_port_contact
+      - messaging_or_iot_workload
+      - broker_used_across_the_estate
+      - port_reused_by_other_software
+    suspicious_when:
+      - broker_protocol_port_contact
+      - broker_new_to_the_estate
+    high_risk_when:
+      - broker_protocol_port_contact
+      - interpreter_holding_the_broker_port
+      - broker_outside_the_estate
+      - steady_reconnect_cadence
+
+  false_positive:
+    - condition: The host runs software built on a message bus.
+      explanation: >-
+        Applications built on AMQP or MQTT connect to a broker as their normal operation, and
+        nothing in this telemetry distinguishes that from a channel. The separating facts are
+        the recorded role of the host and the fact that every machine running the application
+        reaches the same endpoint, which the estate-wide count shows immediately.
+    - condition: An IoT gateway, sensor bridge or building management client is installed.
+      explanation: >-
+        MQTT is the native protocol of these deployments and they beacon to a broker by design,
+        producing both the port and the fixed interval. Where an estate has any of this, the
+        template needs the affected hosts excluded up front or it will produce nothing usable.
+    - condition: Another product happens to use one of these ports.
+      explanation: >-
+        Ports 5222, 5672 and 61616 in particular are reused by chat clients, application
+        servers and management agents that are not doing pub/sub at all. This is a port
+        collision rather than a protocol match, resolved by the process name, and it is the
+        reason the port test alone cannot carry a verdict.
+    - condition: A developer runs a broker client against a local or staging broker.
+      explanation: >-
+        Engineering machines legitimately speak these protocols during development, often from
+        a runtime such as python or java, which reproduces the interpreter case. The
+        destination is internal or a staging address and the activity follows working hours
+        and the developer's own project.

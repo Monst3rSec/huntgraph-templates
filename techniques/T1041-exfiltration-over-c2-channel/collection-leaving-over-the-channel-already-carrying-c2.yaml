@@ -1,0 +1,409 @@
+type: detection
+
+id: hg-win-collection-leaving-over-the-channel-already-carrying-c2-t1041
+
+version: 1.0.0
+
+info:
+  name: Collected data leaving over the channel already carrying command and control
+  description: >-
+    Reusing the command and control channel for exfiltration costs the adversary nothing and
+    removes an entire class of evidence: there is no second destination to look up, no new
+    protocol, no new process, and nothing on the wire that was not already there. The
+    connection is not the finding — the implant has been making that connection for days and
+    every one of them looked the same. What changes is the shape. A channel that exists to
+    carry instructions is quiet and regular; a channel carrying a collection is neither, and
+    the moment a body of data is pushed through it the host starts contacting the same peer
+    far more than it did an hour ago. Falcon's connection records do not carry byte counts,
+    so this template does not claim to measure volume directly. It uses two things it can
+    measure honestly instead: the change in contact density against the channel's own prior
+    behaviour, and the pairing of that change with collection activity on the same host in
+    the same window — an archive built, a document tree copied, a mail store touched — which
+    is what gives the burst a reason. Neither half is worth much alone. Collection tooling
+    runs on its own all the time, and a busy hour on an established peer is often just an
+    application working. Together, and with the peer held by a process that has no business
+    on the network, they are the sequence. The comparison against the channel's own history
+    is what does the work, so this needs the baseline window before it separates anything;
+    it also deliberately leaves the beaconing question to the command-and-control templates
+    that own it, and the staging half to the T1074 and T1560 files, rather than restating
+    either.
+  severity: high
+  author: huntgraph
+  tags:
+    - exfiltration
+    - command-and-control
+    - data-egress
+    - network
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1041
+    - https://attack.mitre.org/detectionstrategies/DET0348
+    - https://attack.mitre.org/techniques/T1030
+
+mitre:
+  tactics:
+    - TA0010
+  techniques:
+    - T1041
+  sub_techniques: []
+  detection_strategies:
+    - DET0348
+  analytics:
+    - AN0988
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may push a collected body of data back through the command and control
+    channel they already hold, so that exfiltration introduces no new destination, protocol
+    or process, obtaining removal of the data while every artefact it produces is one the
+    defender has already decided is normal for that host.
+  attacker_behavior:
+    - Gathers documents, mail or database output into one place on the victim host.
+    - Compresses or splits the collection with a tool run from the implant's own process tree.
+    - Sends the result to the peer the implant is already talking to rather than a new one.
+    - Returns the channel to its quiet cadence once the transfer finishes.
+  legitimate_behavior:
+    - Backup and sync clients read user data and upload it to their own service continuously.
+    - Support tooling collects diagnostic bundles and posts them to a vendor endpoint.
+    - Line-of-business applications archive and transmit reports on a schedule.
+    - A busy period against an established service endpoint is ordinary application behaviour.
+  risk_indicator:
+    - Collection tooling runs on the host immediately before the channel becomes busy.
+    - The burst lands on a peer the host has been contacting quietly for days.
+    - The process holding the peer is an interpreter or proxy-execution binary, not a client.
+    - The same process tree both gathered the data and owns the outbound session.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: collection-tooling-then-outbound-contact
+        name: Collection run on a host that then contacts an external peer
+        purpose: >-
+          Establish the sequence that gives an ordinary connection a meaning. Tag the
+          commands that gather or package data and the outbound sessions separately, then
+          require both to appear against the same host inside one window. Either half on its
+          own is unremarkable; the ordering is what turns a routine egress into a candidate
+          for something having been taken.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2|NetworkConnectIP4|NetworkConnectIP6)$/
+          | case {
+              #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+                | CommandLine=/\b(rar|winrar|7z|7za|makecab|tar|Compress-Archive|robocopy|xcopy)\b/i
+                | CommandLine=/\.(docx?|xlsx?|pptx?|pdf|csv|pst|ost|msg|eml|sql|bak|db)\b|\\+Users\\+[^\\]+\\+(Documents|Desktop|Downloads|OneDrive)/i
+                | gathered := FileName ;
+              #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+                | CommandLine=/\b(mysqldump|sqlcmd|Export-Csv|Export-Clixml|esentutl|ntdsutil)\b/i
+                | gathered := FileName ;
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+                | peer := RemoteAddressIP4 ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([gathered, peer, ContextBaseFileName, CommandLine], limit=10),
+                              count(as=events)])
+          | gathered=/.+/
+          | peer=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Backup, sync and archiving products reading user data as their normal workload"
+            - "Diagnostic bundle collection raised against a support ticket"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - remote_address
+
+      - id: established-peer-taking-a-sudden-dense-run
+        name: Long-standing peer suddenly taking far more contact than usual
+        purpose: >-
+          Carry the volume argument with the only measure the endpoint actually has. For a
+          peer a host has been talking to across many hours, compare the busiest hour against
+          the average one. A channel that carries instructions is flat; a channel that has
+          just carried a collection has one hour that does not belong to the rest of the
+          series, and the contrast is against the channel's own history rather than any
+          fleet-wide threshold.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+          | bucket(span=1h, field=[ComputerName, ContextBaseFileName, RemoteAddressIP4],
+                   function=[count(as=per_hour)])
+          | groupBy([ComputerName, ContextBaseFileName, RemoteAddressIP4],
+                    function=[count(as=active_hours),
+                              avg(per_hour, as=mean_rate),
+                              max(per_hour, as=peak_rate),
+                              min(@timestamp, as=first_seen),
+                              max(@timestamp, as=last_seen)])
+          | active_hours >= 12
+          | mean_rate < 20
+          | peak_rate > 200
+          | sort(peak_rate, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Service endpoints whose traffic follows a known business cycle such as month end"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: single-peer-held-by-a-non-network-process
+        name: One external peer held for days by a process with no network role
+        purpose: >-
+          Identify the channel as a channel before arguing about what went through it. An
+          interpreter, a proxy-execution binary or a fetcher that keeps returning to exactly
+          one external address over days is maintaining something, because none of these
+          programs has a service to poll. Establishing that first is what makes the burst in
+          the previous case exfiltration over an existing channel rather than an unrelated
+          upload.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | ContextBaseFileName=/^(powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin|curl|wget|python|pythonw|node|msbuild|installutil)\.exe$/i
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+          | groupBy([ComputerName, ContextBaseFileName, RemoteAddressIP4, RemotePort],
+                    function=[count(as=connections),
+                              min(@timestamp, as=first_seen),
+                              max(@timestamp, as=last_seen)])
+          | connections >= 30
+          | sort(connections, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Automation and deployment hosts where scripted external calls are the normal workload"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: channel-owned-by-the-process-that-gathered-the-data
+        name: The process that packaged the data also owns the outbound session
+        purpose: >-
+          Tighten the correlation from the host to the process. Matching the identifier of
+          the process that ran the collection against the process that owns the connection
+          removes the coincidence that the host-and-window pairing cannot rule out, and
+          produces the strongest form of the finding: one program that gathered material and
+          then sent it, with no separate transfer client involved at all.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2|NetworkConnectIP4|NetworkConnectIP6)$/
+          | case {
+              #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+                | CommandLine=/\b(rar|winrar|7z|7za|makecab|tar|Compress-Archive|robocopy|xcopy|mysqldump|Export-Csv)\b/i
+                | gatherer := FileName
+                | pid := TargetProcessId ;
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+                | peer := RemoteAddressIP4
+                | pid := ContextProcessId ;
+            }
+          | groupBy([ComputerName, pid],
+                    function=[collect([gatherer, peer, ContextBaseFileName, ParentBaseFileName], limit=5),
+                              count(as=events)])
+          | gatherer=/.+/
+          | peer=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Backup clients that legitimately archive and upload from the same process"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - remote_address
+
+evidence:
+  required:
+    - id: outbound_contact_paired_with_collection
+      name: Outbound contact on a host that has just gathered data
+      description: >-
+        An external peer was contacted in the same window as collection or packaging activity
+        on the same host, which is the sequence that turns an established connection into a
+        candidate route out for the material.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: exfiltration_over_command_and_control_channel
+
+  supporting:
+    - id: collection_tooling_ran_first
+      name: Archiving, copying or export tooling ran before the contact
+      description: >-
+        A command that packages or extracts data was executed on the host shortly before the
+        outbound contact, giving the transfer something to carry.
+      source: process_creation
+      field: CommandLine
+      indicates: collection_preceding_egress
+    - id: channel_density_changed
+      name: Contact with the peer jumped far above its own norm
+      description: >-
+        A peer the host had been contacting quietly across many hours took an order of
+        magnitude more contact in one window, which is the change in shape a channel shows
+        when it stops carrying instructions and starts carrying data.
+      source: network_connection
+      field: ContextProcessId
+      indicates: transfer_burst_on_an_established_channel
+    - id: peer_held_by_a_non_network_process
+      name: The peer is held by an interpreter or proxy-execution binary
+      description: >-
+        The outbound session belongs to a process with no service to poll and no reason to
+        maintain an external peer, which is what identifies the connection as a channel
+        rather than application traffic.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: abnormal_network_originator
+    - id: same_process_gathered_and_sent
+      name: One process both packaged the data and owns the session
+      description: >-
+        The process identifier behind the collection command matches the one behind the
+        outbound connection, so no separate transfer client was involved and the two actions
+        are the same program.
+      source: process_creation
+      field: TargetProcessId
+      indicates: collection_and_egress_in_one_process
+    - id: peer_unique_to_this_host
+      name: No other host in the estate contacts the peer
+      description: >-
+        The destination appears against a single machine across the baseline window, which
+        rules out a shared service and leaves a path maintained for this host alone.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: unusual_destination
+
+  contradicting:
+    - id: backup_or_sync_client
+      name: Backup, sync or cloud storage client
+      description: >-
+        The process is a product whose declared job is to read user data and upload it,
+        which reproduces the collection and the egress as one ordinary operation.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: legitimate_application_component
+    - id: approved_transfer_destination
+      name: Destination on the approved egress list
+      description: >-
+        The peer is a service the organisation uses and many hosts reach it across the
+        baseline window, so the contact is not a path chosen for this victim.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: legitimate_enterprise_activity
+    - id: recorded_data_movement
+      name: Recorded migration, export or support collection
+      description: >-
+        A change record or ticket covers a bulk export or diagnostic collection on this host
+        in this window, which accounts for both the packaging and the transfer.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - outbound_contact_paired_with_collection
+
+    supporting:
+      any:
+        - collection_tooling_ran_first
+        - channel_density_changed
+        - peer_held_by_a_non_network_process
+        - same_process_gathered_and_sent
+        - peer_unique_to_this_host
+      all:
+        - collection_tooling_ran_first
+        - channel_density_changed
+        - same_process_gathered_and_sent
+
+    contradicting:
+      any:
+        - backup_or_sync_client
+        - approved_transfer_destination
+        - recorded_data_movement
+      all: []
+
+  verdict:
+    low_risk_when:
+      - outbound_contact_paired_with_collection
+      - backup_or_sync_client
+      - approved_transfer_destination
+      - recorded_data_movement
+    suspicious_when:
+      - outbound_contact_paired_with_collection
+      - collection_tooling_ran_first
+      - peer_unique_to_this_host
+    high_risk_when:
+      - outbound_contact_paired_with_collection
+      - collection_tooling_ran_first
+      - channel_density_changed
+      - peer_held_by_a_non_network_process
+      - same_process_gathered_and_sent
+
+  false_positive:
+    - condition: A backup or file sync client reads user documents and uploads them.
+      explanation: >-
+        This is the same sequence performed openly, and it will match the host-and-window
+        pairing every time it runs. It separates on the actor and the destination: the
+        process is the product's own binary rather than an interpreter, and its endpoint is
+        reached by every host running the product.
+    - condition: A support engineer collects a diagnostic bundle and uploads it to a vendor.
+      explanation: >-
+        Bundle collection archives a broad set of files and then posts the result, which
+        matches both halves closely. It is distinguishable by the ticket, by the vendor
+        destination being contacted from other hosts, and by the activity being interactive
+        and one-off rather than repeating against a peer already held for days.
+    - condition: A scheduled report job exports data and transmits it to a partner service.
+      explanation: >-
+        Export tooling followed by an outbound transfer is a normal business pattern on
+        application servers. The schedule repeats identically across the baseline window and
+        the destination is a fixed partner endpoint, whereas the hypothesis requires a burst
+        that departs from the peer's own established rate.
+    - condition: An application server has a genuinely busy hour against its service endpoint.
+      explanation: >-
+        Load spikes produce exactly the density change the second case looks for. On their
+        own they carry no collection activity on the host, which is why the burst is only
+        supporting evidence and the pairing with packaging or export is what is required.

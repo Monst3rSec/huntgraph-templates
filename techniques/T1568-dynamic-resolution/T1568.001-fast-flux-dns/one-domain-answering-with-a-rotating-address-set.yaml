@@ -1,0 +1,364 @@
+type: detection
+
+id: hg-win-one-domain-answering-with-a-rotating-address-set-t1568-001
+
+version: 1.0.0
+
+info:
+  name: One domain answering with a rapidly rotating address set
+  description: >-
+    Fast flux keeps a single command-and-control name alive while the addresses behind it
+    move continuously. The operator publishes a large address pool with a record lifetime of
+    a few minutes and cycles through it, so seizing or blocking any address costs nothing
+    and a block list of addresses can never keep up. Two things about that are visible to an
+    endpoint sensor without reading a single packet. The first is churn: the same name,
+    looked up repeatedly by the same process, comes back with a different set of addresses
+    each time. The second is cadence: the client only re-queries a name when the previous
+    answer has expired, so a host asking for the same name every few minutes is the record
+    lifetime made observable, even though the lifetime value itself is not in the telemetry.
+    The difficulty is that content delivery networks, anycast front ends and cloud load
+    balancers behave identically — short lifetimes and rotating answers are exactly how they
+    work — so churn on its own is not a finding. The discriminator is who is asking. A
+    delivery network is resolved by every browser on every host in the estate; a flux domain
+    is resolved by one or two machines, by a process that is not a browser, and the
+    addresses it returns are then actually connected to by that same process.
+  severity: medium
+  author: huntgraph
+  tags:
+    - command-and-control
+    - dynamic-resolution
+    - fast-flux
+    - dns
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1568/001
+    - https://attack.mitre.org/detectionstrategies/DET0485
+    - https://attack.mitre.org/techniques/T1568
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1568
+  sub_techniques:
+    - T1568.001
+  detection_strategies:
+    - DET0485
+  analytics:
+    - AN1331
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may host command and control behind a domain whose address records change
+    every few minutes across a large pool, so that the channel survives the loss of any
+    single address and cannot be contained by blocking the addresses it resolves to.
+  attacker_behavior:
+    - Publishes a single name backed by a large, frequently rewritten address pool.
+    - Sets a record lifetime short enough to force the client to re-query constantly.
+    - Rotates proxy hosts through the pool so no address stays reachable for long.
+    - Keeps the implant pointed at one name while the infrastructure moves beneath it.
+  legitimate_behavior:
+    - Content delivery networks return short-lived, rotating addresses by design.
+    - Cloud load balancers and anycast front ends change answers between queries.
+    - Traffic-steering and failover services deliberately shorten record lifetimes.
+    - Roaming laptops re-resolve everything each time they change network.
+  risk_indicator:
+    - Only one or two hosts in the estate ever ask for the churning name.
+    - The name is queried by a process that is not a browser or mail client.
+    - A single answer carries an unusually large number of addresses.
+    - The querying process connects to several of the rotating addresses in turn.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - DomainName
+        - IP4Records
+        - ContextProcessId
+        - ContextBaseFileName
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - RemoteAddressIP4
+        - RemotePort
+        - ContextProcessId
+        - ContextBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: same-name-re-queried-with-changing-answers
+        name: One name re-queried repeatedly with a different answer each time
+        purpose: >-
+          Measure churn and cadence together, which is the whole of fast flux as an endpoint
+          can see it. Counting how many times a process asks for one name, and how many
+          distinct answers it gets back, expresses both the short record lifetime forcing
+          the re-query and the rotation happening between queries, without needing the
+          lifetime value itself.
+        query: |
+          #event_simpleName=DnsRequest
+          | IP4Records=/.+/
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName, DomainName],
+                    function=[count(as=lookups),
+                              count(IP4Records, distinct=true, as=answer_sets),
+                              collect([IP4Records], limit=20)])
+          | lookups >= 12
+          | answer_sets >= 4
+          | sort(answer_sets, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Content delivery, cloud front-end and traffic-steering domains on the approved egress list"
+            - "Roaming hosts that re-resolve everything on each network change"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - domain
+            - organization
+
+      - id: single-answer-carrying-a-large-address-pool
+        name: One answer returning an unusually large address set
+        purpose: >-
+          Catch the single-flux pool directly. Ordinary services return one to three
+          addresses; a flux name advertises a slice of a botnet. This reads the answer as a
+          delimited list of addresses, so it depends on the sensor recording the full record
+          set rather than only the first address.
+        query: |
+          #event_simpleName=DnsRequest
+          | IP4Records=/(\d{1,3}\.){3}\d{1,3};(\d{1,3}\.){3}\d{1,3};(\d{1,3}\.){3}\d{1,3};(\d{1,3}\.){3}\d{1,3};(\d{1,3}\.){3}\d{1,3}/
+          | groupBy([ComputerName, DomainName, ContextBaseFileName],
+                    function=[count(as=lookups), collect([IP4Records], limit=10)])
+          | sort(lookups, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Large web platforms that legitimately publish wide address pools"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: churning-name-almost-nobody-asks-for
+        name: Rotating name resolved by only a handful of hosts
+        purpose: >-
+          Carry the discriminator. Delivery networks and load balancers churn just as hard
+          as flux infrastructure, but the whole estate resolves them. Grouping by name and
+          counting how many distinct hosts ever asked separates infrastructure everyone
+          uses from infrastructure built for one or two victims.
+        query: |
+          #event_simpleName=DnsRequest
+          | IP4Records=/.+/
+          | groupBy([DomainName],
+                    function=[count(ComputerName, distinct=true, as=hosts),
+                              count(IP4Records, distinct=true, as=answer_sets),
+                              count(as=lookups),
+                              collect([ContextBaseFileName], limit=10)])
+          | answer_sets >= 4
+          | hosts <= 3
+          | sort(answer_sets, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Names resolved by a single host because only that host runs the product concerned"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - domain
+            - organization
+
+      - id: process-following-the-rotation
+        name: One process contacting several addresses behind one name
+        purpose: >-
+          Confirm that the rotation is being used rather than merely observed. A process
+          that resolves one or two names and then opens sessions to four or more different
+          external addresses is consuming the pool, which is what an implant pointed at a
+          flux domain does and what a client talking to a fixed service does not.
+        query: |
+          #event_simpleName=/^(DnsRequest|NetworkConnectIP4|NetworkConnectIP6)$/
+          | ContextBaseFileName!=/^(msedge|chrome|firefox|iexplore|brave|opera|vivaldi|msedgewebview2)\.exe$/i
+          | case {
+              #event_simpleName=DnsRequest
+                | IP4Records=/.+/
+                | fluxing_name := DomainName ;
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|169\.254\.|224\.)/
+                | peer := RemoteAddressIP4 ;
+            }
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName],
+                    function=[count(peer, distinct=true, as=distinct_peers),
+                              count(fluxing_name, distinct=true, as=distinct_names),
+                              collect([fluxing_name, peer, RemotePort], limit=20)])
+          | fluxing_name=/.+/ and peer=/.+/
+          | distinct_names <= 2
+          | distinct_peers >= 4
+          | sort(distinct_peers, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Update and telemetry agents that fan out across a vendor's regional endpoints"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - remote_address
+
+evidence:
+  required:
+    - id: rotating_answer_set_for_one_name
+      name: One name returning a different address set on each lookup
+      description: >-
+        Repeated lookups of a single domain by the same process returned materially
+        different addresses each time, which is the address rotation the technique depends
+        on rather than an occasional record change.
+      source: dns_request
+      field: IP4Records
+      indicates: rotating_resolution
+
+  supporting:
+    - id: short_lived_records_forcing_requery
+      name: Name re-queried at short intervals
+      description: >-
+        The same process asked for the same name many times in a short window, which only
+        happens when the previous answer has already expired and is the record lifetime
+        made visible without the value being in the telemetry.
+      source: dns_request
+      field: DomainName
+      indicates: short_record_lifetime
+    - id: few_hosts_resolve_the_name
+      name: Almost no other host resolves the name
+      description: >-
+        The churning domain was queried by only one or two machines across the baseline
+        window, unlike a delivery network or cloud front end that the whole estate resolves.
+      source: baseline
+      field: DomainName
+      indicates: unusual_destination
+    - id: non_browser_querier
+      name: The name is resolved by a process that is not a browser
+      description: >-
+        The lookups came from an interpreter, proxy-execution binary or unnamed process
+        rather than from software that routinely follows delivery-network answers.
+      source: dns_request
+      field: ContextBaseFileName
+      indicates: untrusted_actor
+    - id: pool_consumed_by_the_process
+      name: The process connected to several of the rotating addresses
+      description: >-
+        Sessions were opened to four or more different external addresses behind one or two
+        names by the same process, which means the pool is being used as a channel rather
+        than simply appearing in answers.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: active_command_and_control_attempt
+
+  contradicting:
+    - id: delivery_network_or_load_balancer
+      name: Content delivery network or cloud load balancer
+      description: >-
+        The name belongs to a delivery, steering or front-end platform whose whole design is
+        short-lived, rotating answers, and the estate resolves it constantly from browsers
+        and agents alike.
+      source: baseline
+      field: DomainName
+      indicates: legitimate_enterprise_activity
+    - id: vendor_regional_endpoints
+      name: Product fanning out across vendor regional endpoints
+      description: >-
+        The querying process is a deployed agent whose service is published across many
+        regional addresses, so contacting several of them in turn is its documented failover
+        behaviour.
+      source: dns_request
+      field: ContextBaseFileName
+      indicates: legitimate_application_component
+    - id: roaming_or_test_host
+      name: Roaming laptop or network test system
+      description: >-
+        The host changes network frequently or exists to test resolution, so it re-resolves
+        names far more often than a settled machine and inflates both the query count and
+        the number of distinct answers.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_infrastructure_role
+
+  risk_logic:
+    required:
+      - rotating_answer_set_for_one_name
+
+    supporting:
+      any:
+        - short_lived_records_forcing_requery
+        - few_hosts_resolve_the_name
+        - non_browser_querier
+        - pool_consumed_by_the_process
+      all:
+        - few_hosts_resolve_the_name
+        - pool_consumed_by_the_process
+
+    contradicting:
+      any:
+        - delivery_network_or_load_balancer
+        - vendor_regional_endpoints
+        - roaming_or_test_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - rotating_answer_set_for_one_name
+      - delivery_network_or_load_balancer
+      - vendor_regional_endpoints
+      - roaming_or_test_host
+    suspicious_when:
+      - rotating_answer_set_for_one_name
+      - short_lived_records_forcing_requery
+    high_risk_when:
+      - rotating_answer_set_for_one_name
+      - few_hosts_resolve_the_name
+      - non_browser_querier
+      - pool_consumed_by_the_process
+
+  false_positive:
+    - condition: A content delivery network returns rotating short-lived addresses.
+      explanation: >-
+        This is the benign twin and it is genuinely indistinguishable on churn alone —
+        delivery networks rotate answers for the same reasons flux operators do. What
+        separates them is reach: the estate resolves delivery names thousands of times from
+        browsers, which is why the host-count leg rather than the churn leg decides this file.
+    - condition: A cloud service publishes traffic-steering records with short lifetimes.
+      explanation: >-
+        Failover and latency steering rewrite answers between queries, producing exactly the
+        counted pattern. The querying process is normally a browser or a known vendor agent,
+        and the parent domain belongs to a platform other hosts also reach.
+    - condition: A laptop moves between networks and re-resolves everything.
+      explanation: >-
+        Roaming flushes the resolver cache and forces re-queries, and a different network
+        path can return different addresses for the same name. The re-queries are spread
+        across many names at once rather than concentrated on one name from one process.
+    - condition: An agent fans out across a vendor's regional endpoints after a failure.
+      explanation: >-
+        Deployed products commonly try several published addresses when one is unreachable,
+        which reproduces the pool-consumption leg. The addresses belong to one announced
+        service range and every host running the product behaves the same way.

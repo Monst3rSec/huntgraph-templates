@@ -1,0 +1,383 @@
+type: detection
+
+id: hg-win-traffic-handed-to-an-anonymising-relay-network-t1090-003
+
+version: 1.0.0
+
+info:
+  name: Traffic handed to an anonymising relay network
+  description: >-
+    Chaining proxies means a defender who traces the connection reaches a relay, then
+    another, and gives up before reaching anyone. The honest thing to say about this
+    technique is that its real-world detection is a destination-reputation question: knowing
+    that an address is a Tor guard, an I2P router or a node in an operational relay box
+    network requires a feed, and no endpoint sensor derives that from telemetry. This file
+    therefore approximates the reputation answer with three things it can see for itself.
+    The first is the client, because onion routing needs software on the host and that
+    software has recognisable names and a recognisable local control port. The second is
+    consumption: anything routed through Tor connects to a loopback SOCKS listener first, so
+    a process talking to 127.0.0.1 on 9050 is being anonymised whatever it claims to be. The
+    third is shape, and it inverts the single-hop case deliberately — a relay proxy shows as
+    many sessions to one or two addresses, while onion routing shows as a rotating fan-out
+    to a large set of addresses none of which were ever resolved, because relays are chosen
+    from a consensus by address rather than looked up by name. Without a reputation feed the
+    fan-out case is the only part that survives an unfamiliar client, and it should be read
+    as a lead rather than a verdict.
+  severity: high
+  author: huntgraph
+  tags:
+    - command-and-control
+    - multi-hop-proxy
+    - onion-routing
+    - anonymising-network
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1090/003
+    - https://attack.mitre.org/detectionstrategies/DET0359
+    - https://attack.mitre.org/techniques/T1090
+    - https://attack.mitre.org/techniques/T1188
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1090
+  sub_techniques:
+    - T1090.003
+  detection_strategies:
+    - DET0359
+  analytics:
+    - AN1020
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - dns:query
+  data_components:
+    - Network Connection Creation
+    - Process Creation
+    - Network Traffic Flow
+
+hypothesis:
+  statement: >-
+    An adversary may route command and control through an anonymising network of chained
+    relays so that the address a defender recovers belongs to a volunteer or compromised
+    node, obtaining an origin that cannot be traced from the victim's side and infrastructure
+    that no takedown reaches.
+  attacker_behavior:
+    - Installs an onion routing client and points the implant at its local SOCKS listener.
+    - Uses a pluggable transport so the first hop resembles ordinary web traffic.
+    - Reaches a hidden service name that has no public resolution.
+    - Rotates through a large set of relay addresses chosen from a consensus, not by name.
+    - Runs the client from a user-writable directory so no installation is required.
+  legitimate_behavior:
+    - Security researchers and threat intelligence teams run anonymising clients deliberately.
+    - Privacy-focused browsers ship an onion routing client as a bundled component.
+    - Peer-to-peer and blockchain applications fan out to many addresses without resolving them.
+    - Journalists, legal and compliance staff may have a sanctioned business need.
+    - Penetration testing engagements route traffic through anonymising infrastructure.
+  risk_indicator:
+    - A process connects to a loopback SOCKS or control port associated with onion routing.
+    - The host resolves a hidden service name through the system resolver.
+    - One process reaches many external addresses while resolving none of them.
+    - The client runs from a user profile or temporary directory rather than an install path.
+    - The host has no history of anonymised traffic during the baseline window.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - ContextBaseFileName
+        - RemoteAddressIP4
+        - RemotePort
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - ContextBaseFileName
+        - DomainName
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: local-anonymising-listener-consumed
+        name: A process handing traffic to a loopback onion routing listener
+        purpose: >-
+          Anything routed through Tor or I2P connects to the client's local SOCKS listener
+          before it reaches the network, so this catches the consumer rather than the
+          transport. It survives a renamed client, and it names the process actually being
+          anonymised, which is the thing an analyst wants to know first.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemoteAddressIP4=/^127\./
+          | RemotePort=/^(9050|9051|9150|9151|4444|4447|7656|1080)$/
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName, RemotePort],
+                    function=[count(as=sessions)])
+          | sort(sessions, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Research and threat intelligence workstations with sanctioned anonymising clients"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: anonymising-client-or-transport-started
+        name: Onion routing client or pluggable transport executed
+        purpose: >-
+          Name the transport where it is nameable. The pluggable transports matter as much as
+          the client itself, because they exist to make the first hop resemble ordinary
+          traffic and their presence says the operator expected the network to be watching.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(tor|tor-real|torsocks|obfs4proxy|snowflake-client|meek-client|conjure-client|i2p|i2pd|lokinet|nglite|onionshare|proxychains|proxychains4)\.exe$/i
+            or CommandLine=/(--SocksPort|--ControlPort|\btorrc\b|Tor\s+Browser|proxychains|socks5h:\/\/127\.0\.0\.1:(9050|9150))/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=starts), collect([CommandLine], limit=5)])
+          | sort(starts, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Privacy browser bundles approved for specific roles"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: hidden-service-name-resolved
+        name: Hidden service name sent to the system resolver
+        purpose: >-
+          Onion and I2P names are meant to be resolved inside the overlay, never by the
+          corporate resolver, so a query for one is a leak rather than a lookup. It fails,
+          which is why it is cheap to hunt and why nothing legitimate produces it.
+        query: |
+          #event_simpleName=DnsRequest
+          | DomainName=/\.(onion|i2p|loki)$/i
+          | groupBy([ComputerName, ContextBaseFileName, DomainName],
+                    function=[count(as=lookups)])
+          | sort(lookups, order=desc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: relay-fanout-without-resolution
+        name: One process reaching many external addresses it never resolved
+        purpose: >-
+          This is the reputation-free version of the hypothesis and the inverse of the
+          single-hop case. A relay proxy concentrates sessions on one or two endpoints; an
+          onion client spreads them across a rotating set drawn from a consensus, and it
+          resolves nothing because the consensus carries addresses. Breadth combined with the
+          complete absence of name resolution is a shape no browser produces.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6|DnsRequest)$/
+          | ContextBaseFileName!=/^(System|svchost\.exe|MsMpEng\.exe|CcmExec\.exe|OneDrive\.exe|Teams\.exe|chrome\.exe|msedge\.exe|firefox\.exe|outlook\.exe|SearchIndexer\.exe)$/i
+          | case {
+              #event_simpleName=DnsRequest
+                | resolved_name := DomainName ;
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|224\.)/
+                | RemotePort=/^(80|443|8443|9001|9030|9100)$/
+                | relay_peer := RemoteAddressIP4 ;
+            }
+          | groupBy([ComputerName, ContextBaseFileName],
+                    function=[count(field=relay_peer, distinct=true, as=relay_peers),
+                              count(field=resolved_name, distinct=true, as=names_resolved),
+                              collect([relay_peer, RemotePort], limit=15)])
+          | names_resolved = 0
+          | relay_peers >= 15
+          | sort(relay_peers, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Peer-to-peer, blockchain and content distribution clients that connect by address"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+evidence:
+  required:
+    - id: relay_transport_in_use
+      name: Traffic handed to an anonymising transport
+      description: >-
+        The host either passed traffic to a local onion routing listener or reached a wide
+        rotating set of external addresses without resolving any of them, which is how a
+        chained relay network is entered.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: anonymised_transport_used
+
+  supporting:
+    - id: anonymising_client_executed
+      name: Onion routing client or pluggable transport ran
+      description: >-
+        A recognised anonymising client or a transport designed to disguise its first hop
+        was executed on the host in the same period.
+      source: process_creation
+      field: CommandLine
+      indicates: anonymising_tooling_present
+    - id: local_socks_port_consumed
+      name: Loopback SOCKS or control port contacted
+      description: >-
+        A process connected to the loopback port an onion routing client offers, which means
+        that process's traffic was carried over the overlay rather than sent directly.
+      source: network_connection
+      field: RemotePort
+      indicates: traffic_routed_through_overlay
+    - id: hidden_service_name_resolved
+      name: Hidden service name sent to the corporate resolver
+      description: >-
+        A name that only resolves inside an overlay network was queried through the system
+        resolver, which is a leak from software configured to reach that overlay.
+      source: dns_request
+      field: DomainName
+      indicates: overlay_destination_referenced
+    - id: client_in_writable_path
+      name: Client running from a user-writable directory
+      description: >-
+        The executable sits under a user profile, AppData or Temp rather than an installation
+        directory, so it was carried onto the host rather than deployed to it.
+      source: process_creation
+      field: ImageFileName
+      indicates: untrusted_execution_location
+    - id: no_prior_anonymised_traffic
+      name: Host has no history of anonymised traffic
+      description: >-
+        Neither the client, the loopback consumption nor the unresolved fan-out appears for
+        this host across the baseline window, so the capability is new.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: research_or_intelligence_host
+      name: Research or threat intelligence workstation
+      description: >-
+        The host belongs to a function whose job includes reaching anonymising networks, which
+        reproduces every element of the hypothesis deliberately.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_security_function
+    - id: peer_to_peer_application
+      name: Peer-to-peer or blockchain client
+      description: >-
+        The connecting image is a distributed application that discovers peers by address and
+        therefore fans out widely without resolving names, which is the fan-out case by design.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: legitimate_application_component
+    - id: sanctioned_privacy_use
+      name: Approved privacy tooling or a recorded engagement
+      description: >-
+        A record covers the use, for example a penetration test routing through anonymising
+        infrastructure or a role approved to run a privacy browser.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_security_testing
+
+  risk_logic:
+    required:
+      - relay_transport_in_use
+
+    supporting:
+      any:
+        - anonymising_client_executed
+        - local_socks_port_consumed
+        - hidden_service_name_resolved
+        - client_in_writable_path
+        - no_prior_anonymised_traffic
+      all:
+        - anonymising_client_executed
+        - local_socks_port_consumed
+
+    contradicting:
+      any:
+        - research_or_intelligence_host
+        - peer_to_peer_application
+        - sanctioned_privacy_use
+      all: []
+
+  verdict:
+    low_risk_when:
+      - relay_transport_in_use
+      - research_or_intelligence_host
+      - peer_to_peer_application
+      - sanctioned_privacy_use
+    suspicious_when:
+      - relay_transport_in_use
+      - no_prior_anonymised_traffic
+    high_risk_when:
+      - relay_transport_in_use
+      - anonymising_client_executed
+      - local_socks_port_consumed
+      - client_in_writable_path
+      - no_prior_anonymised_traffic
+
+  false_positive:
+    - condition: A security researcher or intelligence analyst runs an anonymising client.
+      explanation: >-
+        This is the intended use of the software and it produces every signal here,
+        including the loopback consumption and the fan-out. Host role is the only
+        discriminator, which makes an accurate inventory of research machines a precondition
+        for deploying this template rather than a refinement of it.
+    - condition: A peer-to-peer or blockchain application discovers peers by address.
+      explanation: >-
+        Distributed applications hold a peer list of addresses and connect without resolving
+        anything, which reproduces the fan-out case exactly. The image names the product and
+        the behaviour is continuous across the baseline rather than appearing once.
+    - condition: A privacy browser bundle is installed for a specific business role.
+      explanation: >-
+        Some bundles ship an onion routing client and start it automatically, producing both
+        the client execution and the loopback consumption. It resolves through inventory and
+        by the client living inside the bundle's installation directory.
+    - condition: A content distribution or update client connects to many addresses directly.
+      explanation: >-
+        Some distribution networks hand out address lists rather than names, producing
+        breadth without resolution. The destinations belong to a small number of provider
+        ranges and repeat across the estate, where a relay set is unique to one host.
+    - condition: A penetration test routes traffic through anonymising infrastructure.
+      explanation: >-
+        Authorised testing deliberately reproduces this technique. It is covered by an
+        engagement record naming the source host and the window, which is why the recorded
+        approval is contradicting evidence.

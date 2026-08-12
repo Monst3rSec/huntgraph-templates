@@ -1,0 +1,377 @@
+type: detection
+
+id: hg-win-archived-data-copied-to-consumer-cloud-storage-t1567-002
+
+version: 1.0.0
+
+info:
+  name: Archived data copied to consumer cloud storage
+  description: >-
+    Copying stolen data into consumer cloud storage is the most heavily used exfiltration
+    route in ransomware and espionage operations alike, because the transfer tooling is
+    mature, resumable and bandwidth-limited by design, and because the destination is a
+    service half the estate already talks to. The service itself therefore proves nothing.
+    What is observable is the tooling: a general-purpose transfer client such as rclone,
+    megacmd or a vendor CLI is not part of a standard Windows build, and when it appears it
+    announces itself in its own command line with a copy verb and a configured remote. The
+    same tooling is routinely renamed to something innocuous, which does not help the
+    adversary much, because the flags are not renamed with it. A binary that is not called
+    rclone but is invoked with transfer, bandwidth-limit and multi-thread-stream options is
+    a more distinctive finding than the original would have been. This template depends on
+    knowing which storage providers and which transfer tools are sanctioned in this estate;
+    without that history it will report every legitimate backup job, so treat the baseline
+    as a precondition.
+  severity: high
+  author: huntgraph
+  tags:
+    - exfiltration
+    - web-service
+    - cloud-storage
+    - file-transfer
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1567/002
+    - https://attack.mitre.org/detectionstrategies/DET0570
+    - https://attack.mitre.org/techniques/T1567
+    - https://attack.mitre.org/techniques/T1560/001
+    - https://attack.mitre.org/techniques/T1074/001
+
+mitre:
+  tactics:
+    - TA0010
+  techniques:
+    - T1567
+  sub_techniques:
+    - T1567.002
+  detection_strategies:
+    - DET0570
+  analytics:
+    - AN1571
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may copy collected data into a consumer cloud storage account under their
+    control so that it leaves the network over a permitted HTTPS service, obtaining a
+    resumable, rate-limited transfer channel that requires no attacker infrastructure and
+    that resembles ordinary file synchronisation.
+  attacker_behavior:
+    - Drops a portable transfer client into a user-writable directory and runs it there.
+    - Configures a remote pointing at an attacker-owned storage account.
+    - Issues a recursive copy or sync of a staging directory or a file share to that remote.
+    - Limits bandwidth and thread counts so the transfer does not disturb the host or the link.
+    - Renames the transfer binary while keeping the flags that make it work.
+  legitimate_behavior:
+    - Sanctioned sync clients keep user folders replicated to corporate storage.
+    - Backup jobs use transfer CLIs to move data to approved object storage.
+    - Engineers use vendor CLIs to publish build output to cloud buckets.
+    - Individuals sync personal files where consumer storage is permitted.
+  risk_indicator:
+    - The storage provider is not one the organisation sanctions.
+    - The transfer client is not part of the standard build and runs from a temporary path.
+    - The binary name does not match the tool its command-line flags belong to.
+    - An archive of user or share data was produced shortly before the copy.
+    - Neither the host nor the account has any history of using this provider.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - DomainName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: transfer-client-invoked-against-a-remote
+        name: Transfer client run with a copy verb and a configured remote
+        purpose: >-
+          Establish the base population. The client names its own destination, so a
+          recursive copy aimed at a consumer storage remote is visible from the command line
+          without inspecting a single byte of the transfer.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(rclone|megacmd|megaclient|mega-put|dbxcli|gsutil|azcopy|onedrivecmd|b2|s3cmd|aws)\b/i
+          | CommandLine=/\b(copy|copyto|sync|move|moveto|put|upload|cp)\b/i
+          | CommandLine=/\b(mega|dropbox|drive|gdrive|onedrive|box|pcloud|wasabi|b2|s3|remote)\s*:/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=transfers), collect([CommandLine], limit=5)])
+          | sort(transfers, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Backup and archiving jobs whose approved destinations are documented in the build"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: renamed-transfer-tool-identified-by-its-flags
+        name: Transfer tool renamed but still carrying its own options
+        purpose: >-
+          Defeat the cheapest evasion available here. Renaming the binary changes the file
+          name and nothing else, so a process that is not called rclone but is driven with
+          rclone's transfer, bandwidth and threading options is more anomalous than the
+          original would have been.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/--(transfers|multi-thread-streams|bwlimit|max-age|ignore-existing|auto-confirm|checkers|drive-chunk-size)[\s=]/i
+          | CommandLine=/\b(copy|copyto|sync|move|moveto)\b/i
+          | FileName!=/^(rclone|rclone\.exe|gsutil\.exe|azcopy\.exe)$/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName],
+                    function=[count(as=runs), collect([CommandLine], limit=5)])
+          | sort(runs, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Wrapper scripts in the backup product that invoke the transfer tool under its own name"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: storage-provider-reached-by-an-unexpected-process
+        name: Consumer storage provider contacted by a process that is not a sync client
+        purpose: >-
+          Cover uploads that never invoke a transfer CLI at all. Where the provider is
+          reached directly over its API, the discriminator moves to the originating process,
+          because an interpreter or an office application has no business holding a session
+          with a file storage service.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6|DnsRequest)$/
+          | case {
+              #event_simpleName=DnsRequest
+                | DomainName=/(^|\.)(mega\.nz|mega\.co\.nz|dropbox\.com|dropboxapi\.com|drive\.google\.com|onedrive\.live\.com|box\.com|pcloud\.com|wasabisys\.com|backblazeb2\.com|4shared\.com|sync\.com)$/i
+                | storage_domain := DomainName ;
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | ContextBaseFileName=/^(powershell|pwsh|wscript|cscript|mshta|rundll32|certutil|bitsadmin|curl|wget|python|pythonw|node|winword|excel|powerpnt)\.exe$/i
+                | RemotePort in (443, 8443)
+                | peer := RemoteAddressIP4 ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([ContextBaseFileName, storage_domain, peer]),
+                              count(as=events)])
+          | storage_domain=/.+/
+          | peer=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Sanctioned synchronisation clients reaching their own vendor endpoints"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - domain
+
+      - id: archive-created-then-transferred
+        name: Archive produced shortly before a cloud transfer
+        purpose: >-
+          Anchor the transfer to the collection that fed it. The pairing of packaging user or
+          share data and then copying it out is the strongest sequence available here and is
+          what distinguishes exfiltration from a backup that has always run.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/\b(7z|7za|rar|winrar|tar|Compress-Archive|makecab)\b/i
+                | archived := CommandLine ;
+              CommandLine=/\b(rclone|megacmd|dbxcli|gsutil|azcopy|s3cmd|onedrivecmd)\b/i
+                | transferred := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[collect([archived, transferred, FileName]), count(as=steps)])
+          | archived=/.+/
+          | transferred=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Backup jobs that compress and upload on a fixed schedule from a designated host"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: bulk_copy_to_consumer_cloud_storage
+      name: Recursive copy issued against a consumer storage remote
+      description: >-
+        A transfer client was run with a copy or sync verb against a remote belonging to a
+        consumer cloud storage provider, which is the outward movement of data rather than
+        preparation for it.
+      source: process_creation
+      field: CommandLine
+      indicates: data_transfer_to_external_service
+
+  supporting:
+    - id: transfer_tool_renamed
+      name: Transfer binary renamed but driven with its original options
+      description: >-
+        The executable name does not match the tool whose flags appear on its command line,
+        which is deliberate concealment rather than a naming coincidence.
+      source: process_creation
+      field: FileName
+      indicates: tool_masquerading
+    - id: storage_provider_resolved
+      name: Storage provider resolved from this machine
+      description: >-
+        The host looked up a consumer cloud storage domain, tying the command line to actual
+        egress rather than to a transfer that never started.
+      source: dns_request
+      field: DomainName
+      indicates: external_service_contacted
+    - id: upload_session_from_an_unexpected_process
+      name: Storage session opened by a process that is not a sync client
+      description: >-
+        The connection to the storage provider came from an interpreter, a fetcher or an
+        office application rather than from the vendor's own synchronisation client.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: abnormal_execution_chain
+    - id: archive_preceded_the_transfer
+      name: Archive produced before the transfer
+      description: >-
+        The same account packaged data with an archive utility shortly before the copy,
+        which is the collect-compress-move sequence rather than continuous synchronisation.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: collection_then_exfiltration
+    - id: provider_new_to_this_host_and_estate
+      name: No history of this storage provider being used here
+      description: >-
+        Neither this host nor the wider estate has contacted this provider during the
+        baseline window, so the destination is new rather than a change in volume.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_destination
+
+  contradicting:
+    - id: sanctioned_backup_tooling
+      name: Host runs the sanctioned backup or archiving product
+      description: >-
+        The machine is a designated backup or archive system where a transfer CLI moving
+        bulk data to object storage is its stated function.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: vendor_sync_client_originated
+      name: Session originated by the sanctioned sync client
+      description: >-
+        The traffic to the storage provider belongs to the vendor's own synchronisation
+        client installed as part of the standard build, running under the user's session.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_application_component
+    - id: recorded_data_migration
+      name: Recorded migration or bulk data move
+      description: >-
+        A change record covers moving a large data set to cloud storage during the window in
+        which the transfers occurred.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - bulk_copy_to_consumer_cloud_storage
+
+    supporting:
+      any:
+        - transfer_tool_renamed
+        - storage_provider_resolved
+        - upload_session_from_an_unexpected_process
+        - archive_preceded_the_transfer
+        - provider_new_to_this_host_and_estate
+      all:
+        - transfer_tool_renamed
+        - archive_preceded_the_transfer
+
+    contradicting:
+      any:
+        - sanctioned_backup_tooling
+        - vendor_sync_client_originated
+        - recorded_data_migration
+      all: []
+
+  verdict:
+    low_risk_when:
+      - bulk_copy_to_consumer_cloud_storage
+      - sanctioned_backup_tooling
+      - vendor_sync_client_originated
+      - recorded_data_migration
+    suspicious_when:
+      - bulk_copy_to_consumer_cloud_storage
+      - provider_new_to_this_host_and_estate
+    high_risk_when:
+      - bulk_copy_to_consumer_cloud_storage
+      - transfer_tool_renamed
+      - archive_preceded_the_transfer
+      - storage_provider_resolved
+
+  false_positive:
+    - condition: A backup job copies data to approved object storage with a transfer CLI.
+      explanation: >-
+        This looks identical at the command line. It is separated by the destination being a
+        sanctioned provider, by the job running from a designated host on a schedule, and by
+        the tool being installed in a product directory rather than dropped in a temporary one.
+    - condition: An engineer publishes build output to a cloud bucket with a vendor CLI.
+      explanation: >-
+        Vendor CLIs are used this way constantly on engineering hosts. The account and host
+        have a long history of the same command against the same bucket, and no archive of
+        user or share data precedes it.
+    - condition: A user syncs personal files where consumer cloud storage is permitted.
+      explanation: >-
+        Where the policy allows it, the vendor's own sync client will hold sessions with the
+        provider continuously. That client is the originator, which is why the network case
+        excludes it and looks for interpreters and office applications instead.
+    - condition: A support engineer uses a portable transfer tool during a recovery.
+      explanation: >-
+        Recovery work sometimes pulls a portable binary onto a host to move data quickly.
+        This is short-lived, tied to an incident record, and normally moves data inward or to
+        an internal target rather than to a personal account at a consumer provider.
