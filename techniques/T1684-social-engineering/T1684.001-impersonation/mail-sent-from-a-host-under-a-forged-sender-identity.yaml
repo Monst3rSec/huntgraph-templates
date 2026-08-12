@@ -1,0 +1,347 @@
+type: detection
+
+id: hg-lin-mail-sent-from-a-host-under-a-forged-sender-identity-t1684-001
+
+version: 1.0.0
+
+info:
+  name: Mail sent from a host under a forged sender identity
+  description: >-
+    Impersonation works because the recipient trusts the name on the message, not the machine
+    that produced it. On a Linux host every local mail submission tool will happily send under
+    whatever identity it is told to use: sendmail takes an envelope sender with -f, mailx and
+    mutt take a From address with -r, msmtp and swaks take one with --from, and a message
+    piped into sendmail -t carries whatever From header the sender wrote into the body. None
+    of that requires a mailbox, a password or an account of any kind, which is what makes a
+    compromised application server or a developer workstation a convenient place from which to
+    write to finance as the chief executive, or to a colleague as the help desk. This is the
+    one part of the technique an endpoint sensor actually sees: not the message, not its
+    delivery, and not whether the receiving domain accepted it, but the command that composed
+    it. The discriminator is who normally sends mail from this host and under whose name.
+    Application and monitoring mail is sent by a service account, from a daemon or a cron job,
+    under one stable no-reply identity, and it does so continuously. Impersonation is a person
+    at an interactive shell overriding the sender once, with an identity the host has never
+    used before, often carrying the urgency and payment language the technique depends on.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - social-engineering
+    - impersonation
+    - email
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1684/001
+    - https://attack.mitre.org/detectionstrategies/DET0286
+    - https://attack.mitre.org/techniques/T1684
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1684
+  sub_techniques:
+    - T1684.001
+  detection_strategies:
+    - DET0286
+  analytics:
+    - AN0793
+  platforms:
+    - Linux
+  data_sources:
+    - "auditd:SYSCALL"
+  data_components:
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    An adversary may use a local mail submission tool to send messages under a sender identity
+    that does not belong to them, so that a colleague, an executive or the help desk is
+    addressed by someone the recipient trusts, obtaining an action, an approval or a
+    credential without any technical exploitation.
+  attacker_behavior:
+    - Overrides the envelope sender with sendmail -f or mailx -r to name someone else.
+    - Pipes a hand-written From header into sendmail -t so the client displays a trusted name.
+    - Submits directly over SMTP from an interpreter or swaks, bypassing the local mail queue.
+    - Borrows a display name belonging to an executive, a vendor or the internal help desk.
+    - Frames the message around payment, an invoice or an urgent request needing quick action.
+  legitimate_behavior:
+    - Applications and monitoring agents send alerts under a fixed no-reply identity.
+    - Cron and backup jobs mail their output to an operations address every run.
+    - Administrators test a newly configured relay by sending a message by hand.
+    - Ticketing and CI systems send notifications on behalf of the user who triggered them.
+    - Mailing tools are used with an explicit sender by design in bulk notification pipelines.
+  risk_indicator:
+    - The sender identity has never been used from this host during the baseline window.
+    - The submitting process is a child of an interactive shell rather than of cron or a daemon.
+    - The From header is written by hand into a piped message body rather than set by a client.
+    - The submitting account is unrelated to the identity in the sender argument.
+    - The message carries payment, wire, invoice or urgency wording in the same command line.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: sender-identity-overridden-on-a-mail-tool
+        name: Mail submission tool run with an explicit sender override
+        purpose: >-
+          Surface the direct route. Every local mail client exposes a flag that replaces the
+          sender with an arbitrary address, and using it is the whole of the impersonation.
+          Grouping by the submitting account and the parent keeps the recurring service-account
+          senders together so a one-off override under a human account stands out.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(sendmail|sendmail\.postfix|sendmail\.sendmail|mail|mailx|s-nail|mutt|neomutt|msmtp|swaks|sendemail|exim|exim4)$/i
+          | CommandLine=/(\s-f\s*\S+@|\s-r\s*\S+@|--from[= ]\S+@|--sender[= ]\S+@|set\s+from=)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=submissions), collect([CommandLine], limit=5)])
+          | sort(submissions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Service accounts whose application alerting sends under one fixed no-reply address"
+            - "Approved bulk notification pipelines that set the sender by design"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: from-header-written-into-a-piped-message
+        name: From header composed by hand and piped into the local mailer
+        purpose: >-
+          Cover the route that leaves no flag behind. A message fed to sendmail -t takes its
+          recipients and its From header from the body, so an operator writes the header
+          themselves with a here-document, printf or echo. A mail client never constructs a
+          header this way, which makes the composition itself the signal.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(sendmail|msmtp|exim)\b/i
+          | CommandLine=/From:\s*[^\s@]+@|Reply-To:\s*[^\s@]+@/i
+          | CommandLine=/(printf|echo|cat\s*<<|here|tee|\|\s*\/usr\/sbin\/sendmail|\|\s*sendmail)/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=messages), collect([CommandLine], limit=5)])
+          | sort(messages, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Report generators and backup scripts that template a fixed From header every run"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: smtp-submission-from-an-interpreter
+        name: Message submitted over SMTP from a script or interpreter
+        purpose: >-
+          Catch the route that never touches the local mail queue at all. Sending straight to a
+          relay from an interpreter or from curl means nothing is queued, nothing is logged
+          locally by the mail system, and the sender is set purely by the script, so the
+          command line is the only place the impersonated identity ever appears.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(python[0-9.]*|perl|ruby|php|node|curl|nc|ncat|openssl|bash|sh|zsh)$/i
+          | CommandLine=/(smtplib|Net::SMTP|Mail::Sender|nodemailer|smtps?:\/\/|MAIL\s+FROM|s_client.*(:25|:465|:587))/i
+          | CommandLine=/(sendmail|send_message|MAIL\s+FROM|--mail-from|from\s*=|From:)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=submissions), collect([CommandLine], limit=5)])
+          | sort(submissions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Application code paths whose SMTP submission is part of the deployed service"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: impersonation-language-in-a-composed-message
+        name: Payment or urgency wording in a message composed on the command line
+        purpose: >-
+          Apply the discriminator the technique itself names. Impersonation is aimed at making
+          someone act quickly, so the subject line carries payment, wire, invoice or urgency
+          wording, and the sender is chosen to make that plausible. Automated mail is
+          repetitive and operational; a message assembled around a payment request under an
+          overridden sender is not.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(sendmail|mailx|\bmail\b|mutt|neomutt|msmtp|swaks|sendemail|smtplib|Net::SMTP)/i
+          | CommandLine=/(-s\s|Subject:|--body|--data)/i
+          | CommandLine=/(wire\s*transfer|payment|invoice|remittance|bank\s*details|urgent|password\s*reset|verify\s*your|gift\s*card|payroll)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=messages), collect([CommandLine], limit=5)])
+          | sort(messages, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Finance and billing systems whose routine notifications legitimately use this wording"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: sender_identity_forged
+      name: Message submitted under an overridden sender identity
+      description: >-
+        A local mail tool was run with an explicit envelope-sender or From override, or a
+        From header was written by hand into a piped message, so the message leaves the host
+        claiming to come from someone other than the account that sent it.
+      source: process_creation
+      field: CommandLine
+      indicates: sender_identity_forged
+
+  supporting:
+    - id: submitted_from_an_interactive_session
+      name: Sent from an interactive shell rather than a scheduler
+      description: >-
+        The submitting process was started by a login shell or a remote session rather than by
+        cron, systemd or an application, which is how a person sends a message by hand and not
+        how service mail is produced.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: relay_bypassed_from_a_script
+      name: Submitted straight to a relay from an interpreter
+      description: >-
+        The message was pushed over SMTP from a script or command-line client rather than
+        queued through the local mail system, which leaves the impersonated identity visible
+        only in the command that sent it.
+      source: process_creation
+      field: FileName
+      indicates: mail_submission_outside_normal_path
+    - id: impersonation_language_present
+      name: Payment or urgency wording in the composed message
+      description: >-
+        The command that composed the message carries payment, invoice or urgency wording,
+        which is the pressure the technique relies on to get the recipient to act before
+        checking who really sent it.
+      source: process_creation
+      field: ImageFileName
+      indicates: social_engineering_pressure
+    - id: sender_new_for_host
+      name: Sender identity never used from this host
+      description: >-
+        This sender address or display name has not been used from this host during the
+        baseline window, unlike the stable service identity that application mail always uses.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: scheduled_service_mail
+      name: Produced by a scheduler or service manager
+      description: >-
+        The submitting process is a child of cron, systemd or a monitoring daemon, which is
+        how backup reports, alerts and job output are mailed on every run.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: known_notification_sender
+      name: Host is a sanctioned notification sender
+      description: >-
+        This host is recorded as an application or alerting server whose role is to send mail
+        under a fixed no-reply identity, so an explicit sender argument is its normal
+        behaviour.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_application_component
+    - id: sender_stable_across_fleet
+      name: Same sender identity used continuously and estate-wide
+      description: >-
+        The identical sender address appears from this host and its peers throughout the
+        baseline window at a steady rate, which is a notification pipeline rather than a
+        one-off impersonation.
+      source: baseline
+      field: ComputerName
+      indicates: routine_automation
+
+  risk_logic:
+    required:
+      - sender_identity_forged
+
+    supporting:
+      any:
+        - submitted_from_an_interactive_session
+        - relay_bypassed_from_a_script
+        - impersonation_language_present
+        - sender_new_for_host
+      all:
+        - submitted_from_an_interactive_session
+        - sender_new_for_host
+
+    contradicting:
+      any:
+        - scheduled_service_mail
+        - known_notification_sender
+        - sender_stable_across_fleet
+      all: []
+
+  verdict:
+    low_risk_when:
+      - sender_identity_forged
+      - scheduled_service_mail
+      - known_notification_sender
+      - sender_stable_across_fleet
+    suspicious_when:
+      - sender_identity_forged
+      - sender_new_for_host
+    high_risk_when:
+      - sender_identity_forged
+      - submitted_from_an_interactive_session
+      - impersonation_language_present
+      - sender_new_for_host
+
+  false_positive:
+    - condition: An application or monitoring agent mails alerts under a fixed no-reply address.
+      explanation: >-
+        Service mail sets the sender explicitly on every send, which reproduces the required
+        evidence continuously. It runs under a service account, is parented by a daemon or a
+        scheduler, and uses the same identity throughout the baseline window rather than a new
+        one, so both the parent and the baseline separate it.
+    - condition: A cron or backup job mails its output to an operations mailbox.
+      explanation: >-
+        Job output is routinely piped into the local mailer with a chosen sender and subject.
+        The submission is parented by cron or systemd, recurs on a schedule, and addresses an
+        internal operations mailbox rather than a person chosen for what they can approve.
+    - condition: An administrator tests a newly configured relay by hand.
+      explanation: >-
+        Relay testing uses swaks or sendmail interactively with an arbitrary sender and looks
+        very close to the technique. It is a small number of messages sent to the tester
+        themselves or to a test mailbox, it happens alongside mail configuration changes on the
+        same host, and it carries no payment or urgency content.
+    - condition: A billing or payroll system sends genuine payment notifications.
+      explanation: >-
+        The wording case will match real finance mail, which is exactly the language the
+        technique borrows. The distinguishing details are that the sender identity is the
+        system's own established address, the host is a recognised billing server, and the
+        volume is steady rather than a single message to one chosen recipient.

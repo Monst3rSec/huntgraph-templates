@@ -186,6 +186,20 @@ exists to prevent. Confirming the NG-SIEM schema for module loads and process ha
 access is worth more than several batches of authoring: it converts the single largest
 block of remaining work from impossible to routine.
 
+### Recorded skips
+
+`skipped.yaml` names the targets this project has decided not to cover, each with the
+reason and the concrete telemetry change that would make it writable. They appear in
+`coverage.csv` with status `skipped` and a `skip_reason` column rather than being
+folded into the outstanding count.
+
+The distinction matters more than it looks. Without the register, a deliberate
+decision is indistinguishable from a backlog item, so every skip reads as work
+someone will get to eventually and the reasoning is lost the moment its author moves
+on. An acknowledged blind spot is manageable; the same gap unrecorded is just an
+unknown. The bar for entry is narrow — not "this is hard" or "the query would be
+noisy", but "the only observable is one we cannot collect".
+
 ## Contributing
 
 - Write the hypothesis for a human analyst. If it only restates the query, it is not

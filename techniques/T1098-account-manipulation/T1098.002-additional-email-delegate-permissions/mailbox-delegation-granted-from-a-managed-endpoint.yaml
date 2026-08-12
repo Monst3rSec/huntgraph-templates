@@ -1,0 +1,348 @@
+type: detection
+
+id: hg-win-mailbox-delegation-granted-from-a-managed-endpoint-t1098-002
+
+version: 1.0.0
+
+info:
+  name: Mailbox delegation granted from a managed endpoint
+  description: >-
+    Delegation is the quietest way to keep reading someone else's mail. A grant of FullAccess
+    or SendAs on a mailbox, or a folder permission handed to Default or Anonymous, survives
+    the victim's password reset, survives their MFA re-enrolment, and needs no token to keep
+    working, because the access belongs to whichever principal was named rather than to a
+    stolen session. Nothing appears in the victim's mailbox and nothing prompts them. This
+    hypothesis covers exactly one route to that grant, and it is important to be clear about
+    which: the Exchange cmdlets executed on a managed Windows endpoint, whether against
+    on-premises Exchange through the Management Shell or against Exchange Online through a
+    remote session. That is the observable the analytic declares as process creation, and it
+    is the one a CrowdStrike endpoint sensor genuinely collects, in full, including the
+    arguments naming the mailbox, the grantee and the rights. A grant made in the Exchange
+    admin centre, in Outlook Web Access, through Graph, or in a Gmail delegation setting never
+    touches an endpoint and is invisible here; catching those needs the mail platform's own
+    audit stream. The discriminator on the endpoint is that delegation is a mail-administration
+    task performed by mail administrators from admin workstations, in bulk, during change
+    windows. A single grant issued from an ordinary user's machine, from an encoded command,
+    or naming Default or Anonymous as the grantee is not administration.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - account-manipulation
+    - mailbox-delegation
+    - exchange
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1098/002
+    - https://attack.mitre.org/detectionstrategies/DET0373
+    - https://attack.mitre.org/techniques/T1098
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1098
+  sub_techniques:
+    - T1098.002
+  detection_strategies:
+    - DET0373
+  analytics:
+    - AN1052
+  platforms:
+    - Windows
+  data_sources:
+    - "WinEventLog:Security"
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may run Exchange cmdlets from a managed Windows endpoint to grant themselves
+    or a controlled principal delegate rights over another user's mailbox, so that they keep
+    reading and sending that mail after the compromised credential is reset, obtaining
+    persistence that leaves no session, token or agent behind.
+  attacker_behavior:
+    - Grants FullAccess or SendAs over a target mailbox with the Exchange permission cmdlets.
+    - Assigns folder rights to Default or Anonymous so any tenant account can read the mail.
+    - Adds an impersonation role assignment so one principal can act as many mailboxes.
+    - Connects a remote Exchange session from a workstation that does not administer mail.
+    - Wraps the cmdlet in an encoded or obfuscated command to keep the arguments out of view.
+  legitimate_behavior:
+    - Mail administrators delegate assistants onto executive mailboxes as a standard request.
+    - Shared and resource mailboxes are provisioned with FullAccess for a whole team.
+    - Migration and archiving tooling takes broad mailbox rights for the duration of a project.
+    - Leaver processes grant a manager access to a departed employee's mailbox.
+    - Service desk automation applies delegation changes in scripted batches.
+  risk_indicator:
+    - The grantee is Default or Anonymous rather than a named person.
+    - The rights granted are FullAccess, SendAs or an impersonation role.
+    - The host issuing the cmdlet has no history of mail administration.
+    - The cmdlet arrives through an encoded command or a downloaded script.
+    - The account running the cmdlet is not a member of the mail administration team.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: mailbox-permission-granted-to-a-principal
+        name: Mailbox permission cmdlet granting FullAccess or SendAs
+        purpose: >-
+          Surface the grant itself. Adding FullAccess or SendAs to a mailbox is the technique
+          in one command, and the arguments carry everything a triage needs: whose mailbox,
+          which principal, and which rights. Grouping by host and account separates the mail
+          administrators who do this daily from a workstation that does it once.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Add-MailboxPermission|Add-RecipientPermission|Add-ADPermission|Set-Mailbox\b.*-GrantSendOnBehalfTo)/i
+          | CommandLine=/(FullAccess|SendAs|Send-As|GrantSendOnBehalfTo|ExtendedRights)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=grants), collect([CommandLine], limit=5)])
+          | sort(grants, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Mail administration workstations where delegation is the operator's daily job"
+            - "Provisioning automation that grants team access to shared and resource mailboxes"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: folder-rights-given-to-default-or-anonymous
+        name: Mailbox folder rights assigned to Default or Anonymous
+        purpose: >-
+          Isolate the variant that needs no named grantee at all. Giving the Default or
+          Anonymous principal reviewer rights on the Inbox or the top of the information store
+          lets any account in the tenant read that mailbox, which is both broader and far
+          quieter than naming a user. Legitimate delegation names a person.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Add-MailboxFolderPermission|Set-MailboxFolderPermission)/i
+          | CommandLine=/-User\s*['"]?(Default|Anonymous)\b/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=grants), collect([CommandLine], limit=5)])
+          | sort(grants, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Calendar publishing standards that set Default availability rights estate-wide"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: impersonation-role-assigned
+        name: Impersonation role assigned to an account or service principal
+        purpose: >-
+          Cover the grant that scales. An impersonation role assignment lets a single principal
+          act as every mailbox in scope, so it replaces many individual delegations with one
+          command and is the form used when the goal is collection rather than access to one
+          person's mail.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/New-ManagementRoleAssignment|New-ManagementScope|Set-CASMailbox/i
+          | CommandLine=/(ApplicationImpersonation|-Role\s*['"]?Impersonation|ActiveSyncAllowedDeviceIDs)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=assignments), collect([CommandLine], limit=5)])
+          | sort(assignments, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Migration and archiving projects with an approved impersonation assignment"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: exchange-session-opened-from-an-unusual-host
+        name: Remote Exchange management session opened from a workstation
+        purpose: >-
+          Show how the grant was reached rather than what it did. Mail administration runs from
+          a small, stable set of hosts, so a remote Exchange session being established
+          elsewhere, or a cmdlet arriving inside an encoded command, is the access path that
+          makes an unexpected delegation credible.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(powershell\.exe|pwsh\.exe|powershell_ise\.exe|wsmprovhost\.exe)$/i
+          | CommandLine=/(Connect-ExchangeOnline|New-PSSession.*(outlook\.office365\.com|\/powershell)|Import-PSSession|ExchangeOnlineManagement|Add-PSSnapin.*Exchange|RemoteExchange\.ps1)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=sessions), collect([CommandLine], limit=5)])
+          | sort(sessions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Exchange servers and the designated mail administration jump hosts"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+evidence:
+  required:
+    - id: delegation_granted
+      name: Delegate rights granted over a mailbox
+      description: >-
+        An Exchange cmdlet was executed that grants a principal access to another user's
+        mailbox or its folders, which is the persistence itself rather than a step towards it.
+      source: process_creation
+      field: CommandLine
+      indicates: mailbox_delegation_granted
+
+  supporting:
+    - id: grantee_is_everyone
+      name: Rights given to Default or Anonymous
+      description: >-
+        The permission was assigned to the Default or Anonymous principal instead of a named
+        person, so any account in the tenant inherits access to the mailbox.
+      source: process_creation
+      field: FileName
+      indicates: broad_persistence_scope
+    - id: session_from_a_non_admin_host
+      name: Exchange session opened from a host that does not administer mail
+      description: >-
+        The remote management session used to issue the cmdlet was established from a
+        workstation with no history of mail administration, which is where the grant came from
+        rather than what it did.
+      source: process_creation
+      field: ComputerName
+      indicates: abnormal_administration_path
+    - id: obfuscated_invocation
+      name: Cmdlet delivered through an encoded or downloaded command
+      description: >-
+        The delegation was issued from an encoded command line or a script fetched at run
+        time, which keeps the mailbox and grantee arguments out of casual view and is not how
+        administration is performed.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: unusual_for_host
+      name: No history of mailbox administration on this host
+      description: >-
+        No Exchange permission cmdlet has run on this host during the baseline window, so the
+        grant is a deviation as well as a permission change.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: mail_administrator_account
+      name: Issued by a mail administrator from an admin workstation
+      description: >-
+        The account and host both belong to the mail administration team, for whom delegating
+        assistants and provisioning shared mailboxes is routine daily work.
+      source: identity_context
+      field: UserName
+      indicates: legitimate_enterprise_activity
+    - id: approved_change_record
+      name: Covered by an approved change or service request
+      description: >-
+        The grant matches a recorded delegation request, a leaver process or a migration
+        project scheduled for this window, naming the same mailbox and grantee.
+      source: change_management
+      field: CommandLine
+      indicates: approved_change
+    - id: bulk_provisioning_run
+      name: Part of a bulk provisioning run
+      description: >-
+        The same cmdlet was issued repeatedly across many mailboxes in one window from
+        provisioning tooling, which is shared-mailbox or migration setup rather than a targeted
+        grant on one person's mail.
+      source: baseline
+      field: CommandLine
+      indicates: routine_automation
+
+  risk_logic:
+    required:
+      - delegation_granted
+
+    supporting:
+      any:
+        - grantee_is_everyone
+        - session_from_a_non_admin_host
+        - obfuscated_invocation
+        - unusual_for_host
+      all:
+        - session_from_a_non_admin_host
+        - unusual_for_host
+
+    contradicting:
+      any:
+        - mail_administrator_account
+        - approved_change_record
+        - bulk_provisioning_run
+      all: []
+
+  verdict:
+    low_risk_when:
+      - delegation_granted
+      - mail_administrator_account
+      - approved_change_record
+      - bulk_provisioning_run
+    suspicious_when:
+      - delegation_granted
+      - unusual_for_host
+    high_risk_when:
+      - delegation_granted
+      - grantee_is_everyone
+      - session_from_a_non_admin_host
+      - obfuscated_invocation
+
+  false_positive:
+    - condition: A mail administrator delegates an assistant onto an executive mailbox.
+      explanation: >-
+        This is the single most common legitimate use of the cmdlet and produces the required
+        evidence exactly. It is issued by a mail administration account from an admin
+        workstation that does this routinely, and the grantee is a named person who works with
+        the mailbox owner.
+    - condition: Shared or resource mailboxes are provisioned for a team.
+      explanation: >-
+        Provisioning grants FullAccess to several accounts at once, often in a scripted loop.
+        The pattern is many grants over one mailbox in a single run from provisioning tooling,
+        rather than one grant issued quietly from a user's own machine.
+    - condition: A migration or archiving project takes broad mailbox rights.
+      explanation: >-
+        Migration tooling legitimately requests FullAccess or an impersonation role over a wide
+        scope, which matches the strongest cases here. It is bounded by a change record, runs
+        under a documented service account, and is removed when the project ends.
+    - condition: A leaver process gives a manager access to a departed employee's mailbox.
+      explanation: >-
+        Offboarding routinely delegates the leaver's mailbox to their manager and looks
+        identical on the endpoint. It follows a termination in the identity system within days,
+        and the grantee is the reporting manager rather than an unrelated or generic principal.
+    - condition: A calendar publishing standard sets Default folder rights across the estate.
+      explanation: >-
+        Availability standards do assign rights to the Default principal, which is the folder
+        case. Those runs touch calendar folders at limited reviewer level across many
+        mailboxes at once, where the technique targets the Inbox or the top of the information
+        store on one mailbox.

@@ -1,0 +1,336 @@
+type: detection
+
+id: hg-lin-ssh-session-ridden-through-a-forwarded-agent-or-control-socket-t1563-001
+
+version: 1.0.0
+
+info:
+  name: SSH session ridden through a forwarded agent or control socket
+  description: >-
+    An adversary on a host where someone else has an SSH session does not need that person's
+    key or password. If the user connected with agent forwarding, a Unix socket on the host
+    will sign authentication challenges on their behalf for as long as they stay connected;
+    if they connected with multiplexing, a control socket will open new channels on the
+    existing connection outright. Either way the adversary reaches the next host as the
+    victim, and this is why the sub-technique is worth separating from ordinary SSH use:
+    there is no new credential, and on the destination there is no new authentication event
+    to find. The visible artefact is entirely on the source host — a process touching an
+    agent or control socket that belongs to a different user, followed by an outbound SSH
+    flow that no login can account for. Root makes this trivial, which is why the socket
+    permissions offer no protection.
+  severity: high
+  author: huntgraph
+  tags:
+    - lateral-movement
+    - session-hijacking
+    - ssh
+    - agent-forwarding
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1563/001
+    - https://attack.mitre.org/detectionstrategies/DET0256
+    - https://attack.mitre.org/techniques/T1563
+
+mitre:
+  tactics:
+    - TA0008
+  techniques:
+    - T1563
+  sub_techniques:
+    - T1563.001
+  detection_strategies:
+    - DET0256
+  analytics:
+    - AN0710
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:EXECVE
+    - auditd:SYSCALL
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary with access to a host may reuse another user's forwarded SSH agent socket or
+    multiplexed control socket to authenticate onward as that user, obtaining lateral
+    movement that requires no credential of their own and that leaves no new authentication
+    event on the destination.
+  attacker_behavior:
+    - Enumerates agent sockets under the temporary directories to find a live forwarded agent.
+    - Points the agent socket environment variable at a socket owned by a different user.
+    - Opens a new channel over an existing multiplexed connection using its control socket.
+    - Reaches a further internal host over SSH while holding no key or password themselves.
+  legitimate_behavior:
+    - Users forward their own agent deliberately so they can hop from a jump host.
+    - Terminal multiplexers rewrite the agent socket variable when a session is reattached.
+    - Build and deployment tooling multiplexes SSH connections to reduce handshake cost.
+    - Administrators debug SSH problems by inspecting sockets and connection state.
+  risk_indicator:
+    - The process using the socket runs as a different account than the socket's owner.
+    - Socket paths are enumerated before one is used.
+    - A control socket is reused by a process that is not a descendant of the master connection.
+    - An outbound SSH flow leaves the host with no corresponding login on it.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - RemoteAddressIP4
+        - RemotePort
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: agent-socket-path-supplied-on-a-command-line
+        name: Agent socket variable pointed at an explicit socket path
+        purpose: >-
+          Surface the core act. A user's own shell inherits the agent socket from its login
+          and never has to name it, so a command line that sets the variable explicitly to a
+          socket under the temporary or per-user runtime directories is someone attaching to
+          an agent they were not given.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/SSH_AUTH_SOCK\s*=\s*(FILE:)?\/(tmp|var\/tmp|private\/tmp|run\/user\/\d+|dev\/shm)\//i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=uses), collect([CommandLine], limit=5)])
+          | sort(uses, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Terminal multiplexer wrapper scripts that re-export the socket on reattach"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: agent-sockets-enumerated
+        name: Agent socket directories searched
+        purpose: >-
+          Catch the reconnaissance step that precedes the hijack. A user knows where their own
+          agent is; finding somebody else's requires listing the socket directories, and that
+          search is a cheap, specific tell that nothing legitimate has a reason to perform.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\/tmp\/ssh-|agent\.\d+|SSH_AUTH_SOCK|\/run\/user\/\d+\/(keyring|gcr)\/ssh)/
+          | CommandLine=/\b(ls|find|stat|lsof|ss|readlink|strings|grep)\b/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=lookups), collect([CommandLine], limit=5)])
+          | sort(lookups, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Support engineers troubleshooting agent forwarding under a recorded ticket"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: multiplexed-control-socket-reused
+        name: Existing multiplexed connection reused through its control socket
+        purpose: >-
+          Cover the second route, which needs no agent at all. A control socket left by a
+          master connection will open new sessions on that already-authenticated connection,
+          so naming one on the client command line is riding a session rather than starting one.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/\/(ssh|scp|sftp)$/
+          | CommandLine=/(-S\s+\/\S+|ControlPath\s*=?\s*\/\S+|ControlMaster|ControlPersist|-O\s+(check|forward|proxy|exit))/
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=reuses), collect([CommandLine], limit=5)])
+          | sort(reuses, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Build and deployment tooling that multiplexes SSH by configuration"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: outbound-ssh-flow-with-no-login-on-the-host
+        name: Onward SSH flow from a host with no matching session
+        purpose: >-
+          Confirm the hijack reached a destination. This is the one place where the absence
+          of an authentication event is itself the signal: the flow leaves the host, but the
+          hijacking process holds no credential, so pair this result with the login record for
+          the same host and window and treat the gap as the finding.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemotePort=/^22$/
+          | RemoteAddressIP4=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+          | groupBy([ComputerName, ContextProcessId, RemoteAddressIP4],
+                    function=[count(as=hops)])
+          | sort(hops, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Bastion hosts and deployment runners that originate SSH continuously"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - remote_address
+            - organization
+
+evidence:
+  required:
+    - id: foreign_agent_socket_used
+      name: Agent or control socket attached explicitly
+      description: >-
+        A process named an SSH agent socket or a multiplexing control socket on its command
+        line rather than inheriting one from its own login, which is how another user's
+        authenticated state is borrowed.
+      source: process_creation
+      field: CommandLine
+      indicates: session_hijacking
+
+  supporting:
+    - id: cross_user_process_context
+      name: Socket used by an account other than its owner
+      description: >-
+        The account running the process is not the account that owns the socket, so the
+        authentication that follows is performed as someone who did not initiate it.
+      source: process_creation
+      field: UserName
+      indicates: identity_impersonation
+    - id: agent_sockets_enumerated
+      name: Socket directories searched beforehand
+      description: >-
+        The temporary or per-user runtime directories were listed for agent sockets, which is
+        how an adversary locates a live forwarded agent belonging to somebody else.
+      source: process_creation
+      field: ImageFileName
+      indicates: credential_access_reconnaissance
+    - id: onward_hop_without_new_login
+      name: Outbound SSH flow unaccounted for by any session
+      description: >-
+        The host originated an SSH connection to another internal system in a window where no
+        login on this host can account for it, which is what riding a session looks like from
+        the network.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: lateral_movement_progression
+    - id: no_precedent_for_socket_reuse
+      name: No comparable socket reuse in the baseline
+      description: >-
+        Explicit socket attachment by this account on this host does not appear during the
+        baseline window, so the behaviour is a deviation rather than a habit.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: socket_owner_is_the_caller
+      name: Socket belongs to the account using it
+      description: >-
+        Identity context shows the socket owner and the account running the process are the
+        same person, which is ordinary agent forwarding rather than a hijack.
+      source: identity_context
+      field: UserName
+      indicates: expected_user_activity
+    - id: terminal_multiplexer_refresh
+      name: Reattached terminal multiplexer session
+      description: >-
+        The variable was re-exported by a terminal multiplexer or its wrapper on reattach,
+        which rewrites the agent socket path as a matter of course.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_application_component
+    - id: sanctioned_multiplexing_host
+      name: Host multiplexes SSH by design
+      description: >-
+        The host is a bastion or deployment runner where connection multiplexing and control
+        sockets are configured deliberately to avoid repeated handshakes.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - foreign_agent_socket_used
+
+    supporting:
+      any:
+        - cross_user_process_context
+        - agent_sockets_enumerated
+        - onward_hop_without_new_login
+        - no_precedent_for_socket_reuse
+      all:
+        - cross_user_process_context
+        - onward_hop_without_new_login
+
+    contradicting:
+      any:
+        - socket_owner_is_the_caller
+        - terminal_multiplexer_refresh
+        - sanctioned_multiplexing_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - foreign_agent_socket_used
+      - socket_owner_is_the_caller
+      - terminal_multiplexer_refresh
+      - sanctioned_multiplexing_host
+    suspicious_when:
+      - foreign_agent_socket_used
+      - no_precedent_for_socket_reuse
+    high_risk_when:
+      - foreign_agent_socket_used
+      - cross_user_process_context
+      - agent_sockets_enumerated
+      - onward_hop_without_new_login
+
+  false_positive:
+    - condition: A user forwards their own agent and hops from a jump host.
+      explanation: >-
+        Agent forwarding exists precisely so this works, and the onward hop leaves the same
+        network trace. The separator is ownership: in the benign case the socket, the shell
+        and the destination all belong to one person, and no directory search precedes the use.
+    - condition: A terminal multiplexer rewrites the agent socket on reattach.
+      explanation: >-
+        Reattaching a detached session updates the agent socket variable so the old session
+        can sign again, which looks like explicit attachment. The parent is the multiplexer or
+        its wrapper script and the socket still belongs to the reattaching user.
+    - condition: Build tooling multiplexes SSH connections to reduce handshake cost.
+      explanation: >-
+        Control sockets are a performance feature and pipelines set them by configuration.
+        These runs come from a fixed automation identity, name a control path inside the
+        automation's own working directory, and repeat on every build.
+    - condition: An engineer inspects sockets while debugging agent forwarding.
+      explanation: >-
+        Troubleshooting forwarding involves exactly the listing and reading that reconnaissance
+        does. It is interactive, tied to a named engineer with a ticket, and is not followed by
+        an outbound connection to a host that engineer has never reached.
