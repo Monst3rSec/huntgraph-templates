@@ -1,0 +1,420 @@
+type: detection
+
+id: hg-win-command-line-concealed-with-invisible-unicode-t1027-018
+version: 1.0.0
+
+info:
+  name: Command line concealed with invisible Unicode characters
+  description: >-
+    Unicode reserves a set of code points that occupy bytes but render as nothing at all:
+    zero-width spaces and joiners, word joiners, soft hyphens, byte order marks, the
+    bidirectional embedding and override controls, variation selectors, the tag block, and
+    the private use areas that a font simply declines to draw. Each is a legitimate part of
+    the standard and each is invisible in a terminal, a code editor, a ticket, a pull request
+    and an alert console. That gap between what a reviewer reads and what an interpreter
+    parses is the whole technique. Zero-width characters break up a keyword so that a
+    signature looking for it fails while the shell still resolves the command; the
+    bidirectional overrides reorder a line so that the text on screen is not the text in
+    execution order; private use and tag code points carry an entire encoded payload through
+    a file that looks empty, to be reassembled at runtime by a decode-and-evaluate step.
+    What makes this worth writing precisely is that unlike almost every other evasion here,
+    the discriminator is not a judgement call. These code points have no business in a
+    Windows command line. Paths do not contain them, arguments do not need them, and no
+    installer, agent or administrator types one deliberately. There is a genuine benign
+    population and it is small and shaped: a byte order mark leading a line that was pasted
+    out of a UTF-8 file, and real bidirectional marks inside genuinely Arabic or Hebrew text
+    in an estate that uses those languages. Both are recognisable and both are handled
+    explicitly below. Everything else that survives is a command line written to be read as
+    something other than what it does.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - obfuscation
+    - invisible-unicode
+    - command-line
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1027/018
+    - https://attack.mitre.org/detectionstrategies/DET0920
+    - https://attack.mitre.org/techniques/T1027
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1027
+  sub_techniques:
+    - T1027.018
+  detection_strategies:
+    - DET0920
+  analytics:
+    - AN2063
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may embed non-rendering Unicode code points in commands, arguments and file
+    names so that inspection by a human or by a keyword signature sees benign text, obtaining
+    execution of content that was never visible to whoever approved or reviewed it.
+  attacker_behavior:
+    - Splits keywords with zero-width characters so string matching fails but parsing succeeds.
+    - Encodes a payload entirely in private use or tag code points and rebuilds it at runtime.
+    - Uses bidirectional overrides so the displayed order of a command differs from its execution order.
+    - Names dropped files with invisible characters so two different files read identically.
+    - Follows the reconstruction immediately with a decode-and-evaluate step in the same process.
+  legitimate_behavior:
+    - Text pasted from a UTF-8 file can carry a leading byte order mark into an argument.
+    - Genuinely bidirectional languages use directional marks inside ordinary text.
+    - Some applications place emoji with variation selectors into window titles and arguments.
+    - Localisation and translation tooling handles files full of formatting characters by design.
+    - Copying a path out of a document or web page can pick up a soft hyphen.
+  risk_indicator:
+    - Invisible code points appear inside a command line rather than at its start.
+    - The process carrying them is an interpreter or a script host.
+    - The same command line also contains a decode or dynamic evaluation primitive.
+    - The estate has no bidirectional language usage that would explain directional marks.
+    - The process spawns a child or connects outbound immediately afterwards.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - RemoteAddressIP4
+        - RemotePort
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: zero-width-or-bidi-characters-in-a-command-line
+        name: Zero-width or bidirectional control characters in a command line
+        purpose: >-
+          The primary case, and a rare one in this corpus in that it needs almost no tuning.
+          The class covers the soft hyphen, the Arabic letter mark, the Mongolian vowel
+          separator, the zero-width space, joiner and non-joiner, the left-to-right and
+          right-to-left marks, the embedding, override and isolate controls, the word joiner
+          and invisible operators, the byte order mark and the interlinear annotation
+          characters. None of these render, and none belong in a Windows command line. The
+          one benign shape worth carving out is a byte order mark leading a line pasted from
+          a UTF-8 file, which is excluded directly rather than left to a filter.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/[\x{00AD}\x{061C}\x{180E}\x{200B}-\x{200F}\x{202A}-\x{202E}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{FEFF}\x{FFF9}-\x{FFFB}]/
+          | CommandLine!=/^\x{FEFF}[^\x{00AD}\x{061C}\x{180E}\x{200B}-\x{200F}\x{202A}-\x{202E}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{FEFF}\x{FFF9}-\x{FFFB}]*$/
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Applications known to pass emoji or directional marks in window titles, identified by FileName"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: private-use-or-tag-characters-in-a-command-line
+        name: Private use, tag or variation selector characters in a command line
+        purpose: >-
+          Cover the carrier classes rather than the separator classes. Private use area code
+          points have no assigned meaning, so a font that does not define them draws nothing,
+          which is what makes them usable as a payload alphabet. The tag block and the
+          variation selector supplement behave the same way and are the ranges used to smuggle
+          text past editors and past systems that read text on a person's behalf. These are
+          kept apart from the zero-width case because their small benign population is
+          different: icon fonts and emoji rather than pasted text.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/[\x{E000}-\x{F8FF}\x{FE00}-\x{FE0F}\x{E0000}-\x{E007F}\x{E0100}-\x{E01EF}\x{F0000}-\x{FFFFD}\x{100000}-\x{10FFFD}]/
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Terminal and shell wrappers that render icon-font glyphs in their own arguments"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: hidden-characters-with-runtime-reconstruction
+        name: Hidden characters alongside a decode or evaluate step
+        purpose: >-
+          Escalate from concealment to execution. Invisible code points are inert on their
+          own; they become a payload when the same command line also contains the machinery
+          that turns text back into code — base64 decoding, character arithmetic, string
+          joining, or dynamic evaluation. This pairing is the technique as MITRE describes it
+          and should be triaged ahead of the broader cases.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/[\x{00AD}\x{061C}\x{180E}\x{200B}-\x{200F}\x{202A}-\x{202E}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{FEFF}\x{E000}-\x{F8FF}\x{FE00}-\x{FE0F}\x{E0000}-\x{E007F}\x{F0000}-\x{FFFFD}]/
+          | CommandLine=/(FromBase64String|Invoke-Expression|\bIEX\b|\beval\s*\(|new\s+Function\s*\(|\[char\]|\[convert\]::|-join\s|Add-Type|Proxy\s*\(|codePointAt|charCodeAt|String\.fromCharCode)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: file-written-with-hidden-characters-in-its-name
+        name: Script or executable written with invisible characters in its path
+        purpose: >-
+          Extend the same idea to the artefact. A file whose name contains non-rendering code
+          points reads identically to a legitimate one in any directory listing, review or
+          allowlist entry while being a different file to the filesystem. Catching it at write
+          time gives the path to hunt on before anything executes.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten|NewScriptWritten)$/
+          | TargetFileName=/[\x{00AD}\x{061C}\x{180E}\x{200B}-\x{200F}\x{202A}-\x{202E}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{FEFF}\x{E000}-\x{F8FF}\x{FE00}-\x{FE0F}\x{E0000}-\x{E007F}]/
+          | groupBy([ComputerName, TargetFileName, ContextProcessId, SHA256HashData],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "User document directories in estates that store files named in bidirectional scripts"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: egress-from-a-process-carrying-hidden-characters
+        name: Outbound connection from a process launched with hidden characters
+        purpose: >-
+          Confirm the concealment served a purpose. Matching the process that carried the
+          invisible code points to its own outbound connections turns an obfuscated argument
+          list into observed retrieval or controller contact, and gives triage a second stage
+          to work from rather than a curiosity about encoding.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | CommandLine=/[\x{00AD}\x{061C}\x{180E}\x{200B}-\x{200F}\x{202A}-\x{202E}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{FEFF}\x{E000}-\x{F8FF}\x{FE00}-\x{FE0F}\x{E0000}-\x{E007F}]/
+                | hidden_pid := TargetProcessId ;
+              #event_simpleName=NetworkConnectIP4
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/ ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([CommandLine, FileName, RemoteAddressIP4, RemotePort]),
+                              count(as=events)])
+          | hidden_pid = ContextProcessId
+        filters:
+          include: []
+          exclude:
+            - "RemoteAddressIP4 within approved vendor and update ranges"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: invisible_codepoints_in_command_line
+      name: Non-rendering code points in a command line
+      description: >-
+        The command line contains zero-width, bidirectional control, private use, tag or
+        variation selector characters, so the text an analyst or a signature reads is not the
+        text the interpreter parsed.
+      source: process_creation
+      field: CommandLine
+      indicates: command_obfuscation
+
+  supporting:
+    - id: runtime_reconstruction
+      name: Decode or evaluate step in the same command
+      description: >-
+        The same command line carries base64 decoding, character arithmetic, string joining or
+        dynamic evaluation, which is the machinery that turns concealed text back into
+        executable code at runtime.
+      source: process_creation
+      field: CommandLine
+      indicates: payload_reconstruction
+    - id: interpreter_carried_it
+      name: Carried by a script host
+      description: >-
+        The process holding the hidden characters is an interpreter or script host rather than
+        an ordinary application, which is where concealed text becomes instructions.
+      source: process_creation
+      field: FileName
+      indicates: script_interpreter_execution
+    - id: hidden_characters_in_written_path
+      name: File written with invisible characters in its name
+      description: >-
+        A script or executable was written under a path containing non-rendering code points,
+        so it reads identically to a legitimate file in any listing or allowlist.
+      source: file_creation
+      field: TargetFileName
+      indicates: artifact_concealment
+    - id: egress_from_hidden_process
+      name: The obfuscated process connected outbound
+      description: >-
+        The process launched with concealed characters opened an external connection, showing
+        the reconstruction led to retrieval or controller contact.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: execution_chain_progression
+    - id: unusual_for_host
+      name: No history of such characters on this host
+      description: >-
+        No command line on this host has carried these code points during the baseline window,
+        so their appearance is new rather than a property of installed software.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: bidirectional_language_content
+      name: Genuine bidirectional text in an argument
+      description: >-
+        The directional marks sit inside real Arabic, Hebrew or Persian text in a path or
+        argument, in an estate where those languages are used, which is what those code points
+        exist for.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_localisation
+    - id: editor_emitted_byte_order_mark
+      name: Byte order mark carried in from a file
+      description: >-
+        The only hidden character is a byte order mark at the start of the line, produced by
+        an editor or by text pasted out of a UTF-8 file rather than placed deliberately.
+      source: derived
+      field: CommandLine
+      indicates: encoding_artifact
+    - id: fleetwide_identical_invocation
+      name: Same command line across the estate
+      description: >-
+        The identical argument appears on many hosts, which makes it a property of installed
+        software — some products do pass emoji and variation selectors — rather than something
+        an operator typed on one machine.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - invisible_codepoints_in_command_line
+
+    supporting:
+      any:
+        - runtime_reconstruction
+        - interpreter_carried_it
+        - hidden_characters_in_written_path
+        - egress_from_hidden_process
+        - unusual_for_host
+      all:
+        - runtime_reconstruction
+        - interpreter_carried_it
+
+    contradicting:
+      any:
+        - bidirectional_language_content
+        - editor_emitted_byte_order_mark
+        - fleetwide_identical_invocation
+      all: []
+
+  verdict:
+    low_risk_when:
+      - invisible_codepoints_in_command_line
+      - bidirectional_language_content
+      - editor_emitted_byte_order_mark
+      - fleetwide_identical_invocation
+    suspicious_when:
+      - invisible_codepoints_in_command_line
+      - interpreter_carried_it
+      - unusual_for_host
+    high_risk_when:
+      - invisible_codepoints_in_command_line
+      - runtime_reconstruction
+      - interpreter_carried_it
+      - hidden_characters_in_written_path
+      - egress_from_hidden_process
+
+  false_positive:
+    - condition: A byte order mark is pasted into a command from a UTF-8 file.
+      explanation: >-
+        Copying the first line out of a UTF-8 encoded script or configuration file brings the
+        byte order mark with it, and it survives into the command line. It appears once, at
+        the very start, with no other hidden characters anywhere in the line, which the
+        primary query excludes directly.
+    - condition: Paths or arguments contain genuine Arabic, Hebrew or Persian text.
+      explanation: >-
+        Bidirectional marks and isolates are the correct way to render mixed-direction text,
+        so they legitimately appear inside file names and arguments in estates that use those
+        languages. The marks sit adjacent to characters from those scripts rather than being
+        embedded in an otherwise ASCII keyword, and the same paths recur for the same users.
+    - condition: An application passes emoji or icon glyphs in its arguments.
+      explanation: >-
+        Terminal wrappers, chat clients and some developer tooling put emoji with variation
+        selectors or icon-font private use glyphs into window titles and arguments. These come
+        from a fixed set of processes, repeat identically across every host running the
+        product, and are never accompanied by a decode or evaluation primitive.
+    - condition: Localisation or translation tooling processes files full of format characters.
+      explanation: >-
+        Translation memory and localisation utilities handle text carrying directional and
+        joining characters as their normal input, and those strings can reach a command line
+        as file paths. This activity is confined to the users and hosts doing that work and
+        involves the tooling's own executables rather than a shell.
+    - condition: A soft hyphen is copied from a web page or document into a path.
+      explanation: >-
+        Soft hyphens are inserted by typesetting to allow line breaking and survive copy and
+        paste, so a path lifted from documentation can carry one. It appears in a path
+        fragment rather than inside a keyword, and the command otherwise fails or runs a
+        perfectly ordinary program.

@@ -1,0 +1,363 @@
+type: detection
+
+id: hg-win-macro-source-replaced-leaving-compiled-p-code-t1564-007
+version: 1.0.0
+
+info:
+  name: Macro source replaced leaving compiled p-code
+  description: >-
+    An Office document with macros stores two versions of the same code. The VBA source lives
+    in the module stream and is what every macro scanner, every analyst and every editor
+    window shows you. Beside it sits a performance cache holding p-code, the compiled form
+    the host application actually runs when its version matches the one recorded in the
+    project stream. Stomping overwrites the source with zeros, blank lines or something
+    innocuous and leaves the p-code untouched. The document then presents an empty or
+    harmless macro to anything that reads source, while Word or Excel executes the original.
+    Some tooling concludes there are no macros at all. The real discriminator is a mismatch
+    between those two streams, and that is a file-analysis result: it comes from opening the
+    document with a p-code disassembler, not from any event an endpoint emits. This template
+    is therefore deliberately narrow. Its anchor is the handling of VBA project internals on
+    a host — the stomping utilities, the p-code dumpers and the OLE stream editors, which
+    name the project and cache streams outright in their arguments and have no other use.
+    Around that anchor sit the effects that are visible: an Office application starting an
+    interpreter, an Office application writing an executable, and a macro-enabled document
+    being opened out of a delivery directory. Those effects are shared with every other macro
+    attack, so they escalate the finding rather than establish it.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - hide-artifacts
+    - vba-stomping
+    - office-macro
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1564/007
+    - https://attack.mitre.org/detectionstrategies/DET0012
+    - https://attack.mitre.org/techniques/T1564
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1564
+  sub_techniques:
+    - T1564.007
+  detection_strategies:
+    - DET0012
+  analytics:
+    - AN0034
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary may overwrite the VBA source inside an Office document while leaving the
+    compiled p-code intact so that anything reading the macro sees benign or empty code,
+    obtaining execution of a payload that survives source-level inspection and, in some
+    tooling, is not reported as a macro at all.
+  attacker_behavior:
+    - Runs a stomping utility that rewrites module streams and leaves the performance cache.
+    - Edits the project stream so the recorded Office version matches the intended target.
+    - Dumps or verifies the p-code afterwards to confirm the payload still executes.
+    - Delivers the document so the user opens it from mail or a download directory.
+    - Lets the macro spawn an interpreter or drop a payload once the document is opened.
+  legitimate_behavior:
+    - Incident responders and malware analysts run the same OLE and p-code tooling on samples.
+    - Red teams build stomped documents as part of authorised exercises.
+    - Developers maintain Office add-ins and macro-enabled templates.
+    - Finance and reporting workflows open macro-enabled workbooks all day.
+    - Document conversion tooling reads and rewrites OLE structures in bulk.
+  risk_indicator:
+    - VBA project internals are manipulated on a host with no analysis or development role.
+    - The stomping utility runs under an interactive user rather than an analysis account.
+    - An Office application spawns an interpreter or writes an executable in the same window.
+    - The document was opened from a mail or download directory rather than a document store.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: vba-project-streams-manipulated
+        name: VBA project or p-code streams handled directly
+        purpose: >-
+          The anchor case. Stomping utilities, p-code disassemblers and OLE stream editors
+          name the project stream, the performance cache or their own stomping switches in
+          plain text. Nothing in ordinary document use touches these structures by name, so
+          the presence of such a command line on a workstation is the closest an endpoint gets
+          to observing the source and p-code being pulled apart.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(EvilClippy|macro_pack[^|]*(--stomp|-G\b)|pcodedmp|olevba|oledump|oleobj|msoffcrypto|_VBA_PROJECT|PerformanceCache|\bdir\s+stream\b|vbaProject\.bin)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Malware analysis and incident response workstations where OLE tooling is expected"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: office-application-spawned-an-interpreter
+        name: Office application starting a script host
+        purpose: >-
+          Observe the p-code executing. A stomped document behaves like any other malicious
+          macro at the moment it runs, and the parent-child pair is the only endpoint evidence
+          that the compiled code did something. It is shared with every macro technique, which
+          is why it escalates a stomping finding rather than defining one.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(winword|excel|powerpnt|msaccess|outlook|mspub|visio)\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32|certutil|curl|bitsadmin|msbuild|installutil)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved Office add-ins and reporting macros that shell out by design"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - parent_process
+
+      - id: office-application-wrote-an-executable
+        name: Executable written by an Office application
+        purpose: >-
+          Catch the other outcome of a macro running: a payload dropped rather than a process
+          spawned. Correlating the Office process to the write shows the document produced the
+          file, which no document-editing workflow does.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|PeFileWritten|NewExecutableWritten|NewScriptWritten)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | FileName=/^(winword|excel|powerpnt|msaccess|mspub|visio)\.exe$/i
+                | office_pid := TargetProcessId ;
+              #event_simpleName=/^(PeFileWritten|NewExecutableWritten|NewScriptWritten)$/
+                | TargetFileName=/\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\/i ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([TargetFileName, SHA256HashData, FileName]),
+                              count(as=events)])
+          | office_pid = ContextProcessId
+        filters:
+          include: []
+          exclude:
+            - "Template and add-in caches written by Office during ordinary startup"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: macro-document-opened-from-a-delivery-path
+        name: Macro-enabled document opened from mail or downloads
+        purpose: >-
+          Establish delivery. A stomped document has to reach a user before its p-code matters,
+          and a macro-enabled file opened straight out of a mail cache or a download directory
+          is the delivery shape. On its own it is common; alongside the anchor it tells you
+          which document to pull for stream-level analysis.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(winword|excel|powerpnt|msaccess|mspub|visio)\.exe$/i
+          | CommandLine=/\.(docm|dotm|xlsm|xltm|xlam|pptm|potm|ppam|doc|xls|ppt)\b/i
+          | CommandLine=/\\(Downloads|Content\.Outlook|INetCache|Temp|Users\\Public)\\/i
+          | groupBy([ComputerName, UserName, FileName],
+                    function=[count(as=opens), collect([CommandLine], limit=5)])
+          | sort(opens, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Shared macro-enabled workbooks distributed through mail as a business process"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - path
+
+evidence:
+  required:
+    - id: vba_project_streams_manipulated
+      name: VBA project internals handled directly
+      description: >-
+        A command line named the VBA project stream, the p-code performance cache, a stomping
+        switch or a p-code disassembler, which is the only endpoint-visible handling of the
+        two streams whose divergence defines this technique.
+      source: process_creation
+      field: CommandLine
+      indicates: macro_source_manipulation
+
+  supporting:
+    - id: office_spawned_interpreter
+      name: Office application started a script host
+      description: >-
+        An Office process launched an interpreter or a proxy execution binary, which is what
+        the compiled p-code doing its work looks like from outside the document.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: macro_execution
+    - id: office_wrote_executable
+      name: Office application wrote an executable
+      description: >-
+        A file was written into a user-writable directory by an Office process, so the
+        document produced a payload rather than only editing content.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: document_opened_from_delivery_path
+      name: Macro-enabled document opened from a delivery directory
+      description: >-
+        The document was opened out of a mail cache, download or temporary directory rather
+        than from a document store, which is the shape of a delivered carrier.
+      source: process_creation
+      field: CommandLine
+      indicates: user_execution_foothold
+    - id: unusual_for_host
+      name: No history of OLE tooling on this host
+      description: >-
+        Nothing has handled VBA project internals on this host during the baseline window, so
+        the activity is new rather than part of a routine analysis or development workflow.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: analysis_workstation
+      name: Malware analysis or incident response host
+      description: >-
+        The machine belongs to a security team, where p-code dumpers and OLE parsers are
+        everyday tools applied to samples that are supposed to be malicious.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_security_operations
+    - id: macro_development_work
+      name: Office add-in or macro development
+      description: >-
+        The user maintains Office add-ins or macro-enabled templates, where inspecting and
+        rewriting VBA project structures is ordinary engineering work.
+      source: process_creation
+      field: UserName
+      indicates: expected_developer_activity
+    - id: document_conversion_pipeline
+      name: Bulk document conversion
+      description: >-
+        The tooling is running across many documents in sequence on a server as part of a
+        conversion, migration or archiving job rather than against a single carrier.
+      source: baseline
+      field: CommandLine
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - vba_project_streams_manipulated
+
+    supporting:
+      any:
+        - office_spawned_interpreter
+        - office_wrote_executable
+        - document_opened_from_delivery_path
+        - unusual_for_host
+      all:
+        - office_spawned_interpreter
+        - document_opened_from_delivery_path
+
+    contradicting:
+      any:
+        - analysis_workstation
+        - macro_development_work
+        - document_conversion_pipeline
+      all: []
+
+  verdict:
+    low_risk_when:
+      - vba_project_streams_manipulated
+      - analysis_workstation
+      - macro_development_work
+      - document_conversion_pipeline
+    suspicious_when:
+      - vba_project_streams_manipulated
+      - unusual_for_host
+    high_risk_when:
+      - vba_project_streams_manipulated
+      - office_spawned_interpreter
+      - office_wrote_executable
+      - document_opened_from_delivery_path
+
+  false_positive:
+    - condition: An analyst runs p-code and OLE tooling against a sample.
+      explanation: >-
+        Incident response uses exactly these utilities, and stomped documents are precisely
+        what they are pointed at. The work happens on analysis workstations under security
+        team accounts, against files in a sample or quarantine directory, and produces no
+        Office execution afterwards.
+    - condition: A red team builds stomped documents for an authorised exercise.
+      explanation: >-
+        This is the technique being performed deliberately and will look identical in
+        telemetry. It should be resolved against the exercise schedule and the operator's
+        host rather than by any property of the events.
+    - condition: A developer maintains a macro-enabled template or add-in.
+      explanation: >-
+        Add-in work involves reading and rewriting VBA project structures, and add-ins do
+        sometimes shell out. It runs from a project directory under a developer account, and
+        the same documents recur over weeks rather than arriving once from mail.
+    - condition: A reporting workbook opened from mail runs a macro that calls a shell.
+      explanation: >-
+        Finance and reporting macros legitimately spawn interpreters and are distributed by
+        mail, which reproduces the supporting evidence entirely. The template does not
+        escalate on that alone: without the project-stream handling there is no stomping
+        finding, only ordinary macro use.
+    - condition: A conversion or archiving job parses OLE documents in bulk.
+      explanation: >-
+        Migration tooling reads the same structures across thousands of files. It runs on a
+        server under a service account against a document repository, in a continuous sequence
+        rather than against one recently delivered file.

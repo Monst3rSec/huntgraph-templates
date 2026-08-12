@@ -1,0 +1,341 @@
+type: detection
+
+id: hg-win-deliberate-delay-inserted-before-payload-execution-t1678
+
+version: 1.0.0
+
+info:
+  name: Deliberate delay inserted before payload execution
+  description: >-
+    Automated analysis gives a sample a fixed budget of a few minutes, so anything that
+    still has not acted when the clock runs out is recorded as harmless. Waiting is
+    therefore the cheapest evasion available, and it costs the adversary nothing but time
+    on a host they already control. Most of that waiting happens inside the process through
+    sleep APIs and never reaches a sensor, but a large share of real intrusions delegate
+    the wait to ordinary tooling instead: a ping with a high count, a timeout, a
+    Start-Sleep, or a one-off scheduled task set to fire later. Those leave a command line.
+    The observable is not the delay by itself, which build scripts and installers produce
+    constantly, but a delay long enough to outlast a sandbox arriving with an execution
+    chain attached to it — chained in the same command, launched by a document handler or
+    archive tool, or repeated in a loop that serves no purpose except to burn time.
+  severity: medium
+  author: huntgraph
+  tags:
+    - stealth
+    - anti-analysis
+    - execution-delay
+    - sandbox-evasion
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1678
+    - https://attack.mitre.org/detectionstrategies/DET0372
+    - https://attack.mitre.org/techniques/T1497/003
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1678
+  sub_techniques: []
+  detection_strategies:
+    - DET0372
+  analytics:
+    - AN1048
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may delegate a long deliberate wait to native tooling before running the
+    next stage, so that automated analysis times out and reports the sample as inert while
+    the payload still executes on the real victim host once nobody is watching.
+  attacker_behavior:
+    - Chains a high-count ping or a timeout to the payload in a single command line.
+    - Calls Start-Sleep or Thread.Sleep with a duration far longer than any script needs.
+    - Repeats short delay commands in a loop to accumulate time without one long call.
+    - Registers a one-off scheduled task with a start time hours or days in the future.
+  legitimate_behavior:
+    - Installers wait for a service or driver to settle before continuing.
+    - Batch scripts poll for network or share availability with ping in a retry loop.
+    - Deployment tooling schedules a one-off reboot or task outside working hours.
+    - Backup and maintenance scripts pace themselves between long-running steps.
+  risk_indicator:
+    - The delay and the follow-on execution appear in the same command line.
+    - The payload the delay leads to sits under a user-writable path.
+    - The delay command was launched by a document handler, archive tool or script host.
+    - The same delay primitive is invoked dozens of times under one parent.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: delay-chained-to-follow-on-execution
+        name: Long delay and the next stage in one command line
+        purpose: >-
+          Surface the single strongest form of the technique, where the wait and the thing
+          it protects are visible together, so the intent behind the delay is not left to
+          inference. A script that waits for a service does not name a payload under a
+          user-writable path on the other side of the ampersand.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(cmd|powershell|pwsh)\.exe$/i
+          | CommandLine=/(ping[^\s]*\s+[^&|]*-n\s+\d{2,}|timeout[^\s]*\s+\/t\s+\d{2,}|waitfor[^\s]*\s+\/t\s+\d{2,}|choice[^\s]*\s+[^&|]*\/t\s+\d{2,}|Start-Sleep\s+(-Seconds\s+)?\d{2,})/i
+          | CommandLine=/(&&|\|\||;)\s*\"?[^\"]{0,40}(%temp%|%appdata%|%programdata%|%public%|\\AppData\\|\\Users\\Public\\|\\ProgramData\\)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=chains), collect([CommandLine], limit=5)])
+          | sort(chains, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Software packaging and deployment scripts that stage to ProgramData by design"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: long-delay-under-a-delivery-parent
+        name: Multi-minute delay requested by a delivery-style parent
+        purpose: >-
+          Catch the delay on its own when the ancestry already says the process had no
+          business waiting. Documents, archives and script hosts do not legitimately ask
+          the operating system to pause for minutes, and a duration in that range is chosen
+          to outlast an analysis window rather than to pace a task.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Start-Sleep\s+(-Seconds\s+)?\d{3,}|Start-Sleep\s+-Milliseconds\s+\d{5,}|Thread\]?::Sleep\(\s*\d{5,}|timeout[^\s]*\s+\/t\s+\d{3,}|ping[^\s]*\s+[^&|]*-n\s+\d{3,}|waitfor[^\s]*\s+\/t\s+\d{3,})/i
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|onenote|mshta|wscript|cscript|hh|7zfm|7zg|winrar|rar|explorer|msedge|chrome|firefox|acrord32)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=delays), collect([CommandLine], limit=5)])
+          | sort(delays, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Developer workstations where interactive shells are launched from editors and terminals"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - command_line
+
+      - id: delay-primitive-invoked-in-a-loop
+        name: Delay command repeated many times under one parent
+        purpose: >-
+          Find the loop variant, where no single call is long enough to look odd but the
+          accumulated wait is. Rank by invocation count under one parent, since a retry
+          loop that reaches its target stops early while a timing loop always runs to its
+          full count.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(ping|timeout|waitfor|choice)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=invocations), collect([CommandLine], limit=3)])
+          | invocations >= 20
+          | sort(invocations, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Network diagnostic and monitoring scripts that poll reachability continuously"
+            - "Build and test agents where retry loops are part of normal pipeline steps"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - process
+
+      - id: one-off-task-scheduled-for-a-future-time
+        name: Single-run scheduled task registered to fire later
+        purpose: >-
+          Cover the delay that outlives the process which set it. Handing the wait to the
+          scheduler survives a reboot and detaches the payload from its delivery chain,
+          which is why a one-off task with an explicit future start date is a delay
+          mechanism rather than ordinary scheduling.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^schtasks\.exe$/i
+          | CommandLine=/\/create/i
+          | CommandLine=/\/sc\s+once/i
+          | CommandLine=/\/(st|sd)\s+\S+/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=tasks), collect([CommandLine], limit=5)])
+          | sort(tasks, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Patch and deployment agents that schedule one-off reboots in maintenance windows"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+evidence:
+  required:
+    - id: deliberate_delay_invoked
+      name: Long delay requested through native tooling
+      description: >-
+        A command line asks the host to wait for a period measured in minutes, using ping
+        counts, timeout, waitfor, choice or a sleep call, rather than performing work.
+      source: process_creation
+      field: CommandLine
+      indicates: execution_delay_primitive
+
+  supporting:
+    - id: delay_chained_to_payload
+      name: Delay and follow-on execution in the same command
+      description: >-
+        The same command line that requests the wait also names what runs afterwards, and
+        that target sits under a temporary or user-writable path.
+      source: process_creation
+      field: CommandLine
+      indicates: staged_execution_chain
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        The waiting process was launched by a document handler, archive utility, mail
+        client, browser or script host rather than by an installer or deployment agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: repeated_delay_invocations
+      name: Delay primitive invoked repeatedly under one parent
+      description: >-
+        The same delay command was run many times in succession, accumulating a long wait
+        out of individually unremarkable calls.
+      source: process_creation
+      field: FileName
+      indicates: analysis_timeout_evasion
+    - id: deferred_task_registered
+      name: One-off task scheduled for a future time
+      description: >-
+        A single-run scheduled task was created with an explicit future start, moving the
+        payload beyond the lifetime of the process that delivered it.
+      source: process_creation
+      field: CommandLine
+      indicates: deferred_execution_registered
+    - id: rare_for_host
+      name: No history of this delay pattern on the host
+      description: >-
+        This combination of delay command and parent has not been seen on the host during
+        the baseline window, unlike scripted waits which recur with their scripts.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: installer_or_deployment_context
+      name: Installer or deployment agent in the ancestry
+      description: >-
+        The delay was requested by a package installer, patch agent or configuration
+        management tool, where waiting for a service or reboot is part of the workflow.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: readiness_wait
+      name: Wait paired with a readiness check
+      description: >-
+        The command waits on a named service, share, port or process rather than on a fixed
+        duration, which is a synchronisation step and not a timing evasion.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_application_component
+    - id: recurring_pattern
+      name: Same delay recurs on a stable schedule
+      description: >-
+        The identical command appears at regular intervals across many hosts, which is
+        scripted maintenance rather than a one-off decision to wait.
+      source: baseline
+      field: ComputerName
+      indicates: scheduled_automation_job
+
+  risk_logic:
+    required:
+      - deliberate_delay_invoked
+
+    supporting:
+      any:
+        - delay_chained_to_payload
+        - delivery_parent
+        - repeated_delay_invocations
+        - deferred_task_registered
+        - rare_for_host
+      all:
+        - delay_chained_to_payload
+        - delivery_parent
+
+    contradicting:
+      any:
+        - installer_or_deployment_context
+        - readiness_wait
+        - recurring_pattern
+      all: []
+
+  verdict:
+    low_risk_when:
+      - deliberate_delay_invoked
+      - installer_or_deployment_context
+      - readiness_wait
+      - recurring_pattern
+    suspicious_when:
+      - deliberate_delay_invoked
+      - rare_for_host
+    high_risk_when:
+      - deliberate_delay_invoked
+      - delay_chained_to_payload
+      - delivery_parent
+      - repeated_delay_invocations
+
+  false_positive:
+    - condition: An installer waits for a service or driver to finish initialising.
+      explanation: >-
+        Setup routines routinely insert timeout or ping waits between steps, and some run
+        to several minutes. They appear under a package installer or patch agent, the wait
+        is followed by more setup activity rather than by a payload under a temporary path,
+        and the same sequence repeats identically wherever the package is deployed.
+    - condition: A batch script polls for network or share availability with ping.
+      explanation: >-
+        Retry loops built on ping produce exactly the repeated-invocation pattern. The
+        discriminator is what the loop is waiting on — a readiness loop names a host or
+        share and stops as soon as it succeeds, so its invocation counts vary, while a
+        timing loop always runs its full count and targets loopback or a public resolver.
+    - condition: Deployment tooling schedules a one-off reboot or task out of hours.
+      explanation: >-
+        Patch management creates single-run tasks with future start times as a matter of
+        course. These come from a known agent, land on many hosts in the same maintenance
+        window, and the task action points at a signed binary in an installation directory.
+    - condition: A developer or administrator runs a sleep in an interactive shell.
+      explanation: >-
+        Interactive troubleshooting and ad-hoc scripting produce long sleeps with no
+        pattern. The ancestry is a terminal, editor or remote management session tied to a
+        named engineer, and nothing is chained behind the wait.
