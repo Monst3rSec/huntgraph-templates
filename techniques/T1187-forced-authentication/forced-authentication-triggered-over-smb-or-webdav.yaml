@@ -1,0 +1,264 @@
+type: detection
+
+id: hg-win-forced-authentication-triggered-over-smb-or-webdav-t1187
+version: 1.0.0
+
+info:
+  name: Forced authentication triggered over SMB or WebDAV
+  description: >-
+    Forced authentication turns the victim into the credential delivery mechanism. The
+    attacker does not need code execution first; they only need the endpoint to touch a
+    crafted SMB or WebDAV path so Windows offers NTLM material to the remote host. The
+    observable is therefore not a suspicious process alone but a process creating or
+    referencing a UNC or WebDAV path that immediately results in outbound authentication.
+  severity: high
+  author: huntgraph
+  tags:
+    - credential-access
+    - forced-authentication
+    - ntlm
+    - smb
+    - webdav
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1187
+    - https://attack.mitre.org/detectionstrategies/DET0022
+
+mitre:
+  tactics:
+    - TA0006
+  techniques:
+    - T1187
+  sub_techniques: []
+  detection_strategies:
+    - DET0022
+  analytics:
+    - AN0065
+  platforms:
+    - Windows
+  data_sources:
+    - NSM:Flow
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - File Creation
+    - File Modification
+    - Network Traffic Content
+    - Network Traffic Flow
+
+hypothesis:
+  statement: >-
+    An adversary may induce a Windows host to authenticate to an attacker-controlled SMB
+    or WebDAV resource by causing a process to create, open or resolve a remote path,
+    exposing NTLM material without needing interactive credentials or prior execution on
+    the target.
+  attacker_behavior:
+    - Embeds a remote UNC or WebDAV path in a document, shortcut, template or script.
+    - Causes Explorer, Office or another user-facing process to touch the remote path.
+    - Collects the resulting NTLM authentication on an attacker-controlled host.
+  legitimate_behavior:
+    - Users open files from approved internal SMB shares.
+    - Office and Explorer regularly browse sanctioned intranet document repositories.
+    - Enterprise file workflows may reference trusted WebDAV endpoints.
+  risk_indicator:
+    - A user-facing process references a remote path the host has not contacted before.
+    - The remote path points to an external or non-corporate address.
+    - The same process that referenced the path is followed by outbound SMB or WebDAV traffic.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: user-facing-process-references-unc
+        name: User-facing process references a UNC path
+        purpose: >-
+          Surface the initial trigger point where Explorer, Office or a script host touches
+          a remote SMB path and causes Windows to negotiate authentication.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(explorer\.exe|winword\.exe|excel\.exe|powerpnt\.exe|outlook\.exe|wscript\.exe|cscript\.exe|mshta\.exe)$/i
+          | CommandLine=/\\\\[^\\]+\\[^\\]+/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=references), collect([CommandLine], limit=5)])
+          | sort(references, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved corporate file shares and intranet repositories"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - path
+
+      - id: webdav-style-path-reference
+        name: User-facing process references a WebDAV path
+        purpose: >-
+          Catch path shapes commonly used to provoke WebDAV authentication instead of SMB.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(explorer\.exe|winword\.exe|excel\.exe|powerpnt\.exe|outlook\.exe|rundll32\.exe)$/i
+          | CommandLine=/(http|https):\/\/[^ ]+|\\\\[^\\]+@SSL\\DavWWWRoot/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=references), collect([CommandLine], limit=5)])
+          | sort(references, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved SharePoint and sanctioned enterprise WebDAV endpoints"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - path
+
+      - id: outbound-authentication-after-reference
+        name: Outbound SMB or WebDAV after the path reference
+        purpose: >-
+          Correlate the user-facing trigger to the network authentication that makes the
+          technique useful to the attacker.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | ContextBaseFileName=/^(explorer\.exe|winword\.exe|excel\.exe|powerpnt\.exe|outlook\.exe|wscript\.exe|cscript\.exe|mshta\.exe|rundll32\.exe)$/i
+          | RemotePort in (80, 443, 445)
+          | groupBy([ComputerName, ContextBaseFileName, RemoteAddressIP4, RemotePort],
+                    function=[count(as=connections)])
+          | sort(connections, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Known internal file servers, SharePoint and sanctioned document repositories"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - remote_address
+
+evidence:
+  required:
+    - id: remote_path_reference
+      name: User-facing process referenced a remote path
+      description: >-
+        Explorer, Office or another interactive process referenced a UNC or WebDAV path,
+        which is the trigger that causes Windows to offer authentication material.
+      source: process_creation
+      field: CommandLine
+      indicates: coerced_remote_authentication
+
+  supporting:
+    - id: outbound_smb_or_webdav
+      name: Outbound SMB or WebDAV followed the reference
+      description: >-
+        The same class of process then opened a network connection on SMB or WebDAV ports,
+        showing the path reference resulted in remote authentication activity.
+      source: network_connection
+      field: RemotePort
+      indicates: authentication_attempt_to_remote_host
+    - id: first_seen_remote_host
+      name: First-seen or rare remote host
+      description: >-
+        The destination host or path is not part of the user's or machine's normal file
+        access pattern during the baseline window.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: unusual_activity_for_host
+    - id: external_destination
+      name: Remote host is external or non-corporate
+      description: >-
+        The endpoint attempted SMB or WebDAV authentication to an address outside the
+        corporate file-sharing estate.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: possible_credential_exposure
+
+  contradicting:
+    - id: approved_file_share
+      name: Approved internal share or document repository
+      description: >-
+        The referenced UNC or WebDAV path belongs to a sanctioned internal repository that
+        users and Office routinely access.
+      source: baseline
+      field: CommandLine
+      indicates: legitimate_enterprise_activity
+    - id: stable_share_usage
+      name: Stable long-running usage of the same share
+      description: >-
+        The user and host have an established history of accessing this path or remote host
+        during ordinary work.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: expected_user_behavior
+
+  risk_logic:
+    required:
+      - remote_path_reference
+    supporting:
+      any:
+        - outbound_smb_or_webdav
+        - first_seen_remote_host
+        - external_destination
+      all:
+        - outbound_smb_or_webdav
+        - external_destination
+    contradicting:
+      any:
+        - approved_file_share
+        - stable_share_usage
+      all: []
+
+  verdict:
+    low_risk_when:
+      - approved_file_share
+      - stable_share_usage
+    suspicious_when:
+      - remote_path_reference
+      - outbound_smb_or_webdav
+    high_risk_when:
+      - remote_path_reference
+      - outbound_smb_or_webdav
+      - external_destination
+
+  false_positive:
+    - condition: Users opening files from approved internal SMB shares
+      explanation: >-
+        Normal enterprise file access frequently uses UNC paths and may appear identical
+        unless the share inventory and baseline are maintained.
+    - condition: Sanctioned SharePoint or WebDAV-backed document workflows
+      explanation: >-
+        Some internal document repositories legitimately use WebDAV-style paths and should
+        be contradicted by stable history and approved endpoint lists.

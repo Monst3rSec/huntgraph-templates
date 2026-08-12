@@ -1,0 +1,256 @@
+type: detection
+
+id: hg-win-document-template-fetched-from-a-remote-host-t1221
+version: 1.0.0
+
+info:
+  name: Document template fetched from a remote host
+  description: >-
+    Template injection keeps the lure document benign while moving the active content to a
+    remote template that Word retrieves only when the victim opens the file. The attack is
+    therefore missing from ordinary attachment inspection: the dangerous content arrives
+    later, from the template location, under the cover of the legitimate application.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - template-injection
+    - word
+    - remote-template
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1221
+    - https://attack.mitre.org/detectionstrategies/DET0566
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1221
+  sub_techniques: []
+  detection_strategies:
+    - DET0566
+  analytics:
+    - AN1564
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Connection Creation
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may use a document whose remote template or relationship causes Word to
+    fetch additional content from a remote host when the victim opens it, turning an
+    apparently harmless file into the first stage of execution.
+  attacker_behavior:
+    - Delivers a document that references a remote template, relationship or include file.
+    - Relies on Word to reach out to a remote SMB, HTTP or WebDAV host when the document opens.
+    - Uses the fetched template to run code or to load additional malicious content.
+  legitimate_behavior:
+    - Some organizations store shared templates on internal file servers or SharePoint.
+    - Office may open remote templates from approved corporate repositories.
+  risk_indicator:
+    - WinWord opens a document and immediately contacts a first-seen remote host.
+    - The remote destination is not part of the normal template infrastructure.
+    - The document open is followed by a child process or further network retrieval.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: word-contacts-remote-host-on-open
+        name: Word contacts a remote host when a document opens
+        purpose: >-
+          Surface the defining behavior of template injection: WinWord reaches out to a
+          remote host as part of opening a document.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | ContextBaseFileName=/^winword\.exe$/i
+          | RemotePort in (80, 443, 445)
+          | groupBy([ComputerName, ContextBaseFileName, RemoteAddressIP4, RemotePort],
+                    function=[count(as=connections)])
+          | sort(connections, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved internal template shares, SharePoint and sanctioned document repositories"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - remote_address
+
+      - id: remote-template-followed-by-child-process
+        name: Remote template access followed by process creation
+        purpose: >-
+          Catch the more dangerous cases where the document open and remote retrieval lead
+          directly to code execution from Word.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^winword\.exe$/i
+          | FileName=/^(cmd\.exe|powershell\.exe|pwsh\.exe|wscript\.exe|cscript\.exe|mshta\.exe|rundll32\.exe)$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=children), collect([CommandLine], limit=5)])
+          | sort(children, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Known trusted Office automation and document-conversion workflows"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - parent_process
+
+      - id: winword-first-seen-template-destination
+        name: Word reaches a first-seen template destination
+        purpose: >-
+          Highlight the template source itself when the destination is novel for the host
+          or user, even if no immediate child process is visible.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | ContextBaseFileName=/^winword\.exe$/i
+          | groupBy([ComputerName, RemoteAddressIP4, RemotePort],
+                    function=[count(as=connections)])
+          | sort(connections, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Stable internal template infrastructure"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - remote_address
+
+evidence:
+  required:
+    - id: remote_template_contact
+      name: Word contacted a remote host while opening a document
+      description: >-
+        WinWord establishes an SMB, HTTP or WebDAV connection during document open,
+        indicating the file depends on content fetched at runtime.
+      source: network_connection
+      field: RemotePort
+      indicates: remote_template_or_relationship_fetch
+
+  supporting:
+    - id: first_seen_destination
+      name: First-seen or rare template destination
+      description: >-
+        The remote host contacted by WinWord is not part of the user's or machine's normal
+        template or document workflow.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: unusual_activity_for_host
+    - id: child_process_from_word
+      name: Word spawned a script or interpreter
+      description: >-
+        The document open is followed by Word launching an interpreter or other execution
+        utility, which is a strong sign the fetched content was used to execute code.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: code_execution_from_document
+    - id: external_or_unsanctioned_destination
+      name: Remote template source is external or unsanctioned
+      description: >-
+        The contacted host is outside the sanctioned template and document repository
+        estate.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: malicious_template_staging
+
+  contradicting:
+    - id: approved_template_repository
+      name: Approved internal template repository
+      description: >-
+        The destination belongs to a sanctioned corporate template store and has stable
+        long-running use.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: legitimate_enterprise_activity
+    - id: known_office_automation
+      name: Known Office automation workflow
+      description: >-
+        The process chain matches a documented internal document-conversion or automation
+        pattern.
+      source: process_creation
+      field: CommandLine
+      indicates: expected_office_behavior
+
+  risk_logic:
+    required:
+      - remote_template_contact
+    supporting:
+      any:
+        - first_seen_destination
+        - child_process_from_word
+        - external_or_unsanctioned_destination
+      all:
+        - child_process_from_word
+        - external_or_unsanctioned_destination
+    contradicting:
+      any:
+        - approved_template_repository
+        - known_office_automation
+      all: []
+
+  verdict:
+    low_risk_when:
+      - approved_template_repository
+      - known_office_automation
+    suspicious_when:
+      - remote_template_contact
+      - first_seen_destination
+    high_risk_when:
+      - remote_template_contact
+      - child_process_from_word
+      - external_or_unsanctioned_destination
+
+  false_positive:
+    - condition: Internal Word templates stored on approved file servers or SharePoint
+      explanation: >-
+        Some estates legitimately host Office templates remotely, which should be
+        contradicted by stable history and allowlisted destinations.
+    - condition: Document automation or conversion platform
+      explanation: >-
+        Office automation can create child processes after opening a document, but those
+        workflows are usually stable and tied to a small set of known hosts.
