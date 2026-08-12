@@ -186,6 +186,28 @@ exists to prevent. Confirming the NG-SIEM schema for module loads and process ha
 access is worth more than several batches of authoring: it converts the single largest
 block of remaining work from impossible to routine.
 
+### There is no generic file-write telemetry
+
+The file events this repo builds on — `PeFileWritten`, `NewExecutableWritten`,
+`NewScriptWritten` — fire on **executables and scripts only**. A `.docx`, a `.zip`, a
+`.png` or a `.pst` being written produces nothing.
+
+This is a smaller gap than the missing components above but it shapes more templates
+than its size suggests, and it is easy to forget when writing. A staging directory
+filling with five hundred documents is invisible; so is a screenshot landing in a temp
+path, and so is the archive that a compression command produces. Wherever this repo
+appears to hunt those things, it is actually hunting the **command that performs them**,
+and the destination path is known only because the command line named it.
+
+That distinction matters when reading a template. A hunt built on the command line
+misses anything done through an API from inside a compiled program or a script body,
+which is exactly what the more capable implants do. The affected templates say so in
+their own descriptions rather than leaving the reader to assume the write itself was
+observed.
+
+There is also no file-**read** and no file-**deletion** event. Reads are inferred from the
+process that opened them; deletions from what appears afterwards.
+
 ### Recorded skips
 
 `skipped.yaml` names the targets this project has decided not to cover, each with the
