@@ -1,0 +1,374 @@
+type: detection
+
+id: hg-win-mail-copied-to-an-external-recipient-by-rule-t1114-003
+
+version: 1.0.0
+
+info:
+  name: Mail copied to an external recipient by rule
+  description: >-
+    This is the durable one, and it deserves to be stated plainly because it is routinely
+    treated as a tidy-up item at the end of an incident rather than as the thing that keeps
+    the incident going. A forwarding rule is a standing subscription to somebody else's mail.
+    It keeps working after the password is reset, after every session is revoked, after MFA
+    is re-enrolled, and after the case is closed, because the rule is a property of the
+    mailbox and not of any credential or token the responder took away. Star Blizzard is
+    documented doing exactly this, and Silent Librarian and Kimsuky both set auto-forwarding
+    on the accounts they took. If a mailbox compromise is remediated without someone reading
+    the rules and the mailbox forwarding settings, the adversary is still reading the mail
+    the next morning. This file deliberately takes a different angle from the email hiding
+    rules template under T1564.008, which shares the same cmdlets. That one is about
+    suppression: what the rule matches on, the vocabulary of security notifications, and an
+    action that deletes mail or buries it in a folder nobody opens, so that the owner never
+    learns their account is being used. This one is about exfiltration: where the copy goes.
+    The discriminator here is the destination and the mechanism, not the match condition, and
+    the response differs accordingly. Suppression means the owner missed some alerts;
+    forwarding means every message received since the rule was created must be treated as
+    disclosed. Four mechanisms produce the same outcome and are worth separating, because
+    checking one and not the others is how this gets missed: an inbox rule with a forward or
+    redirect action, mailbox-level forwarding set with Set-Mailbox, which never appears in
+    the user's own rule list at all, a transport rule that blind-copies mail across the whole
+    organisation, which is the tenant-wide variant LAPSUS$ used, and a change to the remote
+    domain or outbound spam policy that re-enables automatic forwarding after it was turned
+    off. On visibility, the same limit applies as to every mailbox-rule hunt: the rule lives
+    on the mail platform, the authoritative record is the Exchange audit trail, and a rule
+    set through OWA or from an unmanaged device leaves nothing on any endpoint. What this
+    covers is the operator path, the management session driven from a monitored Windows host.
+  severity: high
+  author: huntgraph
+  tags:
+    - collection
+    - email-collection
+    - forwarding-rule
+    - exchange
+    - exfiltration
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1114/003
+    - https://attack.mitre.org/detectionstrategies/DET0576
+    - https://attack.mitre.org/techniques/T1114
+    - https://attack.mitre.org/techniques/T1564/008
+
+mitre:
+  tactics:
+    - TA0009
+  techniques:
+    - T1114
+  sub_techniques:
+    - T1114.003
+  detection_strategies:
+    - DET0576
+  analytics:
+    - AN1589
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:PowerShell
+    - WinEventLog:Security
+    - m365:exchange
+  data_components:
+    - Command Execution
+    - Process Creation
+    - Cloud Service Metadata
+
+hypothesis:
+  statement: >-
+    An adversary holding a mailbox or Exchange administrative session may configure automatic
+    forwarding of received mail to an address outside the organisation, establishing a
+    collection channel that survives password resets, session revocation and the closure of
+    the incident that created it.
+  attacker_behavior:
+    - Creates an inbox rule whose action forwards or redirects mail to an external address.
+    - Sets forwarding at the mailbox level with Set-Mailbox, where it does not appear in the user's rule list.
+    - Creates a transport rule that blind-copies organisation-wide mail to a chosen recipient.
+    - Re-enables automatic forwarding on the remote domain or outbound spam policy after it was disabled.
+    - Chooses a consumer or lookalike domain as the destination so the address is not obviously foreign.
+  legitimate_behavior:
+    - A user forwards their own mail to a personal account while travelling or on leave.
+    - Administrators forward a leaver's mailbox to their manager during handover.
+    - Shared and functional mailboxes forward to a ticketing or case-management address.
+    - Coexistence and migration tooling sets forwarding while a tenant move is in progress.
+    - Journaling and archiving products copy mail to a retention address by design.
+  risk_indicator:
+    - The destination is outside the organisation, particularly a consumer mail provider.
+    - Forwarding is set at the mailbox level rather than as a visible inbox rule.
+    - A transport rule applies the forwarding to every mailbox at once.
+    - The change is made by an account that does not normally administer mail.
+    - The rule is created shortly after a suspicious sign-in or a credential reset for that mailbox.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: inbox-rule-forwards-or-redirects
+        name: Inbox rule created with a forwarding action
+        purpose: >-
+          Establish the base observable on the mechanism most people check first. The
+          forwarding action is what makes this collection rather than filing, so the action
+          parameter is the discriminator and not the fact that a rule was written.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(New|Set)-InboxRule\b/i
+          | CommandLine=/-(ForwardTo|ForwardAsAttachmentTo|RedirectTo)\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=rules), collect([CommandLine], limit=5)])
+          | sort(rules, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Shared mailbox provisioning that routes functional mail to a ticketing address"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: mailbox-level-forwarding-set
+        name: Forwarding set on the mailbox rather than as a rule
+        purpose: >-
+          Cover the mechanism the owner cannot see. Mailbox-level forwarding is a property of
+          the mailbox object, so it does not appear in the user's rule list in Outlook or
+          OWA, and an owner asked to check their rules will report that there are none.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\bSet-Mailbox\b/i
+          | CommandLine=/-(ForwardingSmtpAddress|ForwardingAddress|DeliverToMailboxAndForward)\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Leaver handover automation that forwards a disabled mailbox to the line manager"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: destination-outside-the-organisation
+        name: Forwarding destination is an external or consumer address
+        purpose: >-
+          This is the discriminator that separates collection from routing. Forwarding to a
+          colleague or a shared mailbox is ordinary mail administration; forwarding to a
+          consumer provider or an unrelated domain sends copies somewhere the organisation
+          has no control over and cannot recall them from.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/-(ForwardTo|ForwardAsAttachmentTo|RedirectTo|ForwardingSmtpAddress|ForwardingAddress|BlindCopyTo|RedirectMessageTo)\b/i
+          | CommandLine=/@[A-Za-z0-9.-]*(gmail|googlemail|outlook\.com|hotmail|live\.com|yahoo|aol|proton(mail)?|tutanota|tuta\.io|zoho|gmx|mail\.ru|yandex|inbox\.lv|cock\.li|onionmail|mailfence|fastmail|icloud|me\.com|qq\.com|163\.com|126\.com|naver|daum|seznam|rediffmail|disroot|riseup|simplelogin|33mail|guerrillamail|sharklasers)\b/i
+          | groupBy([ComputerName, UserName, FileName],
+                    function=[count(as=rules), collect([CommandLine], limit=5)])
+          | sort(rules, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Documented personal-forwarding exceptions granted to named users by policy"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: forwarding-enabled-organisation-wide
+        name: Forwarding enabled for the whole organisation
+        purpose: >-
+          Catch the tenant-wide variant, where one change subscribes the adversary to every
+          mailbox at once instead of one. This includes re-enabling automatic forwarding on a
+          remote domain or outbound spam policy, which is the control most organisations rely
+          on to stop the per-mailbox version working at all.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(New|Set)-TransportRule\b|\bSet-RemoteDomain\b|\bSet-HostedOutboundSpamFilterPolicy\b|\bSet-TransportConfig\b/i
+          | CommandLine=/-(BlindCopyTo|RedirectMessageTo|CopyTo|AddToRecipients)\b|-AutoForwardEnabled\s*\$?true\b|-AutoForwardingMode\s+On\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Journaling and archiving configuration applied by the retention platform"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+evidence:
+  required:
+    - id: forwarding_configured
+      name: Automatic forwarding configured from a managed host
+      description: >-
+        A process on a managed host ran a cmdlet that configures automatic forwarding of
+        received mail, whether as an inbox rule action, a mailbox property, a transport rule
+        or an organisation-wide forwarding policy.
+      source: process_creation
+      field: CommandLine
+      indicates: mail_forwarding_configured
+
+  supporting:
+    - id: external_destination
+      name: Destination is outside the organisation
+      description: >-
+        The forwarding address belongs to a consumer mail provider or a domain unrelated to
+        the organisation, so copies leave a boundary from which they cannot be recalled.
+      source: process_creation
+      field: CommandLine
+      indicates: external_data_destination
+    - id: mailbox_level_forwarding
+      name: Forwarding set as a mailbox property
+      description: >-
+        Forwarding was configured with Set-Mailbox rather than as an inbox rule, so it does
+        not appear in the owner's rule list and an owner asked to check their rules will
+        report none.
+      source: process_creation
+      field: CommandLine
+      indicates: concealed_configuration
+    - id: org_wide_forwarding
+      name: Forwarding applied across the organisation
+      description: >-
+        A transport rule or a tenant forwarding policy was changed, extending the collection
+        channel from one mailbox to every mailbox in the organisation.
+      source: process_creation
+      field: CommandLine
+      indicates: organisation_wide_impact
+    - id: unexpected_operator_account
+      name: Change made by an account that does not administer mail
+      description: >-
+        The account running the cmdlets is not one that normally performs mail administration
+        on this estate, weakening an ordinary administrative explanation.
+      source: process_creation
+      field: UserName
+      indicates: unexpected_account_context
+    - id: no_mail_administration_history
+      name: No history of mail administration on this host
+      description: >-
+        This host has not run Exchange management cmdlets during the baseline window, so the
+        management session is itself new rather than part of standing operations.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: destination_is_internal_or_approved
+      name: Destination is internal or an approved partner
+      description: >-
+        The forwarding address is inside the organisation's own domains or belongs to a
+        partner on the approved list, which is routing rather than collection.
+      source: process_creation
+      field: CommandLine
+      indicates: internal_routing_only
+    - id: coexistence_or_journaling_tooling
+      name: Migration, coexistence or journaling product
+      description: >-
+        The acting binary belongs to a migration, coexistence or journaling product whose
+        documented function is to forward or copy mail during a tenant move or for retention.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: recorded_forwarding_request
+      name: Recorded request for the forwarding
+      description: >-
+        A ticket or change record covers forwarding on the named mailbox, such as a leaver
+        handover, a long absence, or a shared mailbox routed to a case queue.
+      source: change_management
+      field: UserName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - forwarding_configured
+
+    supporting:
+      any:
+        - external_destination
+        - mailbox_level_forwarding
+        - org_wide_forwarding
+        - unexpected_operator_account
+        - no_mail_administration_history
+      all:
+        - external_destination
+        - unexpected_operator_account
+
+    contradicting:
+      any:
+        - destination_is_internal_or_approved
+        - coexistence_or_journaling_tooling
+        - recorded_forwarding_request
+      all: []
+
+  verdict:
+    low_risk_when:
+      - forwarding_configured
+      - destination_is_internal_or_approved
+      - coexistence_or_journaling_tooling
+      - recorded_forwarding_request
+    suspicious_when:
+      - forwarding_configured
+      - no_mail_administration_history
+    high_risk_when:
+      - forwarding_configured
+      - external_destination
+      - mailbox_level_forwarding
+      - unexpected_operator_account
+      - no_mail_administration_history
+
+  false_positive:
+    - condition: A user forwards their own mail to a personal account while travelling.
+      explanation: >-
+        This produces an external consumer destination, which is the strongest supporting
+        evidence here, and it is common in organisations that have not blocked automatic
+        forwarding. It is separated by the rule being set by the mailbox owner themselves, by
+        the absence of any preceding suspicious sign-in, and usually by a policy exception
+        record. Note that the same shape is also a real data-loss finding even when benign.
+    - condition: Administrators forward a leaver's mailbox to their manager.
+      explanation: >-
+        Leaver handover sets mailbox-level forwarding routinely, which matches the mechanism
+        this file weights most heavily. It is confirmed by the target being a disabled
+        account, by the destination being an internal manager, and by a leaver ticket.
+    - condition: A shared or functional mailbox forwards to a ticketing address.
+      explanation: >-
+        Support, invoicing and abuse mailboxes commonly forward into a case system. The
+        destination is an internal or contracted service address, the mailbox is a functional
+        one rather than a person's, and the configuration is long-standing.
+    - condition: Coexistence tooling sets forwarding during a tenant migration.
+      explanation: >-
+        Hybrid and migration tooling sets forwarding on mailboxes in flight, sometimes in
+        large batches. The tell is the vendor's binary or connector as the acting process,
+        the destination being the other tenant's routing domain, and uniformity across the
+        migration batch.
+    - condition: The rule was created through the web client and never appears here.
+      explanation: >-
+        This is the coverage gap rather than a false positive. A rule set in OWA, in the
+        Outlook client's own interface, or from an unmanaged device produces no endpoint
+        telemetry at all, and hidden rules written through MAPI are not visible even in the
+        mailbox's rule list. The Exchange audit trail and a MAPI-aware rule inspection are
+        the authority, and an empty result here is not evidence of absence.

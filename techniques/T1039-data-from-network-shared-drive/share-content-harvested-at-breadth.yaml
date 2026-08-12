@@ -1,0 +1,368 @@
+type: detection
+
+id: hg-win-share-content-harvested-at-breadth-t1039
+
+version: 1.0.0
+
+info:
+  name: File share content harvested at breadth
+  description: >-
+    A file share is where an organisation keeps the data it actually cares about, and unlike
+    a single workstation it is worth the whole company rather than one person's worth. That
+    difference is the reason this file is stronger than its local counterpart and the reason
+    it should be triaged ahead of it: the same behaviour against a share has an order of
+    magnitude more consequence. It is also better observed. Share access produces its own
+    telemetry with a property nothing else in this group has — measurable breadth. How many
+    distinct files one account opened, and across how many distinct shares, are numbers, and
+    numbers separate a person retrieving a document from a client walking a tree. The
+    honest difficulty is that a share exists to be read broadly, so the raw counts alone are
+    worthless; every backup pass, indexer and departmental migration produces larger numbers
+    than any adversary. What separates them is who is doing it and whether they have ever
+    done it before, which is why every case here leans on identity and baseline rather than
+    on the volume by itself. Where the harvested files are then gathered into one place that
+    is T1074, and where they are compressed that is T1560.001; this file owns the read.
+  severity: medium
+  author: huntgraph
+  tags:
+    - collection
+    - data-from-network-shared-drive
+    - smb
+    - file-share
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1039
+    - https://attack.mitre.org/detectionstrategies/DET0410
+    - https://attack.mitre.org/techniques/T1074
+    - https://attack.mitre.org/techniques/T1560/001
+    - https://attack.mitre.org/techniques/T1135
+
+mitre:
+  tactics:
+    - TA0009
+  techniques:
+    - T1039
+  sub_techniques: []
+  detection_strategies:
+    - DET0410
+  analytics:
+    - AN1145
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Share Access
+
+hypothesis:
+  statement: >-
+    An adversary holding a valid account may read business data from the file shares that
+    account can reach, taking documents from across a share tree or from several unrelated
+    shares in one sitting, and thereby collecting the organisation's data rather than one
+    endpoint's without ever needing to compromise the file server itself.
+  attacker_behavior:
+    - Opens a large number of distinct files on one share in a short window.
+    - Touches several unrelated departmental shares in the same session.
+    - Reaches a share the account has no working relationship with.
+    - Points a bulk copy utility at a UNC path with recursion enabled.
+    - Copies the results down to the workstation before compressing them.
+  legitimate_behavior:
+    - Backup agents read every file on every share on a schedule.
+    - Search indexers and classification scanners walk share trees continuously.
+    - Departmental migrations copy whole shares to a new server or to cloud storage.
+    - A user opening a folder in Explorer generates opens across many files at once.
+    - Analysts and finance staff legitimately work across several shares in a day.
+  risk_indicator:
+    - The breadth is produced by an interactive user account rather than a service account.
+    - The account or host has no baseline history of reaching that share at all.
+    - The reads span shares belonging to unrelated business functions.
+    - A recursive copy utility is aimed at the UNC path from a workstation.
+    - The activity is confined to one host rather than appearing across the estate.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: network_share_access
+      event_types:
+        - SmbFileOpen
+        - SmbClientConnect
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - ShareName
+        - TargetFileName
+        - RemoteAddressIP4
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: many-distinct-documents-opened-on-one-share
+        name: Large number of distinct documents opened on a single share
+        purpose: >-
+          Measure the breadth that only share telemetry can give. Counting distinct files
+          rather than events is what separates a tree walk from a person repeatedly saving
+          one document, and restricting to business document types keeps application
+          working files and profile data out of the count.
+        query: |
+          #event_simpleName=/^SmbFileOpen$/
+          | TargetFileName=/\.(docx?|xlsx?|pptx?|pdf|csv|rtf|odt|ods|odp|vsdx?|msg|eml|zip|7z)$/i
+          | UserName!=/\$$/
+          | groupBy([ComputerName, UserName, ShareName],
+                    function=[count(TargetFileName, distinct=true, as=distinct_files),
+                              collect([TargetFileName], limit=20)])
+          | distinct_files>=200
+          | sort(distinct_files, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Backup, archiving and content-classification service accounts"
+            - "Machine accounts and share replication engines"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: breadth-across-unrelated-shares
+        name: One account reaching many unrelated shares
+        purpose: >-
+          Catch the operator orienting themselves across the estate rather than working
+          inside one department. A person's job normally lives on a small and stable set of
+          shares, so the count of distinct shares touched in a window is a sharper signal
+          than the count of files inside any one of them.
+        query: |
+          #event_simpleName=/^(SmbFileOpen|SmbClientConnect)$/
+          | UserName!=/\$$/
+          | ShareName!=/^(SYSVOL|NETLOGON|IPC\$|print\$)$/i
+          | groupBy([ComputerName, UserName],
+                    function=[count(ShareName, distinct=true, as=distinct_shares),
+                              collect([ShareName, RemoteAddressIP4], limit=25)])
+          | distinct_shares>=8
+          | sort(distinct_shares, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Backup and migration service accounts with standing access to every share"
+            - "Administrative accounts whose role is share and permission management"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: share-reached-with-no-prior-history
+        name: Share reached by an account with no history there
+        purpose: >-
+          Provide the rarity leg, which is what makes the volume cases usable. Sorting the
+          rarest account and share pairings to the top surfaces the first contact between a
+          user and a data set they have never had a reason to open, which is the moment an
+          account starts being used by someone other than its owner. This case is worthless
+          until the baseline window is populated.
+        query: |
+          #event_simpleName=/^(SmbFileOpen|SmbClientConnect)$/
+          | UserName!=/\$$/
+          | ShareName!=/^(SYSVOL|NETLOGON|IPC\$|print\$)$/i
+          | groupBy([UserName, ShareName, RemoteAddressIP4],
+                    function=[count(as=accesses),
+                              count(ComputerName, distinct=true, as=source_hosts)])
+          | sort(accesses, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Shares published to the whole organisation such as company-wide document libraries"
+            - "Newly provisioned accounts inside their first weeks, where nothing has history"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - user
+            - host
+            - organization
+
+      - id: recursive-copy-aimed-at-a-unc-path
+        name: Bulk copy utility pointed at a UNC path with recursion
+        purpose: >-
+          Attach the intent to the access. Share telemetry says files were opened but not
+          why; a recursive copy utility naming a UNC source says the whole tree is being
+          taken, and the mirror and no-prompt switches are the ones no interactive person
+          types by accident.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\\\\[^\\\s"]+\\[^\\\s"]+/
+          | CommandLine=/\b(robocopy|xcopy|copy|Copy-Item)\b/i
+          | CommandLine=/(\/mir\b|\/e\b|\/s\b|-Recurse|\/y\b)/i
+          | CommandLine!=/\.(exe|dll|msi|sys|ps1|bat|cmd)\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=copies), collect([CommandLine], limit=8)])
+          | sort(copies, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Scheduled share replication and departmental migration jobs during their change window"
+            - "Software distribution points copying packages, which belongs to T1570"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+evidence:
+  required:
+    - id: share_data_harvested
+      name: Business data read from a network share at breadth
+      description: >-
+        One account opened a large number of distinct business documents on a share, or
+        reached an unusual number of unrelated shares, which is a tree being harvested
+        rather than a file being retrieved.
+      source: network_share_access
+      field: TargetFileName
+      indicates: collection_staging
+
+  supporting:
+    - id: unrelated_share_spread
+      name: Reads spanning unrelated business functions
+      description: >-
+        The shares touched in one session belong to different departments or data sets, a
+        spread that an individual role does not normally require.
+      source: network_share_access
+      field: ShareName
+      indicates: hands_on_keyboard_activity
+    - id: no_prior_share_history
+      name: No baseline history for this account and share
+      description: >-
+        The account has never reached this share within the baseline window, so the access
+        is a first contact rather than part of an established working pattern.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_user
+    - id: recursive_unc_copy
+      name: Recursive copy utility aimed at the share
+      description: >-
+        A bulk copy utility was invoked against a UNC path with recursion or mirroring
+        enabled, which states an intent to take the tree rather than a file.
+      source: process_creation
+      field: CommandLine
+      indicates: collection_staging
+    - id: interactive_account
+      name: Breadth produced by an interactive user account
+      description: >-
+        The reads were made under a human account rather than a machine or service account,
+        which is what backup, replication and indexing use.
+      source: network_share_access
+      field: UserName
+      indicates: hands_on_keyboard_activity
+
+  contradicting:
+    - id: backup_or_indexing_service
+      name: Backup, replication or indexing service account
+      description: >-
+        The access belongs to an approved backup, replication, archiving or classification
+        product whose function is to read every file on every share.
+      source: network_share_access
+      field: UserName
+      indicates: legitimate_enterprise_activity
+    - id: migration_window
+      name: Departmental migration in progress
+      description: >-
+        The copy is part of a recorded share migration or server decommission, which moves
+        whole trees deliberately and is bounded by a change record.
+      source: change_management
+      field: CommandLine
+      indicates: legitimate_administrative_action
+    - id: fleetwide_share_sweep
+      name: Same sweep across many hosts
+      description: >-
+        The identical access pattern appears from a large share of the estate in one window,
+        which is a scheduled job or a policy-driven sweep rather than one operator.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - share_data_harvested
+
+    supporting:
+      any:
+        - unrelated_share_spread
+        - no_prior_share_history
+        - recursive_unc_copy
+        - interactive_account
+      all:
+        - no_prior_share_history
+        - interactive_account
+
+    contradicting:
+      any:
+        - backup_or_indexing_service
+        - migration_window
+        - fleetwide_share_sweep
+      all: []
+
+  verdict:
+    low_risk_when:
+      - share_data_harvested
+      - backup_or_indexing_service
+      - migration_window
+      - fleetwide_share_sweep
+    suspicious_when:
+      - share_data_harvested
+      - interactive_account
+    high_risk_when:
+      - share_data_harvested
+      - unrelated_share_spread
+      - no_prior_share_history
+      - recursive_unc_copy
+
+  false_positive:
+    - condition: The backup agent walks every share overnight.
+      explanation: >-
+        Backup produces far higher distinct-file counts than any adversary and satisfies the
+        required evidence outright. It is separable by identity and rhythm: a service or
+        machine account, the same shares every night, and a volume that is stable rather
+        than a one-off spike.
+    - condition: A search indexer or data-classification scanner crawls the share tree.
+      explanation: >-
+        Crawlers open every document they can reach in order to index or label it, which is
+        exactly the breadth this hunt measures. They run continuously from a fixed set of
+        servers under their own service identity and never from a user workstation.
+    - condition: A department is migrated to a new file server or to cloud storage.
+      explanation: >-
+        Migration reproduces both the breadth and the recursive copy evidence, because it is
+        the same operation performed for a good reason. It is bounded by a change record, it
+        runs from an administrative host, and the destination is the new location rather than
+        a local temporary directory.
+    - condition: A user opens a folder in Explorer and the client reads every file in it.
+      explanation: >-
+        Explorer and Office generate opens across a whole folder to build previews and
+        resolve metadata, which inflates distinct-file counts without anyone reading
+        anything. The counts stay inside one folder on one share the user works in daily.
+    - condition: An analyst legitimately works across several departmental shares.
+      explanation: >-
+        Finance, audit and compliance roles genuinely touch many shares, which is why the
+        share-count case cannot stand alone. Those accounts have long baseline history on the
+        same set of shares, so the rarity leg is what distinguishes them.

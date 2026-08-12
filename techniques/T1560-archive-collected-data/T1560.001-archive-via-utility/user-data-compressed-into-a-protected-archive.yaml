@@ -1,0 +1,425 @@
+type: detection
+
+id: hg-any-user-data-compressed-into-a-protected-archive-t1560-001
+version: 1.0.0
+
+info:
+  name: User data compressed into a single protected archive before transfer
+  description: >-
+    Compression is the last step an adversary takes on the host before the data leaves it,
+    and it is the step that says most about intent. An archiver's command line carries the
+    utility, the recursion flag, every source path, the destination path and, often, a
+    password flag — so a single process creation event describes what was taken, from where,
+    and whether the operator expected the result to be inspected on the way out. The hunt is
+    not "an archive was made". It is an archive made over the trees a user keeps documents,
+    mail and browser profiles in, landing somewhere a user would never keep it, with a
+    password on it. Archiving over a build directory into a release folder is the same
+    utility doing honest work, and the source and destination paths are what separate them.
+  severity: high
+  author: huntgraph
+  tags:
+    - collection
+    - archive-collected-data
+    - pre-exfiltration
+    - compression
+    - windows
+    - linux
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1560/001
+    - https://attack.mitre.org/techniques/T1560
+    - https://attack.mitre.org/detectionstrategies/DET0298
+    - https://attack.mitre.org/techniques/T1074/001
+    - https://attack.mitre.org/techniques/T1074/002
+    - https://lolbas-project.github.io/lolbas/Binaries/Diantz/
+
+mitre:
+  tactics:
+    - TA0009
+  techniques:
+    - T1560
+  sub_techniques:
+    - T1560.001
+  detection_strategies:
+    - DET0298
+  analytics:
+    - AN0831
+    - AN0832
+    - AN0833
+  platforms:
+    - Windows
+    - Linux
+    - macOS
+  data_sources:
+    - WinEventLog:Security
+    - auditd:SYSCALL
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    An adversary who has finished collecting data compresses it with an ordinary archiving
+    utility before moving it off the host, packaging user document trees, mail stores or
+    browser profiles into one output file — frequently password-protected and written to a
+    temporary or hidden path — so that the theft becomes a single transfer that resists
+    inspection on the way out.
+  attacker_behavior:
+    - Invokes 7z, WinRAR, tar, zip, makecab, diantz or Compress-Archive over collected files.
+    - Recurses over a user profile, document tree, mail store or browser profile directory.
+    - Applies a password so the contents cannot be read by anything inspecting the transfer.
+    - Writes the archive to a temporary, hidden or system path rather than a user location.
+    - Names several distinct source paths that converge into one output file.
+    - Splits the output into fixed-size volumes sized for a transfer channel.
+  legitimate_behavior:
+    - Build and release pipelines archive output directories on every run.
+    - Backup agents and log rotation compress data continuously by design.
+    - Support tooling collects diagnostic bundles from configuration and log paths.
+    - Users zip a folder of documents to attach to mail or upload to a portal.
+    - Developers compress and decompress source trees as routine work.
+  risk_indicator:
+    - The source paths are user document trees, mail stores or browser profiles.
+    - The archive is password-protected, which is rare in ordinary business use.
+    - The output lands in a temporary, hidden or system directory.
+    - Several unrelated source paths converge into a single output file.
+    - The archiver is spawned by an office application, a browser, a web service account
+      or a script host rather than by a user shell or a build agent.
+
+requires:
+  platforms:
+    - windows
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: archive-over-user-data-trees
+        name: Archive built over document trees, mail stores or browser profiles
+        purpose: >-
+          Separate compression of collected data from compression of build output. What is
+          being packaged is the strongest single discriminator available: a release pipeline
+          archives an artefacts directory, while an operator archives the places a person
+          keeps work — Documents, Desktop, Downloads, a mapped share, a PST or OST, a
+          Thunderbird or browser profile.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(7z|7za|7zr|rar|winrar|zip|tar|gzip|bzip2|xz|makecab|diantz|ditto|hdiutil|Compress-Archive)\b/i
+          | CommandLine=/(\\Documents\b|\\Desktop\b|\\Downloads\b|\\Users\\[^\\]+\\|\/Users\/[^\/]+\/|\/home\/[^\/]+\/|\.pst\b|\.ost\b|\\Outlook\b|Thunderbird|\\AppData\\(Roaming|Local)\\(Mozilla|Google|Microsoft\\Edge)|\/Library\/(Mail|Application Support\/(Firefox|Google))|\\\\[^\\]+\\[^\\]+)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=archives), collect([CommandLine], limit=5)])
+          | sort(archives, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Backup clients whose protected set is the user profile by design"
+            - "Mailbox export and PST migration tooling run by the messaging team"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+            - organization
+
+      - id: password-protected-archive
+        name: Archive created with a password or encrypted headers
+        purpose: >-
+          Isolate the flag that defeats inspection. Very little ordinary business
+          compression is password-protected, and encrypted headers — 7-Zip's -mhe=on or
+          WinRAR's -hp — additionally hide the file listing, so the archive tells a
+          defender nothing about what left. This is a small, checkable, high-signal subset
+          of all archiving.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(7z|7za|7zr|rar|winrar|zip|openssl|hdiutil)\b/i
+          | CommandLine=/(\s-hp\S*|\s-p\S+|\s-mhe\s*=\s*on|\s-P\s+\S+|\s--password\b|\s-e\s+.*\.zip|\benc\s+-\w*(aes|des)|-encryption\b|-passphrase\b)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=protected_archives), collect([CommandLine], limit=5)])
+          | sort(protected_archives, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Regulated export processes that require encrypted archives for third parties"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: archive-written-to-a-scratch-path
+        name: Archive output written to a temporary, hidden or system path
+        purpose: >-
+          Catch the destination half. An archive a person intends to keep goes where they
+          keep things; an archive that exists only to be uploaded goes to %TEMP%, ProgramData,
+          a Windows directory, /tmp, /dev/shm or a dot-directory, because it is meant to be
+          short-lived and unnoticed. This is the compression step of a staging chain and
+          should be read alongside the T1074 local and remote staging hypotheses.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(7z|7za|7zr|rar|winrar|zip|tar|gzip|makecab|diantz|ditto|hdiutil|Compress-Archive)\b/i
+          | CommandLine=/(%TEMP%|%TMP%|\\AppData\\Local\\Temp\\|\\Windows\\Temp\\|\\ProgramData\\|\\PerfLogs\\|\\\$Recycle\.Bin\\|\/tmp\/|\/var\/tmp\/|\/dev\/shm\/|\/private\/tmp\/|[\\\/]\.[A-Za-z0-9_-]+[\\\/])/i
+          | CommandLine=/(\.7z\b|\.zip\b|\.rar\b|\.cab\b|\.tar\b|\.tgz\b|\.gz\b|\.dmg\b|\.001\b)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=archives), collect([CommandLine], limit=5)])
+          | sort(archives, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Installer and patching sequences that build cabinets under Windows\\Temp"
+            - "Diagnostic bundle collectors that write to a temporary path by design"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: many-sources-one-output
+        name: Several unrelated source paths converge into one archive
+        purpose: >-
+          Measure breadth rather than occurrence. Ordinary compression takes one tree and
+          produces one file; collection takes finance, HR and engineering shares and produces
+          one file, or appends to the same output repeatedly as an operator works through a
+          host. Counting distinct archiving invocations against one output name in a short
+          window makes that shape visible where a single command line would not.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(7z|7za|7zr|rar|winrar|zip|tar|makecab|diantz|Compress-Archive)\b/i
+          | case {
+              CommandLine=/\b(a|u|add|update)\b/i and CommandLine=/(\.7z|\.zip|\.rar|\.cab)\b/i
+                | archive_append := CommandLine ;
+              CommandLine=/(-r\b|-recurse|--recursive|-Recurse|\s-cf?\b|\*\.\*|\*\.doc|\*\.xls|\*\.pdf|\*\.pst)/i
+                | recursive_sweep := CommandLine ;
+              CommandLine=/(-v\d+[kmg]\b|-b\s*\d+[kmg]\b|--split|-s\s*\d+[kmg]\b)/i
+                | split_volumes := CommandLine ;
+            }
+          | archive_append=/.+/ or recursive_sweep=/.+/ or split_volumes=/.+/
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=invocations),
+                              collect([archive_append, recursive_sweep, split_volumes], limit=10)])
+          | invocations >= 3
+          | sort(invocations, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Build agents that archive multiple module directories on every pipeline run"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: archiver-spawned-by-an-unusual-parent
+        name: Archiving utility spawned by an application that has no archiving role
+        purpose: >-
+          Cover the case where the command line looks ordinary and only the lineage is wrong.
+          An archiver parented by an office application, a browser, a mail client, a web
+          service account or a remote shell is compressing on someone else's behalf, which is
+          the shape MITRE's macOS analytic calls out directly.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(7z|7za|7zr|rar|winrar|zip|tar|makecab|diantz|certutil|ditto|hdiutil|Compress-Archive)\b/i
+          | ParentBaseFileName=/^(winword\.exe|excel\.exe|powerpnt\.exe|outlook\.exe|msaccess\.exe|mshta\.exe|wscript\.exe|cscript\.exe|w3wp\.exe|httpd|nginx|java|node|chrome\.exe|msedge\.exe|firefox\.exe|Microsoft Word|Microsoft Excel|Terminal)$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Document management add-ins that legitimately package attachments from Office"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: collected_data_archived
+      name: An archiving utility packaged data on the host
+      description: >-
+        A compression or packaging utility ran with arguments that create an archive, which
+        is the step that turns a set of collected files into a single object suitable for
+        transfer.
+      source: process_creation
+      field: CommandLine
+      indicates: data_packaged_for_transfer
+
+  supporting:
+    - id: source_is_user_data
+      name: Source paths are user documents, mail or browser data
+      description: >-
+        The paths being compressed are document trees, profile directories, mail stores or
+        browser profiles rather than build output, logs or configuration.
+      source: process_creation
+      field: CommandLine
+      indicates: sensitive_data_targeted
+    - id: archive_password_protected
+      name: Archive protected with a password or encrypted headers
+      description: >-
+        The command line carries a password or header-encryption flag, which prevents
+        anything inspecting the transfer from reading, or even listing, the contents.
+      source: process_creation
+      field: CommandLine
+      indicates: inspection_resistance
+    - id: archive_in_scratch_path
+      name: Output written to a temporary, hidden or system directory
+      description: >-
+        The archive lands in a temporary, hidden or system path rather than anywhere a user
+        would keep a file they intended to retain.
+      source: process_creation
+      field: CommandLine
+      indicates: collection_staging
+    - id: many_sources_one_output
+      name: Breadth of sources or repeated appends to one archive
+      description: >-
+        Several distinct source paths converge into one output file, the same archive is
+        appended to repeatedly, or the output is split into fixed-size volumes.
+      source: derived
+      field: source_path_count
+      indicates: systematic_collection
+    - id: archiver_parent_anomalous
+      name: Archiver spawned by an application with no archiving role
+      description: >-
+        The parent is an office application, browser, mail client, web service or script
+        host rather than a user shell, a build agent or an installer.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: untrusted_execution_lineage
+    - id: archiver_from_writable_path
+      name: Archiver binary is portable or in a user-writable path
+      description: >-
+        The archiving executable is a standalone copy in a temporary, profile or share path
+        rather than an installed product under Program Files or a system directory.
+      source: process_creation
+      field: ImageFileName
+      indicates: untrusted_execution_location
+
+  contradicting:
+    - id: backup_or_log_rotation
+      name: Backup client or log rotation
+      description: >-
+        The acting process is an approved backup agent or a log rotation utility whose entire
+        function is to compress data on a schedule.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: build_or_release_pipeline
+      name: Build or release pipeline packaging its own output
+      description: >-
+        The source paths are build, artefact or package directories and the parent is a build
+        agent, which is compression of output rather than of collected data.
+      source: process_creation
+      field: CommandLine
+      indicates: expected_developer_activity
+    - id: support_bundle_collection
+      name: Diagnostic or support bundle being assembled
+      description: >-
+        The command matches a vendor support-bundle collector gathering configuration and log
+        paths for a raised case, which legitimately archives to a temporary path.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_enterprise_activity
+    - id: engineering_host
+      name: Engineering host where archiving is constant
+      description: >-
+        The host belongs to an engineering or build asset group where compressing and
+        expanding trees is ordinary work rather than a notable event.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - collected_data_archived
+
+    supporting:
+      any:
+        - source_is_user_data
+        - archive_password_protected
+        - archive_in_scratch_path
+        - many_sources_one_output
+        - archiver_parent_anomalous
+        - archiver_from_writable_path
+      all:
+        - source_is_user_data
+        - archive_password_protected
+
+    contradicting:
+      any:
+        - backup_or_log_rotation
+        - build_or_release_pipeline
+        - support_bundle_collection
+        - engineering_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - collected_data_archived
+      - backup_or_log_rotation
+      - build_or_release_pipeline
+      - support_bundle_collection
+      - engineering_host
+    suspicious_when:
+      - collected_data_archived
+      - source_is_user_data
+    high_risk_when:
+      - collected_data_archived
+      - source_is_user_data
+      - archive_password_protected
+      - archive_in_scratch_path
+      - many_sources_one_output
+
+  false_positive:
+    - condition: A build or release pipeline archives its output directory on every run.
+      explanation: >-
+        Packaging is the pipeline's purpose, so it reproduces the required evidence
+        continuously and often with recursion and split volumes. The source paths are build
+        and artefact directories rather than user data, and the parent is a build agent — the
+        two discriminators the required evidence alone cannot provide.
+    - condition: A backup agent compresses the user profile as part of its protected set.
+      explanation: >-
+        Profile backup produces exactly the source-path evidence this hypothesis leans on,
+        because the paths genuinely are document trees and mail stores. The acting binary is
+        an approved client running on a fixed schedule across many hosts at once, which an
+        operator archiving one host is not.
+    - condition: A user zips a folder of documents to attach to an email or upload to a portal.
+      explanation: >-
+        This is the closest benign twin and it will match the user-data case. It is normally a
+        single invocation, from an interactive shell or the Explorer context menu, writing to
+        the same directory as the source rather than to a temporary path, and without a
+        password.
+    - condition: A vendor support tool assembles a diagnostic bundle into a temporary path.
+      explanation: >-
+        Support bundles legitimately archive configuration and log trees to %TEMP% or /tmp,
+        matching the scratch-path evidence. The collector is a named vendor utility and the
+        activity coincides with a raised support case.
+    - condition: A regulated business process produces password-protected archives for a third party.
+      explanation: >-
+        Some finance, legal and HR workflows require encrypted archives before transfer, which
+        reproduces the strongest supporting evidence. These run from a known host and account
+        on a predictable cadence, which is what the baseline comparison is there to establish.

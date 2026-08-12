@@ -1,0 +1,380 @@
+type: detection
+
+id: hg-any-loaded-drivers-enumerated-before-driver-abuse-t1652
+
+version: 1.0.0
+
+info:
+  name: Loaded device drivers enumerated before driver abuse
+  description: >-
+    Asking a host which drivers it has loaded is asking three questions at once, and none of
+    them is about the driver. It is asking what the machine is for, because a print driver
+    and a storage controller describe very different roles. It is asking what is watching,
+    because every endpoint protection product on the market installs a kernel driver and
+    that driver is the thing standing between an operator and the filesystem. And it is
+    asking what can be turned against the host, because the bring-your-own-vulnerable-driver
+    pattern needs to know whether a signed driver with a known flaw is already present or
+    has to be dropped. `driverquery` is the canonical Windows answer and it is genuinely
+    rare in normal operation — it exists for support diagnostics and almost nothing invokes
+    it on a schedule — which makes this one of the few Discovery techniques where the
+    command itself carries signal rather than only context. The Unix equivalents, `lsmod`,
+    `modinfo` and `kextstat`, are noisier because they appear in ordinary system
+    administration, so on those platforms the file leans on who is asking and on what
+    follows. What follows is the point: the strongest case here is not the enumeration but
+    the enumeration followed by a driver file being written into a user-writable path, which
+    is the loading half of the technique this reconnaissance precedes.
+  severity: medium
+  author: huntgraph
+  tags:
+    - discovery
+    - device-drivers
+    - kernel-modules
+    - byovd
+    - security-software-discovery
+    - windows
+    - linux
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1652
+    - https://attack.mitre.org/detectionstrategies/DET0579
+    - https://attack.mitre.org/techniques/T1518/001
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1652
+  sub_techniques: []
+  detection_strategies:
+    - DET0579
+  analytics:
+    - AN1595
+    - AN1596
+    - AN1597
+  platforms:
+    - Windows
+    - Linux
+    - macOS
+  data_sources:
+    - WinEventLog:Security
+    - auditd:SYSCALL
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    An adversary may enumerate the device drivers or kernel modules loaded on a host in
+    order to identify the endpoint protection driver that must be neutralised, to profile
+    the machine's role from the hardware it serves, or to determine whether a signed driver
+    with a known vulnerability is already present and can be abused for kernel access.
+  attacker_behavior:
+    - Runs driverquery to list installed and loaded drivers with their paths and start types.
+    - Queries the driver or system-driver classes through WMI, CIM or a PowerShell cmdlet.
+    - Reads the services registry hive from the command line to enumerate kernel-mode service entries.
+    - Filters the driver list by the name of a security vendor to locate the protection driver.
+    - Lists loaded kernel modules on Linux with lsmod, modinfo or a read of /proc/modules.
+    - Lists loaded kernel extensions on macOS with kextstat or kextfind.
+    - Writes a driver file into a user-writable path shortly after enumerating what is loaded.
+  legitimate_behavior:
+    - Support engineers list drivers while diagnosing a hardware or stability fault.
+    - Asset inventory and vulnerability tooling collects driver versions to assess patch state.
+    - Imaging and build processes verify that the expected drivers were installed.
+    - Linux administrators check loaded modules while troubleshooting hardware or configuring a kernel feature.
+    - Backup, virtualisation and storage agents inspect kernel modules they depend on at start-up.
+  risk_indicator:
+    - The enumeration is filtered by security vendor or protection driver names.
+    - A driver file is written to a user-writable path shortly after the enumeration.
+    - The enumerating process was launched by an interpreter, archive tool or remote-execution service.
+    - The host has never run driver enumeration during the baseline window.
+    - Driver enumeration appears alongside other host-profiling commands under one lineage.
+
+requires:
+  platforms:
+    - windows
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: windows-driver-inventory-listed
+        name: Installed and loaded drivers listed on Windows
+        purpose: >-
+          Surface the enumeration commands themselves. driverquery has no scheduled
+          purpose, so the ascending sort places the genuinely rare invocations first and the
+          handful of support and inventory hosts that run it regularly fall to the bottom
+          where they can be excluded once and for all.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\bdriverquery\b|\bsysdriver\b\s+get|Win32_SystemDriver|Win32_PnPSignedDriver|Get-WindowsDriver|\bpnputil\b.{0,20}\/enum-drivers|\bsc\b\s+query\s+type=\s*driver|\bfltmc\b\s+(filters|instances)|CurrentControlSet\\Services.{0,40}(Type|ImagePath))/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=enumerations), collect([CommandLine], limit=5)])
+          | sort(enumerations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the asset inventory, vulnerability scanning and patch agents"
+            - "ComputerName of build and imaging hosts where driver verification is part of the process"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - parent_process
+            - command_line
+
+      - id: unix-kernel-modules-enumerated
+        name: Kernel modules or extensions enumerated on Linux and macOS
+        purpose: >-
+          Cover the same question on the platforms where it is asked of the kernel rather
+          than of a driver store. These commands are more common in ordinary administration
+          than driverquery is, so the grouping keeps the parent and the invoking user in the
+          result — on these platforms the discriminator is who is asking, not what is asked.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\blsmod\b|\bmodinfo\b|\/proc\/modules|\/sys\/module\b|\bkextstat\b|\bkextfind\b|\/System\/Library\/Extensions|\bioreg\b.{0,30}(IOService|IOProviderClass)|\bsystemextensionsctl\b\s+list)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=enumerations), collect([CommandLine], limit=5)])
+          | sort(enumerations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Configuration management, monitoring and container runtime agents that check modules at start-up"
+            - "ComputerName of engineering hosts where kernel work is routine"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: security-driver-named-in-enumeration
+        name: Enumeration filtered by a protection driver name
+        purpose: >-
+          Separate profiling from targeting. Listing every driver is a question about the
+          machine; filtering that list by the name of an endpoint protection driver is a
+          question about the defence, and it is the step that precedes an attempt to unload,
+          block or exploit it. Inventory tooling collects driver names but does not search
+          for specific vendors by name.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\bdriverquery\b|\bsysdriver\b|Win32_SystemDriver|Get-WindowsDriver|\bfltmc\b|\blsmod\b|\bmodinfo\b|\bkextstat\b|\bsc\b\s+query)/i
+          | CommandLine=/(csagent|CrowdStrike|SentinelOne|SentinelMonitor|CarbonBlack|cbk7|WdFilter|WdBoot|MpKslDrv|Sysmon|SysmonDrv|SophosED|elastic-endpoint|TmXPFlt|TmComm|klif|klflt|ehdrv|eamonm|edevmon|atrsdfw|naswSP|aswMonFlt)/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=probes), collect([CommandLine], limit=5)])
+          | sort(probes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Endpoint protection health-check and deployment tooling that verifies its own driver"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: enumeration-then-driver-written
+        name: Driver enumeration followed by a driver file written to a writable path
+        purpose: >-
+          Join the reconnaissance to the act it prepares for. Establishing what is already
+          loaded and then dropping a driver binary into a user-writable directory is the
+          opening of the bring-your-own-vulnerable-driver sequence, and neither half on its
+          own carries the same weight as the pair on one host.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2|PeFileWritten|NewExecutableWritten)$/
+          | case {
+              #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+                | CommandLine=/(\bdriverquery\b|Win32_SystemDriver|Get-WindowsDriver|\bfltmc\b\s+filters|\bsc\b\s+query\s+type=\s*driver|\blsmod\b|\bkextstat\b)/i
+                | driver_enumeration := CommandLine ;
+              #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+                | TargetFileName=/\.(sys|ko|kext)$/i
+                | TargetFileName=/\\(AppData|Temp|ProgramData|Users|Public|PerfLogs)\\|\/(tmp|var\/tmp|dev\/shm|home)\//i
+                | driver_written := TargetFileName ;
+            }
+          | groupBy([ComputerName],
+                    function=[collect([driver_enumeration, driver_written, UserName, ParentBaseFileName], limit=10),
+                              count(as=events)])
+          | driver_enumeration=/.+/ and driver_written=/.+/
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of approved driver deployment, patching and imaging agents"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - path
+
+evidence:
+  required:
+    - id: driver_enumeration
+      name: Device drivers or kernel modules enumerated
+      description: >-
+        A command listed the drivers installed or loaded on the host, or the kernel modules
+        and extensions resident on a Linux or macOS system.
+      source: process_creation
+      field: CommandLine
+      indicates: device_driver_discovery
+
+  supporting:
+    - id: protection_driver_targeted
+      name: Enumeration filtered by a protection driver name
+      description: >-
+        The enumeration searched for the driver belonging to an endpoint protection product,
+        which is the step before attempting to unload, block or exploit it rather than a
+        question about the machine.
+      source: process_creation
+      field: ImageFileName
+      indicates: defence_reconnaissance
+    - id: driver_dropped_after_enumeration
+      name: Driver file written to a writable path afterwards
+      description: >-
+        A driver, kernel module or kernel extension file was written into a user-writable
+        directory on the same host shortly after the enumeration, which is the opening of a
+        bring-your-own-driver sequence.
+      source: file_creation
+      field: TargetFileName
+      indicates: vulnerable_driver_staging
+    - id: scripted_parent
+      name: Interpreter or delivery-chain parent
+      description: >-
+        The enumerating process was launched by a command interpreter, archive utility or
+        remote-execution service rather than by an interactive support session or a
+        management agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: rare_for_host
+      name: No history of driver enumeration on this host
+      description: >-
+        Nothing comparable has been seen on this host during the baseline window, which for
+        driverquery in particular is the normal state of an endpoint.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: inventory_or_patch_agent
+      name: Inventory, vulnerability or patch agent
+      description: >-
+        The approved asset inventory, vulnerability scanning or patch management agent
+        performed the enumeration as part of its scheduled collection of driver versions.
+      source: process_creation
+      field: FileName
+      indicates: legitimate_enterprise_activity
+    - id: build_or_imaging_host
+      name: Build, imaging or engineering host
+      description: >-
+        The host builds images or is an engineering system where verifying installed drivers
+        and loading kernel modules is routine work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+    - id: recurring_collection
+      name: Enumeration recurs on a stable schedule
+      description: >-
+        The same enumeration appears at a regular interval across many hosts, which is
+        inventory collection rather than a one-off profiling of a single machine.
+      source: baseline
+      field: ComputerName
+      indicates: scheduled_automation_job
+
+  risk_logic:
+    required:
+      - driver_enumeration
+
+    supporting:
+      any:
+        - protection_driver_targeted
+        - driver_dropped_after_enumeration
+        - scripted_parent
+        - rare_for_host
+      all:
+        - driver_dropped_after_enumeration
+        - rare_for_host
+
+    contradicting:
+      any:
+        - inventory_or_patch_agent
+        - build_or_imaging_host
+        - recurring_collection
+      all: []
+
+  verdict:
+    low_risk_when:
+      - driver_enumeration
+      - inventory_or_patch_agent
+      - build_or_imaging_host
+      - recurring_collection
+    suspicious_when:
+      - driver_enumeration
+      - rare_for_host
+      - scripted_parent
+    high_risk_when:
+      - driver_enumeration
+      - rare_for_host
+      - scripted_parent
+      - protection_driver_targeted
+      - driver_dropped_after_enumeration
+
+  false_positive:
+    - condition: A vulnerability scanner collects driver versions on every host.
+      explanation: >-
+        Driver inventory is a standard component of vulnerability assessment precisely
+        because vulnerable drivers are a known risk, so the scanner reproduces the required
+        evidence estate-wide. It runs from a known agent on a fixed cycle.
+    - condition: A support engineer lists drivers while diagnosing a hardware or stability fault.
+      explanation: >-
+        This is the purpose driverquery exists for, and it will appear on ordinary endpoints
+        where no host-role exclusion applies. It is distinguished by an interactive parent
+        and by the absence of any vendor-name filter or subsequent driver write.
+    - condition: An endpoint protection product verifies its own driver is present and healthy.
+      explanation: >-
+        Self-checks by security tooling name the vendor's own driver, which reproduces the
+        strongest supporting evidence in the third case. The invoking image belongs to the
+        product's own installation directory.
+    - condition: A Linux administrator or container runtime checks loaded modules at start-up.
+      explanation: >-
+        lsmod and modinfo are ordinary administration on Linux and several agents run them
+        on every boot, so on that platform the required evidence alone is close to
+        meaningless without the parent and baseline context.
+    - condition: A driver deployment or patch run writes .sys files after checking what is installed.
+      explanation: >-
+        Legitimate driver deployment does exactly the enumerate-then-write sequence the
+        fourth case looks for. It is separated by the writing process being an approved
+        deployment agent and by the destination being a managed driver store rather than a
+        user-writable temporary directory.

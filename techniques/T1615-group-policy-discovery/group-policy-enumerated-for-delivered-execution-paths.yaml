@@ -1,0 +1,366 @@
+type: detection
+
+id: hg-win-group-policy-enumerated-for-delivered-execution-paths-t1615
+
+version: 1.0.0
+
+info:
+  name: Group Policy enumerated for delivered execution paths and writable policy objects
+  description: >-
+    Group Policy is the estate's own configuration management, and to an adversary that
+    makes it two things at once: a map and a delivery mechanism. The map is what an
+    enumeration of GPOs returns — which hosts receive which settings, which accounts are
+    placed into local administrators by policy, where logon scripts and scheduled tasks are
+    pushed from, and which security controls are enforced rather than merely installed. The
+    delivery mechanism is what follows if any of those policy objects turns out to be
+    writable by the compromised principal, because a file dropped into a policy's Scripts
+    directory runs on every machine the policy applies to, with no lateral movement at all.
+    The reconnaissance is therefore not idle: it is the search for a single writable object
+    that converts one foothold into estate-wide execution. Detection has to accept that
+    gpresult is genuinely common — it is the first thing a desktop engineer runs when a
+    setting has not applied — so the discriminating cases here are not the summary command
+    but the two that have no support-desk equivalent: walking the SYSVOL policy tree for the
+    files that carry code, and testing those paths for write access. This file is the
+    discovery half of the ground T1484.001 covers at the point of modification, and it is
+    deliberately distinct from the T1552.006 template, which hunts the same share for
+    embedded cpassword values rather than for execution paths.
+  severity: medium
+  author: huntgraph
+  tags:
+    - discovery
+    - group-policy
+    - active-directory
+    - sysvol
+    - privilege-escalation-precursor
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1615
+    - https://attack.mitre.org/detectionstrategies/DET0055
+    - https://attack.mitre.org/techniques/T1484/001
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1615
+  sub_techniques: []
+  detection_strategies:
+    - DET0055
+  analytics:
+    - AN0152
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:PowerShell
+  data_components:
+    - Process Creation
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    An adversary may enumerate Group Policy objects and the SYSVOL tree that stores them in
+    order to identify the scripts and scheduled tasks pushed to every host, the accounts
+    granted local administrator by policy, and any policy path the compromised principal can
+    write to, which would give estate-wide execution without further lateral movement.
+  attacker_behavior:
+    - Runs gpresult with a verbose or report switch to read the policies applied to the host.
+    - Enumerates every GPO in the domain through Get-GPO, Get-GPOReport or a PowerView function.
+    - Queries which policies place accounts into privileged local groups.
+    - Walks the SYSVOL Policies tree looking for logon scripts, startup scripts and scheduled task definitions.
+    - Tests the access control on policy directories to find one the current principal can write to.
+    - Runs a directory collection tool that gathers GPO relationships alongside the rest of the domain graph.
+  legitimate_behavior:
+    - A desktop engineer runs gpresult to diagnose a setting that has not applied to a workstation.
+    - Group Policy administrators back up, document or report on GPOs from a management console.
+    - Change tooling exports policy reports before and after a scheduled configuration change.
+    - Auditors collect policy inventory during a compliance review.
+    - Deployment scripts read applied policy to decide whether a host is correctly configured.
+  risk_indicator:
+    - The enumeration walks the SYSVOL policy tree for script and task files rather than reading a summary.
+    - Access control on policy directories is tested, which reporting never needs to do.
+    - The enumeration runs from a host that does not administer Group Policy.
+    - Several distinct categories of directory reconnaissance appear under one process lineage.
+    - The querying process was launched by an interpreter or a remote-execution service.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: group-policy-inventory-enumerated
+        name: Domain-wide GPO inventory retrieved
+        purpose: >-
+          Surface the enumeration commands, separating the ones that ask about this host
+          from the ones that ask about the whole domain. A desktop engineer asks what
+          applies here; an operator asks what exists everywhere, and the domain-wide forms
+          and the offensive framework functions are what carry that distinction.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\bgpresult\b|Get-GPO\b|Get-GPOReport|Get-GPResultantSetOfPolicy|Get-DomainGPO|Get-DomainGPOLocalGroup|Get-DomainGPOUserLocalGroupMapping|Get-NetGPO|Get-NetGPOGroup|groupPolicyContainer|\bgpotool\b)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=enumerations), collect([CommandLine], limit=5)])
+          | sort(enumerations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of Group Policy management and directory administration workstations"
+            - "ParentBaseFileName of the change-management and compliance reporting agents"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - parent_process
+            - command_line
+
+      - id: sysvol-script-and-task-paths-listed
+        name: SYSVOL policy tree walked for scripts and scheduled tasks
+        purpose: >-
+          Catch the enumeration that matters most. Policy processing on a client fetches the
+          specific files its own policies name; listing the whole Policies tree for the
+          files that carry code — logon and startup scripts, scheduled task definitions, the
+          security template — is a search for what is delivered to other machines, not for
+          what applies to this one.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\\SYSVOL\\|\\\\[^\\]+\\SYSVOL|\\Policies\\\{)/i
+          | CommandLine=/(\\Scripts\\|scripts\.ini|psscripts\.ini|ScheduledTasks\.xml|GptTmpl\.inf|Registry\.pol|\bMachine\\Preferences\b|\bUser\\Preferences\b)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=listings), collect([CommandLine], limit=5)])
+          | sort(listings, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Group Policy backup, replication-health and documentation tooling"
+            - "ComputerName of domain controllers performing SYSVOL replication maintenance"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - path
+
+      - id: policy-path-write-access-tested
+        name: Write access tested against a policy directory
+        purpose: >-
+          Identify the step that turns reconnaissance into an attack path. Reporting and
+          diagnosis never need to know whether a policy directory is writable; asking that
+          question has exactly one use, which is finding the object through which code can
+          be pushed to every host the policy applies to.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\\SYSVOL\\|\\\\[^\\]+\\SYSVOL|\\Policies\\\{|groupPolicyContainer)/i
+          | CommandLine=/(\bicacls\b|\bcacls\b|Get-Acl|Get-DomainObjectAcl|Find-InterestingDomainAcl|\bnltest\b.{0,30}\/dsgetdc|WriteProperty|GenericWrite|GenericAll|\bAccessChk\b)/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=probes), collect([CommandLine], limit=5)])
+          | sort(probes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Authorised directory security-assessment and red-team hosts"
+            - "Delegation review tooling run by identity administrators during access reviews"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: policy-enumeration-within-directory-recon
+        name: Policy enumeration alongside other directory reconnaissance
+        purpose: >-
+          Place the finding in context. A single gpresult is a support call; the same
+          command arriving under one lineage together with domain, trust, computer and
+          privileged-group enumeration is an operator building a map of the directory, and
+          the number of distinct categories asked for is what separates the two.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(\bgpresult\b|Get-GPO\b|Get-DomainGPO|Get-NetGPO)/i
+                | recon_policy := CommandLine ;
+              CommandLine=/(\bnltest\b|Get-ADDomain|Get-DomainTrust|\bnet\s+view\s+\/domain)/i
+                | recon_domain := CommandLine ;
+              CommandLine=/(Get-ADComputer|Get-DomainComputer|\bnet\s+group\b.{0,30}\/domain|Get-ADGroupMember|Get-DomainGroupMember)/i
+                | recon_principals := CommandLine ;
+              CommandLine=/(Get-ADUser|Get-DomainUser|\bnet\s+user\b.{0,20}\/domain|\bquser\b|\bdsquery\b)/i
+                | recon_accounts := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[collect([recon_policy, recon_domain, recon_principals, recon_accounts], limit=12),
+                              count(as=commands)])
+          | recon_policy=/.+/
+          | sort(commands, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of directory administration workstations and management jump hosts"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - parent_process
+
+evidence:
+  required:
+    - id: group_policy_enumeration
+      name: Group Policy enumerated
+      description: >-
+        A command enumerated Group Policy objects, the policies resultant on a host, or the
+        SYSVOL directory tree in which policy content is stored.
+      source: process_creation
+      field: CommandLine
+      indicates: group_policy_discovery
+
+  supporting:
+    - id: delivered_code_paths_listed
+      name: Script and scheduled task paths listed
+      description: >-
+        The enumeration targeted the files inside a policy that carry executable content —
+        logon and startup scripts, scheduled task definitions or the security template —
+        rather than reading a settings summary.
+      source: process_creation
+      field: CommandLine
+      indicates: attack_path_reconnaissance
+    - id: write_access_probe
+      name: Write access tested on a policy object
+      description: >-
+        The access control on a policy directory or object was inspected, which is only
+        useful for establishing whether the current principal can push content through it.
+      source: process_creation
+      field: ImageFileName
+      indicates: privilege_escalation_preparation
+    - id: clustered_directory_recon
+      name: Several categories of directory reconnaissance together
+      description: >-
+        Policy enumeration arrived under the same lineage as domain, computer, group and
+        account enumeration, which is an operator orienting rather than an engineer
+        answering one question.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: hands_on_keyboard_reconnaissance
+    - id: rare_for_host
+      name: No history of policy enumeration on this host
+      description: >-
+        Nothing comparable has been seen on this host during the baseline window, in
+        contrast to the management systems where policy queries are routine.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: policy_administration_host
+      name: Group Policy administration host
+      description: >-
+        The host is a Group Policy management or directory administration workstation where
+        enumerating and reporting on policy is the work the machine exists to do.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: reporting_or_backup_agent
+      name: Policy reporting, backup or replication tooling
+      description: >-
+        The approved GPO documentation, backup or SYSVOL replication-health tool performed
+        the enumeration as part of its scheduled run.
+      source: process_creation
+      field: FileName
+      indicates: legitimate_enterprise_activity
+    - id: approved_change_window
+      name: Enumeration within an approved change
+      description: >-
+        The activity falls inside a recorded Group Policy change or access review, where
+        exporting policy and inspecting delegation are expected steps.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_change
+
+  risk_logic:
+    required:
+      - group_policy_enumeration
+
+    supporting:
+      any:
+        - delivered_code_paths_listed
+        - write_access_probe
+        - clustered_directory_recon
+        - rare_for_host
+      all:
+        - delivered_code_paths_listed
+        - write_access_probe
+
+    contradicting:
+      any:
+        - policy_administration_host
+        - reporting_or_backup_agent
+        - approved_change_window
+      all: []
+
+  verdict:
+    low_risk_when:
+      - group_policy_enumeration
+      - policy_administration_host
+      - reporting_or_backup_agent
+      - approved_change_window
+    suspicious_when:
+      - group_policy_enumeration
+      - rare_for_host
+      - delivered_code_paths_listed
+    high_risk_when:
+      - group_policy_enumeration
+      - rare_for_host
+      - delivered_code_paths_listed
+      - write_access_probe
+      - clustered_directory_recon
+
+  false_positive:
+    - condition: A desktop engineer runs gpresult while diagnosing a setting that has not applied.
+      explanation: >-
+        This is by far the largest benign source of the required evidence and it will appear
+        on ordinary workstations, which defeats a host-role exclusion. It is distinguished by
+        the absence of the SYSVOL tree walk and the access-control probe, and by an
+        interactive parent.
+    - condition: GPO documentation or backup tooling exports every policy on a schedule.
+      explanation: >-
+        Backup and documentation tools legitimately enumerate all GPOs and walk the whole
+        SYSVOL tree, reproducing both the required and the strongest supporting evidence.
+        They run from a known agent on a fixed cycle and always from the same few hosts.
+    - condition: An identity access review inspects delegation on policy objects.
+      explanation: >-
+        Access reviews deliberately look for principals with write rights on GPOs, which is
+        the same question the attacker asks. The activity is bounded by a recorded review
+        and performed by accounts that administer identity.
+    - condition: A deployment or imaging script reads applied policy to confirm a build.
+      explanation: >-
+        Build tooling checks resultant policy to decide whether a host is correctly
+        configured, and does so from a scripted parent, which resembles the abnormal
+        execution chain. It recurs identically across every host built in a window.
+    - condition: A domain controller performs SYSVOL replication maintenance.
+      explanation: >-
+        Replication health checks enumerate and compare the policy tree across controllers,
+        producing directory listings that match the second case. Host role and the machine
+        account as the running principal separate them.

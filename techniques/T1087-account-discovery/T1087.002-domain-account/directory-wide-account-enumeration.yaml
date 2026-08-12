@@ -1,0 +1,328 @@
+type: detection
+
+id: hg-any-directory-wide-account-enumeration-t1087-002
+
+version: 1.0.0
+
+info:
+  name: Directory-wide account enumeration from an ordinary endpoint
+  description: >-
+    A local account query tells an adversary who can log into the machine they are standing
+    on. A domain query tells them the shape of the entire organisation, and it is answered
+    by a domain controller, which means one command issued from one compromised laptop
+    reaches every identity the company has. That asymmetry is the whole reason this file
+    scores higher than its local counterpart, T1087.001. The hunt is not for a lookup — an
+    administrator checking one colleague's account is unremarkable — but for breadth: an
+    unfiltered `Get-ADUser -Filter *`, an AdFind sweep, a `csvde` export, a BloodHound
+    collection. Breadth is what makes the result usable as a target list, and it is the
+    classic step immediately before credential theft becomes targeted. Note that only the
+    process-creation half of the MITRE strategy is available here: the LDAP bind and search
+    traffic itself (DC0085) needs network security monitoring this deployment does not have,
+    so an adversary who queries the directory from inside a compiled implant, without
+    spawning a process, will not appear in these results.
+  severity: medium
+  author: huntgraph
+  tags:
+    - discovery
+    - account-discovery
+    - active-directory
+    - ldap
+    - situational-awareness
+    - windows
+    - linux
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1087/002
+    - https://attack.mitre.org/detectionstrategies/DET0129
+    - https://attack.mitre.org/techniques/T1087
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1087
+  sub_techniques:
+    - T1087.002
+  detection_strategies:
+    - DET0129
+  analytics:
+    - AN0363
+    - AN0364
+    - AN0365
+  platforms:
+    - Windows
+    - Linux
+    - macOS
+  data_sources:
+    - WinEventLog:Sysmon
+    - auditd:SYSCALL
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary with a foothold on an ordinary endpoint may ask a domain controller for the
+    whole account population rather than for one account, producing a target list that
+    directs every subsequent credential-theft and lateral-movement decision in the intrusion.
+  attacker_behavior:
+    - Issues an unfiltered or wildcard directory query returning every user object.
+    - Brings dedicated enumeration tooling such as AdFind, ADExplorer or a BloodHound collector onto the host.
+    - Exports directory contents to a file with csvde, ldifde or a redirected command output.
+    - Runs the query from a workstation or an ordinary server that has no directory administration role.
+    - Repeats the sweep for computers, groups and trusts in the same session.
+  legitimate_behavior:
+    - Directory administrators query and export account data from administration hosts.
+    - Identity governance and joiner-mover-leaver tooling reads the directory on a schedule.
+    - Reporting and licence-reconciliation jobs export user lists periodically.
+    - Helpdesk staff look up individual accounts many times a day.
+    - Authorised red teams and assessment vendors run the same collectors under an agreed scope.
+  risk_indicator:
+    - The query scope is unbounded rather than naming a specific account.
+    - Dedicated directory enumeration tooling appears on a host that has never run it.
+    - The output is written to a file, which turns a lookup into a portable target list.
+    - The originating host has no identity administration role in the asset inventory.
+
+requires:
+  platforms:
+    - windows
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: unbounded-directory-query
+        name: Account query with no meaningful scope
+        purpose: >-
+          Separate breadth from a lookup by requiring the query to be unfiltered or wildcard,
+          which is what makes the answer a target list rather than an answer to a question
+          about one person.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Get-ADUser|Get-ADObject|Get-ADAccountAuthorizationGroup|Get-DomainUser|Get-NetUser|dsquery\s+user|ldapsearch|wbinfo\s+-u|net1?(\.exe)?\s+users?\s+.*\/dom)/i
+          | CommandLine=/(-Filter\s+["']?\*|-Filter\s+["']?\{?\s*\*|objectCategory=person|objectClass=user|samaccounttype=805306368|-limit\s+0|\/dom(ain)?\s*$|\ballusers\b)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=queries), collect([CommandLine], limit=5)])
+          | sort(queries, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of domain controllers and identity administration hosts"
+            - "ParentBaseFileName of identity governance and directory synchronisation agents"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: directory-enumeration-tooling
+        name: Dedicated directory enumeration tooling on an endpoint
+        purpose: >-
+          Catch the named collectors whose only purpose is to dump a directory, which are
+          rare enough that presence rather than argument is the signal.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(adfind|ad_?explorer|adrecon|sharphound|bloodhound|azurehound|csvde|ldifde|dsquery|dsget|pywerview|powerview|Invoke-BloodHound|Get-DomainUser|Get-NetUser|ldapdomaindump|windapsearch)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Administration hosts where csvde, ldifde and dsquery are part of the standard toolset"
+            - "Assessment periods agreed in advance with the security testing programme"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: enumeration-written-to-file
+        name: Directory query results written to disk
+        purpose: >-
+          Distinguish a dump from a lookup, since an answer that is kept is an answer that
+          will be carried off the host and worked through later.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Get-ADUser|Get-ADObject|Get-DomainUser|Get-NetUser|dsquery\s+user|ldapsearch|wbinfo\s+-u|adfind|net1?(\.exe)?\s+users?\s+.*\/dom)/i
+          | CommandLine=/(Export-Csv|Out-File|Set-Content|ConvertTo-Json|Tee-Object|\s>>?\s|\|\s*tee\b|-f\s+[A-Za-z]:\\|csvde\s+-f|ldifde\s+-f)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=exports), collect([CommandLine], limit=5)])
+          | sort(exports, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Scheduled reporting jobs that export directory data to a fixed reporting share"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - path
+
+evidence:
+  required:
+    - id: domain_account_enumeration
+      name: Domain account enumeration issued from an endpoint
+      description: >-
+        A command asked the directory for domain account objects, a question answered by a
+        domain controller and therefore reaching well beyond the host that asked it.
+      source: process_creation
+      field: CommandLine
+      indicates: preparatory_enumeration
+
+  supporting:
+    - id: unbounded_query_scope
+      name: Query scope is unbounded
+      description: >-
+        The query used a wildcard filter, an object-class filter or an unlimited result set
+        rather than naming an account, which produces a target list rather than an answer.
+      source: process_creation
+      field: CommandLine
+      indicates: estate_wide_reconnaissance
+    - id: directory_enumeration_tooling
+      name: Dedicated enumeration tooling present
+      description: >-
+        A collector whose only purpose is to enumerate or dump a directory ran on the host,
+        such as AdFind, ADExplorer, ADRecon, a BloodHound collector or a PowerView function.
+      source: process_creation
+      field: FileName
+      indicates: unusual_binary_in_environment
+    - id: results_written_to_disk
+      name: Results kept rather than read
+      description: >-
+        The query output was redirected or exported to a file, which is what turns directory
+        reconnaissance into a portable artefact for later targeting.
+      source: process_creation
+      field: CommandLine
+      indicates: collection_staging
+    - id: non_administrative_source_host
+      name: Host with no identity administration role
+      description: >-
+        The originating host is a workstation or an ordinary server rather than a domain
+        controller, an administration jump host or an identity platform.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: identity_administration_host
+      name: Issued from an identity administration host
+      description: >-
+        The command came from a domain controller, a privileged access workstation or an
+        identity management server whose purpose is directory administration.
+      source: baseline
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: directory_synchronisation_agent
+      name: Directory synchronisation or governance agent
+      description: >-
+        The parent process is an identity governance, directory synchronisation or
+        joiner-mover-leaver agent that reads the whole account population by design.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: scheduled_reporting_job
+      name: Scheduled reporting or reconciliation job
+      description: >-
+        The enumeration ran from a scheduler on a fixed cadence, exporting to the same
+        reporting location it has used throughout the baseline window.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: scheduled_automation_job
+    - id: authorised_assessment
+      name: Authorised security assessment
+      description: >-
+        A recorded engagement covers the activity, naming the testers, the scope and the
+        window during which directory collection was expected.
+      source: change_management
+      field: UserName
+      indicates: authorised_security_testing
+
+  risk_logic:
+    required:
+      - domain_account_enumeration
+
+    supporting:
+      any:
+        - unbounded_query_scope
+        - directory_enumeration_tooling
+        - results_written_to_disk
+        - non_administrative_source_host
+      all:
+        - unbounded_query_scope
+        - non_administrative_source_host
+
+    contradicting:
+      any:
+        - identity_administration_host
+        - directory_synchronisation_agent
+        - scheduled_reporting_job
+        - authorised_assessment
+      all: []
+
+  verdict:
+    low_risk_when:
+      - domain_account_enumeration
+      - identity_administration_host
+      - directory_synchronisation_agent
+      - scheduled_reporting_job
+      - authorised_assessment
+    suspicious_when:
+      - domain_account_enumeration
+      - unbounded_query_scope
+    high_risk_when:
+      - domain_account_enumeration
+      - unbounded_query_scope
+      - directory_enumeration_tooling
+      - results_written_to_disk
+      - non_administrative_source_host
+
+  false_positive:
+    - condition: An identity governance platform reads the whole directory on a schedule.
+      explanation: >-
+        Governance and synchronisation tooling enumerates every account by design and will
+        reproduce the unbounded-scope evidence on every run. It appears under a stable service
+        identity, from the same hosts, on a predictable cadence, throughout the baseline.
+    - condition: A directory administrator exports user data with csvde or ldifde.
+      explanation: >-
+        These are Microsoft's own administration utilities and their presence is not itself
+        remarkable on an administration host. What separates the two cases is the host role
+        and whether the acting account has any history of directory work.
+    - condition: A licence or headcount reconciliation job exports the user list monthly.
+      explanation: >-
+        Reconciliation reporting reproduces both the unbounded scope and the write-to-disk
+        evidence together, which is the strongest combination this file has. It is
+        distinguishable only by cadence, by the scheduler as parent and by a stable output path.
+    - condition: An authorised red team runs a BloodHound collection.
+      explanation: >-
+        An assessment is behaviourally indistinguishable from the intrusion it simulates.
+        This is the case that the engagement record exists to resolve, and it should be
+        confirmed rather than assumed from the tooling being well known.
+    - condition: A helpdesk tool queries the directory for the account a caller is asking about.
+      explanation: >-
+        Helpdesk lookups are numerous but scoped to one account at a time, so they satisfy
+        the required evidence and none of the escalation. They are the reason the unbounded
+        scope rather than the query itself carries the verdict.

@@ -1,0 +1,378 @@
+type: detection
+
+id: hg-win-mailbox-exported-or-searched-through-a-remote-session-t1114-002
+
+version: 1.0.0
+
+info:
+  name: Mailbox exported or searched through a remote session
+  description: >-
+    Remote collection takes the mail from the server rather than from the endpoint, and that
+    difference decides everything about what can be seen. The adversary holds credentials or
+    a token, connects to Exchange, Exchange Online or Graph, and asks for the mail. No mail
+    store is touched on any workstation, nothing is copied out of a user profile, and if the
+    session runs from the adversary's own machine or from a browser in OWA then no managed
+    host is involved at any point. State the consequence plainly rather than implying
+    coverage that does not exist: the authoritative record of remote mail collection is the
+    mail platform's own audit trail, the MailItemsAccessed and Exchange cmdlet events in
+    Purview together with the sign-in logs, and none of that reaches an endpoint sensor. This
+    hunt covers the one half that does reach it, which is the operator path. An adversary who
+    already has an administrative workstation, or who has landed on a server and is working
+    from there, drives Exchange through PowerShell on a host this deployment monitors, and
+    the full command line is captured. That is a narrower claim than the technique but it is
+    a real one, and it is where several of the loudest intrusions actually left evidence: the
+    New-MailboxExportRequest and Get-MailboxExportRequest pair used against executives and IT
+    staff during the SolarWinds compromise, the same cmdlet used after ProxyShell, and
+    MailSniper's keyword sweeps across every mailbox in a tenant. Those cmdlets are worth
+    hunting on their own terms because they have no casual use. An export request writes an
+    entire mailbox to a file, and a global mailbox search reads every mailbox in the
+    organisation, so neither is something an administrator does incidentally while working on
+    something else. The legitimate twin is eDiscovery and legal hold, which uses the same
+    cmdlets and is the reason this cannot be a straight alert: the discriminator is whether a
+    named case, a ticket and a compliance operator sit behind the run. Pair this with mail
+    platform auditing rather than treating it as coverage of the technique.
+  severity: high
+  author: huntgraph
+  tags:
+    - collection
+    - email-collection
+    - exchange
+    - mailbox-export
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1114/002
+    - https://attack.mitre.org/detectionstrategies/DET0048
+    - https://attack.mitre.org/techniques/T1114
+    - https://attack.mitre.org/software/S0413
+
+mitre:
+  tactics:
+    - TA0009
+  techniques:
+    - T1114
+  sub_techniques:
+    - T1114.002
+  detection_strategies:
+    - DET0048
+  analytics:
+    - AN0131
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:PowerShell
+    - WinEventLog:Sysmon
+    - azure:signinlogs
+    - m365:purview
+  data_components:
+    - Command Execution
+    - Application Log Content
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary holding mailbox or Exchange administrative credentials may drive the mail
+    platform from a managed Windows host, exporting whole mailboxes to files or sweeping
+    every mailbox for keywords, collecting mail without ever touching a local mail store.
+  attacker_behavior:
+    - Issues New-MailboxExportRequest to write a target mailbox out to a file share.
+    - Runs Search-Mailbox or a compliance search to sweep mailboxes for keywords of interest.
+    - Uses MailSniper cmdlets to search every mailbox in the organisation from one session.
+    - Calls Exchange Web Services or the Graph messages endpoint directly from a script.
+    - Targets the mailboxes of executives, IT staff and the incident responders working the intrusion.
+  legitimate_behavior:
+    - Compliance staff run eDiscovery and legal hold searches using the same cmdlets.
+    - Administrators export a departing employee's mailbox to a PST for retention.
+    - Migration tooling reads mailboxes in bulk while moving a tenant.
+    - Support staff run targeted message traces to diagnose a delivery problem.
+    - Mail security products query mailboxes programmatically to remediate delivered phishing.
+  risk_indicator:
+    - The export or search targets executives, IT staff or the security team rather than a leaver.
+    - A mailbox search runs across the whole organisation rather than a named case scope.
+    - The cmdlets run under an account with no mail administration or compliance role.
+    - Mail is reached through a raw API call from a script rather than through the management module.
+    - The host has no history of Exchange administration during the baseline window.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - DomainName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: mailbox-export-request-issued
+        name: Whole mailbox written out by export request
+        purpose: >-
+          Isolate the sharpest observable in this technique. An export request serialises an
+          entire mailbox to a file, so it is collection by definition rather than an action
+          that might turn out to be collection, and it appears in the SolarWinds and
+          ProxyShell intrusions in exactly this form.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(New|Get|Resume)-MailboxExportRequest\b|\bNew-ComplianceSearchAction\b[^|]*-Export\b|\bExport-(Mailbox|ActiveSyncLog)\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=requests), collect([CommandLine], limit=5)])
+          | sort(requests, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Scheduled leaver-retention exports run by the mailbox lifecycle process"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: mailboxes-swept-for-keywords
+        name: Mailboxes searched for keywords across the organisation
+        purpose: >-
+          Catch the reconnaissance shape rather than the bulk copy. Sweeping mailboxes for
+          terms decides what is worth taking, and the organisation-wide variant is what
+          MailSniper exists to do, which makes the scope of the search more telling than the
+          fact of it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\bSearch-Mailbox\b|\bNew-ComplianceSearch\b|\bStart-ComplianceSearch\b|\bInvoke-GlobalMailSearch\b|\bInvoke-SelfSearch\b|\bGet-GlobalAddressList\b|\bMailSniper\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=searches), collect([CommandLine], limit=5)])
+          | sort(searches, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Compliance searches raised against a named eDiscovery case by the legal team"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: mail-reached-through-a-raw-api-call
+        name: Mailbox contents pulled through EWS or Graph from a script
+        purpose: >-
+          Cover the route that bypasses the management module altogether. A script that
+          builds its own Exchange Web Services or Graph request is not doing mail
+          administration, and the same shape covers the tooling that automates token abuse
+          against a tenant.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Microsoft\.Exchange\.WebServices|EWS\/Exchange\.asmx|ExchangeService|graph\.microsoft\.com[^\s"']*\/(me|users)[^\s"']*\/(messages|mailFolders)|Get-MgUserMessage|AADInternals|Get-AADIntTeamsMessages|Invoke-RestMethod[^|]*(outlook\.office|graph\.microsoft))/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=calls), collect([CommandLine], limit=5)])
+          | sort(calls, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Registered integration accounts whose applications read mail through Graph by design"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - process
+            - organization
+
+      - id: mail-endpoint-resolved-by-an-interpreter
+        name: Mail service resolved by a script host rather than a mail client
+        purpose: >-
+          Give the hunt a second, independent handle on the same behaviour. Name resolution
+          for the mail service from an interpreter rather than from Outlook indicates the
+          session was scripted, and it still fires when the cmdlet itself was obfuscated
+          enough to defeat a command-line pattern.
+        query: |
+          #event_simpleName=/^(DnsRequest|ProcessRollup2)$/
+          | case {
+              #event_simpleName=DnsRequest
+                | DomainName=/(outlook\.office365\.com|outlook\.office\.com|ps\.outlook\.com|graph\.microsoft\.com|substrate\.office\.com|manage\.office\.com)$/i ;
+              #event_simpleName=ProcessRollup2
+                | FileName=/^(powershell|pwsh|python|python3|wscript|cscript|curl|node)\.exe$/i
+                | interpreter := FileName ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([DomainName, interpreter, UserName, CommandLine], limit=5),
+                              count(as=events)])
+          | interpreter=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Monitoring and mail-hygiene agents that poll the mail service on a fixed interval"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: remote_mail_access_command
+      name: Mail platform driven from a managed host
+      description: >-
+        A process on a managed host executed a cmdlet or API call whose only purpose is to
+        read, export or search mailbox contents on the mail platform.
+      source: process_creation
+      field: CommandLine
+      indicates: remote_mail_collection
+
+  supporting:
+    - id: whole_mailbox_exported
+      name: Export request for an entire mailbox
+      description: >-
+        An export request was issued, which serialises a complete mailbox to a file and is
+        collection of the whole account rather than a query against it.
+      source: process_creation
+      field: CommandLine
+      indicates: bulk_mail_extraction
+    - id: organisation_wide_search
+      name: Search spanning every mailbox
+      description: >-
+        The search was scoped to all mailboxes or to the global address list rather than to a
+        named case or a single account, which is reconnaissance across the whole estate.
+      source: process_creation
+      field: CommandLine
+      indicates: broad_mailbox_reconnaissance
+    - id: programmatic_api_access
+      name: Mail reached through a raw API call
+      description: >-
+        Mailbox contents were requested through Exchange Web Services or the Graph messages
+        endpoint from a script rather than through the Exchange management module.
+      source: process_creation
+      field: CommandLine
+      indicates: scripted_mail_access
+    - id: mail_service_resolved_by_interpreter
+      name: Mail service resolved by a script host
+      description: >-
+        A script interpreter rather than a mail client resolved the mail service name,
+        indicating the session was automated regardless of how the command line was written.
+      source: dns_request
+      field: DomainName
+      indicates: scripted_mail_access
+    - id: no_mail_administration_history
+      name: No history of mail administration on this host or account
+      description: >-
+        Neither this host nor this account has driven the mail platform during the baseline
+        window, so the management session is itself new rather than routine.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: named_compliance_case
+      name: Search or export tied to a named case
+      description: >-
+        The activity is attached to an eDiscovery case, a legal hold or a leaver-retention
+        ticket, which is the sanctioned use of exactly these cmdlets.
+      source: change_management
+      field: UserName
+      indicates: legitimate_administrative_action
+    - id: mail_platform_tooling
+      name: Migration, archiving or mail security product
+      description: >-
+        The acting binary belongs to a migration, archiving or mail security product whose
+        documented function is to read mailboxes on the organisation's behalf.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: recurring_scheduled_operation
+      name: Same operation runs on a fixed schedule
+      description: >-
+        The identical command shape recurs at a fixed interval under a service account, which
+        is an automated retention or hygiene job rather than an operator at a keyboard.
+      source: baseline
+      field: CommandLine
+      indicates: bulk_administrative_operation
+
+  risk_logic:
+    required:
+      - remote_mail_access_command
+
+    supporting:
+      any:
+        - whole_mailbox_exported
+        - organisation_wide_search
+        - programmatic_api_access
+        - mail_service_resolved_by_interpreter
+        - no_mail_administration_history
+      all:
+        - whole_mailbox_exported
+        - no_mail_administration_history
+
+    contradicting:
+      any:
+        - named_compliance_case
+        - mail_platform_tooling
+        - recurring_scheduled_operation
+      all: []
+
+  verdict:
+    low_risk_when:
+      - remote_mail_access_command
+      - named_compliance_case
+      - mail_platform_tooling
+      - recurring_scheduled_operation
+    suspicious_when:
+      - remote_mail_access_command
+      - no_mail_administration_history
+    high_risk_when:
+      - remote_mail_access_command
+      - whole_mailbox_exported
+      - organisation_wide_search
+      - programmatic_api_access
+      - no_mail_administration_history
+
+  false_positive:
+    - condition: Compliance staff run an eDiscovery search or legal hold.
+      explanation: >-
+        This is the same cmdlet set with the same organisation-wide scope, and it is the
+        single reason this cannot be a straight alert. It is separated by a named case in the
+        compliance centre, by the operator holding an eDiscovery role, and by the search
+        terms matching the matter rather than the incident.
+    - condition: An administrator exports a departing employee's mailbox for retention.
+      explanation: >-
+        Leaver processing produces export requests routinely, often on a schedule. The tell
+        is that the target is a disabled or recently disabled account rather than an active
+        executive or an IT account, and that a leaver ticket exists.
+    - condition: Migration tooling reads mailboxes in bulk during a tenant move.
+      explanation: >-
+        Migration reads every mailbox by design, which resembles an organisation-wide sweep.
+        It is identified by the vendor's own binary or connector, by a migration project
+        window, and by the reads being uniform across the whole batch rather than weighted
+        toward interesting accounts.
+    - condition: A mail security product queries mailboxes to remediate delivered phishing.
+      explanation: >-
+        Post-delivery remediation searches mailboxes for a message and removes it, using
+        compliance search cmdlets. The acting process is the product's connector and the
+        searches key on a message identifier rather than on business terms.
+    - condition: The collection happened entirely off the endpoint and never appears here.
+      explanation: >-
+        This is the coverage gap rather than a false positive. A session run from an
+        unmanaged device, from OWA in a browser, or directly against Graph with a stolen
+        token leaves no trace on any managed host. Purview MailItemsAccessed and the sign-in
+        logs are the authority for those, and an empty result here is not evidence of
+        absence.

@@ -1,0 +1,363 @@
+type: detection
+
+id: hg-win-local-file-content-read-in-bulk-by-an-interpreter-t1005
+
+version: 1.0.0
+
+info:
+  name: Local file content read in bulk by an interpreter
+  description: >-
+    This is the weakest observable in the collection group, and the file is written to be
+    honest about that rather than to look complete. The behaviour MITRE describes — an
+    adversary searching the local filesystem for files of interest and reading them — is a
+    read, and a read of an ordinary document produces no endpoint event here. What is
+    visible is the command that performs it, so this template hunts the instruction rather
+    than the access, and it is worth deploying only as enrichment for a host that is
+    already under suspicion. Two things keep it from collapsing into noise. The first is
+    the distinction from enumeration: listing filenames is File and Directory Discovery
+    (T1083), so this file requires the content-bearing half — a document extension filter
+    paired with an actual read or copy verb, not a directory listing. The second is the
+    clustering. One command that reads a document tree is a person opening their own work.
+    A single session that reads documents, dumps a local database, touches virtual machine
+    disk files and pulls application configuration is orienting itself around whatever is
+    valuable on the host, and no ordinary task has a reason to span those categories at
+    once. Note that where this reading is done by a script at machine rate the mechanism is
+    covered by T1119, and where the results are gathered into one directory that is
+    T1074.001; this file owns only the local read itself.
+  severity: low
+  author: huntgraph
+  tags:
+    - collection
+    - data-from-local-system
+    - bulk-file-read
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1005
+    - https://attack.mitre.org/detectionstrategies/DET0380
+    - https://attack.mitre.org/techniques/T1083
+    - https://attack.mitre.org/techniques/T1119
+    - https://attack.mitre.org/techniques/T1074/001
+
+mitre:
+  tactics:
+    - TA0009
+  techniques:
+    - T1005
+  sub_techniques: []
+  detection_strategies:
+    - DET0380
+  analytics:
+    - AN1070
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary who has landed on a host may read the content of local files that hold
+    business value — user documents, local databases, virtual machine disks and application
+    configuration — selecting them by extension and reading them in bulk through a command
+    interpreter, rather than opening any one of them in the application that owns it.
+  attacker_behavior:
+    - Filters a user document tree by extension and reads or copies what matches.
+    - Dumps a local database or exports a table to a flat file for removal.
+    - Reads virtual machine disk or configuration files that contain whole guest systems.
+    - Pulls application configuration files that describe how the environment is wired.
+    - Spans several unrelated categories of local data inside one short session.
+  legitimate_behavior:
+    - Backup agents read every document on the host on a schedule, by design.
+    - Search indexers open document content continuously to build their index.
+    - Migration and profile-transfer tooling reads a user's whole document tree once.
+    - Developers and analysts read and convert their own files from a shell.
+    - Data-loss-prevention and e-discovery scanners deliberately read documents in bulk.
+  risk_indicator:
+    - The read spans more than one unrelated category of local data in one session.
+    - The reading process is a shell or interpreter, not the application that owns the file type.
+    - The command reaches into user profiles other than the one running it.
+    - The parent is a remote-execution service, a mail client, a browser or an archive tool.
+    - Neither the host nor the account has any history of reading files this way.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: several-categories-of-local-data-read-together
+        name: Unrelated categories of local data read in one session
+        purpose: >-
+          This is the discriminator for the whole hypothesis and the only case here that
+          stands on its own. Tag each command by the kind of local data it reads and collapse
+          the tags per host and account, so that a session which pulled documents, dumped a
+          database and touched a virtual machine disk separates from the very many sessions
+          that did exactly one of those for an ordinary reason.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/[A-Za-z]:\\+Users\\+[^\\]+\\+(Documents|Desktop|Downloads|OneDrive)/i
+                | datakind := "user_documents" ;
+              CommandLine=/(\.(mdb|accdb|sqlite3?|db3)\b|\bsqlcmd\b|\bbcp\b|\bmysqldump\b|Export-Csv|Backup-SqlDatabase)/i
+                | datakind := "local_database" ;
+              CommandLine=/\.(vmdk|vmx|vhdx?|ova|vbox|avhdx?)\b/i
+                | datakind := "virtual_machine_image" ;
+              CommandLine=/(\\(inetpub|wwwroot)\\|\bweb\.config\b|\bappsettings\.json\b|\.(ini|conf)\b)/i
+                | datakind := "application_configuration" ;
+            }
+          | datakind=/.+/
+          | CommandLine=/(\bcopy\b|\btype\b|Get-Content|Out-File|Set-Content|Export-Csv|Compress-Archive|\bmore\b)/i
+          | groupBy([ComputerName, UserName],
+                    function=[count(datakind, distinct=true, as=categories),
+                              collect([datakind, FileName, CommandLine], limit=12)])
+          | categories>=2
+          | sort(categories, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Backup, e-discovery and data-loss-prevention agents that read broadly by design"
+            - "Scheduled housekeeping and reporting scripts that run the same set on every host"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: document-tree-filtered-and-read
+        name: Document tree filtered by extension and read
+        purpose: >-
+          Separate reading from listing. Enumerating filenames belongs to T1083; this case
+          requires both the extension filter that selects business documents and a verb that
+          actually takes their content, which is what makes it collection rather than
+          discovery.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\.(docx?|xlsx?|pptx?|pdf|csv|rtf|odt|ods|odp|vsdx?|msg|eml)\b/i
+          | CommandLine=/(Get-ChildItem|\bgci\b|-Recurse|\bdir\b[^|]{0,40}\/s|\bforfiles\b|\bwhere\b\s+\/r)/i
+          | CommandLine=/(\bcopy\b|\bxcopy\b|\brobocopy\b|Copy-Item|\btype\b|Get-Content|Out-File|Compress-Archive)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=reads), collect([CommandLine], limit=5)])
+          | sort(reads, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Profile migration and workstation refresh tooling during a scheduled migration window"
+            - "Search indexer and content-classification service processes"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: read-crossing-into-other-user-profiles
+        name: Bulk read reaching into other users' profiles
+        purpose: >-
+          Give the case that is hard to explain away. A person reads their own documents; an
+          operator reads everyone's. Restricting to commands that name a profile tree while
+          running under a different account removes the ordinary use of the same tooling.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/[A-Za-z]:\\+Users\\+[^\\]+\\+(Documents|Desktop|Downloads|OneDrive|AppData)/i
+          | CommandLine!=/[A-Za-z]:\\+Users\\+(Public|Default|All Users)\\+/i
+          | CommandLine=/(\bcopy\b|\bxcopy\b|\brobocopy\b|Copy-Item|Get-Content|Compress-Archive|\btype\b)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=reads), collect([CommandLine], limit=8)])
+          | sort(reads, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Backup and profile-roaming agents running under a service account"
+            - "Helpdesk profile-recovery procedures raised against a change record"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: bulk-read-issued-by-an-unrelated-parent
+        name: Bulk read issued from a parent with no document relationship
+        purpose: >-
+          Where the command itself is hopelessly common the parent is the only real
+          discriminator, which is the case here. A read pipeline started by a mail client, a
+          browser, a macro host, an archive utility or a remote-execution service is not a
+          person working on their files.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(winword\.exe|excel\.exe|powerpnt\.exe|outlook\.exe|chrome\.exe|msedge\.exe|firefox\.exe|7z(FM|G)?\.exe|winrar\.exe|wmiprvse\.exe|wsmprovhost\.exe|mshta\.exe|psexesvc\.exe)$/i
+          | CommandLine=/(\bcopy\b|\bxcopy\b|\brobocopy\b|Copy-Item|Get-Content|Compress-Archive|-Recurse|\bdir\b[^|]{0,40}\/s)/i
+          | CommandLine=/\.(docx?|xlsx?|pptx?|pdf|csv|msg|eml|mdb|accdb|sqlite3?|vmdk|vhdx?)\b/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=reads), collect([CommandLine], limit=5)])
+          | sort(reads, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved remote administration platforms that invoke file operations through WMI or WinRM"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: bulk_local_read
+      name: Local file content selected by type and read
+      description: >-
+        A command selected local files by extension or by a data-bearing path and then read
+        or copied their content, which is collection of the data itself rather than
+        enumeration of what exists on the host.
+      source: process_creation
+      field: CommandLine
+      indicates: collection_staging
+
+  supporting:
+    - id: several_data_categories
+      name: More than one category of local data touched
+      description: >-
+        The same host and account read documents, a local database, a virtual machine image
+        or application configuration inside one window, a span no single ordinary task has a
+        reason to cover.
+      source: derived
+      field: datakind
+      indicates: hands_on_keyboard_activity
+    - id: crosses_user_profiles
+      name: Read reached into another user's profile
+      description: >-
+        The command named a profile tree belonging to an account other than the one running
+        it, which is normal for a backup service and abnormal for an interactive user.
+      source: process_creation
+      field: CommandLine
+      indicates: unusual_activity_for_user
+    - id: unrelated_parent
+      name: Started by a process with no relationship to the data
+      description: >-
+        The reading process was launched by a mail client, browser, macro host, archive tool
+        or remote-execution service rather than by a shell the user is working in.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: first_seen_for_host
+      name: No history of reading files this way
+      description: >-
+        Neither the host nor the account has baseline history of this command shape, so the
+        read is a deviation rather than part of an established routine.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: backup_or_indexing_agent
+      name: Backup, indexing or classification agent
+      description: >-
+        The reading process belongs to an approved backup, search-indexing, e-discovery or
+        data-loss-prevention product whose entire function is to read documents in bulk.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_enterprise_activity
+    - id: user_reading_own_files
+      name: Account reading only its own profile
+      description: >-
+        Every path named sits inside the profile of the account that ran the command, which
+        is a person working on their own files.
+      source: process_creation
+      field: UserName
+      indicates: expected_user_behavior
+    - id: fleetwide_same_read
+      name: Same read across the estate
+      description: >-
+        The identical command appears across a large share of hosts in one window, which is a
+        scheduled sweep, a migration wave or an inventory job rather than a targeted read.
+      source: baseline
+      field: CommandLine
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - bulk_local_read
+
+    supporting:
+      any:
+        - several_data_categories
+        - crosses_user_profiles
+        - unrelated_parent
+        - first_seen_for_host
+      all:
+        - several_data_categories
+        - unrelated_parent
+
+    contradicting:
+      any:
+        - backup_or_indexing_agent
+        - user_reading_own_files
+        - fleetwide_same_read
+      all: []
+
+  verdict:
+    low_risk_when:
+      - bulk_local_read
+      - backup_or_indexing_agent
+      - user_reading_own_files
+      - fleetwide_same_read
+    suspicious_when:
+      - bulk_local_read
+      - first_seen_for_host
+    high_risk_when:
+      - bulk_local_read
+      - several_data_categories
+      - crosses_user_profiles
+      - unrelated_parent
+
+  false_positive:
+    - condition: A backup agent reads every document on the host each night.
+      explanation: >-
+        Backup is bulk reading of exactly these file types and it reproduces the required
+        evidence completely. It is separable because the acting image is the backup client,
+        it runs under a service account on a fixed schedule, and the same read appears on
+        every protected host rather than on one.
+    - condition: The search indexer or a content-classification scanner opens document content.
+      explanation: >-
+        Indexing and classification products exist to read documents in bulk and they touch
+        far more files than any operator would. They run continuously as a service, never
+        from an interactive shell, and their reads are confined to their own service process.
+    - condition: Workstation refresh or profile migration tooling copies a user's whole document tree.
+      explanation: >-
+        Migration reproduces both the extension filter and the cross-profile evidence, since
+        it deliberately reads one user's data while running as another. It is bounded by a
+        change record and a migration window, and it copies the tree wholesale rather than
+        selecting by type.
+    - condition: A developer or analyst converts or concatenates their own files from a shell.
+      explanation: >-
+        Reading a set of spreadsheets or documents from PowerShell is ordinary work on an
+        analytical or engineering endpoint. It stays inside the account's own profile, covers
+        one category of data, and has established history on that host.
+    - condition: An e-discovery or legal-hold collection runs against a named custodian.
+      explanation: >-
+        A hold collection is deliberately indistinguishable from the technique in telemetry
+        terms — it selects business documents by type and copies them off the endpoint. It is
+        authorised, scoped to named custodians, and recorded outside the security tooling.

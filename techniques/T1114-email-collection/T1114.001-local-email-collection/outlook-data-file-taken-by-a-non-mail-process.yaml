@@ -1,0 +1,392 @@
+type: detection
+
+id: hg-win-outlook-data-file-taken-by-a-non-mail-process-t1114-001
+
+version: 1.0.0
+
+info:
+  name: Outlook data file taken by a non-mail process
+  description: >-
+    An .ost file is the entire mailbox sitting on the endpoint as a single file. Outlook 2010
+    and later supports .ost files up to 50GB, and .pst archives hold whatever the user chose
+    to keep out of the server quota, which in practice is the oldest and most sensitive
+    correspondence they own. Taking one file gets years of mail, the attachments, the contact
+    list and the calendar, with no authentication to the mail platform and no trace in the
+    mail platform's audit log. This is why the file is worth a hunt of its own rather than
+    being folded into generic document collection. The observable is unusually clean for
+    Collection work, and the reason is that these files have exactly one legitimate reader.
+    Outlook holds its own store open; nothing else in a normal estate has any business naming
+    it. The short list of exceptions is nameable and stable — the backup agent, the search
+    indexer, a PST-capture or archiving product, and a profile-migration tool during a
+    rebuild — which means the contradicting evidence here can be enumerated rather than
+    guessed at. Be precise about what this deployment actually sees, because it is not what
+    MITRE's analytic assumes. AN0130 rests on File Access, the Windows Security 4663 and 4656
+    handle-open records, and this deployment does not collect those. What it collects is
+    process creation with the full command line, so the hunt fires when a process names the
+    store on its command line: a recursive search for *.pst across a user tree, a copy of
+    backup.ost into a staging directory, an archive built over the Outlook folder. Malware
+    that opens the file through the Windows API or through MAPI without ever naming a path —
+    Emotet's Outlook module and QakBot's mail scraper both work this way — leaves nothing at
+    all on this telemetry. An empty result from this hunt is therefore not evidence of
+    absence, and enabling object-access auditing on the Outlook directories is the change
+    that would close the gap. Within what is visible, the strong sequence is search, then
+    copy or compress, then egress; a single reference in isolation is worth a look, but the
+    file names the store and moves it that is the finding.
+  severity: high
+  author: huntgraph
+  tags:
+    - collection
+    - email-collection
+    - outlook
+    - mail-store
+    - data-staging
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1114/001
+    - https://attack.mitre.org/detectionstrategies/DET0047
+    - https://attack.mitre.org/techniques/T1114
+
+mitre:
+  tactics:
+    - TA0009
+  techniques:
+    - T1114
+  sub_techniques:
+    - T1114.001
+  detection_strategies:
+    - DET0047
+  analytics:
+    - AN0130
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - File Access
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary with code execution on a workstation may locate and take the local Outlook
+    data files, obtaining the user's entire mail history as a single file without ever
+    authenticating to the mail server or appearing in its audit trail.
+  attacker_behavior:
+    - Searches user profile trees recursively for files with a .pst or .ost extension.
+    - Copies the mail store out of the Outlook directory into a staging path such as the temp directory.
+    - Compresses the mail store, often split into volumes, to make a 50GB file transferable.
+    - Reads the store from a remote host over an administrative share rather than locally.
+    - Transfers the collected store outbound from the same process that assembled it.
+  legitimate_behavior:
+    - The endpoint backup agent reads the mail store on its scheduled run.
+    - The Windows search indexer opens the store to maintain the mail index.
+    - A PST capture or mail archiving product ingests .pst archives on a policy schedule.
+    - Profile migration tooling copies the store during a hardware refresh or reimage.
+    - A helpdesk engineer copies a user's .pst to repair a corrupt profile.
+  risk_indicator:
+    - The process naming the store is an interpreter or a binary in a user-writable directory.
+    - The store is searched for recursively rather than opened at its known path.
+    - The store is copied or compressed rather than read in place.
+    - The same process makes an outbound connection to an external address shortly afterwards.
+    - The host has no history of any process other than Outlook naming the store.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: mail-store-named-by-a-non-mail-process
+        name: Outlook store named by a process that is not the mail client
+        purpose: >-
+          Establish the base observable. The mail store has one legitimate reader, so a
+          process other than Outlook naming the file or its directory is the whole hunt in
+          one line, and the value comes from how rarely it should ever be true.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\.ost\b|\.pst\b|AppData\\Local\\Microsoft\\Outlook|Documents\\Outlook Files|Microsoft\\Outlook\\Offline Address Books)/i
+          | FileName!=/^(outlook|searchindexer|searchprotocolhost|searchfilterhost|scanpst|scanost)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=refs), collect([CommandLine], limit=5)])
+          | sort(refs, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ImageFileName of the endpoint backup agent, PST archiving product or profile-migration tool"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - process
+            - organization
+
+      - id: recursive-search-for-mail-stores
+        name: User tree searched recursively for mail stores
+        purpose: >-
+          Separate an operator hunting for the file from a tool that already knows where it
+          lives. Outlook, the indexer and the backup agent all open the store at its known
+          path; only somebody who does not yet know which profiles hold mail walks the tree
+          looking for the extension.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\*\.pst|\*\.ost|\.pst\b|\.ost\b)/i
+          | CommandLine=/(\bdir\b[^|]*\/s\b|forfiles|\bwhere\b\s+\/r|Get-ChildItem|\bgci\b|\bls\b\s+-r|-Recurse|-Include|-Filter|\bfindstr\b|\bfind\b\s+\/)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=searches), collect([CommandLine], limit=5)])
+          | sort(searches, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Inventory and licence-audit scanners that enumerate file types across the estate"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: mail-store-copied-or-compressed
+        name: Mail store copied out or compressed for transfer
+        purpose: >-
+          Distinguish reading the mailbox from taking it. A 50GB .ost has to be moved or
+          packed before it can leave, so the copy and the archive are the collection step
+          itself rather than an inference about intent. This is the point at which the
+          activity stops being explainable as inspection.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\.ost\b|\.pst\b|AppData\\Local\\Microsoft\\Outlook|Documents\\Outlook Files)/i
+          | CommandLine=/\b(copy|xcopy|robocopy|Copy-Item|move|Move-Item|Compress-Archive|makecab|tar|7z|7za|rar|zip)\b|-v\d+[mg]\b|process\s+call\s+create/i
+          | FileName!=/^(outlook|scanpst|scanost)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Scheduled backup and archiving jobs that copy mail stores to the approved repository"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+            - organization
+
+      - id: mail-store-access-followed-by-egress
+        name: Process that named the mail store connecting outbound
+        purpose: >-
+          Close the chain by joining the process that touched the store to a connection it
+          then made to an address outside the estate. This is what separates a collection
+          that stayed on the host from one that left it, and it changes the response from
+          investigation to containment.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | CommandLine=/(\.ost\b|\.pst\b|AppData\\Local\\Microsoft\\Outlook|Documents\\Outlook Files)/i
+                | FileName!=/^(outlook|searchindexer|searchprotocolhost|scanpst|scanost)\.exe$/i
+                | collector_pid := TargetProcessId ;
+              #event_simpleName=NetworkConnectIP4
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/ ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([CommandLine, FileName, RemoteAddressIP4, RemotePort]),
+                              count(as=events)])
+          | collector_pid = ContextProcessId
+        filters:
+          include: []
+          exclude:
+            - "RemoteAddressIP4 within the approved backup and mail-archiving service ranges"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: mail_store_referenced
+      name: Outlook store named by a process other than the mail client
+      description: >-
+        A process that is not Outlook, the search indexer or a store repair utility named an
+        .ost or .pst file, or the Outlook data directory, on its command line.
+      source: process_creation
+      field: CommandLine
+      indicates: local_mail_store_access
+
+  supporting:
+    - id: recursive_store_search
+      name: Profile tree searched for mail stores
+      description: >-
+        The user profile or a document tree was walked recursively for the .pst or .ost
+        extension, which is the behaviour of somebody locating mailboxes rather than opening
+        a store whose path is already known.
+      source: process_creation
+      field: CommandLine
+      indicates: mail_store_enumeration
+    - id: store_copied_or_compressed
+      name: Mail store copied out or archived
+      description: >-
+        The store was copied to another path or compressed, frequently into split volumes,
+        which is preparation for transfer rather than reading the mailbox in place.
+      source: process_creation
+      field: CommandLine
+      indicates: collection_staging
+    - id: untrusted_reader
+      name: Reader is an interpreter or a user-writable binary
+      description: >-
+        The process naming the store is a script host or an executable running from a
+        user-writable directory rather than an installed backup, archiving or migration
+        product.
+      source: process_creation
+      field: ImageFileName
+      indicates: untrusted_execution_location
+    - id: egress_after_access
+      name: Same process connected to an external address
+      description: >-
+        The process that named the mail store subsequently opened a connection to an address
+        outside the estate, indicating the collected mail did not stay on the host.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: outbound_transfer
+    - id: no_store_access_history
+      name: No precedent for this access on this host
+      description: >-
+        No process other than the mail client has named the Outlook store on this host during
+        the baseline window, so the access is new rather than part of a standing job.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: backup_or_archiving_product
+      name: Backup, indexing or mail archiving product
+      description: >-
+        The acting binary belongs to the endpoint backup agent, the search indexer, or a PST
+        capture and archiving product whose documented job is to read mail stores.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: recorded_profile_maintenance
+      name: Recorded migration or profile repair
+      description: >-
+        A change or ticket record covers work on this user's mailbox profile, such as a
+        hardware refresh, a reimage or the repair of a corrupt store.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: scheduled_estate_wide_pattern
+      name: Same access runs on schedule across the estate
+      description: >-
+        The identical command shape appears on many hosts at a fixed interval, which is a
+        backup or archiving schedule rather than one operator working on one mailbox.
+      source: baseline
+      field: CommandLine
+      indicates: bulk_administrative_operation
+
+  risk_logic:
+    required:
+      - mail_store_referenced
+
+    supporting:
+      any:
+        - recursive_store_search
+        - store_copied_or_compressed
+        - untrusted_reader
+        - egress_after_access
+        - no_store_access_history
+      all:
+        - store_copied_or_compressed
+        - egress_after_access
+
+    contradicting:
+      any:
+        - backup_or_archiving_product
+        - recorded_profile_maintenance
+        - scheduled_estate_wide_pattern
+      all: []
+
+  verdict:
+    low_risk_when:
+      - mail_store_referenced
+      - backup_or_archiving_product
+      - recorded_profile_maintenance
+      - scheduled_estate_wide_pattern
+    suspicious_when:
+      - mail_store_referenced
+      - no_store_access_history
+    high_risk_when:
+      - mail_store_referenced
+      - recursive_store_search
+      - store_copied_or_compressed
+      - untrusted_reader
+      - egress_after_access
+
+  false_positive:
+    - condition: The endpoint backup agent reads the mail store on its scheduled run.
+      explanation: >-
+        Backup products name .ost and .pst paths constantly and are the single largest source
+        of hits here. They are distinguished by a signed vendor binary in Program Files, by
+        the same command shape appearing on every host in the estate, and by a fixed schedule
+        rather than an interactive parent.
+    - condition: The Windows search indexer opens the store to maintain the mail index.
+      explanation: >-
+        SearchIndexer and its filter hosts are excluded by name in the base case, but a
+        third-party desktop search product will not be. Those are identifiable as an
+        installed application with a persistent service and no outbound connection following
+        the read.
+    - condition: A PST capture or mail archiving product ingests .pst archives.
+      explanation: >-
+        Archiving products walk user trees looking for .pst files by design, which produces
+        the recursive-search case as well as the base case. The tell is that the search runs
+        estate-wide on a policy schedule and writes to the archive repository rather than to
+        a temp or staging path.
+    - condition: Profile migration tooling copies the store during a hardware refresh.
+      explanation: >-
+        Migration copies the store, which is the strongest supporting evidence here, so this
+        case will look serious until it is placed. It is confirmed by a change record, by the
+        destination being the migration share, and by the same activity appearing across the
+        refresh batch.
+    - condition: A helpdesk engineer copies a user's .pst to repair a corrupt profile.
+      explanation: >-
+        This is genuine one-off interactive activity that matches the base and copy cases and
+        has no automation to explain it. It is separated by a ticket, by the operator being a
+        known support account, and by the copy staying on the host or on the support share.
+    - condition: The mail store was read through the Windows API and never appears here.
+      explanation: >-
+        This is the coverage gap rather than a false positive. Implants that open the store
+        through MAPI or a direct file handle never name a path on a command line, so an empty
+        result proves nothing. Object-access auditing on the Outlook directories, which is
+        the File Access component MITRE's analytic assumes, is what would make that visible.

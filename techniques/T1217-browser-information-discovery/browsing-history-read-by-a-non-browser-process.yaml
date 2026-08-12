@@ -1,0 +1,353 @@
+type: detection
+
+id: hg-win-browsing-history-read-by-a-non-browser-process-t1217
+
+version: 1.0.0
+
+info:
+  name: Browsing history or bookmarks read by a non-browser process
+  description: >-
+    Browser history is an organisational map that nobody thinks of as sensitive. It names
+    the internal portals, the ticketing system, the source control host, the cloud consoles
+    and the administrative interfaces this user actually reaches, and the bookmark file
+    ranks them by what mattered enough to keep. For an operator who has just landed and
+    does not yet know what the organisation runs, that is a faster and quieter answer than
+    scanning for it, and it identifies which users are worth escalating to — a person whose
+    history is full of directory and hypervisor consoles is a different target from one
+    whose history is expenses and payroll. The discriminator here is real rather than
+    statistical: these files sit at predictable paths under the user profile, and the only
+    process with any routine reason to touch them is the browser that owns them. Anything
+    else naming those paths is doing something the estate has no standing need for.
+    Note the boundary with the saved-password store — Login Data, the cookie database and
+    the key material protecting them are credential theft and belong to the credentials
+    from web browsers hypothesis, not to this one, which stays with the history, bookmark
+    and profile artefacts that answer "what does this organisation use".
+    Windows file-read telemetry is not collected here, so the observable is the command
+    line that names the artefact rather than the read itself; a tool that opens these files
+    through an API without naming them on a command line will not appear.
+  severity: medium
+  author: huntgraph
+  tags:
+    - discovery
+    - browser-information-discovery
+    - reconnaissance
+    - user-profile
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1217
+    - https://attack.mitre.org/detectionstrategies/DET0013
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1217
+  sub_techniques: []
+  detection_strategies:
+    - DET0013
+  analytics:
+    - AN0037
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:PowerShell
+  data_components:
+    - Process Creation
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    An adversary may read the history, bookmark and profile artefacts a browser keeps under
+    the user profile in order to learn which internal systems and services the organisation
+    uses and which users are worth escalating to, without scanning the network or touching
+    any credential store.
+  attacker_behavior:
+    - Reads the history database from a browser profile to list internally visited sites.
+    - Copies the bookmarks file out of the profile to learn which systems the user relies on.
+    - Opens a browser database with a command line SQLite utility to extract visited URLs.
+    - Enumerates the profile directories to discover which browsers and accounts are present.
+    - Runs a history extraction utility that renders the databases into readable output.
+  legitimate_behavior:
+    - The browser itself reads and writes these files continuously while running.
+    - Backup and profile migration tools copy whole browser profiles between machines.
+    - Enterprise browser management and sync clients read profile configuration.
+    - Forensic and investigative tooling deliberately collects browser history during a case.
+    - Support engineers clear or rebuild a corrupted profile while fixing a browser fault.
+  risk_indicator:
+    - The reading process is not the browser that owns the profile.
+    - The command names the history or bookmark artefact specifically rather than the profile as a whole.
+    - A generic SQLite utility or script host is the process opening a browser database.
+    - The reader was launched by a shell, script host or document handler.
+    - The activity is unprecedented for this host and account in the baseline window.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: history-or-bookmarks-named-by-another-process
+        name: History or bookmark artefact named by a process that is not the browser
+        purpose: >-
+          The anchor. These artefacts have exactly one routine reader, so excluding the
+          browsers that own them leaves a population small enough to work through by hand.
+          The artefact names are deliberately the reconnaissance set rather than the
+          credential set, which keeps this hypothesis distinct from browser credential theft.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\\History\b|\bBookmarks(\.bak)?\b|Top Sites|Network Action Predictor|Visited Links|places\.sqlite|favicons\.sqlite|formhistory\.sqlite|sessionstore(-backups)?|Site Characteristics|Shortcuts\b)/i
+          | CommandLine=/(User Data|Mozilla\\+Firefox|Chrome|Chromium|Edge|BraveSoftware|Opera|Vivaldi|AppData\\+Local|AppData\\+Roaming)/i
+          | FileName!=/^(chrome|msedge|msedgewebview2|firefox|brave|opera|vivaldi|iexplore|chromium)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=reads), collect([CommandLine], limit=5)])
+          | sort(reads, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ImageFileName of approved backup, profile-migration and browser-management tooling"
+            - "Endpoint forensic collection agents operating under a recorded investigation"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - process
+            - organization
+
+      - id: browser-database-opened-with-a-generic-sqlite-tool
+        name: Browser database opened with a general purpose SQLite utility
+        purpose: >-
+          Catch the extraction step rather than the copy. Browser history lives in SQLite,
+          and reaching it with a generic database utility or module is a deliberate act of
+          reading the contents — no backup product, sync client or browser needs a
+          standalone SQLite tool to touch its own files.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(sqlite3|System\.Data\.SQLite|PSSQLite|Invoke-SqliteQuery|sqlite_|\.db3\b)/i
+          | CommandLine=/(moz_places|moz_historyvisits|moz_bookmarks|urls\b|visits\b|keyword_search_terms|downloads\b|History|places\.sqlite)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=queries), collect([CommandLine], limit=5)])
+          | sort(queries, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Developer workstations where SQLite tooling is part of the normal build toolchain"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: browser-profiles-enumerated
+        name: Browser profile directories enumerated to find installed browsers and accounts
+        purpose: >-
+          Cover the step before the read, where the operator does not yet know which
+          browsers are installed or how many profiles exist. Listing the profile roots and
+          reading the profile index is how that question is answered, and it is the part of
+          the technique that survives when the artefact is opened by an API rather than named.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(User Data\\+(Default|Profile\s*\d)|profiles\.ini|Mozilla\\+Firefox\\+Profiles|BraveSoftware\\+Brave-Browser\\+User Data|Local\\+(Google|Microsoft)\\+(Chrome|Edge)\\+User Data)/i
+          | CommandLine=/(\bdir\b|Get-ChildItem|\bgci\b|\bls\b|tree|Test-Path|Where-Object|findstr)/i
+          | FileName!=/^(chrome|msedge|msedgewebview2|firefox|brave|opera|vivaldi|chromium)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=listings), collect([CommandLine], limit=5)])
+          | sort(listings, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Profile migration and imaging tooling that surveys profiles during a hardware refresh"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: history-extraction-tooling-invoked
+        name: Browser history extraction utility executed
+        purpose: >-
+          Name the packaged form. These utilities exist to render browser history and
+          bookmarks into readable output, and outside an investigation there is no
+          operational reason for one to run on a user endpoint.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(BrowsingHistoryView|BrowserHistoryView|ChromeHistoryView|MZHistoryView|IEHistoryView|hindsight|BrowserHistoryCapturer|BrowserGatherer|Get-BrowserData|Invoke-BrowserGather)\b/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=runs), collect([CommandLine], limit=5)])
+          | sort(runs, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Authorised forensic and incident response tooling used under a recorded investigation"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: browser_artefact_referenced
+      name: Browser history, bookmark or profile artefact referenced
+      description: >-
+        A process that is not the owning browser named a browser history database, bookmark
+        file, profile index or other reconnaissance artefact from a browser profile.
+      source: process_creation
+      field: CommandLine
+      indicates: browser_artefact_reconnaissance
+
+  supporting:
+    - id: database_tool_used
+      name: Generic SQLite utility used against a browser database
+      description: >-
+        A general purpose SQLite utility or module was pointed at a browser database, which
+        reads the contents rather than moving the file and has no maintenance purpose.
+      source: process_creation
+      field: CommandLine
+      indicates: artefact_content_extraction
+    - id: profiles_enumerated
+      name: Profile directories enumerated first
+      description: >-
+        The browser profile roots were listed or the profile index read, which is how an
+        operator discovers which browsers and accounts exist before reading from them.
+      source: process_creation
+      field: CommandLine
+      indicates: profile_discovery
+    - id: extraction_tooling
+      name: History extraction utility present
+      description: >-
+        A utility whose function is rendering browser history or bookmarks into readable
+        output was executed on the host.
+      source: process_creation
+      field: ImageFileName
+      indicates: browser_artefact_tool
+    - id: untrusted_reader
+      name: Reader is a shell, script host or delivery process
+      description: >-
+        The referencing process was started by a command shell, script host, document
+        handler or archive tool rather than by an installed management or backup product.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: rare_for_host
+      name: Access unprecedented for this host and account
+      description: >-
+        No comparable reference to browser artefacts has been observed for this host and
+        account in the baseline window, unlike deployed profile tooling which recurs.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: backup_or_migration_tool
+      name: Approved backup or profile migration product
+      description: >-
+        The reader is an approved backup, profile migration, imaging or browser management
+        product that handles whole profiles by design.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_enterprise_activity
+    - id: forensic_collection
+      name: Sanctioned forensic collection
+      description: >-
+        The access belongs to a recorded investigation in which browser artefacts were
+        deliberately collected by a named responder.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_security_testing
+    - id: fleetwide_tooling
+      name: Same reader across the estate
+      description: >-
+        The same process references browser artefacts across many hosts on a regular
+        cadence, which is deployed tooling rather than a targeted read on one endpoint.
+      source: baseline
+      field: UserName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - browser_artefact_referenced
+
+    supporting:
+      any:
+        - database_tool_used
+        - profiles_enumerated
+        - extraction_tooling
+        - untrusted_reader
+        - rare_for_host
+      all:
+        - database_tool_used
+        - untrusted_reader
+
+    contradicting:
+      any:
+        - backup_or_migration_tool
+        - forensic_collection
+        - fleetwide_tooling
+      all: []
+
+  verdict:
+    low_risk_when:
+      - browser_artefact_referenced
+      - backup_or_migration_tool
+      - forensic_collection
+      - fleetwide_tooling
+    suspicious_when:
+      - browser_artefact_referenced
+      - rare_for_host
+    high_risk_when:
+      - browser_artefact_referenced
+      - database_tool_used
+      - profiles_enumerated
+      - untrusted_reader
+
+  false_positive:
+    - condition: A profile migration tool copies whole browser profiles during a hardware refresh.
+      explanation: >-
+        Migration products touch every file in the profile including history and bookmarks,
+        which reproduces the required evidence exactly. They are installed products acting on
+        the whole profile directory rather than naming the history database, they run during
+        a refresh window, and the same pattern appears on every machine passing through it.
+    - condition: Enterprise browser management or sync reads profile configuration.
+      explanation: >-
+        Managed browser policy and sync clients legitimately read profile files to apply
+        configuration. The reader is a signed management component that is present across the
+        estate, and it reads configuration and preference files rather than the visit history.
+    - condition: Forensic tooling collects browser history during an investigation.
+      explanation: >-
+        Investigative collection harvests exactly these artefacts with exactly this tooling,
+        so it is indistinguishable on telemetry alone. It is covered by an incident record,
+        performed by a named responder, and usually preceded by the response agent arriving.
+    - condition: A developer runs SQLite tooling on a workstation where it is part of the toolchain.
+      explanation: >-
+        On engineering endpoints a SQLite utility is ordinary and may be pointed at many
+        databases during a day's work. The distinguishing detail is the target: a browser
+        profile path under another user's directory is not part of any build.
+    - condition: Support clears or rebuilds a corrupted browser profile.
+      explanation: >-
+        Fixing a broken profile involves listing the profile directories and moving history
+        and bookmark files aside. It is interactive, tied to a ticket, and the artefacts are
+        deleted or renamed rather than read or copied off the host.

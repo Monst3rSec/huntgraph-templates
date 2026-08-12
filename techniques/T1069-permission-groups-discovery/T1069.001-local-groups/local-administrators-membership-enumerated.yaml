@@ -1,0 +1,329 @@
+type: detection
+
+id: hg-any-local-administrators-membership-enumerated-t1069-001
+
+version: 1.0.0
+
+info:
+  name: Local privileged group membership enumerated before elevation
+  description: >-
+    Knowing which accounts exist on a host is not the same as knowing which of them matter.
+    `net localgroup administrators` answers the second question, and it is the question an
+    adversary asks when they have code execution but not yet the privileges they want: which
+    identity on this machine, if I can obtain it, gives me everything else. The same applies
+    to the groups that grant remote entry rather than elevation — Remote Desktop Users,
+    Remote Management Users, sudo, wheel, admin. This file stays deliberately local in
+    scope: the answer describes one machine, so it is scored low on its own and earns its
+    weight from what surrounds it. The strongest shape available is the pairing — the
+    membership question followed, in the same lineage, by an attempt to use one of those
+    identities. Where the same question is asked of the directory rather than the host, it
+    reaches every machine in the estate at once and is covered separately by T1069.002.
+  severity: low
+  author: huntgraph
+  tags:
+    - discovery
+    - permission-groups
+    - local-groups
+    - privilege-escalation-recon
+    - windows
+    - linux
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1069/001
+    - https://attack.mitre.org/detectionstrategies/DET0114
+    - https://attack.mitre.org/techniques/T1069
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1069
+  sub_techniques:
+    - T1069.001
+  detection_strategies:
+    - DET0114
+  analytics:
+    - AN0317
+    - AN0318
+    - AN0319
+  platforms:
+    - Windows
+    - Linux
+    - macOS
+  data_sources:
+    - WinEventLog:Security
+    - auditd:SYSCALL
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary with execution on a host may enumerate its local group memberships to
+    identify which accounts hold administrative or remote-access rights on that machine, and
+    will then attempt to obtain or use one of those identities from the same session.
+  attacker_behavior:
+    - Lists local group membership through Net, the local-group cmdlets or WMI.
+    - Names a privileged group directly rather than listing all groups.
+    - Reads the group or sudoers database on Linux, or queries the admin group on macOS.
+    - Follows the membership question with an elevation or remote-execution attempt in the same lineage.
+    - Runs the enumeration from a shell parented by a document handler or a remote channel.
+  legitimate_behavior:
+    - Configuration management enforces local administrator membership on every policy run.
+    - Compliance and audit tooling sweeps local group membership across the estate.
+    - Support staff check whether a user holds local administrator rights while diagnosing a fault.
+    - Software installers verify that the installing account is a local administrator.
+    - Privileged access management products reconcile local group membership continuously.
+  risk_indicator:
+    - A privileged group is named directly rather than the full group list being requested.
+    - An elevation or remote-execution attempt follows in the same process lineage.
+    - The parent process is a document handler, archive tool, browser or remote-execution channel.
+    - Neither the host nor the acting account has produced this enumeration during the baseline window.
+
+requires:
+  platforms:
+    - windows
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: local-group-membership-listing
+        name: Local group membership requested
+        purpose: >-
+          Establish the behaviour and rank by rarity, because the command is universal and
+          only its novelty on a given host carries weight on its own.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(net1?(\.exe)?\s+localgroup|Get-LocalGroupMember|Get-LocalGroup\b|wmic\s+group|Win32_GroupUser|dscl\s+\.\s+(-)?(list|read)\s+\/Groups|getent\s+group|\/etc\/group\b|\bid\s+-Gn?\b)/i
+          | CommandLine!=/\/dom/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=listings), collect([CommandLine], limit=5)])
+          | sort(listings, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of configuration-management, compliance and privileged-access-management agents"
+            - "ComputerName of build and imaging hosts where group configuration is the machine's purpose"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: privileged-group-named-directly
+        name: A privileged local group named by name
+        purpose: >-
+          Separate the specific question from the general one, since naming the
+          administrators or remote-access group is asking who to become rather than asking
+          how the machine is configured.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(net1?(\.exe)?\s+localgroup|Get-LocalGroupMember|wmic\s+group|dscl\s+\.|getent\s+group|\/etc\/(group|sudoers))/i
+          | CommandLine=/(administrators?\b|administradores|administrateurs|remote\s+desktop\s+users|remote\s+management\s+users|distributed\s+com\s+users|backup\s+operators|\bsudo\b|\bwheel\b|\badmin\b|\broot\b|_?lpadmin)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=queries), collect([CommandLine], limit=5)])
+          | sort(queries, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Compliance sweeps that enumerate the administrators group on every host on a fixed cadence"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - parent_process
+
+      - id: membership-check-then-elevation
+        name: Membership question followed by an elevation attempt
+        purpose: >-
+          Join the reconnaissance to what it was for, which is the difference between a
+          configuration check and an operator working out which identity to take.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(net1?(\.exe)?\s+localgroup\s+.*(administrators?|remote)|Get-LocalGroupMember|getent\s+group\s+(sudo|wheel|admin)|dscl\s+\.\s+(-)?read\s+\/Groups\/admin)/i
+                | group_query := CommandLine ;
+              CommandLine=/(runas(\.exe)?\s+\/user|psexec|Enter-PSSession|Invoke-Command\s+.*-ComputerName|wmic\s+\/node:|schtasks\s+.*\/s\s+|sc\s+\\\\|sudo\s+-[iusl]\b|\bsu\s+-\b|Start-Process\s+.*-Verb\s+RunAs)/i
+                | elevation_attempt := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([group_query, elevation_attempt, ParentBaseFileName]),
+                              count(as=events)])
+          | group_query=/.+/ and elevation_attempt=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Administration hosts where privileged-group checks and elevation are the normal working pattern"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+
+evidence:
+  required:
+    - id: local_group_enumeration
+      name: Local group membership requested
+      description: >-
+        A command asked the host which accounts belong to its local groups, through Net, the
+        local-group cmdlets, WMI, the directory service or the group database.
+      source: process_creation
+      field: CommandLine
+      indicates: preparatory_enumeration
+
+  supporting:
+    - id: privileged_group_targeted
+      name: A privileged group named directly
+      description: >-
+        The query named an administrative or remote-access group rather than requesting the
+        full group list, which is the question of who to become rather than how the host is
+        configured.
+      source: process_creation
+      field: CommandLine
+      indicates: privilege_escalation_reconnaissance
+    - id: elevation_attempt_followed
+      name: Elevation or remote-execution attempt in the same lineage
+      description: >-
+        The same host and account attempted to run something as another identity or against
+        another machine shortly after asking who held the rights.
+      source: process_creation
+      field: FileName
+      indicates: privilege_escalation_attempt
+    - id: delivery_or_remote_parent
+      name: Delivery or remote-execution parent
+      description: >-
+        The enumerating process was launched by a document handler, archive tool, mail
+        client, browser or a remote-execution channel rather than by management tooling.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: first_time_for_host
+      name: New behaviour for the host
+      description: >-
+        The host has not produced this enumeration during the baseline window, separating an
+        intrusion from the compliance sweep that runs every week.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: configuration_management_agent
+      name: Configuration management or PAM agent
+      description: >-
+        The parent is a configuration-management or privileged-access-management agent whose
+        function is to read and enforce local group membership.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: compliance_audit_sweep
+      name: Scheduled compliance or audit sweep
+      description: >-
+        The enumeration ran from a scheduler on a fixed cadence across many hosts rather
+        than repeatedly against one.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: scheduled_automation_job
+    - id: administrator_troubleshooting
+      name: Administrator with a support history
+      description: >-
+        The acting account routinely checks group membership across the estate during the
+        baseline window as part of support work.
+      source: baseline
+      field: UserName
+      indicates: legitimate_administrative_action
+    - id: recorded_access_review
+      name: Recorded access review or audit
+      description: >-
+        A change or audit record covers the activity, naming the review being carried out and
+        the scope agreed for it.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - local_group_enumeration
+
+    supporting:
+      any:
+        - privileged_group_targeted
+        - elevation_attempt_followed
+        - delivery_or_remote_parent
+        - first_time_for_host
+      all:
+        - privileged_group_targeted
+        - elevation_attempt_followed
+
+    contradicting:
+      any:
+        - configuration_management_agent
+        - compliance_audit_sweep
+        - administrator_troubleshooting
+        - recorded_access_review
+      all: []
+
+  verdict:
+    low_risk_when:
+      - local_group_enumeration
+      - configuration_management_agent
+      - compliance_audit_sweep
+      - administrator_troubleshooting
+      - recorded_access_review
+    suspicious_when:
+      - local_group_enumeration
+      - privileged_group_targeted
+    high_risk_when:
+      - local_group_enumeration
+      - privileged_group_targeted
+      - elevation_attempt_followed
+      - delivery_or_remote_parent
+
+  false_positive:
+    - condition: Configuration management enforces local administrator membership on every run.
+      explanation: >-
+        Policy agents read the administrators group before deciding whether to change it, so
+        they reproduce the privileged-group evidence on every host on every cycle. They are
+        identifiable by a stable parent and a cadence that predates the investigation.
+    - condition: A compliance sweep enumerates local groups estate-wide.
+      explanation: >-
+        Audit tooling asks exactly this question by design. The distinguishing shape is
+        breadth across hosts with a single query each, rather than depth on one host with
+        several follow-up questions.
+    - condition: Support staff check whether a user has local administrator rights.
+      explanation: >-
+        This is one of the most common helpdesk actions there is, and it can legitimately be
+        followed by an elevation to fix the problem, which reproduces the strongest pairing in
+        this file. An acting account with a support history and a matching ticket resolve it.
+    - condition: An installer verifies that the installing account is a local administrator.
+      explanation: >-
+        Installers check group membership before proceeding and then elevate, which is the
+        same sequence an adversary produces. The installer as parent and correlation with a
+        deployment wave across many hosts are the discriminators.
+    - condition: A user runs sudo or id on a Linux host during ordinary work.
+      explanation: >-
+        Group and identity queries are part of normal shell use on Linux and macOS and will
+        be extremely frequent on developer and administrator machines. On those hosts this
+        template is only useful as enrichment for an existing lead.

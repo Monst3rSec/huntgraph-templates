@@ -1,0 +1,393 @@
+type: detection
+
+id: hg-any-logs-read-to-learn-what-was-recorded-t1654
+
+version: 1.0.0
+
+info:
+  name: Logs read to learn what was recorded before deciding what to remove
+  description: >-
+    Reading logs is the step that sits between an intrusion and its cover-up, and it is the
+    half that most detection ignores. Clearing an event log is loud — the act of clearing is
+    itself an event, and the corpus already hunts it under T1685.005 and T1685.006. Reading
+    a log is silent, and it is what an operator does first, for two reasons. The first is
+    self-assessment: knowing which channels are enabled, whether they are forwarded off the
+    host, and what they captured of the last hour tells the operator whether they were seen
+    and what has to be dealt with. The second is that logs are a data source in their own
+    right. Authentication records name accounts, source addresses and the hosts that talk to
+    this one, which is why Volt Typhoon queried the Security log for successful logons and
+    why Aquatic Panda enumerated authentication logs before selectively deleting entries
+    from them. That second motive is the reason a low-privilege read is worth surfacing even
+    when nothing is cleared afterwards. The unavoidable difficulty is that log reading is
+    also what every administrator, monitoring agent and troubleshooting script does all day,
+    so the required evidence alone is weak. The weight is carried by three narrower shapes:
+    a bulk export rather than a query, a search of authentication records specifically, and
+    a read followed by a clear on the same host.
+  severity: medium
+  author: huntgraph
+  tags:
+    - discovery
+    - log-enumeration
+    - anti-forensics
+    - indicator-removal-precursor
+    - windows
+    - linux
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1654
+    - https://attack.mitre.org/detectionstrategies/DET0255
+    - https://attack.mitre.org/techniques/T1070
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1654
+  sub_techniques: []
+  detection_strategies:
+    - DET0255
+  analytics:
+    - AN0705
+    - AN0706
+    - AN0707
+  platforms:
+    - Windows
+    - Linux
+    - macOS
+  data_sources:
+    - WinEventLog:Security
+    - auditd:SYSCALL
+    - auditd:PATH
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    An adversary may enumerate and read system and security logs to establish which channels
+    are recording, what was captured of their activity, and which accounts and hosts the
+    authentication records name, using the answer either to select entries for removal or to
+    extend reconnaissance into the rest of the estate.
+  attacker_behavior:
+    - Lists the available event log channels to see what is enabled and how large each is.
+    - Queries or exports a security or system channel in bulk to a file for offline reading.
+    - Searches authentication records for successful logons, account names and source addresses.
+    - Reads or greps the authentication logs on a Linux host, or the unified log on macOS.
+    - Inspects login records through last, lastb or the wtmp and utmp files.
+    - Clears or truncates the same log shortly after reading it.
+  legitimate_behavior:
+    - Administrators and support engineers read logs while investigating a fault or an incident.
+    - Monitoring and log-forwarding agents read every channel continuously by design.
+    - Backup and archival tooling exports event logs on a retention schedule.
+    - Security operations and forensic collection tooling exports logs during a genuine investigation.
+    - Application installers and health checks read their own logs after a change.
+  risk_indicator:
+    - The read is a bulk export of a whole channel to a file rather than a targeted query.
+    - Authentication records specifically are searched for successful logons or account names.
+    - The same host clears or truncates a log shortly after reading it.
+    - The reading process was launched by an interpreter or a remote-execution service.
+    - The host has no history of log enumeration outside its monitoring agent.
+
+requires:
+  platforms:
+    - windows
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewExecutableWritten
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: event-log-channels-enumerated-or-exported
+        name: Event log channels listed or exported in bulk
+        purpose: >-
+          Separate the two kinds of Windows log access. Asking which channels exist, or
+          exporting a whole channel to a file, is a very different act from querying a
+          channel for a specific event while diagnosing a fault — the first is an inventory
+          of what is recording and a copy of what it recorded, and outside of backup tooling
+          it is uncommon.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\bwevtutil\b.{0,40}\b(el|enum-logs|gl|get-log|epl|export-log|qe|query-events)\b|Get-WinEvent\b.{0,40}-ListLog|Get-EventLog\b.{0,20}-List|Get-WinEvent\b.{0,60}(-Path|Export-|Out-File|\|\s*Export-Csv)|CollectGuestLogs|\bLogParser\b.{0,40}(Security|System|Application))/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=reads), collect([CommandLine], limit=5)])
+          | sort(reads, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the log forwarding, monitoring and backup agents"
+            - "ComputerName of security operations collection and forensic workstations"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - parent_process
+            - command_line
+
+      - id: authentication-records-searched
+        name: Authentication records searched for logons and accounts
+        purpose: >-
+          Catch the read whose motive is reconnaissance rather than self-assessment. Logs
+          that record who signed in, from where, name accounts and hosts an operator has no
+          other way to learn about, and a search restricted to logon events is a very
+          different query from a general troubleshooting read.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\bSecurity\b.{0,40}\b(4624|4625|4648|4672|4768|4769)\b|\b(4624|4625|4648)\b.{0,40}\bSecurity\b|Get-EventLog\s+security|Get-WinEvent\b.{0,60}\bSecurity\b|\/var\/log\/(auth\.log|secure|wtmp|btmp|lastlog)|\bjournalctl\b.{0,40}(sshd|sudo|_COMM=sshd)|\blastb?\b\s|\/var\/log\/system\.log|log\s+show\b.{0,60}(loginwindow|authd|sshd))/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=searches), collect([CommandLine], limit=5)])
+          | sort(searches, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Log forwarding and SIEM collection agents that read authentication logs continuously"
+            - "ComputerName of identity and security operations hosts where logon review is routine"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: many-log-sources-read-in-one-lineage
+        name: Several distinct log categories read under one process lineage
+        purpose: >-
+          Apply the clustering shape. One log read is troubleshooting; authentication,
+          security, application and shell-history logs all read from the same parent inside
+          one session is an operator establishing what the host knows about them, and the
+          count of distinct categories is what separates the two readings.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(\/var\/log\/(auth\.log|secure|wtmp|btmp)|Get-EventLog\s+security|\bSecurity\b.{0,30}\b(4624|4625)\b|\blastb?\b\s)/i
+                | log_authentication := CommandLine ;
+              CommandLine=/(\bwevtutil\b|Get-WinEvent|\/var\/log\/(syslog|messages|kern\.log)|\bjournalctl\b|log\s+show\b)/i
+                | log_system := CommandLine ;
+              CommandLine=/(\.(bash_history|zsh_history|sh_history)|ConsoleHost_history\.txt|PSReadLine)/i
+                | log_shell_history := CommandLine ;
+              CommandLine=/(\/var\/log\/(apache2|nginx|httpd)|\bIIS\b.{0,20}\blogs?\b|inetpub\\logs|W3SVC)/i
+                | log_service := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[collect([log_authentication, log_system, log_shell_history, log_service], limit=12),
+                              count(as=reads)])
+          | log_authentication=/.+/
+          | sort(reads, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Monitoring, log shipping and observability agents as the parent process"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - parent_process
+
+      - id: log-read-then-log-cleared
+        name: Log read and then cleared on the same host
+        purpose: >-
+          Join the reconnaissance to the removal it was selecting for. This is the sequence
+          the technique exists to describe: an operator reads a channel to find out what it
+          holds, then clears or truncates it. Either half alone has a large benign
+          population; the pair on one host within a window does not.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(\bwevtutil\b.{0,40}\b(el|qe|epl|gl)\b|Get-WinEvent|Get-EventLog|\/var\/log\/(auth\.log|secure|syslog|messages)|\bjournalctl\b|log\s+show\b)/i
+                | log_read := CommandLine ;
+              CommandLine=/(\bwevtutil\b.{0,20}\bcl\b|Clear-EventLog|Remove-EventLog|Limit-EventLog|\btruncate\b.{0,30}\/var\/log|\b(rm|shred|unlink)\b.{0,30}\/var\/log|>\s*\/var\/log\/|journalctl\b.{0,20}--vacuum|\blog\b\s+erase)/i
+                | log_cleared := CommandLine ;
+            }
+          | groupBy([ComputerName],
+                    function=[collect([log_read, log_cleared, UserName, ParentBaseFileName], limit=10),
+                              count(as=events)])
+          | log_read=/.+/ and log_cleared=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Log rotation and retention tooling that reads and then trims logs by design"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - process
+
+evidence:
+  required:
+    - id: log_enumeration
+      name: System or security logs read
+      description: >-
+        A command enumerated log channels, queried or exported an event log, or read the
+        system, authentication or service log files on a Linux or macOS host.
+      source: process_creation
+      field: CommandLine
+      indicates: log_enumeration
+
+  supporting:
+    - id: bulk_export
+      name: Whole channel exported rather than queried
+      description: >-
+        The command exported an entire log channel to a file or listed every available
+        channel, which is a copy of the record rather than an answer to a specific
+        troubleshooting question.
+      source: process_creation
+      field: ImageFileName
+      indicates: bulk_log_collection
+    - id: authentication_records_targeted
+      name: Authentication records specifically searched
+      description: >-
+        The read was restricted to logon and authentication events, which name accounts,
+        source addresses and peer hosts and so serve reconnaissance rather than diagnosis.
+      source: process_creation
+      field: CommandLine
+      indicates: credential_and_host_reconnaissance
+    - id: clearing_follows
+      name: Log cleared shortly after being read
+      description: >-
+        The same host cleared, truncated or deleted a log after reading it, which is the
+        removal the enumeration was selecting targets for.
+      source: process_creation
+      field: FileName
+      indicates: indicator_removal_in_progress
+    - id: scripted_parent
+      name: Interpreter or remote-execution parent
+      description: >-
+        The reading process was launched by a command interpreter or remote-execution
+        service rather than by an interactive administrative session or a monitoring agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: collection_script_written
+      name: Collection script written to the host
+      description: >-
+        A script was written to the host by the same process lineage, which is how bulk log
+        gathering is usually automated once the operator knows which channels are worth
+        taking.
+      source: file_creation
+      field: TargetFileName
+      indicates: tooling_staged_on_host
+
+  contradicting:
+    - id: monitoring_agent
+      name: Monitoring or log forwarding agent
+      description: >-
+        The approved log shipping, SIEM collection or observability agent performed the read
+        as part of its continuous collection.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: security_operations_host
+      name: Security operations or forensic host
+      description: >-
+        The host is a security operations or forensic collection system where exporting and
+        searching logs from across the estate is the work the machine exists to do.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: recorded_investigation
+      name: Activity within a recorded investigation or change
+      description: >-
+        The reads fall inside a recorded incident investigation, maintenance window or
+        troubleshooting ticket, where reading and exporting logs is the expected activity.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_change
+
+  risk_logic:
+    required:
+      - log_enumeration
+
+    supporting:
+      any:
+        - bulk_export
+        - authentication_records_targeted
+        - clearing_follows
+        - scripted_parent
+        - collection_script_written
+      all:
+        - authentication_records_targeted
+        - clearing_follows
+
+    contradicting:
+      any:
+        - monitoring_agent
+        - security_operations_host
+        - recorded_investigation
+      all: []
+
+  verdict:
+    low_risk_when:
+      - log_enumeration
+      - monitoring_agent
+      - security_operations_host
+      - recorded_investigation
+    suspicious_when:
+      - log_enumeration
+      - scripted_parent
+      - authentication_records_targeted
+    high_risk_when:
+      - log_enumeration
+      - scripted_parent
+      - authentication_records_targeted
+      - bulk_export
+      - clearing_follows
+
+  false_positive:
+    - condition: A monitoring or log forwarding agent reads every channel continuously.
+      explanation: >-
+        This is the single largest source of the required evidence and it runs on every host
+        in the estate, which is why the agent has to be excluded by parent process rather
+        than by volume. It is stable, recurring and identical across hosts.
+    - condition: An administrator investigates a fault by querying the event log.
+      explanation: >-
+        Targeted event log queries are ordinary support work and will appear on ordinary
+        endpoints. They are distinguished by an interactive parent, by querying rather than
+        exporting, and by the absence of any subsequent clearing.
+    - condition: A security operations analyst exports logs during a genuine investigation.
+      explanation: >-
+        Incident response performs exactly the bulk export this file treats as the strongest
+        supporting evidence, and often from a host that has never done it before, which also
+        defeats the baseline. Host role and a recorded investigation are the separators.
+    - condition: Log rotation or retention tooling reads and then trims a log.
+      explanation: >-
+        Rotation reproduces the read-then-clear sequence in the fourth case on a schedule. It
+        is identifiable by the rotation utility as the invoking process and by the regular
+        interval, whereas the adversarial pattern is a single unrepeated occurrence.
+    - condition: An application installer or health check reads its own log after a change.
+      explanation: >-
+        Service logs are read by the software that wrote them during upgrades and health
+        checks. These reads are confined to that application's own log path and do not touch
+        authentication records.

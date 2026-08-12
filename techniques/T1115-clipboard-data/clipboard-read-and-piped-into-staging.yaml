@@ -1,0 +1,332 @@
+type: detection
+
+id: hg-any-clipboard-read-and-piped-into-staging-t1115
+version: 1.0.0
+
+info:
+  name: Clipboard contents read and piped into staging or transfer
+  description: >-
+    Clipboard access is one of the most common things software does. Password managers read
+    and clear it on a timer, remote desktop clients synchronise it continuously, clipboard
+    history tools watch it permanently, and every one of them does so through an OS API that
+    this repo cannot observe. A file that fires on "the clipboard was read" would therefore
+    be both blind to implants and deafening about ordinary software, so this hypothesis does
+    not attempt it. What is observable is the command-line route — pbpaste, xclip -o, xsel
+    and Get-Clipboard are processes — and what makes that route meaningful is never the read
+    on its own but what surrounds it: the read feeding an encoder, an archive or a transfer
+    in the same command, the read repeating on a poll, or the read being performed by
+    something with no terminal and no reason to want the clipboard. That is exactly the
+    chaining and context MITRE's own analytics for this technique describe. Clipboard reads
+    performed from inside a script body or through the API remain invisible and this file
+    does not pretend otherwise.
+  severity: medium
+  author: huntgraph
+  tags:
+    - collection
+    - clipboard-data
+    - credential-theft
+    - staging
+    - windows
+    - macos
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1115
+    - https://attack.mitre.org/detectionstrategies/DET0341
+
+mitre:
+  tactics:
+    - TA0009
+  techniques:
+    - T1115
+  sub_techniques: []
+  detection_strategies:
+    - DET0341
+  analytics:
+    - AN0965
+    - AN0966
+    - AN0967
+  platforms:
+    - Windows
+    - macOS
+    - Linux
+  data_sources:
+    - WinEventLog:Sysmon
+    - macos:unifiedlog
+    - auditd:SYSCALL
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary harvests the clipboard because it is where users put the things they are
+    actively moving — passwords pasted out of a vault, one-time codes, connection strings,
+    wallet addresses — and does so from the command line in a way that immediately encodes,
+    stores or transmits the result, or that repeats on a poll to catch whatever is copied
+    next.
+  attacker_behavior:
+    - Runs pbpaste, xclip -o, xsel or Get-Clipboard to read the current clipboard.
+    - Pipes the result straight into base64, gzip, an archive or a file in a scratch path.
+    - Sends the result onward with curl, wget, scp, nc or a web request in the same command.
+    - Re-reads the clipboard on a short interval to capture whatever is copied next.
+    - Invokes the read from a macro host, service, scheduler or remote shell with no terminal.
+  legitimate_behavior:
+    - Password managers read and clear the clipboard through the OS API on a timer.
+    - Remote desktop and virtualisation clients synchronise the clipboard between sessions.
+    - Clipboard history and snippet managers watch the clipboard permanently.
+    - Developers pipe pbpaste or xclip into commands interactively all day.
+    - Shell aliases and dotfiles wrap clipboard tools for copy-and-paste convenience.
+  risk_indicator:
+    - The read is chained in one command line to encoding, archiving or transfer.
+    - The output is written to a temporary, hidden or profile path.
+    - The read repeats many times from one lineage inside a short window.
+    - The parent is a macro host, service, scheduler or remote shell with no terminal.
+    - The acting binary is a copy of a clipboard tool in a user-writable path.
+
+requires:
+  platforms:
+    - windows
+    - macos
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: clipboard-read-chained-to-staging
+        name: Clipboard read joined to encoding, archiving or transfer in one command
+        purpose: >-
+          Require the chain rather than the read. A developer runs pbpaste into a diff and a
+          user pastes into an editor, but a clipboard read whose output is base64-encoded,
+          appended to a file in a temporary directory or handed to curl in the same command
+          line is collecting, not pasting. This single condition is what stops the hypothesis
+          being satisfied by one ordinary command.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\bpbpaste\b|\bxclip\b[^|]*-o|\bxsel\b[^|]*(-o|-b|--output|--clipboard)|Get-Clipboard|Clipboard\]::GetText|Clipboard\]::GetData|\bwl-paste\b)/i
+          | CommandLine=/(\|\s*(base64|openssl|gzip|gz|xz|zip|tar|7z|curl|wget|nc\b|ncat|socat|ssh|scp)|Out-File|Set-Content|Add-Content|>>?\s*\S|Invoke-WebRequest|Invoke-RestMethod|System\.Net\.WebClient|-OutFile\b)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Developer dotfiles and shell aliases that wrap clipboard tools into pipelines"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+            - organization
+
+      - id: clipboard-polled-on-an-interval
+        name: Clipboard re-read repeatedly from one lineage
+        purpose: >-
+          Catch the monitor rather than the single read. Documented clipboard stealers poll on
+          a fixed short interval so they capture whatever is copied next, and several
+          published implants use thirty seconds. Counting reads per host and lineage inside a
+          window turns an ordinary command into an observable behaviour; an interactive user
+          does not run pbpaste forty times an hour from the same parent.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(pbpaste|xclip|xsel|wl-paste|powershell\.exe|pwsh(\.exe)?)$/i
+          | CommandLine=/(\bpbpaste\b|\bxclip\b|\bxsel\b|\bwl-paste\b|Get-Clipboard|Clipboard\]::GetText)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=reads), collect([CommandLine], limit=10)])
+          | reads >= 20
+          | sort(reads, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Clipboard history and snippet managers whose function is continuous polling"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - parent_process
+            - organization
+
+      - id: clipboard-read-without-a-terminal
+        name: Clipboard read by a process with no interactive terminal
+        purpose: >-
+          Establish the actor where the command itself is ordinary. MITRE's macOS and Linux
+          analytics for this technique both key on whether the read is tied to a user terminal
+          session, and the Windows one on abnormal parents. A clipboard read parented by an
+          office application, a mail client, a scheduler, a service host or an inbound remote
+          shell is reading a clipboard that belongs to someone else's session.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\bpbpaste\b|\bxclip\b|\bxsel\b|\bwl-paste\b|Get-Clipboard|Clipboard\]::GetText|Clipboard\]::GetData)/i
+          | ParentBaseFileName=/^(winword\.exe|excel\.exe|powerpnt\.exe|outlook\.exe|msaccess\.exe|mshta\.exe|wscript\.exe|cscript\.exe|services\.exe|svchost\.exe|taskeng\.exe|schtasks\.exe|w3wp\.exe|sshd|crond?|systemd|launchd|Microsoft Word|Microsoft Excel|osascript)$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Remote desktop and virtualisation agents that synchronise clipboards by design"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: clipboard_contents_read
+      name: Clipboard read from a command line
+      description: >-
+        A clipboard reading utility or cmdlet was invoked as a process, which is the only
+        route to clipboard contents this telemetry can observe.
+      source: process_creation
+      field: CommandLine
+      indicates: clipboard_contents_accessed
+
+  supporting:
+    - id: chained_to_staging_or_transfer
+      name: Read chained to encoding, storage or transfer
+      description: >-
+        The same command line encodes, archives, writes to a file or transmits the clipboard
+        contents, which is collection rather than a paste.
+      source: process_creation
+      field: CommandLine
+      indicates: collection_staging
+    - id: reads_repeated
+      name: Clipboard re-read repeatedly from one lineage
+      description: >-
+        The same parent invoked a clipboard read many times inside the window, which is
+        polling for whatever the user copies next.
+      source: derived
+      field: clipboard_read_count
+      indicates: sustained_surveillance
+    - id: no_terminal_parent
+      name: Read performed by a process with no interactive terminal
+      description: >-
+        The parent is an office application, mail client, service host, scheduler or remote
+        shell rather than a terminal the user is sitting at.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: untrusted_execution_lineage
+    - id: output_to_scratch_path
+      name: Clipboard contents written to a temporary or hidden path
+      description: >-
+        The destination named in the command line is a temporary directory, a dot-directory
+        or a profile path used as a drop location rather than a working file.
+      source: process_creation
+      field: CommandLine
+      indicates: collection_staging
+    - id: clipboard_tool_from_writable_path
+      name: Clipboard utility running from a user-writable path
+      description: >-
+        The acting binary is a copy of a clipboard tool under a temporary, profile or share
+        directory rather than the system-installed utility.
+      source: process_creation
+      field: ImageFileName
+      indicates: untrusted_execution_location
+
+  contradicting:
+    - id: interactive_terminal_session
+      name: Read issued from the console user's own terminal
+      description: >-
+        The parent is a terminal emulator or login shell belonging to the interactive user,
+        which is a person using their own clipboard.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: expected_user_activity
+    - id: clipboard_management_product
+      name: Clipboard history, sync or password management product
+      description: >-
+        The acting process belongs to an approved clipboard manager, password manager or
+        remote desktop client whose stated function includes reading the clipboard.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: engineering_host
+      name: Engineering host where clipboard pipelines are routine
+      description: >-
+        The host belongs to an engineering asset group where dotfiles and aliases pipe
+        clipboard contents into commands as normal work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - clipboard_contents_read
+
+    supporting:
+      any:
+        - chained_to_staging_or_transfer
+        - reads_repeated
+        - no_terminal_parent
+        - output_to_scratch_path
+        - clipboard_tool_from_writable_path
+      all:
+        - chained_to_staging_or_transfer
+        - no_terminal_parent
+
+    contradicting:
+      any:
+        - interactive_terminal_session
+        - clipboard_management_product
+        - engineering_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - clipboard_contents_read
+      - interactive_terminal_session
+      - clipboard_management_product
+      - engineering_host
+    suspicious_when:
+      - clipboard_contents_read
+      - chained_to_staging_or_transfer
+    high_risk_when:
+      - clipboard_contents_read
+      - chained_to_staging_or_transfer
+      - no_terminal_parent
+      - reads_repeated
+      - output_to_scratch_path
+
+  false_positive:
+    - condition: A developer pipes pbpaste or xclip into another command interactively.
+      explanation: >-
+        This reproduces the chaining evidence exactly and is extremely common on engineering
+        hosts. The parent is an interactive terminal in the console user's own session, and
+        the destination is a working file rather than a temporary drop path.
+    - condition: A clipboard history or snippet manager polls the clipboard continuously.
+      explanation: >-
+        Continuous polling is the product's purpose and will produce far more reads than any
+        implant, matching the repetition evidence. Most such products use the OS API rather
+        than spawning a utility, so those that do appear here are identifiable by binary.
+    - condition: A password manager reads and clears the clipboard on a timer.
+      explanation: >-
+        This is the single most common legitimate clipboard access in an enterprise. It is
+        performed through the OS API and is therefore invisible to this hunt rather than a
+        source of alerts, which is why the required evidence is a process and not an access.
+    - condition: A remote desktop or virtualisation client synchronises the clipboard.
+      explanation: >-
+        Session clipboard sync reads constantly and can be parented by a service, matching the
+        no-terminal evidence. The acting binary belongs to the remoting product and the
+        activity tracks session start and end.
+    - condition: A shell alias or dotfile wraps a clipboard tool for convenience.
+      explanation: >-
+        Aliases such as a copy-to-clipboard helper produce stable, repeated command lines from
+        the same user and host, which is what the baseline comparison exists to establish.

@@ -1,0 +1,377 @@
+type: detection
+
+id: hg-any-running-processes-searched-for-a-named-target-t1057
+version: 1.0.0
+
+info:
+  name: Running processes searched for a named target rather than listed
+  description: >-
+    `tasklist`, `ps` and `Get-Process` run constantly and matching them is worthless. What
+    this file hunts is the narrower question underneath: not "what is running here" but "is
+    *this particular thing* running here". A filter appended to the listing — `| findstr`,
+    `| grep`, `-Name`, `pgrep -f` — turns an inventory into a lookup, and the string being
+    looked up is the operator telling you what they care about before they act on it. The
+    same file covers three other shapes that are specific to process discovery rather than
+    to discovery in general: walking `/proc` directly instead of calling `ps`, which is how
+    enumeration is done where `ps` is absent or where the operator would rather not run it;
+    enumeration arriving down a remote-execution channel such as WinRM, WMI or an SSH
+    session; and enumeration followed within the window by the targeted termination of
+    something it found. Where the name being searched for is a security or backup product,
+    the T1518.001 and T1518.002 templates own that ground and are sharper — this file is
+    deliberately the general case, and is low severity because its required evidence is one
+    of the most common commands in any estate.
+  severity: low
+  author: huntgraph
+  tags:
+    - discovery
+    - process-enumeration
+    - situational-awareness
+    - proc-filesystem
+    - windows
+    - linux
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1057
+    - https://attack.mitre.org/detectionstrategies/DET0034
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1057
+  sub_techniques: []
+  detection_strategies:
+    - DET0034
+  analytics:
+    - AN0095
+    - AN0096
+    - AN0097
+  platforms:
+    - Windows
+    - Linux
+    - macOS
+  data_sources:
+    - WinEventLog:Security
+    - auditd:SYSCALL
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary on a host may query the running process table for a specific named target
+    rather than for an inventory, in order to confirm whether a competing implant, an
+    analysis tool, a monitoring agent or an application holding data of interest is present,
+    and then act on that answer by terminating it or by adapting what runs next.
+  attacker_behavior:
+    - Pipes a process listing into a filter to test for one named process.
+    - Reads /proc entries directly to enumerate processes without invoking ps.
+    - Issues process enumeration through a remote-execution channel rather than at a console.
+    - Terminates a process shortly after confirming it is running.
+    - Repeats the lookup across several hosts with the same target name.
+  legitimate_behavior:
+    - Monitoring agents poll the process table continuously to report health.
+    - Application start-up scripts check whether an instance is already running before launching.
+    - Support engineers grep the process list while diagnosing a hung application.
+    - Backup and deployment jobs confirm a service process is up before proceeding.
+    - Container and orchestration tooling reads /proc as a matter of routine.
+
+  risk_indicator:
+    - The listing is filtered for a specific process name rather than consumed whole.
+    - /proc is walked directly in preference to the standard process tools.
+    - The parent is a remote-execution service, a network-facing server or an interpreter.
+    - The looked-up process is terminated shortly afterwards.
+    - Neither the lookup nor the target name has been seen on this host in the baseline window.
+
+requires:
+  platforms:
+    - windows
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: listing-filtered-for-a-named-process
+        name: Process listing narrowed to one name
+        purpose: >-
+          Return lookups rather than inventories, and surface the string being looked for,
+          because the name asked about is the part of this behaviour that carries meaning.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\btasklist(\.exe)?\b|Get-Process\b|Win32_Process\b|\bwmic\s+process\b|\bps\s+-?(aux|ef|A|e)\b|\bpgrep\b|\bpidof\b)/i
+          | CommandLine=/(\|\s*(findstr|find|select-string|sls|grep|egrep)\b|Get-Process\s+(-Name\s+)?["']?[a-z0-9_.-]+|\bpgrep\s+(-f\s+)?[a-z0-9_.-]+|\bpidof\s+[a-z0-9_.-]+|\/fi\s+["']?imagename)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=lookups), collect([CommandLine], limit=10)])
+          | sort(lookups, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of monitoring, backup and orchestration agents that probe for their own worker processes"
+            - "Application launcher scripts that check for an existing instance before starting"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: proc-filesystem-walked-directly
+        name: Process table read out of /proc rather than through ps
+        purpose: >-
+          Catch enumeration that bypasses the standard tooling. Reading `/proc/*/cmdline`
+          or `/proc/*/exe` is how a process list is obtained in a stripped container or by
+          an operator who would rather not invoke `ps`, and it is not how an engineer
+          normally looks at a system.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\/proc\/(\*|\[0-9\]|\$\{?[a-z_]+\}?|%s|%d)?\/?(cmdline|comm|exe|status|stat)\b/i
+          | CommandLine=/(\bcat\b|\bhead\b|\bstrings\b|\bxargs\b|\bfor\b|\bfind\b|\bls\b|\breadlink\b|\bawk\b|\bgrep\b|\bopen\b|\bread\b)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=walks), collect([CommandLine], limit=10)])
+          | sort(walks, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Container runtime and orchestration components whose normal work is reading /proc"
+            - "Performance and observability agents that sample /proc on an interval"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - command_line
+            - parent_process
+
+      - id: enumeration-over-a-remote-execution-channel
+        name: Process discovery arriving through remote execution
+        purpose: >-
+          The command is ordinary; the channel is not. Process enumeration whose parent is
+          a remote-execution service or a network-facing server is somebody looking at a
+          host they are not sitting in front of.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\btasklist(\.exe)?\b|Get-Process\b|Win32_Process\b|\bwmic\s+process\b|\bps\s+-?(aux|ef|A|e)\b|\bpgrep\b|\btop\s+-b\b)/i
+          | ParentBaseFileName=/^(wsmprovhost|wmiprvse|winrshost|services|psexesvc|sshd|bash|w3wp|httpd|nginx|apache2|tomcat\d*|java|node|php(-fpm)?|python\d*(\.\d+)?|perl|ruby)(\.exe)?$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=enumerations), collect([CommandLine], limit=10)])
+          | sort(enumerations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Remote administration jump boxes and the operations accounts that work from them"
+            - "Application servers whose own health checks shell out to list worker processes"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - user
+            - parent_process
+
+      - id: lookup-then-termination
+        name: A process looked up and then killed
+        purpose: >-
+          Join the question to the act. Confirming a named process is running and then
+          terminating it is the shape of an operator clearing something out of the way,
+          and is what separates a lookup with intent from a status check.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(\btasklist(\.exe)?\b|Get-Process\b|Win32_Process\b|\bwmic\s+process\b|\bps\s+-?(aux|ef|A|e)\b|\bpgrep\b|\bpidof\b)/i
+                | looked_up := CommandLine ;
+              CommandLine=/(\btaskkill(\.exe)?\s+.*\/(im|pid)\b|Stop-Process\b|\bwmic\s+process\s+.*\bdelete\b|\bpkill\b|\bkillall\b|\bkill\s+-(9|SIGKILL|TERM)\b)/i
+                | terminated := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([looked_up, terminated, ParentBaseFileName, FileName], limit=10),
+                              min(@timestamp, as=first_seen),
+                              max(@timestamp, as=last_seen)])
+          | looked_up=/.+/ and terminated=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Installer and upgrade routines that stop a running instance before replacing it"
+            - "Watchdog scripts that restart a hung process as designed"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - user
+            - process
+
+evidence:
+  required:
+    - id: process_enumeration
+      name: Running process table queried
+      description: >-
+        A command asked the host which processes are running, whether through the standard
+        tooling or by reading the process filesystem. This is one of the most common
+        commands in any estate and is not a finding on its own.
+      source: process_creation
+      field: CommandLine
+      indicates: running_process_inventory_collected
+
+  supporting:
+    - id: targeted_name_search
+      name: Listing filtered for a specific process name
+      description: >-
+        The enumeration was narrowed to one named process rather than consumed as an
+        inventory, which is a lookup about a particular piece of software rather than
+        general situational awareness.
+      source: process_creation
+      field: CommandLine
+      indicates: targeted_reconnaissance
+    - id: proc_filesystem_walk
+      name: Process filesystem read directly
+      description: >-
+        Process details were read out of /proc rather than obtained through ps or an
+        equivalent, which avoids the tools an administrator would normally reach for.
+      source: process_creation
+      field: CommandLine
+      indicates: enumeration_avoiding_standard_tooling
+    - id: remote_execution_parent
+      name: Parent is a remote-execution or server process
+      description: >-
+        The enumeration was launched by WinRM, WMI, a remote service host, an SSH session
+        or a network-facing application server rather than from an interactive console.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: termination_followup
+      name: A process terminated after the lookup
+      description: >-
+        The same user on the same host killed a process shortly after enumerating, which is
+        the lookup being acted upon rather than a status check.
+      source: process_creation
+      field: FileName
+      indicates: execution_chain_progression
+    - id: rare_for_host
+      name: Lookup unprecedented for this host
+      description: >-
+        Neither the command shape nor the searched-for name has appeared on this host during
+        the baseline window, unlike agent polling which recurs continuously.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: monitoring_agent_parent
+      name: Monitoring or orchestration agent
+      description: >-
+        The approved monitoring, backup or orchestration agent performed the enumeration as
+        part of its normal health reporting or scheduling work.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: recurring_polling
+      name: Continuous polling pattern
+      description: >-
+        The same enumeration recurs at a fixed interval on this host and across the estate,
+        which is instrumentation rather than a person asking a question.
+      source: baseline
+      field: ComputerName
+      indicates: scheduled_automation_job
+    - id: engineering_or_admin_host
+      name: Host or account whose role is operations
+      description: >-
+        The host is a management, build or engineering system, or the account is an
+        operations identity for which inspecting and killing processes is ordinary work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_administrative_activity
+    - id: open_incident_record
+      name: Open incident or change record
+      description: >-
+        An incident or approved change covers this host at the time, which accounts for both
+        the diagnostic lookup and any process that was restarted.
+      source: change_management
+      field: ComputerName
+      indicates: approved_change_window
+
+  risk_logic:
+    required:
+      - process_enumeration
+
+    supporting:
+      any:
+        - targeted_name_search
+        - proc_filesystem_walk
+        - remote_execution_parent
+        - termination_followup
+        - rare_for_host
+      all:
+        - targeted_name_search
+        - termination_followup
+
+    contradicting:
+      any:
+        - monitoring_agent_parent
+        - recurring_polling
+        - engineering_or_admin_host
+        - open_incident_record
+      all: []
+
+  verdict:
+    low_risk_when:
+      - process_enumeration
+      - monitoring_agent_parent
+      - recurring_polling
+      - engineering_or_admin_host
+      - open_incident_record
+    suspicious_when:
+      - process_enumeration
+      - targeted_name_search
+      - rare_for_host
+    high_risk_when:
+      - process_enumeration
+      - targeted_name_search
+      - remote_execution_parent
+      - termination_followup
+      - proc_filesystem_walk
+
+  false_positive:
+    - condition: A monitoring agent samples the process table every few seconds.
+      explanation: >-
+        Instrumentation is the overwhelming source of volume here and satisfies the required
+        evidence continuously. It is identified by a stable parent and a fixed interval, and
+        should be excluded by parent so that the same command from an unusual lineage still
+        surfaces.
+    - condition: A start-up script checks whether an instance is already running.
+      explanation: >-
+        Launcher scripts pipe a process listing into grep or findstr for exactly one name,
+        which reproduces the strongest supporting evidence in this file. They repeat
+        identically at every service start and appear in the baseline as a fixed pattern.
+    - condition: An installer stops a running instance before replacing its binaries.
+      explanation: >-
+        Look-up-then-kill is the normal shape of an upgrade, so it satisfies the strongest
+        pairing here. It coincides with executable writes under the application's own
+        installation path and with a deployment or patch window.
+    - condition: Container and observability tooling reads /proc continuously.
+      explanation: >-
+        Reading process entries out of /proc is routine for runtimes, cgroup accounting and
+        performance agents, which is otherwise the sharpest evidence in this file. Those
+        readers are a small, stable set of binaries and are best excluded by name.
+    - condition: An engineer greps the process list while diagnosing a hung application.
+      explanation: >-
+        Interactive troubleshooting produces targeted lookups and often a kill afterwards. It
+        is tied to a named person on a host they are entitled to work on, and usually
+        accompanies an incident record.

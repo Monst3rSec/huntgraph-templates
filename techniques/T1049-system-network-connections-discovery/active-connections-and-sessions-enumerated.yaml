@@ -1,0 +1,372 @@
+type: detection
+
+id: hg-any-active-connections-and-sessions-enumerated-t1049
+
+version: 1.0.0
+
+info:
+  name: Active connections and logged-on sessions enumerated
+  description: >-
+    Listing the connections a host has open, and the sessions logged on to it, tells an
+    operator which machines this one already talks to, which accounts are present, and
+    whether an administrator is watching. It is also one of the most common commands an
+    administrator runs, which is the whole problem: `netstat -ano` on its own is not
+    evidence of anything and a template that alerts on it is noise with a MITRE id
+    attached. Severity here is deliberately low and the file is written as an enrichment
+    template — something an analyst runs against a host already under suspicion, or that
+    an agent uses to add weight to a lead. The three things that make a run worth reading
+    are all context rather than content: the command sat in a cluster of other
+    orientation commands, the parent had no business running it, or the output was
+    captured to a file instead of being read on screen.
+  severity: low
+  author: huntgraph
+  tags:
+    - discovery
+    - system-network-connections-discovery
+    - session-enumeration
+    - host-orientation
+    - windows
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1049
+    - https://attack.mitre.org/detectionstrategies/DET0320
+    - https://attack.mitre.org/techniques/T1018
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1049
+  sub_techniques: []
+  detection_strategies:
+    - DET0320
+  analytics:
+    - AN0903
+    - AN0904
+  platforms:
+    - Windows
+    - Linux
+  data_sources:
+    - WinEventLog:Sysmon
+    - auditd:SYSCALL
+  data_components:
+    - Process Creation
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    An adversary newly present on a host may list its open connections and logged-on
+    sessions to learn which systems it already communicates with and who else is on it,
+    producing commands that are individually routine but abnormal in their grouping,
+    their parentage or their disposal of the output.
+  attacker_behavior:
+    - Lists open TCP connections and the processes that own them.
+    - Enumerates inbound sessions and mapped shares to find connected peers.
+    - Lists interactive and remote-desktop sessions to see who else is present.
+    - Captures the output to a file rather than reading it interactively.
+    - Runs the enumeration alongside other orientation commands in one short burst.
+  legitimate_behavior:
+    - Administrators run netstat and ss constantly while diagnosing service faults.
+    - Support staff check for logged-on users before rebooting or patching a machine.
+    - Monitoring agents poll connection state as part of routine health collection.
+    - Application troubleshooting scripts capture connection tables into a bundle.
+    - Backup and clustering software checks sessions before taking resources offline.
+  risk_indicator:
+    - The command belongs to a burst of several unrelated orientation commands.
+    - The parent is a document application, mail client, web server or script host.
+    - The output is redirected to a file in a user-writable or public directory.
+    - The same enumeration repeats many times, which is watching rather than checking.
+    - Neither the host nor the account has run this in the baseline window.
+
+requires:
+  platforms:
+    - windows
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: connection-enumeration-inside-an-orientation-burst
+        name: Connection listing surrounded by other orientation commands
+        purpose: >-
+          This is the discriminator for the whole hypothesis. One netstat is an
+          administrator; a connection listing sitting alongside session enumeration, user
+          enumeration and host enumeration from the same lineage inside a few minutes is
+          somebody working out where they have landed. Tag by what each command
+          enumerates and require several distinct categories, not several runs of one.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(netstat(\.exe)?\s+-[a-z]*[ano]|Get-NetTCPConnection|\bss\s+-[a-z]*t|lsof\s+-i)/i
+                | orient := "open_connections" ;
+              CommandLine=/(net(\.exe)?\s+session|net(\.exe)?\s+use\b|quser(\.exe)?|qwinsta(\.exe)?|\bwho\s+-a\b|\bw\b\s*$|Get-SmbSession)/i
+                | orient := "active_sessions" ;
+              CommandLine=/(whoami(\.exe)?|net(\.exe)?\s+user|\bid\b\s*$|Get-LocalUser|net(\.exe)?\s+localgroup)/i
+                | orient := "account_context" ;
+              CommandLine=/(ipconfig(\.exe)?\s+\/all|ifconfig\b|\bip\s+a(ddr)?\b|route(\.exe)?\s+print|Get-NetIPConfiguration)/i
+                | orient := "network_configuration" ;
+              CommandLine=/(tasklist(\.exe)?|Get-Process|\bps\s+-e|net(\.exe)?\s+start|systeminfo(\.exe)?)/i
+                | orient := "running_software" ;
+            }
+          | orient=/.+/
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(field=orient, distinct=true, as=categories),
+                              count(as=commands),
+                              collect([orient, CommandLine], limit=15)])
+          | categories >= 4
+          | sort(categories, order=desc)
+        filters:
+          include:
+            - "Lineages that include at least one open_connections or active_sessions command"
+          exclude:
+            - "Support diagnostic bundles and vendor health-check scripts"
+            - "ParentBaseFileName of monitoring and inventory agents"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - parent_process
+            - organization
+
+      - id: enumeration-output-captured-to-a-file
+        name: Connection or session listing redirected to a file
+        purpose: >-
+          An administrator reads the connection table on screen; an operator who cannot
+          stay interactive writes it somewhere to collect later. Redirection into a
+          user-writable or public path is the cheapest honest separator between reading
+          and taking, and it is visible in the command line.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(netstat(\.exe)?\s+-|Get-NetTCPConnection|\bss\s+-|lsof\s+-i|net(\.exe)?\s+session|quser(\.exe)?|qwinsta(\.exe)?)/i
+          | CommandLine=/(\s>+\s*\S|Out-File|Set-Content|\|\s*tee\b)/i
+          | CommandLine=/(\\+Users\\+Public|\\+ProgramData|\\+Windows\\+Temp|\\+Temp\\+|\/tmp\/|\/var\/tmp\/|\/dev\/shm\/|AppData\\+Local\\+Temp)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=captures), collect([CommandLine], limit=5)])
+          | sort(captures, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Diagnostic bundle collectors that write to a known support output directory"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: enumeration-under-an-unrelated-parent
+        name: Connection listing parented by software with no such role
+        purpose: >-
+          Where the command itself carries no signal, the thing running it is the only
+          real discriminator. A document application, mail client, web server or script
+          host has no reason to ask what this machine is connected to, so a single
+          command from one of those lineages is worth more than a burst from a console.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|onenote|acrord32|7zg|winrar|w3wp|httpd|nginx|tomcat\d*|mshta|wscript|cscript|regsvr32|rundll32|msbuild)\.exe$/i
+            or ParentBaseFileName=/^(soffice|python\d*|perl|php|node|java)$/i
+          | CommandLine=/(netstat(\.exe)?\s+-|Get-NetTCPConnection|\bss\s+-[a-z]*t|lsof\s+-i|net(\.exe)?\s+session|net(\.exe)?\s+use\b|quser|qwinsta|\bwho\s+-a\b)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=commands), collect([CommandLine], limit=8)])
+          | sort(commands, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Application health probes that shell out to connection utilities by design"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: same-enumeration-repeated-many-times
+        name: The same connection listing repeated across the window
+        purpose: >-
+          Separate checking from watching. An administrator answers a question once;
+          repeating the same listing dozens of times over a search window is somebody
+          monitoring who else connects — for a defender's session, for a rival's
+          implant, or for the moment a target host comes online.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(netstat(\.exe)?\s+-[a-z]*[ano]|\bss\s+-[a-z]*t|lsof\s+-i|net(\.exe)?\s+session|quser(\.exe)?|qwinsta(\.exe)?)/i
+          | ParentBaseFileName!=/^(MonitoringHost\.exe|CcmExec\.exe|zabbix_agentd|telegraf|collectd|nrpe)$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, CommandLine],
+                    function=[count(as=runs), collect([FileName], limit=3)])
+          | runs >= 12
+          | sort(runs, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Scheduled health checks and clustering software that poll session state"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - user
+            - command_line
+
+evidence:
+  required:
+    - id: connection_or_session_listing
+      name: Open connections or logged-on sessions were listed
+      description: >-
+        A command was executed whose purpose is to enumerate this host's open network
+        connections, its mapped shares, or the sessions currently logged on to it.
+      source: process_creation
+      field: CommandLine
+      indicates: host_relationship_enumeration
+
+  supporting:
+    - id: orientation_cluster
+      name: Part of a burst of unrelated orientation commands
+      description: >-
+        Four or more different categories of enumeration ran from the same lineage in the
+        same window, which is an operator establishing where they are rather than an
+        administrator answering one question.
+      source: derived
+      field: categories
+      indicates: systematic_orientation
+    - id: output_captured_to_file
+      name: Output written to a user-writable path
+      description: >-
+        The listing was redirected into a temporary, public or user-writable directory
+        rather than displayed, which is collection for later retrieval.
+      source: process_creation
+      field: CommandLine
+      indicates: collection_staging
+    - id: unrelated_parent_process
+      name: Parent has no connection-enumeration role
+      description: >-
+        The command was launched by a document application, mail client, web server or
+        script host rather than by a console, shell session or management agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: enumeration_repeated
+      name: The same listing repeated many times
+      description: >-
+        The identical command ran repeatedly across the window from a parent that is not a
+        scheduled monitoring agent, which is watching rather than checking.
+      source: derived
+      field: runs
+      indicates: persistent_observation
+    - id: new_for_host_and_account
+      name: New for this host and account
+      description: >-
+        Neither the host nor the account produced this enumeration during the baseline
+        window, so it is not part of routine administration on this machine.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: administrative_session
+      name: Interactive administration by a machine administrator
+      description: >-
+        The commands come from a console or shell session opened by an account whose role
+        is to administer this host, alongside other administrative work.
+      source: identity_context
+      field: UserName
+      indicates: legitimate_administrative_action
+    - id: monitoring_agent
+      name: Monitoring or clustering agent polling session state
+      description: >-
+        The parent is a monitoring, clustering or backup agent that collects connection
+        and session state as part of its documented function.
+      source: process_creation
+      field: FileName
+      indicates: legitimate_application_component
+    - id: recorded_incident
+      name: Recorded fault investigation
+      description: >-
+        The activity coincides with an incident or change record covering a service fault
+        on the same host, which is what connection listings are for.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - connection_or_session_listing
+
+    supporting:
+      any:
+        - orientation_cluster
+        - output_captured_to_file
+        - unrelated_parent_process
+        - enumeration_repeated
+        - new_for_host_and_account
+      all:
+        - orientation_cluster
+        - new_for_host_and_account
+
+    contradicting:
+      any:
+        - administrative_session
+        - monitoring_agent
+        - recorded_incident
+      all: []
+
+  verdict:
+    low_risk_when:
+      - connection_or_session_listing
+      - administrative_session
+      - monitoring_agent
+      - recorded_incident
+    suspicious_when:
+      - connection_or_session_listing
+      - orientation_cluster
+      - new_for_host_and_account
+    high_risk_when:
+      - connection_or_session_listing
+      - orientation_cluster
+      - unrelated_parent_process
+      - output_captured_to_file
+      - enumeration_repeated
+
+  false_positive:
+    - condition: An administrator diagnoses a service fault with netstat or ss.
+      explanation: >-
+        This is the overwhelmingly common case and it is why the severity here is low.
+        Nothing in the command distinguishes it; only the account's role, the parent
+        session and the absence of surrounding enumeration do.
+    - condition: Support staff check for logged-on users before patching or rebooting.
+      explanation: >-
+        quser and qwinsta are standard pre-change checks and run at scale during patch
+        windows, which can look like an orientation burst when paired with systeminfo.
+        The timing relative to the maintenance window is the separator.
+    - condition: A diagnostic bundle captures the connection table to a file.
+      explanation: >-
+        Vendor and internal support bundles redirect exactly these commands into a
+        collection directory, which reproduces the output-capture evidence. The
+        destination path and the surrounding bundle commands identify it.
+    - condition: A monitoring or clustering agent polls connection and session state.
+      explanation: >-
+        These poll on a fixed interval, which is what the repetition case looks for. They
+        are recognisable by a stable parent and an exactly regular cadence, and belong in
+        the exclusion list.
+    - condition: An application server shells out to a connection utility in a health probe.
+      explanation: >-
+        Some application health checks call netstat or lsof from the server process,
+        triggering the unrelated-parent case with identical command lines every interval.

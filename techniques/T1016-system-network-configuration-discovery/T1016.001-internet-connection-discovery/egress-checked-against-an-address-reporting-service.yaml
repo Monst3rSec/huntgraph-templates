@@ -1,0 +1,371 @@
+type: detection
+
+id: hg-any-egress-checked-against-an-address-reporting-service-t1016-001
+
+version: 1.0.0
+
+info:
+  name: Egress checked against an address-reporting service
+  description: >-
+    Checking whether the host can reach the internet, and what the outside world sees when
+    it does, is very often the first thing a payload does — before it fetches a stage,
+    before it beacons, sometimes before it decides whether to run at all. The answer it
+    wants is the egress address, and the cheapest way to get it is to ask a service whose
+    only function is to echo the caller's address back. That gives this file something
+    most Discovery targets lack: a specific, nameable, baseline-able destination.
+    Enterprise software almost never queries ifconfig.me or ipify, and the handful of
+    products that do are a short and stable list, so the domain itself carries real
+    signal. The connectivity-probe half — pinging a public resolver, tracing a route to a
+    well-known site — carries much less, and is kept here as corroboration rather than as
+    a finding, because operations staff do it constantly.
+  severity: medium
+  author: huntgraph
+  tags:
+    - discovery
+    - internet-connection-discovery
+    - egress-check
+    - address-echo-service
+    - windows
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1016/001
+    - https://attack.mitre.org/techniques/T1016
+    - https://attack.mitre.org/detectionstrategies/DET0357
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1016
+  sub_techniques:
+    - T1016.001
+  detection_strategies:
+    - DET0357
+  analytics:
+    - AN1015
+    - AN1016
+  platforms:
+    - Windows
+    - Linux
+  data_sources:
+    - WinEventLog:Sysmon
+    - auditd:EXECVE
+  data_components:
+    - Process Creation
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    An adversary running code on a host may confirm it can reach the internet and learn
+    its egress address by querying a service that echoes the caller's address, doing so
+    from a process that has no other reason to ask and often before any other network
+    activity.
+  attacker_behavior:
+    - Requests an address-echo service that returns the host's public IP as its response.
+    - Probes a public resolver or well-known site to confirm the host is not isolated.
+    - Traces a route outward to identify proxies, redirectors and egress paths.
+    - Tries several different echo services in case one is blocked or filtered.
+    - Performs the check from a script host or a freshly delivered binary.
+  legitimate_behavior:
+    - The operating system runs its own connectivity check against the vendor's endpoint.
+    - VPN, SD-WAN and remote-access clients confirm egress and detect captive portals.
+    - Monitoring and speed-test tooling reports the site's public address deliberately.
+    - Engineers ping a public resolver while diagnosing an outage.
+    - Some licensing and geolocation features look up the public address by design.
+  risk_indicator:
+    - The querying process is an interpreter, a document application or a new binary.
+    - The domain is an address-echo service rather than the vendor connectivity endpoint.
+    - Two or more different echo services are tried in one short burst.
+    - The host has never contacted this destination during the baseline window.
+    - The check is followed by a connection to an address the estate does not use.
+
+requires:
+  platforms:
+    - windows
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - DomainName
+        - ContextProcessId
+        - ContextBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: address-echo-service-queried
+        name: A service whose only function is echoing the caller's address
+        purpose: >-
+          The core observable. These domains exist to tell a caller its own public
+          address, which is information no ordinary business application needs. Resolving
+          one from a process that is not a browser is the single most specific thing in
+          this file and is worth reading wherever it appears.
+        query: |
+          #event_simpleName=/^DnsRequest$/
+          | DomainName=/(^|\.)(ifconfig\.(me|co|io)|icanhazip\.com|(api\d*\.)?ipify\.org|ipinfo\.io|ip-api\.com|checkip\.(amazonaws\.com|dyndns\.org)|whatismyipaddress\.com|wtfismyip\.com|myip\.(ipip\.net|com)|ident\.me|ipecho\.net|seeip\.org|myexternalip\.com|trackip\.net|l2\.io|db-ip\.com|ipconfig\.io|2ip\.(ua|io))$/i
+          | ContextBaseFileName!=/^(chrome\.exe|msedge\.exe|firefox\.exe|iexplore\.exe|brave\.exe|opera\.exe|safari)$/i
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName],
+                    function=[count(field=DomainName, distinct=true, as=echo_services),
+                              count(as=lookups),
+                              collect([DomainName], limit=10)])
+          | sort(echo_services, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "VPN, SD-WAN and captive-portal clients that report egress address by design"
+            - "Approved monitoring and speed-test agents"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - domain
+            - organization
+
+      - id: several-echo-services-tried-in-one-burst
+        name: More than one address-echo service tried by one process
+        purpose: >-
+          A product that reports the public address uses the one service its vendor chose
+          and uses it consistently. Code that does not know what the network permits tries
+          two or three in succession until one answers, so the count of distinct echo
+          services per process is a sharper discriminator than any single lookup.
+        query: |
+          #event_simpleName=/^DnsRequest$/
+          | DomainName=/(^|\.)(ifconfig\.(me|co|io)|icanhazip\.com|(api\d*\.)?ipify\.org|ipinfo\.io|ip-api\.com|checkip\.(amazonaws\.com|dyndns\.org)|whatismyipaddress\.com|wtfismyip\.com|myip\.(ipip\.net|com)|ident\.me|ipecho\.net|seeip\.org|myexternalip\.com)$/i
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName],
+                    function=[count(field=DomainName, distinct=true, as=echo_services),
+                              collect([DomainName], limit=10)])
+          | echo_services >= 2
+          | sort(echo_services, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Network diagnostic suites that deliberately query multiple echo endpoints"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: egress-check-issued-by-an-interpreter-or-document-lineage
+        name: Egress check performed from a script host or delivery lineage
+        purpose: >-
+          Name the actor. The retrieval command is visible in the command line when the
+          check is done with a download utility, and the parent tells you whether this is
+          operations tooling or something that arrived as an attachment. A document
+          application or archive tool asking what the host's public address is has no
+          benign reading.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(ifconfig\.(me|co|io)|icanhazip|ipify|ipinfo\.io|ip-api\.com|checkip\.|wtfismyip|myip\.ipip\.net|ident\.me|ipecho\.net|myexternalip)/i
+            or CommandLine=/(Invoke-(WebRequest|RestMethod)|curl|wget|Net\.WebClient|Start-BitsTransfer|bitsadmin)/i and CommandLine=/(whatismyip|what_is_my_ip|myip|externalip|public[_-]?ip)/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=checks), collect([CommandLine], limit=5)])
+          | sort(checks, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Configuration management modules that record the node's public address"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - parent_process
+
+      - id: reachability-probe-to-a-public-endpoint
+        name: Connectivity probe against a public resolver or well-known site
+        purpose: >-
+          The corroborating half, deliberately weaker. Pinging a public resolver or
+          tracing a route to a well-known site is what operations staff do during an
+          outage, so this case earns its place only when it lands on the same host and
+          lineage as an echo-service lookup. Read it as context, never on its own.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(ping|ping\.exe|tracert\.exe|traceroute|curl|curl\.exe|wget|powershell\.exe|pwsh)$/i
+          | CommandLine=/(\b(8\.8\.8\.8|8\.8\.4\.4|1\.1\.1\.1|9\.9\.9\.9|208\.67\.222\.222)\b|\b(google|bing|baidu|yandex)\.com\b|Test-NetConnection\s+.*-InformationLevel)/i
+          | ParentBaseFileName!=/^(gpscript\.exe|CcmExec\.exe|MonitoringHost\.exe|explorer\.exe)$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=probes), collect([CommandLine], limit=5)])
+          | sort(probes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Service desk connectivity scripts and network validation jobs"
+            - "Operating system and VPN client connectivity checks"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+evidence:
+  required:
+    - id: egress_address_queried
+      name: An address-reporting service was contacted
+      description: >-
+        A process resolved or requested a service whose function is to report the caller's
+        public address, which answers whether the host has internet egress and by what
+        route.
+      source: dns_request
+      field: DomainName
+      indicates: egress_capability_check
+
+  supporting:
+    - id: multiple_echo_services
+      name: Several echo services tried in succession
+      description: >-
+        One process queried two or more distinct address-echo services, which is code
+        probing for whatever is permitted rather than a product using its vendor's
+        endpoint.
+      source: derived
+      field: echo_services
+      indicates: filtering_evasion_attempt
+    - id: untrusted_querying_process
+      name: Query issued by an interpreter or unmanaged binary
+      description: >-
+        The process performing the check is a script host, a download utility or an image
+        outside the managed software estate rather than a browser or network client.
+      source: dns_request
+      field: ContextBaseFileName
+      indicates: untrusted_actor
+    - id: delivery_lineage_parent
+      name: Parent belongs to a delivery chain
+      description: >-
+        The check descends from a document application, mail client, archive tool or
+        script host, which is the shape of code that arrived rather than code that was
+        deployed.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: reachability_probe_alongside
+      name: Connectivity probe on the same host and lineage
+      description: >-
+        A ping or route trace to a public resolver or well-known site accompanied the
+        address lookup, which is the same question asked a second way.
+      source: process_creation
+      field: CommandLine
+      indicates: corroborating_connectivity_test
+    - id: destination_new_for_estate
+      name: Destination unseen in the baseline window
+      description: >-
+        Neither this host nor the wider estate contacted this echo service during the
+        baseline window, so it is not part of any deployed product's behaviour.
+      source: baseline
+      field: DomainName
+      indicates: unusual_destination
+
+  contradicting:
+    - id: os_connectivity_check
+      name: Operating system connectivity check
+      description: >-
+        The lookup is the platform's own network connectivity indicator, performed by the
+        system service that owns it against the vendor's endpoint.
+      source: dns_request
+      field: ContextBaseFileName
+      indicates: legitimate_application_component
+    - id: vpn_or_portal_client
+      name: VPN, SD-WAN or captive-portal client
+      description: >-
+        The querying process is a remote-access or network client that reports egress
+        address and detects captive portals as a documented function.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_application_component
+    - id: operations_diagnostic
+      name: Recorded outage investigation
+      description: >-
+        The probes coincide with an incident record covering an internet or proxy outage
+        affecting the same hosts, which is when operations staff test egress.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - egress_address_queried
+
+    supporting:
+      any:
+        - multiple_echo_services
+        - untrusted_querying_process
+        - delivery_lineage_parent
+        - reachability_probe_alongside
+        - destination_new_for_estate
+      all:
+        - untrusted_querying_process
+        - destination_new_for_estate
+
+    contradicting:
+      any:
+        - os_connectivity_check
+        - vpn_or_portal_client
+        - operations_diagnostic
+      all: []
+
+  verdict:
+    low_risk_when:
+      - egress_address_queried
+      - os_connectivity_check
+      - vpn_or_portal_client
+      - operations_diagnostic
+    suspicious_when:
+      - egress_address_queried
+      - untrusted_querying_process
+      - destination_new_for_estate
+    high_risk_when:
+      - egress_address_queried
+      - untrusted_querying_process
+      - delivery_lineage_parent
+      - multiple_echo_services
+      - reachability_probe_alongside
+
+  false_positive:
+    - condition: The operating system performs its own network connectivity check.
+      explanation: >-
+        Every platform probes a vendor endpoint to decide whether it is online, and some
+        editions of that check report an address. It runs from a system service under the
+        machine account and its destination is the vendor's, not a public echo service.
+    - condition: A VPN, SD-WAN or captive-portal client confirms egress.
+      explanation: >-
+        These clients genuinely query public address services, sometimes more than one, so
+        they reproduce even the multiple-services evidence. They are a short, stable list
+        and belong in the exclusion set at deployment time.
+    - condition: Monitoring or speed-test tooling reports the site's public address.
+      explanation: >-
+        Reporting egress address is the point of this software. It runs on a schedule from
+        a consistent process and its destination appears in the baseline from day one.
+    - condition: An engineer pings a public resolver during an outage.
+      explanation: >-
+        This is the single largest source of hits on the reachability-probe case, which is
+        why that case is corroboration only. It clusters in time across many hosts during
+        a genuine outage rather than appearing on one machine.
+    - condition: Configuration management records the node's public address.
+      explanation: >-
+        Provisioning and inventory modules sometimes look up the external address as a
+        fact about the host. These run from the agent's own lineage with an unchanging
+        command line.

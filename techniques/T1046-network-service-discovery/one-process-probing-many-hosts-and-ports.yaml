@@ -1,0 +1,378 @@
+type: detection
+
+id: hg-any-one-process-probing-many-hosts-and-ports-t1046
+
+version: 1.0.0
+
+info:
+  name: One process probing many hosts or many ports
+  description: >-
+    Scanning has a shape no ordinary workstation produces. A user's machine talks to a
+    handful of servers repeatedly; a scan touches a great many addresses once each, or
+    walks a long list of ports on one address, and it does both inside a few minutes from
+    a single process. That shape is the hypothesis — not the tool name. Operators scan
+    with whatever is already present: a PowerShell TcpClient loop, a bash for-loop around
+    netcat, a single dropped binary, so a hunt keyed on `nmap` finds only the careless.
+    Connection outcome is deliberately not used here: the endpoint sensor records that a
+    connection was attempted, not that it was refused, so breadth and the absence of a
+    client relationship carry the detection instead of an error rate. The fan-out shape
+    overlaps with T1557.002, where a host talking to every neighbour indicates
+    interception rather than enumeration; the discriminators are that this hunt groups by
+    destination port and expects each target touched once or twice, where interception
+    means sustained sessions with the same peers.
+  severity: high
+  author: huntgraph
+  tags:
+    - discovery
+    - network-service-discovery
+    - port-scan
+    - lateral-movement-precursor
+    - windows
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1046
+    - https://attack.mitre.org/detectionstrategies/DET0376
+    - https://attack.mitre.org/techniques/T1018
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1046
+  sub_techniques: []
+  detection_strategies:
+    - DET0376
+  analytics:
+    - AN1057
+    - AN1058
+  platforms:
+    - Windows
+    - Linux
+  data_sources:
+    - WinEventLog:Sysmon
+    - auditd:SYSCALL
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary who has landed on a host may enumerate what is listening around it,
+    producing connection attempts from one process to far more distinct addresses, or far
+    more distinct ports, than any client application on that host has reason to contact.
+  attacker_behavior:
+    - Sweeps one service port across an entire subnet to find every host running it.
+    - Walks a list of ports against a single host chosen for further attack.
+    - Scans with a script or a built-in utility rather than a recognisable scanner.
+    - Runs the scan from the first host reached rather than from managed tooling.
+    - Touches each destination once, because a response is all that is needed.
+  legitimate_behavior:
+    - Vulnerability scanners probe every host and port from designated collectors.
+    - Asset inventory and patching agents contact the whole estate on a schedule.
+    - Monitoring systems poll service ports on the servers they watch.
+    - Engineers troubleshoot reachability with a short loop of connection tests.
+    - Backup and deployment agents connect broadly during their maintenance window.
+  risk_indicator:
+    - The probing process is an interpreter or a binary in a user-writable path.
+    - The originating host is a workstation rather than a scanning or management server.
+    - Each destination is contacted once or twice rather than in a sustained session.
+    - The host has no history of this breadth of contact in the baseline window.
+    - The port set spans unrelated services rather than one application's protocol.
+
+requires:
+  platforms:
+    - windows
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - ContextBaseFileName
+        - RemoteAddressIP4
+        - RemotePort
+        - Protocol
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: one-port-swept-across-many-hosts
+        name: A single service port contacted across many addresses
+        purpose: >-
+          Find the horizontal sweep — one process asking a whole range of addresses
+          whether they are running one particular service, which is how an operator
+          locates every candidate for a lateral move in a single pass.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemoteAddressIP4=/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/
+          | ContextBaseFileName!=/^(System|svchost\.exe|lsass\.exe|SearchIndexer\.exe|MsMpEng\.exe|CcmExec\.exe|OneDrive\.exe|Teams\.exe|chrome\.exe|msedge\.exe|firefox\.exe|outlook\.exe)$/i
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName, RemotePort],
+                    function=[count(field=RemoteAddressIP4, distinct=true, as=hosts_touched),
+                              count(as=attempts),
+                              collect([RemoteAddressIP4], limit=20)])
+          | hosts_touched >= 25
+          | sort(hosts_touched, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of vulnerability scanning collectors and asset discovery servers"
+            - "ContextBaseFileName of inventory, patching and monitoring agents"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: many-ports-walked-on-one-host
+        name: Many distinct ports contacted on a single address
+        purpose: >-
+          Find the vertical scan — one process enumerating the services on one chosen
+          target, which is the step between picking a host and attacking it, and which no
+          client application produces because a client knows the port it needs.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | ContextBaseFileName!=/^(System|svchost\.exe|lsass\.exe|CcmExec\.exe|OneDrive\.exe|Teams\.exe|chrome\.exe|msedge\.exe|firefox\.exe)$/i
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName, RemoteAddressIP4],
+                    function=[count(field=RemotePort, distinct=true, as=ports_touched),
+                              count(as=attempts),
+                              collect([RemotePort], limit=30)])
+          | ports_touched >= 15
+          | sort(ports_touched, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Monitoring agents that poll multiple service ports on the hosts they watch"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: broad-contact-with-no-repeat-visits
+        name: Wide contact where each destination is touched once
+        purpose: >-
+          This is the discriminator for the whole hypothesis. A busy client reconnects to
+          the same small set of servers many times, so its attempts-per-destination ratio
+          is high; a scan asks each address once and moves on, so the ratio sits near one
+          however wide the sweep. Combining breadth with a low ratio separates enumeration
+          from an application that simply talks to a lot of things.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemoteAddressIP4=/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/
+          | ContextBaseFileName!=/^(System|svchost\.exe|lsass\.exe|CcmExec\.exe|SearchIndexer\.exe)$/i
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName],
+                    function=[count(field=RemoteAddressIP4, distinct=true, as=hosts_touched),
+                              count(field=RemotePort, distinct=true, as=ports_touched),
+                              count(as=attempts)])
+          | hosts_touched >= 20
+          | touches_per_host := attempts / hosts_touched
+          | touches_per_host <= 3
+          | sort(hosts_touched, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Distributed applications whose clients contact every node of a cluster once"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: scanning-tooling-invoked
+        name: Purpose-built or improvised scanning tooling executed
+        purpose: >-
+          The weak secondary signal, kept because it names the actor when it does fire.
+          Tool names catch the operator who brought a scanner with them, and the loop
+          constructs catch the more common case of scanning with what was already on the
+          host. Treat a hit here as context for the connection-shape cases rather than as
+          the finding on its own.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\bnmap\b|masscan|zmap|rustscan|naabu|\bfscan\b|netscan|angryip|advanced[_ ]?ip[_ ]?scanner|portqry|\bnbtscan\b)/i
+            or CommandLine=/(n(c|cat)(\.exe)?\s+(-\w*z|\-\-?zero)|New-Object\s+System\.Net\.Sockets\.TcpClient|Test-NetConnection\s+.*-Port|\/dev\/tcp\/)/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=invocations), collect([CommandLine], limit=5)])
+          | sort(invocations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Security team assessment hosts and approved vulnerability scanning tooling"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+evidence:
+  required:
+    - id: connection_fan_out
+      name: One process contacting an unusual breadth of destinations
+      description: >-
+        A single process opened connections to far more distinct addresses, or far more
+        distinct ports, than a client application on this host has reason to contact.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: network_service_enumeration
+
+  supporting:
+    - id: port_set_spans_services
+      name: Port set spans unrelated services
+      description: >-
+        The ports contacted belong to unrelated services rather than to one application's
+        protocol, which is enumeration rather than a client doing its job.
+      source: network_connection
+      field: RemotePort
+      indicates: service_port_enumeration
+    - id: single_touch_per_target
+      name: Each destination contacted once
+      description: >-
+        Attempts divided by distinct destinations sits near one, meaning the process asked
+        each address a question and moved on rather than holding a session.
+      source: derived
+      field: touches_per_host
+      indicates: probing_rather_than_communicating
+    - id: probing_process_is_untrusted
+      name: Probe originates from an interpreter or user-writable binary
+      description: >-
+        The process opening the connections is a script host or an image outside the
+        managed software estate, rather than a deployed agent with a network role.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: untrusted_actor
+    - id: scanning_tool_executed
+      name: Scanning tooling or a connection loop was run
+      description: >-
+        A recognised scanner, or a loop construct that performs the same probing with
+        built-in facilities, was executed on the host in the same period.
+      source: process_creation
+      field: CommandLine
+      indicates: purpose_built_scanning_tool
+    - id: breadth_new_for_host
+      name: This breadth of contact is new for the host
+      description: >-
+        The host has no history in the baseline window of any process reaching this many
+        distinct destinations or ports.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: scanning_infrastructure
+      name: Designated scanning or discovery host
+      description: >-
+        The originating host is a vulnerability scanner, asset discovery collector or
+        network management server whose function is to probe the estate.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_scanning_infrastructure
+    - id: management_agent_fan_out
+      name: Fan-out belongs to a management agent
+      description: >-
+        The probing process is an inventory, patching, backup or monitoring agent that
+        contacts many hosts as its documented function.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: legitimate_application_component
+    - id: authorised_assessment
+      name: Scheduled penetration test or discovery window
+      description: >-
+        The activity falls inside a recorded assessment or a scheduled discovery run with
+        a change record naming the source host.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_security_testing
+
+  risk_logic:
+    required:
+      - connection_fan_out
+
+    supporting:
+      any:
+        - port_set_spans_services
+        - single_touch_per_target
+        - probing_process_is_untrusted
+        - scanning_tool_executed
+        - breadth_new_for_host
+      all:
+        - single_touch_per_target
+        - breadth_new_for_host
+
+    contradicting:
+      any:
+        - scanning_infrastructure
+        - management_agent_fan_out
+        - authorised_assessment
+      all: []
+
+  verdict:
+    low_risk_when:
+      - connection_fan_out
+      - scanning_infrastructure
+      - management_agent_fan_out
+      - authorised_assessment
+    suspicious_when:
+      - connection_fan_out
+      - single_touch_per_target
+      - breadth_new_for_host
+    high_risk_when:
+      - connection_fan_out
+      - single_touch_per_target
+      - port_set_spans_services
+      - probing_process_is_untrusted
+      - scanning_tool_executed
+
+  false_positive:
+    - condition: A vulnerability scanner or asset discovery collector sweeps the estate.
+      explanation: >-
+        This reproduces every element of the hypothesis by design, including the low
+        touches-per-host ratio, and it is the single largest source of hits. The host role
+        is the discriminator, which makes an accurate asset inventory a precondition for
+        deploying this template rather than an optional refinement.
+    - condition: An inventory, patching or backup agent contacts every host on a schedule.
+      explanation: >-
+        Management agents produce genuine broad fan-out with one or two connections per
+        target. They are recognisable by process image and by the regularity of the
+        schedule, and they belong in the exclusion list rather than in triage.
+    - condition: A monitoring system polls several service ports on the hosts it watches.
+      explanation: >-
+        This looks like a vertical scan against each monitored host. The port set is
+        stable across runs and matches the monitoring configuration, where an operator's
+        scan walks a contiguous or well-known range once.
+    - condition: An engineer loops connection tests while diagnosing a reachability fault.
+      explanation: >-
+        Troubleshooting with Test-NetConnection or netcat legitimately produces both the
+        tooling signal and a burst of probes. It is usually narrow, tied to a ticket, and
+        run under the engineer's interactive session.
+    - condition: A clustered application's client contacts every node once at startup.
+      explanation: >-
+        Service meshes, distributed caches and database drivers discover peers by
+        connecting to each member of a list, which yields breadth with a near-one ratio.
+        The destination set matches the cluster membership and repeats at every restart.

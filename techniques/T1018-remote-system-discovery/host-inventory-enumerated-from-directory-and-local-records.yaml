@@ -1,0 +1,369 @@
+type: detection
+
+id: hg-any-host-inventory-enumerated-from-directory-and-local-records-t1018
+
+version: 1.0.0
+
+info:
+  name: Host inventory enumerated from directory and local records
+  description: >-
+    This is the question of what EXISTS on the network, which is a different hunt from
+    what is LISTENING on it. An operator building a target list reads the records that
+    already name the estate — computer objects in the directory, the ARP cache, the hosts
+    file, name-service tables — and sweeps an address range for replies. None of those
+    commands is rare on its own; a login script runs `net view` and an engineer reads
+    `arp -a` every day. What is rare is several unrelated categories of host record being
+    read from one process lineage inside a couple of minutes, which is somebody
+    orienting themselves rather than answering a specific question. The file is built on
+    that clustering and on the parent process, not on the commands, and it is scoped to
+    process telemetry alone: service probing across those hosts belongs to T1046 and is
+    modelled there from connection records.
+  severity: medium
+  author: huntgraph
+  tags:
+    - discovery
+    - remote-system-discovery
+    - host-enumeration
+    - lateral-movement-precursor
+    - windows
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1018
+    - https://attack.mitre.org/detectionstrategies/DET0574
+    - https://attack.mitre.org/techniques/T1046
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1018
+  sub_techniques: []
+  detection_strategies:
+    - DET0574
+  analytics:
+    - AN1583
+    - AN1584
+  platforms:
+    - Windows
+    - Linux
+  data_sources:
+    - WinEventLog:Sysmon
+    - auditd:EXECVE
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary who needs a list of machines to move to may read the records that
+    already enumerate the estate and sweep an address range for live replies, producing
+    several unrelated categories of host enumeration from one process lineage in a short
+    window.
+  attacker_behavior:
+    - Queries the directory for computer objects, domain controllers or trusts.
+    - Reads local host records — the ARP cache, the hosts file, name-service tables.
+    - Sweeps an address range with a loop around a reachability utility.
+    - Attempts a zone transfer or bulk name resolution to enumerate hostnames.
+    - Runs several of these categories back to back from one shell or script.
+  legitimate_behavior:
+    - Login scripts map drives and enumerate shares with the same net commands.
+    - Engineers read the ARP cache and hosts file while diagnosing connectivity.
+    - Inventory and monitoring tooling queries the directory for computer objects.
+    - Administrators sweep a range to confirm a subnet change took effect.
+    - Domain join and health-check tooling runs directory lookups routinely.
+  risk_indicator:
+    - Several unrelated enumeration categories run from one lineage in minutes.
+    - The parent is a document application, a mail client, an archive tool or a web server.
+    - The sequence runs once from a host that has never produced it before.
+    - A sweep enumerates a contiguous address range rather than named hosts.
+    - The account is not one that administers machines.
+
+requires:
+  platforms:
+    - windows
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: several-host-record-categories-in-one-lineage
+        name: Unrelated categories of host record read in one session
+        purpose: >-
+          This is the discriminator for the whole hypothesis. Tag each command by the kind
+          of host record it reads and collapse the tags per host, account and parent, so
+          that a session which queried the directory, dumped the ARP cache, read the hosts
+          file and swept a range stands out from the very many sessions that did exactly
+          one of those for a reason.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(net(\.exe)?\s+view|net(\.exe)?\s+group\s+.*domain computers|dsquery\s+computer|Get-ADComputer|adfind.*objectcategory=computer|ldapsearch.*objectClass=computer|nltest(\.exe)?\s+\/(dclist|dsgetdc|domain_trusts))/i
+                | record := "directory_objects" ;
+              CommandLine=/(arp(\.exe)?\s+-a|\bip\s+neigh|Get-NetNeighbor|nbtstat(\.exe)?\s+-[ncA])/i
+                | record := "neighbour_cache" ;
+              CommandLine=/(drivers\\+etc\\+hosts|\/etc\/hosts|\/etc\/networks|lmhosts)/i
+                | record := "static_host_file" ;
+              CommandLine=/(nslookup\s+.*(ls\s+-d|-type=any)|dig\s+.*\baxfr\b|host\s+-[lt]\s)/i
+                | record := "name_service_bulk" ;
+              CommandLine=/(for\s+\/l\s+%|for\s+i\s+in\s+.*seq|fping|ping(\.exe)?\s+-[na]\s*1\s+\d+\.\d+\.\d+\.\d+|esxcli\s+network\s+diag\s+ping)/i
+                | record := "address_sweep" ;
+            }
+          | record=/.+/
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(field=record, distinct=true, as=categories),
+                              count(as=commands),
+                              collect([record, CommandLine], limit=15)])
+          | categories >= 3
+          | sort(categories, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Login and logon-script lineages that enumerate the domain on every session"
+            - "ParentBaseFileName of inventory, monitoring and domain health-check agents"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - parent_process
+            - organization
+
+      - id: directory-queried-for-computer-objects
+        name: Directory queried for the machine inventory
+        purpose: >-
+          Isolate the bulk directory read that returns every computer object, every domain
+          controller or every trust — which answers "what machines exist" in one call and
+          is the cheapest possible target list for an operator with domain credentials.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(net(\.exe)?\s+view\s+\/(domain|all)|net(\.exe)?\s+group\s+.*"?domain computers|dsquery\s+computer\s+-limit|Get-ADComputer\s+-Filter|adfind.*objectcategory=computer|nltest(\.exe)?\s+\/(dclist|domain_trusts))/i
+          | ParentBaseFileName!=/^(gpscript\.exe|userinit\.exe|CcmExec\.exe|MonitoringHost\.exe)$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=queries), collect([CommandLine], limit=5)])
+          | sort(queries, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Directory management consoles operated from administrative jump hosts"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: address-range-swept-for-live-hosts
+        name: Contiguous address range swept for replies
+        purpose: >-
+          Catch the sweep in the two forms endpoint process telemetry actually shows: a
+          loop construct written into one command line, and a burst of reachability
+          utilities under one parent with a different destination each time. Answering a
+          range rather than a named host is what makes it enumeration.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(ping|ping\.exe|fping|arping|cmd\.exe|powershell\.exe|pwsh|bash|sh)$/i
+          | CommandLine=/(\d{1,3}\.\d{1,3}\.\d{1,3}\.(%|\$|\d{1,3}\s*$)|for\s+\/l\s+%|seq\s+1\s+25[45]|Test-Connection\s+.*-Count\s+1)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(field=CommandLine, distinct=true, as=distinct_targets),
+                              count(as=probes),
+                              collect([CommandLine], limit=10)])
+          | distinct_targets >= 20
+          | sort(distinct_targets, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Network validation scripts run by the platform team after subnet changes"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - parent_process
+            - organization
+
+      - id: enumeration-under-an-unrelated-parent
+        name: Host enumeration parented by software with no such role
+        purpose: >-
+          Where the command set is hopelessly common the parent is the only real
+          discriminator. A document application, mail client, archive tool or web server
+          process has no reason to ask what machines exist, so any single enumeration
+          command from one of those lineages is worth more than a burst from a shell.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|onenote|acrobat|acrord32|7zg|7zfm|winrar|w3wp|httpd|nginx|java|tomcat\d*|mshta|wscript|cscript|regsvr32|rundll32)\.exe$/i
+            or ParentBaseFileName=/^(winword|excel|outlook|soffice|python\d*|perl|php)$/i
+          | CommandLine=/(net(\.exe)?\s+view|net(\.exe)?\s+group|dsquery\s+computer|Get-ADComputer|nltest|arp(\.exe)?\s+-a|nbtstat|\bip\s+neigh|\/etc\/hosts|drivers\\+etc\\+hosts)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=commands), collect([CommandLine], limit=8)])
+          | sort(commands, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Application servers whose deployment tooling legitimately calls net commands"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: remote_host_enumeration
+      name: Commands that enumerate remote systems were run
+      description: >-
+        One or more commands were executed whose purpose is to list machines on the
+        network, from the directory, from local host records or by sweeping a range.
+      source: process_creation
+      field: CommandLine
+      indicates: remote_system_enumeration
+
+  supporting:
+    - id: multiple_record_categories
+      name: Several unrelated categories enumerated together
+      description: >-
+        Three or more different kinds of host record were read from one lineage in the
+        same window, which is orientation rather than a targeted lookup.
+      source: derived
+      field: categories
+      indicates: systematic_orientation
+    - id: unrelated_parent_process
+      name: Parent has no host-enumeration role
+      description: >-
+        The commands were launched by a document application, mail client, archive tool,
+        web server or script host rather than by a shell, console or management agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: contiguous_range_swept
+      name: A contiguous address range was probed
+      description: >-
+        A loop or a burst of reachability utilities addressed a numeric range rather than
+        named hosts, which enumerates a subnet instead of checking a service.
+      source: process_creation
+      field: CommandLine
+      indicates: address_space_enumeration
+    - id: sequence_new_for_host
+      name: This enumeration is new for the host and account
+      description: >-
+        Neither the host nor the account produced this combination of commands during the
+        baseline window, so it is not part of a login script or a recurring job.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: non_administrative_account
+      name: Account does not administer machines
+      description: >-
+        The account running the enumeration has no machine-administration role, so it has
+        no operational reason to be building an inventory.
+      source: identity_context
+      field: UserName
+      indicates: privilege_mismatch
+
+  contradicting:
+    - id: logon_script_lineage
+      name: Enumeration issued by a logon script
+      description: >-
+        The commands descend from the logon script or policy engine that runs the same
+        sequence for every user at every sign-in.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_administrative_action
+    - id: inventory_tooling
+      name: Inventory or monitoring product performing discovery
+      description: >-
+        The enumeration belongs to an asset inventory, monitoring or domain health product
+        whose documented function is to list machines.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: recorded_diagnostic
+      name: Recorded connectivity investigation
+      description: >-
+        The activity coincides with a change or incident record covering a subnet
+        migration or a reported connectivity fault on the same hosts.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - remote_host_enumeration
+
+    supporting:
+      any:
+        - multiple_record_categories
+        - unrelated_parent_process
+        - contiguous_range_swept
+        - sequence_new_for_host
+        - non_administrative_account
+      all:
+        - multiple_record_categories
+        - sequence_new_for_host
+
+    contradicting:
+      any:
+        - logon_script_lineage
+        - inventory_tooling
+        - recorded_diagnostic
+      all: []
+
+  verdict:
+    low_risk_when:
+      - remote_host_enumeration
+      - logon_script_lineage
+      - inventory_tooling
+      - recorded_diagnostic
+    suspicious_when:
+      - remote_host_enumeration
+      - multiple_record_categories
+      - sequence_new_for_host
+    high_risk_when:
+      - remote_host_enumeration
+      - multiple_record_categories
+      - unrelated_parent_process
+      - contiguous_range_swept
+      - non_administrative_account
+
+  false_positive:
+    - condition: A logon script enumerates the domain at every sign-in.
+      explanation: >-
+        Logon scripts routinely run net view and directory lookups, and they do it on
+        every host under every account, which produces the clustering signal at scale. The
+        parent lineage and the fact that it repeats daily are the discriminators.
+    - condition: An engineer reads the ARP cache and hosts file while diagnosing a fault.
+      explanation: >-
+        Connectivity troubleshooting genuinely mixes several categories of host record in
+        one session, which is the strongest supporting evidence here. It ties to a ticket,
+        runs interactively, and comes from an account that administers machines.
+    - condition: Inventory or monitoring tooling queries the directory for computer objects.
+      explanation: >-
+        Discovering machines is the documented function of these products. They run from
+        designated hosts on a schedule and their command lines are stable across runs.
+    - condition: An administrator sweeps a range to confirm a subnet change took effect.
+      explanation: >-
+        Post-change validation looks exactly like a ping sweep, including the loop
+        construct. A change record and the timing relative to the maintenance window
+        separate it from reconnaissance.
+    - condition: A deployment or provisioning agent calls net commands from a server process.
+      explanation: >-
+        Some application server tooling shells out to net or nltest during provisioning,
+        which triggers the unrelated-parent case. These recur with identical command lines
+        and belong in the exclusion list once identified.

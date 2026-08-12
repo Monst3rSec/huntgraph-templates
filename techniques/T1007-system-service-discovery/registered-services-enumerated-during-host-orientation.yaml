@@ -1,0 +1,396 @@
+type: detection
+
+id: hg-any-registered-services-enumerated-during-host-orientation-t1007
+version: 1.0.0
+
+info:
+  name: Registered services enumerated while orienting on a host
+  description: >-
+    `sc query`, `net start`, `tasklist /svc`, `systemctl list-units` and `launchctl list`
+    are among the most-run commands in any estate, and a template that matches them alone
+    is an alert stream nobody can read. This file therefore does not treat service
+    enumeration as a finding. It treats it as the anchor of a pattern, and everything that
+    makes it interesting sits around it: the same lineage also asking who the user is, what
+    is running, what the network looks like and what the machine is, all inside a couple of
+    minutes; a parent that has no business asking, such as a script host, an archive tool,
+    a web server or a mail client; the answer redirected into a file rather than read on
+    screen; or the enumeration followed by the operator stopping or reconfiguring one of the
+    services it returned. An administrator running `net start` is orienting too, but they
+    orient once, from a shell they opened themselves, and they do not write the output to
+    `%TEMP%`. Deployed on its own this is an enrichment template — low severity by design,
+    used to give an existing lead a shape rather than to raise one.
+  severity: low
+  author: huntgraph
+  tags:
+    - discovery
+    - service-enumeration
+    - host-orientation
+    - situational-awareness
+    - windows
+    - linux
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1007
+    - https://attack.mitre.org/detectionstrategies/DET0483
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1007
+  sub_techniques: []
+  detection_strategies:
+    - DET0483
+  analytics:
+    - AN1325
+    - AN1326
+    - AN1327
+  platforms:
+    - Windows
+    - Linux
+    - macOS
+  data_sources:
+    - WinEventLog:Security
+    - auditd:EXECVE
+    - macos:osquery
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary who has just gained execution on a host may enumerate the registered
+    services and scheduled jobs to learn what security agents, backup agents and
+    exploitable service accounts exist there, so that the next step — stopping a service,
+    hijacking one for persistence, or deciding the host is not worth keeping — is made from
+    knowledge rather than from guesswork.
+  attacker_behavior:
+    - Queries the service control manager for the full list of registered services on arrival.
+    - Runs service enumeration alongside user, process, network and system queries in one burst.
+    - Redirects the service listing into a file under a temporary or user-writable directory.
+    - Enumerates services and then stops, reconfigures or deletes one of the results.
+    - Issues the enumeration from a script host, interpreter or server process rather than an interactive shell.
+  legitimate_behavior:
+    - Monitoring and inventory agents poll the service list on a fixed schedule across the estate.
+    - Support engineers list services while diagnosing a failed application.
+    - Configuration management verifies that a managed service is present and running before converging it.
+    - Installers and patch tooling query service state before and after a restart.
+    - Backup and health-check scripts enumerate services as part of a routine report.
+  risk_indicator:
+    - Service enumeration appears with several other distinct enumeration categories from one lineage.
+    - The parent process is a document handler, archive utility, browser, mail client or network-facing server.
+    - The listing is written to a file rather than consumed interactively.
+    - A service returned by the enumeration is stopped or reconfigured shortly afterwards.
+    - The pattern is unprecedented for this host and user against the baseline window.
+
+requires:
+  platforms:
+    - windows
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: enumeration-clustered-by-lineage
+        name: Service enumeration inside a burst of distinct discovery categories
+        purpose: >-
+          Rank by breadth rather than by volume. One service query is an administrator; a
+          lineage that asks about services, accounts, processes, network and system inside
+          one short window is somebody working out where they have landed.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(\bsc(\.exe)?\s+(query|queryex|qc|getdisplayname)|\bnet(\.exe)?\s+start\b|Get-Service\b|Win32_Service\b|\bwmic\s+service\b|tasklist(\.exe)?\s+\/svc|\bsystemctl\s+(list-units|list-unit-files|status)\b|\bservice\s+--status-all\b|\blaunchctl\s+(list|print)\b)/i
+                | category := "services"
+                | service_command := CommandLine ;
+              CommandLine=/(\bschtasks(\.exe)?\s+\/query|Get-ScheduledTask\b|\bcrontab\s+-l\b|\bsystemctl\s+list-timers\b|\batq\b)/i
+                | category := "scheduled_jobs" ;
+              CommandLine=/(\btasklist(\.exe)?(\s+\/|\s*$)|Get-Process\b|\bps\s+-?(aux|ef|A)\b|\bwmic\s+process\b)/i
+                | category := "processes" ;
+              CommandLine=/(\bwhoami\b|\bnet(\.exe)?\s+(user|group|localgroup|accounts)\b|Get-LocalUser\b|Get-ADUser\b|\bid\s+-|\bdscl\s+\.\s+-list)/i
+                | category := "accounts" ;
+              CommandLine=/(\bipconfig\b|\bifconfig\b|\bnetstat\b|\bss\s+-|\barp\s+-a\b|\broute\s+print\b|\bnet(\.exe)?\s+(use|share|view)\b)/i
+                | category := "network" ;
+              CommandLine=/(\bsysteminfo\b|\bhostname\b|\buname\s+-a\b|Get-ComputerInfo\b|\bsw_vers\b|\bwmic\s+os\b)/i
+                | category := "system" ;
+            }
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(category, distinct=true, as=distinct_categories),
+                              count(service_command, as=service_queries),
+                              min(@timestamp, as=first_seen),
+                              max(@timestamp, as=last_seen),
+                              collect([CommandLine], limit=20)])
+          | service_queries >= 1
+          | distinct_categories >= 3
+          | sort(distinct_categories, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the monitoring, inventory and configuration-management agents"
+            - "UserName of the service accounts that run scheduled health checks"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - user
+            - parent_process
+
+      - id: enumeration-from-a-parent-with-no-business-asking
+        name: Service enumeration parented by a delivery or server process
+        purpose: >-
+          Where the command itself cannot discriminate, the parent is the only real
+          discriminator left. Service enumeration under an office application, archive
+          tool, browser, mail client or network-facing server is not an administrator
+          orienting themselves.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\bsc(\.exe)?\s+(query|queryex|qc)|\bnet(\.exe)?\s+start\b|Get-Service\b|Win32_Service\b|\bwmic\s+service\b|tasklist(\.exe)?\s+\/svc|\bsystemctl\s+(list-units|list-unit-files)\b|\bservice\s+--status-all\b|\blaunchctl\s+list\b)/i
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|onenote|msaccess|visio|mspub|acrord32|acrobat|7z(fm|g)?|winrar|rar|w3wp|httpd|nginx|apache2|tomcat\d*|java|node|php(-fpm)?|mshta|wscript|cscript|hh|msdt|teams|slack|chrome|msedge|firefox)(\.exe)?$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=enumerations), collect([CommandLine], limit=5)])
+          | sort(enumerations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of application-monitoring plugins that legitimately poll service state"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - parent_process
+            - command_line
+
+      - id: service-listing-captured-to-a-file
+        name: Service listing redirected into a file
+        purpose: >-
+          Separate reading from collecting. An engineer reads the service list on screen;
+          an operator building a host report writes it somewhere they can retrieve it,
+          which is the behaviour recorded in the procedure examples for this technique.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\bsc(\.exe)?\s+(query|queryex|qc)|\bnet(\.exe)?\s+start\b|Get-Service\b|Win32_Service\b|\bwmic\s+service\b|tasklist(\.exe)?\s+\/svc|\bsystemctl\s+list-units\b|\bservice\s+--status-all\b|\blaunchctl\s+list\b)/i
+          | CommandLine=/(>>?\s*["']?[^\s|]*(\\Temp\\|\\AppData\\|\\ProgramData\\|\\Users\\Public\\|\/tmp\/|\/var\/tmp\/|\/dev\/shm\/)|\bOut-File\b|\bTee-Object\b|\btee\s+)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=captures), collect([CommandLine], limit=10)])
+          | sort(captures, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Diagnostic collection scripts that write to a support bundle path under change control"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: enumeration-then-service-control
+        name: Enumeration followed by stopping or reconfiguring a service
+        purpose: >-
+          Join the question to the answer being acted on. Enumerating services and then
+          disabling or reconfiguring one is the forward half of the behaviour, and is what
+          separates reconnaissance with intent from a status check.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(\bsc(\.exe)?\s+(query|queryex|qc)|\bnet(\.exe)?\s+start\b|Get-Service\b|Win32_Service\b|\bwmic\s+service\b|tasklist(\.exe)?\s+\/svc|\bsystemctl\s+list-units\b|\bservice\s+--status-all\b)/i
+                | enumerated := CommandLine ;
+              CommandLine=/(\bsc(\.exe)?\s+(stop|delete|config|failure)\b|\bnet(\.exe)?\s+stop\b|Stop-Service\b|Set-Service\b|\bsystemctl\s+(stop|disable|mask)\b|\blaunchctl\s+(unload|bootout|disable)\b)/i
+                | controlled := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([enumerated, controlled, ParentBaseFileName, FileName], limit=10),
+                              min(@timestamp, as=first_seen),
+                              max(@timestamp, as=last_seen)])
+          | enumerated=/.+/ and controlled=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Patch and deployment windows where stopping a service after checking it is the documented procedure"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - user
+            - process
+
+evidence:
+  required:
+    - id: service_enumeration
+      name: Registered services enumerated
+      description: >-
+        A command asked the service control manager, systemd or launchd for the registered
+        services or scheduled jobs on the host. On its own this is an ordinary
+        administrative act and carries no weight without the evidence below.
+      source: process_creation
+      field: CommandLine
+      indicates: service_inventory_collected
+
+  supporting:
+    - id: orientation_cluster
+      name: Several distinct enumeration categories from one lineage
+      description: >-
+        The same host, user and parent also enumerated accounts, processes, network state
+        or system identity within the window, which is the breadth characteristic of an
+        operator orienting rather than of a targeted administrative check.
+      source: process_creation
+      field: CommandLine
+      indicates: host_orientation_burst
+    - id: non_administrative_parent
+      name: Parent process with no administrative role
+      description: >-
+        The enumeration was launched by a document handler, archive utility, browser, mail
+        client or network-facing server rather than by a shell, management agent or
+        scheduler.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: output_staged_to_file
+      name: Listing written to a file rather than read
+      description: >-
+        The command redirected its output into a temporary or user-writable path, which is
+        collection for later retrieval rather than an engineer reading a status on screen.
+      source: process_creation
+      field: CommandLine
+      indicates: recon_output_collected
+    - id: service_control_followup
+      name: A service stopped or reconfigured after the listing
+      description: >-
+        The same user on the same host stopped, disabled, deleted or reconfigured a service
+        shortly after enumerating, which is the enumeration being acted upon.
+      source: process_creation
+      field: FileName
+      indicates: execution_chain_progression
+    - id: rare_for_host
+      name: Pattern unprecedented for this host and user
+      description: >-
+        No comparable enumeration has been seen for this host, user and parent during the
+        baseline window, unlike inventory polling which recurs on a predictable cycle.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: management_agent_parent
+      name: Monitoring or configuration-management agent
+      description: >-
+        The approved monitoring, inventory or configuration-management agent issued the
+        query as part of its scheduled collection or convergence run.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: recurring_inventory_cycle
+      name: Recurring collection across the estate
+      description: >-
+        The same enumeration recurs on a stable schedule and appears across many hosts,
+        which is inventory rather than a one-off orientation.
+      source: baseline
+      field: ComputerName
+      indicates: scheduled_automation_job
+    - id: administrative_workstation
+      name: Host or account whose role is administration
+      description: >-
+        The host is a management jump box, or the account is an operations identity whose
+        normal work is enumerating and controlling services across the estate.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_administrative_activity
+    - id: active_change_record
+      name: Open change or incident record
+      description: >-
+        An approved change window or an open incident covers this host at the time of the
+        enumeration, which accounts for both the listing and any service that was stopped.
+      source: change_management
+      field: ComputerName
+      indicates: approved_change_window
+
+  risk_logic:
+    required:
+      - service_enumeration
+
+    supporting:
+      any:
+        - orientation_cluster
+        - non_administrative_parent
+        - output_staged_to_file
+        - service_control_followup
+        - rare_for_host
+      all:
+        - orientation_cluster
+        - non_administrative_parent
+
+    contradicting:
+      any:
+        - management_agent_parent
+        - recurring_inventory_cycle
+        - administrative_workstation
+        - active_change_record
+      all: []
+
+  verdict:
+    low_risk_when:
+      - service_enumeration
+      - management_agent_parent
+      - recurring_inventory_cycle
+      - administrative_workstation
+      - active_change_record
+    suspicious_when:
+      - service_enumeration
+      - orientation_cluster
+      - rare_for_host
+    high_risk_when:
+      - service_enumeration
+      - orientation_cluster
+      - non_administrative_parent
+      - output_staged_to_file
+      - service_control_followup
+
+  false_positive:
+    - condition: A monitoring agent polls the service list on every host on a fixed interval.
+      explanation: >-
+        This is the dominant source of volume for this technique and it reproduces the
+        required evidence exactly. It is identifiable by a stable parent, a fixed period and
+        an identical command line across the estate, and should be excluded by parent rather
+        than by command line so that the same command from elsewhere still surfaces.
+    - condition: A support engineer lists services while diagnosing a failed application.
+      explanation: >-
+        Troubleshooting produces genuine clusters — services, processes and network state
+        together — so it can satisfy the clustering evidence. It is tied to a named engineer
+        working from an interactive shell, usually accompanies an incident record, and does
+        not redirect its output into a temporary directory.
+    - condition: Configuration management checks a service before converging it.
+      explanation: >-
+        Enumerate-then-control is the normal shape of idempotent configuration management,
+        which means it also satisfies the strongest supporting evidence in this file. It
+        runs from the configuration-management agent during convergence runs and repeats on
+        a schedule visible in the baseline.
+    - condition: A backup or health-check script writes a service report to a file.
+      explanation: >-
+        Reporting scripts do redirect enumeration output to disk, which is otherwise a sharp
+        discriminator. They write to a fixed reporting path rather than to `%TEMP%` or
+        `/tmp`, and run under a service identity on a schedule.
+    - condition: A patch cycle stops services after checking their state.
+      explanation: >-
+        Patching legitimately enumerates and then stops services across many hosts at once.
+        The distinguishing features are the change record, the maintenance window and the
+        breadth across the estate rather than depth on one host.

@@ -1,0 +1,367 @@
+type: detection
+
+id: hg-any-desktop-captured-by-command-line-tooling-t1113
+version: 1.0.0
+
+info:
+  name: Desktop captured by command-line screenshot tooling
+  description: >-
+    Most screen capture is an API call inside a compiled implant, and an endpoint sensor
+    that reports process, file and network events cannot see it — MITRE's Windows analytic
+    for this technique rests on module loads of the graphics libraries, which this repo does
+    not collect. What is reachable is the other half of the same analytic: the tooling. A
+    capture utility invoked from a command line, or a screenshot API written inline into a
+    PowerShell one-liner, is fully visible, and that covers renamed utilities, living-off-
+    the-land binaries and the interactive-operator case. This file therefore hunts the
+    invocation and its context — a silent flag, an output path nobody browses, a parent with
+    no desktop, a cadence — and makes no claim about captures taken through an API from
+    compiled code. Note also that image files themselves are invisible here: the sensor
+    reports executable and script writes, not the creation of a .png, so the accumulating
+    output cannot be used as evidence and the command line has to carry the destination.
+  severity: medium
+  author: huntgraph
+  tags:
+    - collection
+    - screen-capture
+    - surveillance
+    - living-off-the-land
+    - windows
+    - macos
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1113
+    - https://attack.mitre.org/detectionstrategies/DET0346
+    - https://lolbas-project.github.io/lolbas/Binaries/Psr/
+
+mitre:
+  tactics:
+    - TA0009
+  techniques:
+    - T1113
+  sub_techniques: []
+  detection_strategies:
+    - DET0346
+  analytics:
+    - AN0980
+    - AN0981
+    - AN0982
+  platforms:
+    - Windows
+    - macOS
+    - Linux
+  data_sources:
+    - WinEventLog:Sysmon
+    - macos:unifiedlog
+    - auditd:SYSCALL
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary captures the victim's desktop to read what the user is working on, using a
+    native or portable capture utility driven from a command line rather than through the
+    desktop interface, and betrays itself through the flags that suppress the capture, the
+    path the image is written to, the process that started it and the rate at which it
+    repeats.
+  attacker_behavior:
+    - Runs screencapture, xwd, import, scrot or a portable utility such as nircmd.
+    - Uses flags that suppress the shutter sound, the cursor or any on-screen indication.
+    - Writes the image to a temporary, hidden or profile path rather than a pictures folder.
+    - Embeds a screen capture API call directly in a PowerShell or shell one-liner.
+    - Repeats the capture on a fixed interval to build a record of a session.
+    - Starts the capture from a script host, service or remote shell with no desktop session.
+  legitimate_behavior:
+    - A user takes a screenshot through the desktop interface or a screenshot application.
+    - Remote support and RMM products capture the screen during an assisted session.
+    - Automated UI test suites screenshot every step of every run.
+    - Monitoring and kiosk tooling captures the display on a schedule by design.
+    - Documentation and training tooling records the screen while a person narrates.
+  risk_indicator:
+    - The capture is suppressed with a silent or no-cursor flag.
+    - Output goes to a temporary, hidden or system path.
+    - The parent has no interactive desktop — a service, scheduler or remote shell.
+    - Captures repeat many times from one lineage in a short window.
+    - The capture API appears inline in an interpreter command line.
+
+requires:
+  platforms:
+    - windows
+    - macos
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: capture-tool-run-without-a-desktop
+        name: Screen capture utility started by a process with no desktop session
+        purpose: >-
+          Establish the actor. A person taking a screenshot does it from a shell they are
+          sitting at or through the desktop interface; a capture utility parented by a
+          service host, a scheduler, a remote shell, an office application or a script
+          interpreter is capturing a screen its parent is not looking at. Where the utility
+          itself is unremarkable, this lineage is the only real discriminator available.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(screencapture|xwd|import|import-im6|scrot|maim|spectacle|gnome-screenshot|xfce4-screenshooter|nircmd(c)?\.exe|psr\.exe|snippingtool\.exe)$/i
+          | ParentBaseFileName=/^(services\.exe|svchost\.exe|taskeng\.exe|schtasks\.exe|wscript\.exe|cscript\.exe|mshta\.exe|powershell\.exe|pwsh(\.exe)?|cmd\.exe|winword\.exe|excel\.exe|outlook\.exe|w3wp\.exe|sshd|crond?|systemd|launchd|python\d?(\.\d+)?|perl|ruby|node)$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=captures), collect([CommandLine], limit=5)])
+          | sort(captures, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Remote support and RMM agents that capture the screen during assisted sessions"
+            - "Automated UI test runners on build and QA hosts"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - parent_process
+            - organization
+
+      - id: capture-suppressed-and-hidden
+        name: Capture taken silently and written to a scratch or hidden path
+        purpose: >-
+          Isolate the flags and destinations that exist to keep the capture from being
+          noticed. macOS screencapture takes -x to suppress the shutter sound and -C or -o to
+          drop the cursor and window chrome; a destination under a temporary directory, a
+          dot-directory or a Windows system path is not where anyone stores a screenshot they
+          intend to look at again. Both halves in one command line is a strong statement of
+          intent, since the image file write itself is not observable.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(screencapture|xwd|import|scrot|maim|nircmd(c)?(\.exe)?|psr(\.exe)?)\b/i
+          | case {
+              CommandLine=/(\s-x\b|\s-C\b|\s-o\b|savescreenshotfull|savescreenshot|\/start\b.*\/gui\s+0|\s-q\b|\s-u\b|\s--silent\b)/i
+                | suppressed := CommandLine ;
+              CommandLine=/(%TEMP%|%TMP%|%APPDATA%|\\AppData\\Local\\Temp\\|\\Windows\\Temp\\|\\ProgramData\\|\/tmp\/|\/var\/tmp\/|\/dev\/shm\/|\/private\/tmp\/|[\\\/]\.[A-Za-z0-9_-]+[\\\/])/i
+                | scratch_output := CommandLine ;
+            }
+          | suppressed=/.+/ or scratch_output=/.+/
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=captures), collect([suppressed, scratch_output], limit=10)])
+          | sort(captures, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Kiosk and digital signage monitoring that captures the display to a cache path"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: capture-repeated-on-an-interval
+        name: Captures repeat from one lineage over a short window
+        purpose: >-
+          Convert a single unremarkable event into a pattern. One screenshot is a person; a
+          capture utility invoked dozens of times from the same parent inside an hour is a
+          recording of a session, which is how several documented implants operate. Counting
+          invocations per host and lineage is what separates surveillance from use.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(screencapture|xwd|import|import-im6|scrot|maim|gnome-screenshot|nircmd(c)?\.exe|psr\.exe)$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=captures), collect([CommandLine], limit=10)])
+          | captures >= 10
+          | sort(captures, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Test automation and screen recording products whose function is repeated capture"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - parent_process
+            - organization
+
+      - id: inline-capture-api-in-an-interpreter
+        name: Screen capture API written inline into an interpreter command line
+        purpose: >-
+          Recover the API route in the one place it is visible. A capture performed by
+          compiled code is out of reach, but the same call typed into a PowerShell or shell
+          one-liner — CopyFromScreen, a Drawing.Bitmap sized to the virtual screen, an
+          ImageGrab or mss call — appears in full in the command line. This is the operator
+          working interactively or through a downloaded one-liner rather than through an
+          implant.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(CopyFromScreen|Drawing\.Bitmap|Graphics\]::FromImage|Windows\.Forms\.Screen|PrimaryScreen\.Bounds|VirtualScreen|ImageGrab\.grab|mss\(\)|CGWindowListCreateImage|XGetImage)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Internal automation libraries that wrap screen capture for reporting"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: screen_capture_invoked
+      name: Screen capture tooling or API invoked from a command line
+      description: >-
+        A known screen capture utility ran, or a screen capture API call appeared inline in an
+        interpreter command line, which is the observable half of this technique.
+      source: process_creation
+      field: CommandLine
+      indicates: desktop_contents_captured
+
+  supporting:
+    - id: no_desktop_parent
+      name: Started by a process with no interactive desktop
+      description: >-
+        The parent is a service host, scheduler, remote shell, office application or script
+        interpreter rather than a shell or desktop the user is sitting at.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: untrusted_execution_lineage
+    - id: capture_suppressed
+      name: Capture taken with silencing flags
+      description: >-
+        The command line suppresses the shutter sound, the cursor or any on-screen
+        indication, which serves no purpose except to keep the user unaware.
+      source: process_creation
+      field: CommandLine
+      indicates: evasion_of_user_awareness
+    - id: output_to_scratch_path
+      name: Image written to a temporary, hidden or system path
+      description: >-
+        The destination in the command line is a temporary directory, a dot-directory or a
+        system path rather than a pictures or documents location.
+      source: process_creation
+      field: CommandLine
+      indicates: collection_staging
+    - id: captures_repeated
+      name: Captures repeat over a short window
+      description: >-
+        The same lineage invoked the capture utility many times inside the window, which is a
+        recording of a session rather than a person taking a screenshot.
+      source: derived
+      field: capture_count
+      indicates: sustained_surveillance
+    - id: portable_capture_binary
+      name: Capture utility is portable or in a user-writable path
+      description: >-
+        The executable is a standalone or renamed capture tool running from a temporary,
+        profile or share path rather than an installed product.
+      source: process_creation
+      field: ImageFileName
+      indicates: untrusted_execution_location
+
+  contradicting:
+    - id: remote_support_session
+      name: Remote support or RMM session in progress
+      description: >-
+        The capture belongs to an approved remote support or monitoring product operating
+        during an assisted session, where screen capture is the product's purpose.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: interactive_desktop_lineage
+      name: Started from the user's own desktop session
+      description: >-
+        The parent is the desktop shell, a terminal the console user is sitting at, or a
+        screenshot application, which is a person taking their own screenshot.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: expected_user_activity
+    - id: test_automation_host
+      name: Build or QA host running automated UI tests
+      description: >-
+        The host belongs to a build or QA asset group where UI test suites capture the screen
+        on every step of every run.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - screen_capture_invoked
+
+    supporting:
+      any:
+        - no_desktop_parent
+        - capture_suppressed
+        - output_to_scratch_path
+        - captures_repeated
+        - portable_capture_binary
+      all:
+        - no_desktop_parent
+        - captures_repeated
+
+    contradicting:
+      any:
+        - remote_support_session
+        - interactive_desktop_lineage
+        - test_automation_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - screen_capture_invoked
+      - interactive_desktop_lineage
+      - remote_support_session
+      - test_automation_host
+    suspicious_when:
+      - screen_capture_invoked
+      - no_desktop_parent
+    high_risk_when:
+      - screen_capture_invoked
+      - no_desktop_parent
+      - capture_suppressed
+      - output_to_scratch_path
+      - captures_repeated
+
+  false_positive:
+    - condition: A remote support technician captures the user's screen during an assisted session.
+      explanation: >-
+        Support tooling captures the desktop by design, often silently and often on an
+        interval, so it can reproduce every supporting item at once. The discriminator is the
+        product identity and a matching support ticket, not anything in the command line.
+    - condition: An automated UI test suite screenshots every step of a run.
+      explanation: >-
+        Test runners produce exactly the repetition and the temporary output path this
+        hypothesis leans on, at far higher volume than any operator would. Asset group
+        membership is the reliable discriminator.
+    - condition: A user takes a screenshot from a terminal they are sitting at.
+      explanation: >-
+        Developers and support staff run screencapture, scrot and import directly. The parent
+        is an interactive terminal in the console user's own session and the output goes to a
+        path they will open again.
+    - condition: Kiosk or signage monitoring captures the display on a schedule.
+      explanation: >-
+        Estate monitoring of unattended displays is silent, periodic and writes to a cache
+        directory, which matches the strongest combination here. It runs on a fixed cadence
+        across a named group of hosts rather than on one host during a session.
+    - condition: An internal automation library wraps a capture API for reporting.
+      explanation: >-
+        In-house scripts that build reports sometimes call CopyFromScreen or ImageGrab
+        inline, matching the API case. These are stable, repeat on a schedule and originate
+        from a known script path, which the baseline comparison is there to establish.

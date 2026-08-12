@@ -1,0 +1,417 @@
+type: detection
+
+id: hg-win-unrelated-sources-converging-on-one-staging-directory-t1074-001
+
+version: 1.0.0
+
+info:
+  name: Unrelated sources converging on one staging directory
+  description: >-
+    Staging is the sharpest observable in the collection group because it is a shape that
+    ordinary work does not produce. People open documents where the documents live. Nobody
+    gathers their spreadsheets, their mail store, a browser profile and a database export
+    into one scratch folder, because there is no reason to; the only actor who needs
+    everything in one place is the one who is about to move it somewhere else in a single
+    transfer. So the hunt is not for a copy — copies are constant — but for convergence:
+    several unrelated source trees feeding one destination, inside one window, under one
+    account. The destination adds to it. Staging goes where nobody looks and where nothing
+    is backed up, which in practice means a temporary directory, a public profile,
+    ProgramData or a folder named to blend into a system path. This file deliberately stops
+    at the staging directory. Compressing what lands there is Archive via Utility
+    (T1560.001) and moving it out is Exfiltration; the archive case below exists only to tie
+    the directory to that next step, not to restate it. Where the staging host is not the
+    host that held the data, T1074.002 is the file to read instead.
+  severity: medium
+  author: huntgraph
+  tags:
+    - collection
+    - data-staged
+    - local-data-staging
+    - staging-directory
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1074/001
+    - https://attack.mitre.org/detectionstrategies/DET0261
+    - https://attack.mitre.org/techniques/T1074
+    - https://attack.mitre.org/techniques/T1560/001
+    - https://attack.mitre.org/techniques/T1074/002
+
+mitre:
+  tactics:
+    - TA0009
+  techniques:
+    - T1074
+  sub_techniques:
+    - T1074.001
+  detection_strategies:
+    - DET0261
+  analytics:
+    - AN0724
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary preparing to remove data may first gather it, copying files from several
+    unrelated locations on the host into a single directory chosen for being temporary,
+    concealed or unmonitored, so that the whole collection can be compressed and moved in
+    one operation rather than in many visible transfers.
+  attacker_behavior:
+    - Copies files from several unrelated source trees into one destination directory.
+    - Chooses a destination under a temporary, public or system-adjacent path.
+    - Creates a directory whose name imitates a vendor or system folder to blend in.
+    - Drops the collection script or tool into the same directory it stages into.
+    - Hands the staging directory to an archive utility once the gathering is finished.
+  legitimate_behavior:
+    - Backup and imaging tools consolidate data into a working directory before writing it out.
+    - Installers and updaters unpack into temporary directories constantly.
+    - Profile migration tooling gathers a user's data into one location by design.
+    - Log collection and support-bundle scripts gather diagnostics into a single folder.
+    - Users copy a set of files together before mailing or uploading them.
+  risk_indicator:
+    - Sources from more than one unrelated category converge on one destination.
+    - The destination is temporary, public or named to imitate a system directory.
+    - The gathering is done from a shell or interpreter rather than by a packaged product.
+    - An archive utility is pointed at the same directory shortly afterwards.
+    - Neither the host nor the account has history of writing to that location.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: unrelated-source-categories-into-a-staging-path
+        name: Several unrelated source categories copied into a staging path
+        purpose: >-
+          This is the discriminator for the whole hypothesis. Tag each copy by the kind of
+          data its source represents, require the destination to look like a staging
+          location, and collapse the tags per host and account. One category is a person
+          moving their files; three unrelated categories arriving in the same scratch
+          directory is a collection being assembled.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(copy|xcopy|robocopy|Copy-Item|move|Move-Item)\b/i
+          | CommandLine=/[A-Za-z]:\\+(Windows\\+Temp|ProgramData|PerfLogs|Intel|Recovery|Users\\+Public)\\+|\\+AppData\\+Local\\+Temp\\+/i
+          | case {
+              CommandLine=/[A-Za-z]:\\+Users\\+[^\\]+\\+(Documents|Desktop|Downloads|OneDrive)/i
+                | sourcekind := "user_documents" ;
+              CommandLine=/(\\+Microsoft\\+Outlook\\+|\.(pst|ost|msg|eml)\b)/i
+                | sourcekind := "mail_store" ;
+              CommandLine=/(\\+(Google|Mozilla|BraveSoftware)\\+|\\+Microsoft\\+Edge\\+User Data\\+)/i
+                | sourcekind := "browser_profile" ;
+              CommandLine=/(\.(mdb|accdb|sqlite3?|bak|dmp)\b|\bmysqldump\b|\bsqlcmd\b|Export-Csv)/i
+                | sourcekind := "database_export" ;
+              CommandLine=/\\\\[^\\\s"]+\\[^\\\s"]+/
+                | sourcekind := "network_share" ;
+            }
+          | sourcekind=/.+/
+          | groupBy([ComputerName, UserName],
+                    function=[count(sourcekind, distinct=true, as=source_categories),
+                              collect([sourcekind, FileName, CommandLine], limit=15)])
+          | source_categories>=2
+          | sort(source_categories, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Backup, imaging and profile migration products during their scheduled window"
+            - "Support-bundle and diagnostic collection scripts raised against a ticket"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: document-tree-copied-recursively-into-a-scratch-path
+        name: Document tree copied recursively into a temporary or public path
+        purpose: >-
+          Catch the single-source form of staging that the convergence case misses, where
+          one large tree is taken whole. Recursion plus a document filter plus a destination
+          nobody backs up is the combination that separates gathering for removal from a
+          user tidying their files.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(robocopy|xcopy|copy|Copy-Item)\b/i
+          | CommandLine=/(\/mir\b|\/e\b|\/s\b|-Recurse)/i
+          | CommandLine=/\.(docx?|xlsx?|pptx?|pdf|csv|msg|eml|pst|ost)\b|[A-Za-z]:\\+Users\\+[^\\]+\\+(Documents|Desktop|OneDrive)/i
+          | CommandLine=/[A-Za-z]:\\+(Windows\\+Temp|ProgramData|PerfLogs|Intel|Recovery|Users\\+Public)\\+|\\+AppData\\+Local\\+Temp\\+/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=copies), collect([CommandLine], limit=8)])
+          | sort(copies, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Workstation refresh tooling copying profiles during a recorded migration"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - path
+
+      - id: staging-directory-named-to-imitate-a-system-path
+        name: Working directory created under a name that imitates a system folder
+        purpose: >-
+          Separate the operator who wants the directory overlooked from the one who did not
+          care. A folder called Intel, NVIDIA or Microsoft sitting under ProgramData or the
+          Windows temporary path, created by a shell rather than by an installer, is chosen
+          for camouflage and nothing else.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(mkdir|md|New-Item)\b/i
+          | CommandLine=/[A-Za-z]:\\+(Windows\\+Temp|ProgramData|PerfLogs|Users\\+Public)\\+(Intel|NVIDIA|AMD|Microsoft|Windows|Adobe|Update|Cache|System|Drivers|Logs)\b/i
+          | ParentBaseFileName!=/^(msiexec\.exe|trustedinstaller\.exe|setup\.exe|ccmexec\.exe|tiworker\.exe)$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=creations), collect([CommandLine], limit=8)])
+          | sort(creations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Vendor installers and driver packages that legitimately own these directory names"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: collection-tooling-dropped-into-the-staging-path
+        name: Script or tool written into the same directory used for staging
+        purpose: >-
+          Tie the gathering to the thing that performed it. Operators routinely leave the
+          collection script beside its own output, so an executable or script appearing in
+          the staging path is both corroboration and the artefact worth retrieving. Rarity
+          across the estate is what keeps ordinary temporary files out.
+        query: |
+          #event_simpleName=/^(NewScriptWritten|PeFileWritten|NewExecutableWritten)$/
+          | TargetFileName=/[A-Za-z]:\\+(Windows\\+Temp|ProgramData|PerfLogs|Intel|Recovery|Users\\+Public)\\+|\\+AppData\\+Local\\+Temp\\+/i
+          | TargetFileName!=/\\+(ccmcache|SoftwareDistribution|Installer|Package Cache)\\+/i
+          | groupBy([TargetFileName, SHA256HashData],
+                    function=[count(ComputerName, distinct=true, as=host_count),
+                              count(as=writes)])
+          | host_count<=3
+          | sort(host_count, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "SHA256 values of approved deployment, patching and diagnostic packages"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - path
+            - organization
+
+      - id: archive-utility-pointed-at-the-staging-directory
+        name: Archive utility invoked against the staging directory
+        purpose: >-
+          Provide the handoff, not the hypothesis. Archive via Utility (T1560.001) owns the
+          compression behaviour and is where that hunt belongs; this case exists only so an
+          analyst can confirm that a directory identified above went on to be packaged,
+          which is what turns a suspicious folder into a collection prepared for removal.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/[A-Za-z]:\\+(Windows\\+Temp|ProgramData|PerfLogs|Intel|Recovery|Users\\+Public)\\+|\\+AppData\\+Local\\+Temp\\+/i
+          | CommandLine=/\b(7z|7za|rar|winrar|tar|zip|Compress-Archive|makecab)\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=archives), collect([CommandLine], limit=8)])
+          | sort(archives, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Build, packaging and log-rotation jobs that archive into temporary paths routinely"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - path
+
+evidence:
+  required:
+    - id: files_gathered_into_one_directory
+      name: Files copied from elsewhere into a staging directory
+      description: >-
+        A copy or move placed data from a user document tree, a mail store, a browser
+        profile, a database export or a share into a single temporary, public or
+        system-adjacent directory.
+      source: process_creation
+      field: CommandLine
+      indicates: collection_staging
+
+  supporting:
+    - id: unrelated_sources_converged
+      name: More than one unrelated source category in the same destination
+      description: >-
+        The destination received data from source categories with no relationship to each
+        other, which is a collection being assembled rather than a person moving their work.
+      source: derived
+      field: sourcekind
+      indicates: collection_staging
+    - id: concealed_destination
+      name: Destination named to imitate a system or vendor directory
+      description: >-
+        The working directory was created under a name borrowed from a vendor or system
+        folder, by something that is not an installer, which serves no purpose but camouflage.
+      source: process_creation
+      field: CommandLine
+      indicates: execution_concealment
+    - id: tooling_in_staging_path
+      name: Script or executable written into the staging path
+      description: >-
+        A script or binary rare across the estate was written into the same directory used
+        for staging, which is usually the collector that produced the contents.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staged_in_writable_path
+    - id: archived_after_gathering
+      name: Staging directory handed to an archive utility
+      description: >-
+        An archive utility was invoked against the staging path, packaging the gathered data
+        into the single object that a transfer would carry. The archiving behaviour itself is
+        hunted by T1560.001.
+      source: process_creation
+      field: FileName
+      indicates: execution_chain_progression
+    - id: no_history_for_path
+      name: No baseline history of writes to this location
+      description: >-
+        Neither the host nor the account has written to this directory within the baseline
+        window, so the location was chosen for this activity rather than inherited from a
+        product that always uses it.
+      source: baseline
+      field: TargetFileName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: backup_or_imaging_product
+      name: Backup, imaging or migration product
+      description: >-
+        The gathering is performed by an approved backup, imaging or profile migration
+        product, whose whole design is to consolidate data into a working location.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_enterprise_activity
+    - id: installer_unpacking
+      name: Installer or updater unpacking to a temporary path
+      description: >-
+        The writes come from an installer, patch agent or updater expanding a package, which
+        is the single most common reason anything lands in a temporary directory.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_software_installation
+    - id: fleetwide_staging_pattern
+      name: Same staging pattern across the estate
+      description: >-
+        The identical directory and command shape appear on a large share of hosts in one
+        window, which is a product or a scheduled job rather than an operator on one machine.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - files_gathered_into_one_directory
+
+    supporting:
+      any:
+        - unrelated_sources_converged
+        - concealed_destination
+        - tooling_in_staging_path
+        - archived_after_gathering
+        - no_history_for_path
+      all:
+        - unrelated_sources_converged
+        - archived_after_gathering
+
+    contradicting:
+      any:
+        - backup_or_imaging_product
+        - installer_unpacking
+        - fleetwide_staging_pattern
+      all: []
+
+  verdict:
+    low_risk_when:
+      - files_gathered_into_one_directory
+      - backup_or_imaging_product
+      - installer_unpacking
+      - fleetwide_staging_pattern
+    suspicious_when:
+      - files_gathered_into_one_directory
+      - no_history_for_path
+    high_risk_when:
+      - files_gathered_into_one_directory
+      - unrelated_sources_converged
+      - concealed_destination
+      - archived_after_gathering
+
+  false_positive:
+    - condition: A backup or imaging product consolidates data into a working directory.
+      explanation: >-
+        Consolidation before writing out a backup set is the same operation this hunt looks
+        for, performed at far greater scale. It is separable by the acting image, a service
+        identity, a fixed schedule and the fact that the same pattern appears on every
+        protected host rather than on one.
+    - condition: An installer or updater unpacks a package into a temporary directory.
+      explanation: >-
+        Temporary directories exist for this, and package expansion writes many files into
+        one place. The parent is an installer or patch agent, the destination is a package
+        cache path, and nothing is copied in from a user document tree.
+    - condition: Profile migration tooling gathers a user's data into one location.
+      explanation: >-
+        Migration deliberately converges unrelated source categories on a single directory,
+        which reproduces the strongest evidence here exactly. It is bounded by a recorded
+        change, it runs under a migration account, and the destination is the migration
+        share rather than a scratch folder.
+    - condition: A support-bundle or diagnostic script gathers logs and configuration.
+      explanation: >-
+        Diagnostic collectors copy from several unrelated places into one folder and then
+        compress it, which is the full chain this file describes. They are raised against a
+        ticket, they gather logs and configuration rather than documents and mail, and the
+        script is a known vendor tool.
+    - condition: A user copies a set of files together before mailing or uploading them.
+      explanation: >-
+        Assembling an attachment set is ordinary and produces a small convergence into a
+        temporary path. It stays inside the user's own profile data, covers one category,
+        and the volume is a handful of files rather than a tree.

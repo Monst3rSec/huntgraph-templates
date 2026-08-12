@@ -1,0 +1,343 @@
+type: detection
+
+id: hg-any-local-account-enumeration-burst-t1087-001
+
+version: 1.0.0
+
+info:
+  name: Local account enumeration in a burst from one process lineage
+  description: >-
+    `net user` is not a suspicious command. It runs in logon scripts, in support sessions
+    and inside monitoring agents thousands of times a day, and a template that alerts on it
+    is a template nobody reads. The question this file asks is narrower: who can log into
+    this particular machine, asked several different ways, in a short window, by one process
+    lineage. An administrator who wants the local account list uses the one tool they always
+    use. An operator who has just landed on a host does not know which tool is available or
+    which one is logged, so they sweep — Net, then WMI, then the PowerShell cmdlet, then the
+    passwd file — and that breadth over a couple of minutes is the discriminator. This is a
+    low-severity enrichment template by design: it is meant to add weight to a lead an
+    analyst already has, not to originate one. Local enumeration answers a question about
+    this host only; the domain-wide equivalent is T1087.002, which is answered by a domain
+    controller and is scored higher for that reason.
+  severity: low
+  author: huntgraph
+  tags:
+    - discovery
+    - account-discovery
+    - local-accounts
+    - situational-awareness
+    - windows
+    - linux
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1087/001
+    - https://attack.mitre.org/detectionstrategies/DET0303
+    - https://attack.mitre.org/techniques/T1087
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1087
+  sub_techniques:
+    - T1087.001
+  detection_strategies:
+    - DET0303
+  analytics:
+    - AN0846
+    - AN0847
+    - AN0848
+  platforms:
+    - Windows
+    - Linux
+    - macOS
+  data_sources:
+    - WinEventLog:Sysmon
+    - linux:Sysmon
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary who has just obtained execution on a host may enumerate its local accounts
+    to learn which identities can log in and which of them are worth stealing, and will
+    typically ask through several different mechanisms in quick succession because they do
+    not yet know what the host allows.
+  attacker_behavior:
+    - Lists local accounts through Net, WMI or the local-account PowerShell cmdlets.
+    - Reads the passwd database or queries the directory service cache on Linux and macOS.
+    - Asks the same question through several different mechanisms within a few minutes.
+    - Runs the enumeration from a shell whose parent is a document handler or a remote channel.
+    - Follows the account listing with questions about sessions, processes and network state.
+  legitimate_behavior:
+    - Logon scripts query account attributes at every user logon.
+    - Monitoring and inventory agents collect the local account list on a schedule.
+    - Support staff list local accounts while diagnosing a logon or profile fault.
+    - Software installers check whether a required local service account exists.
+    - Configuration management enforces local account state on every policy run.
+  risk_indicator:
+    - Several distinct enumeration mechanisms are used by one lineage in a short window.
+    - The parent process is a document handler, archive tool, mail client or remote-execution channel.
+    - Neither the host nor the acting user has issued these commands during the baseline window.
+    - The account questions sit alongside other orientation questions in the same session.
+
+requires:
+  platforms:
+    - windows
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: local-account-listing
+        name: Local account list requested
+        purpose: >-
+          Establish the behaviour and rank it by rarity, since the command itself is
+          universal and only its novelty on a given host carries any weight.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(net1?(\.exe)?\s+users?\b|Get-LocalUser|wmic\s+useraccount|Win32_UserAccount|dscl\s+\.\s+(-)?list\s+\/Users|dscacheutil\s+-q\s+user|getent\s+passwd|\/etc\/passwd)/i
+          | CommandLine!=/\/dom/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=listings), collect([CommandLine], limit=5)])
+          | sort(listings, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the inventory, monitoring and configuration-management agents"
+            - "ComputerName of build and imaging hosts where account setup is the machine's purpose"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: enumeration-mechanism-sweep
+        name: The same question asked through several mechanisms
+        purpose: >-
+          Separate an operator orienting themselves from an administrator doing their job by
+          counting distinct enumeration routes per host and user rather than counting runs of
+          one command.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/net1?(\.exe)?\s+users?\b/i
+                | route := "net" ;
+              CommandLine=/(wmic\s+useraccount|Win32_UserAccount)/i
+                | route := "wmi" ;
+              CommandLine=/(Get-LocalUser|System\.DirectoryServices\.AccountManagement|\[adsi\])/i
+                | route := "powershell" ;
+              CommandLine=/(dscl\s+\.\s+(-)?list\s+\/Users|dscacheutil\s+-q\s+user)/i
+                | route := "directory-service" ;
+              CommandLine=/(getent\s+passwd|\/etc\/passwd)/i
+                | route := "passwd-file" ;
+              CommandLine=/(quser|qwinsta|\bwho\b|\bw\b|Get-WmiObject\s+.*LoggedOnUser)/i
+                | route := "sessions" ;
+            }
+          | route=/.+/
+          | CommandLine!=/\/dom/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=commands), collect([route, CommandLine], limit=12)])
+          | commands >= 3
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of logon-script hosts, which legitimately run several of these per logon"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - parent_process
+
+      - id: enumeration-from-a-delivery-parent
+        name: Account enumeration under a delivery or remote-execution parent
+        purpose: >-
+          Where the command set is hopelessly common the parent is the only real
+          discriminator, so isolate the lineages that have no business asking who lives on
+          the machine.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(net1?(\.exe)?\s+users?\b|Get-LocalUser|wmic\s+useraccount|dscl\s+\.\s+(-)?list\s+\/Users|dscacheutil\s+-q\s+user|getent\s+passwd|\/etc\/passwd)/i
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|onenote|acrobat|acrord32|7zfm|winrar|explorer|chrome|msedge|firefox|w3wp|httpd|nginx|wsmprovhost|winrshost|wmiprvse|mshta|wscript|cscript)(\.exe)?$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=enumerations), collect([CommandLine], limit=5)])
+          | sort(enumerations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Application-support scripts that legitimately run under a web server identity"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+
+evidence:
+  required:
+    - id: local_account_listing
+      name: Local account list requested
+      description: >-
+        A command asked the host for its local account inventory through Net, WMI, the
+        local-account cmdlets, the directory service cache or the passwd database.
+      source: process_creation
+      field: CommandLine
+      indicates: preparatory_enumeration
+
+  supporting:
+    - id: multiple_enumeration_routes
+      name: Several distinct mechanisms used in one window
+      description: >-
+        One host and user asked the same question through three or more different
+        mechanisms, which is a person establishing what works rather than a tool doing its
+        one job.
+      source: process_creation
+      field: CommandLine
+      indicates: hands_on_keyboard_activity
+    - id: delivery_or_remote_parent
+      name: Delivery or remote-execution parent
+      description: >-
+        The enumerating process was launched by a document handler, archive tool, mail
+        client, browser, web server process or a remote-execution channel.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: first_time_for_host
+      name: New behaviour for the host
+      description: >-
+        The host has not produced this enumeration during the baseline window, which is what
+        separates an intrusion from the logon script that runs every morning.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: unusual_acting_user
+      name: Acting account with no enumeration history
+      description: >-
+        The account issuing the commands has no history of local account administration on
+        this host or any other during the baseline window.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_user
+
+  contradicting:
+    - id: inventory_or_monitoring_agent
+      name: Inventory or monitoring agent
+      description: >-
+        The parent is an asset inventory, monitoring or configuration-management agent whose
+        function is to collect exactly this information on a schedule.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: logon_script_context
+      name: Logon or startup script
+      description: >-
+        The enumeration ran inside a logon or startup script, which fires on every session
+        and often uses several of these mechanisms in one pass.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: scheduled_automation_job
+    - id: administrator_with_history
+      name: Administrator with a long enumeration history
+      description: >-
+        The acting account routinely performs local account administration across the estate
+        during the baseline window and is doing so from its usual host.
+      source: baseline
+      field: UserName
+      indicates: legitimate_administrative_action
+    - id: recorded_support_activity
+      name: Recorded support or diagnostic work
+      description: >-
+        An incident or change record covers the session, naming the fault being diagnosed and
+        the person doing it.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - local_account_listing
+
+    supporting:
+      any:
+        - multiple_enumeration_routes
+        - delivery_or_remote_parent
+        - first_time_for_host
+        - unusual_acting_user
+      all:
+        - multiple_enumeration_routes
+        - delivery_or_remote_parent
+
+    contradicting:
+      any:
+        - inventory_or_monitoring_agent
+        - logon_script_context
+        - administrator_with_history
+        - recorded_support_activity
+      all: []
+
+  verdict:
+    low_risk_when:
+      - local_account_listing
+      - inventory_or_monitoring_agent
+      - logon_script_context
+      - administrator_with_history
+      - recorded_support_activity
+    suspicious_when:
+      - local_account_listing
+      - multiple_enumeration_routes
+    high_risk_when:
+      - local_account_listing
+      - multiple_enumeration_routes
+      - delivery_or_remote_parent
+      - first_time_for_host
+
+  false_positive:
+    - condition: A logon script enumerates accounts at every user logon.
+      explanation: >-
+        Logon scripts frequently query account attributes and may use more than one mechanism
+        in a single pass, reproducing the clustering evidence exactly. They run on a fixed
+        cadence tied to session start, under the script host as parent, on every host in the
+        estate rather than on one.
+    - condition: A monitoring or inventory agent collects the local account list on a schedule.
+      explanation: >-
+        Collecting the account inventory is precisely what these agents are for. They appear
+        with a stable parent, a stable command line and a regular interval, and they will be
+        present in the baseline for every host they cover.
+    - condition: Support staff diagnose a logon or profile fault.
+      explanation: >-
+        A genuine diagnostic session looks very like an orientation burst, including the use
+        of several mechanisms in a few minutes. The discriminators are an acting account with
+        an administration history, an interactive console session, and a matching incident
+        record.
+    - condition: A software installer checks for a required local service account.
+      explanation: >-
+        Installers query and sometimes create local service accounts during deployment. The
+        installer as parent and the correlation with a software deployment wave across many
+        hosts distinguish this from a single host being surveyed.
+    - condition: A container or build host creates and lists accounts as part of its purpose.
+      explanation: >-
+        Image build and provisioning pipelines manipulate local accounts constantly and will
+        generate this evidence continuously. These hosts should be excluded by asset group
+        rather than tuned away by command line.

@@ -1,0 +1,390 @@
+type: detection
+
+id: hg-win-shares-enumerated-across-many-hosts-t1135
+
+version: 1.0.0
+
+info:
+  name: Network shares enumerated across many hosts
+  description: >-
+    Share enumeration is the one Discovery behaviour that leaves a shape worth measuring.
+    An administrator who needs a share connects to the share; an operator mapping the
+    estate asks every host in reach what it is offering, and the difference is breadth
+    rather than intent expressed in a command line. Each question costs an SMB session to
+    a different peer, so the enumeration writes its own evidence into connection telemetry
+    even when the enumerating tool is a script, a compiled binary or an RPC call that never
+    produces a recognisable command line. That matters because this is the step that
+    decides what a collection run or a ransomware deployment will target next — the
+    operator has to know which servers hold the file shares before either is worth doing,
+    and the map is built once, quickly, from one host. The hunt is therefore anchored on
+    fan-out: how many distinct peers one process or account touched over SMB inside a
+    window, and whether the enumeration was followed by access to a share that account has
+    never used. Where the tooling is nameable it is named, but the breadth measurement
+    stands on its own and does not depend on recognising the tool.
+  severity: medium
+  author: huntgraph
+  tags:
+    - discovery
+    - network-share-discovery
+    - smb
+    - lateral-movement-precursor
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1135
+    - https://attack.mitre.org/detectionstrategies/DET0182
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1135
+  sub_techniques: []
+  detection_strategies:
+    - DET0182
+  analytics:
+    - AN0513
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+    - WinEventLog:PowerShell
+  data_components:
+    - Process Creation
+    - Command Execution
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may enumerate the file shares offered by hosts across the estate in order
+    to locate the servers worth collecting from or encrypting, producing a burst of SMB
+    sessions to many distinct peers from a single host and account within a short window.
+  attacker_behavior:
+    - Runs share listing commands against a list of hosts gathered from earlier discovery.
+    - Uses a share-hunting module or utility that walks the domain and reports readable paths.
+    - Connects to the interprocess share on many hosts to enumerate them over RPC.
+    - Follows the sweep by opening a share the account has no history of using.
+    - Repeats the sweep from a second host after moving laterally to widen the map.
+  legitimate_behavior:
+    - Vulnerability scanners and asset inventory agents enumerate shares across the estate.
+    - Backup and archiving products connect to many servers on a scheduled cycle.
+    - Logon scripts and drive-mapping policy connect users to their entitled shares at sign-in.
+    - Storage and migration engineers survey shares while planning a consolidation.
+    - Monitoring agents poll file servers for capacity and availability figures.
+  risk_indicator:
+    - One process reached far more distinct SMB peers than the host's own baseline.
+    - The interprocess share was contacted on many hosts without any file being opened.
+    - The enumeration ran from an interactive account rather than a scanner service account.
+    - A share-hunting module or utility name appears on the command line.
+    - The sweep is unprecedented for this host and does not recur on a schedule.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - RemoteAddressIP4
+        - RemotePort
+        - ContextProcessId
+        - ContextBaseFileName
+    - source: network_share_access
+      event_types:
+        - SmbClientConnect
+        - SmbFileOpen
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - ShareName
+        - RemoteAddressIP4
+        - TargetFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: smb-fan-out-from-one-process
+        name: One process opened SMB sessions to many distinct hosts
+        purpose: >-
+          The anchor for the whole hypothesis, and the case that works when the tooling is
+          unrecognisable. Enumeration is distinguished from use by the number of peers, not
+          by the command, so this counts distinct SMB destinations per process and reports
+          the outliers. Tune the threshold to the estate: a workstation that normally talks
+          to two file servers and suddenly talks to sixty is the finding, and the absolute
+          number matters far less than the departure from what that host usually does.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemotePort=/^(445|139)$/
+          | groupBy([ComputerName, ContextBaseFileName, ContextProcessId],
+                    function=[count(RemoteAddressIP4, distinct=true, as=hosts_touched),
+                              count(as=connections),
+                              collect([RemoteAddressIP4], limit=20)])
+          | hosts_touched >= 10
+          | sort(hosts_touched, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Vulnerability scanners, asset discovery and backup servers with standing estate-wide SMB reach"
+            - "Domain controllers and file servers whose normal role is to talk SMB to everything"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: share-listing-commands-executed
+        name: Share listing commands run against remote hosts
+        purpose: >-
+          Cover the hands-on form, where the operator types the enumeration rather than
+          running a tool. These commands are ordinary in isolation, so the value here is the
+          command line captured alongside the fan-out rather than the command by itself —
+          it names which hosts were asked and tells an analyst whether the sweep was
+          scripted from a list or worked through interactively.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(net(\.exe)?\s+view|net(\.exe)?\s+share|Get-SmbShare|Get-SmbMapping|Get-WmiObject.{0,40}Win32_Share|Get-CimInstance.{0,40}Win32_Share|wmic.{0,20}\bshare\b|Get-ChildItem\s+\\\\\\\\|\bdir\b\s+\\\\\\\\)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=queries), collect([CommandLine], limit=10)])
+          | sort(queries, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Logon scripts and drive-mapping policy that connect users to entitled shares at sign-in"
+            - "Storage management consoles run by the file services team"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: ipc-share-contacted-across-many-hosts
+        name: Interprocess share contacted on many hosts without file access
+        purpose: >-
+          Isolate the RPC enumeration path, which is how share listing works underneath and
+          how it looks when it comes from a compiled tool rather than a shell. Connecting to
+          the interprocess share is how a host is asked what it offers; doing so against many
+          peers and never opening a file is enumeration with no use attached, which is the
+          cleanest expression of this technique available in share telemetry.
+        query: |
+          #event_simpleName=/^SmbClientConnect$/
+          | ShareName=/^IPC\$$/i
+          | UserName!=/\$$/
+          | groupBy([ComputerName, UserName],
+                    function=[count(RemoteAddressIP4, distinct=true, as=hosts_touched),
+                              count(as=connects),
+                              collect([RemoteAddressIP4], limit=20)])
+          | hosts_touched >= 10
+          | sort(hosts_touched, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Machine accounts and management service accounts that poll servers by design"
+            - "Approved inventory and patch management infrastructure"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: share-hunting-tooling-invoked
+        name: Share hunting module or utility executed
+        purpose: >-
+          Name the packaged form. These modules and utilities exist for no purpose other
+          than finding readable and writable shares across a domain, so the tool name is the
+          finding on its own and needs no breadth measurement behind it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(Invoke-ShareFinder|Find-DomainShare|Find-InterestingDomainShareFile|Invoke-FileFinder|SharpShares|Snaffler|smbmap|crackmapexec|netexec|smbclient|PowerHuntShares|Get-DomainFileServer)\b/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=runs), collect([CommandLine], limit=5)])
+          | sort(runs, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Authorised red-team and penetration-testing hosts within a declared engagement window"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: share_enumeration_observed
+      name: Share enumeration performed
+      description: >-
+        A process listed the shares offered by remote hosts, either through an explicit
+        share listing command or through a share hunting module invoked on this host.
+      source: process_creation
+      field: CommandLine
+      indicates: network_share_enumeration
+
+  supporting:
+    - id: smb_fan_out
+      name: SMB sessions to an unusual number of peers
+      description: >-
+        A single process opened SMB sessions to far more distinct hosts within the window
+        than that host's baseline supports, which is mapping rather than using a share.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: broad_host_sweep
+    - id: ipc_share_breadth
+      name: Interprocess share contacted on many hosts
+      description: >-
+        The interprocess share was contacted across many peers with no file subsequently
+        opened, which is share enumeration over RPC with no use attached to it.
+      source: network_share_access
+      field: ShareName
+      indicates: rpc_share_enumeration
+    - id: enumeration_tooling
+      name: Share hunting utility present
+      description: >-
+        A module or binary whose only function is locating readable and writable shares
+        across a domain was executed on the host.
+      source: process_creation
+      field: ImageFileName
+      indicates: share_enumeration_tool
+    - id: untrusted_parent
+      name: Enumeration launched from a shell or delivery process
+      description: >-
+        The enumerating process was started by a command shell, script host, remote
+        execution service or document handler rather than by a scanner or backup agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: hands_on_keyboard_activity
+    - id: unused_share_opened
+      name: A share this account has never used was opened
+      description: >-
+        After the sweep the same account opened a share with no history for that account in
+        the baseline window, which is the pivot from mapping the estate to taking from it.
+      source: network_share_access
+      field: TargetFileName
+      indicates: post_enumeration_access
+    - id: rare_for_host
+      name: Sweep unprecedented on this host
+      description: >-
+        No comparable share enumeration has run on this host during the baseline window,
+        unlike scanning infrastructure whose sweeps recur on a fixed cycle.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: scanner_or_inventory_agent
+      name: Approved scanner or inventory agent
+      description: >-
+        The enumerating process belongs to a vulnerability scanner, asset discovery agent or
+        backup product whose function includes surveying shares across the estate.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_enterprise_activity
+    - id: scanning_infrastructure_source
+      name: Sweep originated from declared scanning infrastructure
+      description: >-
+        The host performing the sweep is a registered scanner or discovery appliance, for
+        which estate-wide SMB reach is the expected and documented behaviour.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_scanning_infrastructure
+    - id: fleetwide_recurring_sweep
+      name: Same sweep across the estate on a cycle
+      description: >-
+        The identical enumeration appears from many hosts at a stable interval, which is a
+        management platform doing inventory rather than one operator building a map.
+      source: baseline
+      field: ComputerName
+      indicates: scheduled_automation_job
+
+  risk_logic:
+    required:
+      - share_enumeration_observed
+
+    supporting:
+      any:
+        - smb_fan_out
+        - ipc_share_breadth
+        - enumeration_tooling
+        - untrusted_parent
+        - unused_share_opened
+        - rare_for_host
+      all:
+        - smb_fan_out
+        - untrusted_parent
+
+    contradicting:
+      any:
+        - scanner_or_inventory_agent
+        - scanning_infrastructure_source
+        - fleetwide_recurring_sweep
+      all: []
+
+  verdict:
+    low_risk_when:
+      - share_enumeration_observed
+      - scanner_or_inventory_agent
+      - scanning_infrastructure_source
+      - fleetwide_recurring_sweep
+    suspicious_when:
+      - share_enumeration_observed
+      - rare_for_host
+    high_risk_when:
+      - share_enumeration_observed
+      - smb_fan_out
+      - ipc_share_breadth
+      - untrusted_parent
+      - unused_share_opened
+
+  false_positive:
+    - condition: A vulnerability scanner or asset discovery agent sweeps SMB across the estate.
+      explanation: >-
+        Scanning infrastructure reproduces the fan-out evidence exactly and at far greater
+        breadth than any operator would attempt. It runs from a small number of registered
+        appliances under a dedicated service account, on a published schedule, and the same
+        pattern is visible in every previous baseline window rather than appearing once.
+    - condition: A backup or archiving product connects to every file server on a cycle.
+      explanation: >-
+        Backup agents legitimately touch many shares in one run and will exceed any breadth
+        threshold. The connecting process is the backup product's own binary, the peer list
+        is stable between runs, and the sessions are followed by sustained file reads rather
+        than by enumeration that opens nothing.
+    - condition: Logon scripts or drive-mapping policy connect a user to their shares at sign-in.
+      explanation: >-
+        Drive mapping produces a burst of SMB sessions at logon and can name several servers.
+        The parent is the logon process or policy engine rather than a shell, the share list
+        matches the user's entitlements, and it repeats at every sign-in for that account.
+    - condition: A storage engineer surveys shares while planning a migration.
+      explanation: >-
+        Consolidation work involves exactly this enumeration, sometimes with the same tooling.
+        It comes from a named engineer on an administrative workstation, usually has a change
+        record behind it, and the accounts involved have a history of storage administration.
+    - condition: A monitoring agent polls file servers for capacity figures.
+      explanation: >-
+        Capacity monitoring touches many servers repeatedly and will register as breadth. The
+        polling is periodic and evenly spaced rather than bursty, comes from the monitoring
+        agent's own process, and reads figures rather than listing share names.

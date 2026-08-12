@@ -1,0 +1,343 @@
+type: detection
+
+id: hg-any-privileged-domain-group-membership-enumerated-t1069-002
+
+version: 1.0.0
+
+info:
+  name: Tier-zero domain group membership enumerated from an endpoint
+  description: >-
+    Of everything an adversary can ask a domain controller, `net group "Domain Admins"
+    /domain` is the most revealing, because it is not a request for information about the
+    environment — it is the question "who do I need to become?" and the answer is a short,
+    specific list of people. That is what separates this file from generic group listing and
+    from T1087.002, which hunts breadth across the account population; here the signal is
+    the deliberate naming of the groups that own the directory. Two things make it worth
+    scoring above its local counterpart T1069.001. The question is answered by a domain
+    controller, so a single command from one compromised laptop describes the privilege
+    structure of the whole organisation. And the answer has an obvious next step, which is
+    why the strongest case in this file joins the group question to the credential or
+    lateral-movement attempt that follows it. Only the process-creation half of MITRE's
+    strategy is available here; LDAP search traffic (DC0085) and PowerShell script-block
+    content are not collected by this deployment, so a query issued from inside an implant
+    without spawning a process will not appear.
+  severity: medium
+  author: huntgraph
+  tags:
+    - discovery
+    - permission-groups
+    - domain-groups
+    - active-directory
+    - tier-zero
+    - privilege-escalation-recon
+    - windows
+    - linux
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1069/002
+    - https://attack.mitre.org/detectionstrategies/DET0360
+    - https://attack.mitre.org/techniques/T1069
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1069
+  sub_techniques:
+    - T1069.002
+  detection_strategies:
+    - DET0360
+  analytics:
+    - AN1025
+    - AN1026
+    - AN1027
+  platforms:
+    - Windows
+    - Linux
+    - macOS
+  data_sources:
+    - WinEventLog:Security
+    - auditd:SYSCALL
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary with a foothold may ask a domain controller which accounts hold
+    directory-owning privilege, producing a short list of identities whose compromise would
+    end the engagement, and will act on that list from the same session.
+  attacker_behavior:
+    - Names Domain Admins, Enterprise Admins or another tier-zero group directly in a query.
+    - Enumerates the whole domain group space to map the privilege structure at once.
+    - Runs a graph collector such as SharpHound or ADRecon to derive privilege paths.
+    - Follows the group question with a remote-execution or credential-access attempt against a named member.
+    - Issues the query from a workstation with no directory administration role.
+  legitimate_behavior:
+    - Directory administrators check privileged group membership as part of routine work.
+    - Identity governance and access-review tooling enumerates privileged groups on a schedule.
+    - Privileged access management products reconcile tier-zero membership continuously.
+    - Helpdesk staff check whether a caller belongs to a particular group.
+    - Authorised red teams and assessment vendors run graph collectors under an agreed scope.
+  risk_indicator:
+    - A tier-zero group is named explicitly rather than a group the user works with.
+    - The whole group space is enumerated rather than one group queried.
+    - A remote-execution or credential-access attempt follows in the same lineage.
+    - The originating host has no identity administration role in the asset inventory.
+
+requires:
+  platforms:
+    - windows
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: tier-zero-group-named
+        name: A directory-owning group named explicitly
+        purpose: >-
+          Surface the sharpest form of the behaviour, where the query names the groups that
+          own the directory rather than any group the user has business with.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(net1?(\.exe)?\s+group|Get-ADGroupMember|Get-ADGroup\b|Get-DomainGroupMember|Get-NetGroupMember|dsquery\s+group|dsget\s+group|ldapsearch|adfind|dscacheutil\s+-q\s+group)/i
+          | CommandLine=/(domain\s+admins|enterprise\s+admins|schema\s+admins|domain\s+controllers|account\s+operators|backup\s+operators|server\s+operators|print\s+operators|group\s+policy\s+creator|dnsadmins|key\s+admins|enterprise\s+key\s+admins|organization\s+management|exchange\s+trusted\s+subsystem|exchange\s+windows\s+permissions|protected\s+users|admin(istrator)?s\b)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=queries), collect([CommandLine], limit=5)])
+          | sort(queries, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of domain controllers, privileged access workstations and identity administration hosts"
+            - "ParentBaseFileName of identity governance, access-review and PAM agents"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: whole-group-space-enumerated
+        name: The entire domain group space mapped
+        purpose: >-
+          Catch the map rather than the lookup, since enumerating every group and its members
+          is how an adversary derives privilege paths nobody documented.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(net1?(\.exe)?\s+group\s+\/dom|Get-ADGroup\s+.*-Filter\s+["']?\*|Get-DomainGroup\b|Get-NetGroup\b|dsquery\s+group\s+.*-limit\s+0|objectCategory=group|sharphound|bloodhound|Invoke-BloodHound|adrecon|ad_?explorer|adfind\s+.*objectcategory=group|ldapdomaindump)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=sweeps), collect([CommandLine], limit=5)])
+          | sort(sweeps, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Scheduled access-review exports that enumerate all groups on a fixed cadence"
+            - "Assessment periods agreed in advance with the security testing programme"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: group-question-then-remote-step
+        name: Privileged group question followed by a remote or credential step
+        purpose: >-
+          Join the question to the answer being used, which is the pairing that turns
+          reconnaissance into an intrusion an analyst can describe.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(net1?(\.exe)?\s+group\s+.*(admins|operators)|Get-ADGroupMember\s+.*(admins|operators)|Get-DomainGroupMember|dsquery\s+group\s+.*admins)/i
+                | group_query := CommandLine ;
+              CommandLine=/(psexec|Enter-PSSession|New-PSSession|Invoke-Command\s+.*-ComputerName|wmic\s+\/node:|schtasks\s+.*\/s\s+|sc\s+\\\\|runas(\.exe)?\s+\/user|\/netonly|Copy-Item\s+.*\\\\|net1?(\.exe)?\s+use\s+\\\\)/i
+                | follow_up := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([group_query, follow_up, ParentBaseFileName]),
+                              count(as=events)])
+          | group_query=/.+/ and follow_up=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Administration jump hosts where group lookups and remote sessions are the normal working pattern"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+
+evidence:
+  required:
+    - id: domain_group_membership_query
+      name: Domain group membership requested
+      description: >-
+        A command asked the directory which accounts belong to a domain group, a question
+        answered by a domain controller and therefore describing the estate rather than the
+        host that asked.
+      source: process_creation
+      field: CommandLine
+      indicates: preparatory_enumeration
+
+  supporting:
+    - id: tier_zero_group_named
+      name: A directory-owning group named explicitly
+      description: >-
+        The query named Domain Admins, Enterprise Admins, Schema Admins or another group
+        whose members effectively own the directory.
+      source: process_creation
+      field: CommandLine
+      indicates: high_value_identity_targeted
+    - id: whole_group_space_enumerated
+      name: Entire group space mapped
+      description: >-
+        Every domain group was enumerated, or a graph collector was run, which derives
+        privilege relationships that no single lookup would reveal.
+      source: process_creation
+      field: CommandLine
+      indicates: estate_wide_reconnaissance
+    - id: directory_enumeration_tooling
+      name: Dedicated enumeration tooling present
+      description: >-
+        A collector whose purpose is to enumerate directory structure ran on the host, such
+        as AdFind, ADRecon, ADExplorer or a BloodHound collector.
+      source: process_creation
+      field: FileName
+      indicates: unusual_binary_in_environment
+    - id: remote_or_credential_step_followed
+      name: Remote or credential step in the same lineage
+      description: >-
+        The same host and account attempted remote execution, an alternate-credential logon
+        or a share connection shortly after asking who held the privilege.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: lateral_movement_attempt
+    - id: non_administrative_source_host
+      name: Host with no identity administration role
+      description: >-
+        The originating host is a workstation or ordinary server rather than a domain
+        controller, a privileged access workstation or an identity platform.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: identity_administration_host
+      name: Issued from an identity administration host
+      description: >-
+        The command came from a domain controller, a privileged access workstation or an
+        identity management server whose purpose is directory administration.
+      source: baseline
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: access_review_automation
+      name: Scheduled access review or governance job
+      description: >-
+        The enumeration ran from a scheduler on a fixed cadence, exporting privileged group
+        membership as part of an established review cycle.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: scheduled_automation_job
+    - id: helpdesk_group_lookup
+      name: Single-group helpdesk lookup
+      description: >-
+        A support tool queried one group's membership to answer a caller's question, which
+        is scoped to a single non-privileged group and goes no further.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: authorised_assessment
+      name: Authorised security assessment
+      description: >-
+        A recorded engagement covers the activity, naming the testers, the scope and the
+        window during which directory collection was expected.
+      source: change_management
+      field: UserName
+      indicates: authorised_security_testing
+
+  risk_logic:
+    required:
+      - domain_group_membership_query
+
+    supporting:
+      any:
+        - tier_zero_group_named
+        - whole_group_space_enumerated
+        - directory_enumeration_tooling
+        - remote_or_credential_step_followed
+        - non_administrative_source_host
+      all:
+        - tier_zero_group_named
+        - non_administrative_source_host
+
+    contradicting:
+      any:
+        - identity_administration_host
+        - access_review_automation
+        - helpdesk_group_lookup
+        - authorised_assessment
+      all: []
+
+  verdict:
+    low_risk_when:
+      - domain_group_membership_query
+      - identity_administration_host
+      - access_review_automation
+      - helpdesk_group_lookup
+      - authorised_assessment
+    suspicious_when:
+      - domain_group_membership_query
+      - tier_zero_group_named
+    high_risk_when:
+      - domain_group_membership_query
+      - tier_zero_group_named
+      - whole_group_space_enumerated
+      - remote_or_credential_step_followed
+      - non_administrative_source_host
+
+  false_positive:
+    - condition: An access-review platform exports privileged group membership on a schedule.
+      explanation: >-
+        Governance tooling enumerates exactly the groups this file is most interested in,
+        and does so estate-wide. It is separable by a stable service identity, a fixed
+        cadence and a presence in the baseline that long predates any investigation.
+    - condition: A privileged access management product reconciles tier-zero membership.
+      explanation: >-
+        PAM products read Domain Admins and its equivalents continuously in order to detect
+        drift, reproducing the strongest single piece of supporting evidence here on every
+        cycle. The parent process identifies them.
+    - condition: A directory administrator checks who is in Domain Admins.
+      explanation: >-
+        This is ordinary administrative work and will be common on administration hosts. The
+        host role and the acting account's history are the discriminators, which is why both
+        appear as contradicting evidence rather than as tuning.
+    - condition: An authorised red team runs a SharpHound collection.
+      explanation: >-
+        A graph collection is behaviourally identical to the intrusion it simulates and will
+        satisfy the whole-group-space evidence outright. This is the case the engagement
+        record exists to resolve and it should be confirmed, not inferred.
+    - condition: A helpdesk tool checks a caller's group membership.
+      explanation: >-
+        Single-group lookups are numerous and satisfy the required evidence alone, which is
+        why the verdict rests on a tier-zero group being named. A lookup against an ordinary
+        application group never reaches the suspicious tier.

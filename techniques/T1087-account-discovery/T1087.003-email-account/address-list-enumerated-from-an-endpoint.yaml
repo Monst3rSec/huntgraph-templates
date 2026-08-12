@@ -1,0 +1,318 @@
+type: detection
+
+id: hg-win-address-list-enumerated-from-an-endpoint-t1087-003
+
+version: 1.0.0
+
+info:
+  name: Global address list enumerated from an endpoint
+  description: >-
+    The global address list is the organisation chart with contact details attached, and it
+    is the natural next question after a mailbox is compromised: who else is here, who
+    approves payments, who runs security. This file is deliberately narrow about what it can
+    see. MITRE's strategy for this sub-technique has two halves, and only one of them is
+    reachable from an endpoint sensor. The Office Suite half — Google Workspace Directory
+    API calls, M365 address-book downloads, anomalous token use — lives in `m365:unified`,
+    `gcp:audit` and `azure:signinlogs`, none of which this deployment collects. That means
+    the most common modern version of this attack, an adversary opening OWA in a browser or
+    calling Graph with a stolen refresh token, produces nothing here and this file will not
+    find it. What remains genuinely visible is the endpoint-issued route: Exchange
+    management cmdlets run from a shell, the MailSniper and Ruler tooling, and malware
+    driving Outlook's own object model to walk the address book. Those are worth having, and
+    the gap above should be closed by adding a mail-platform connector rather than by
+    stretching endpoint telemetry to imitate one.
+  severity: medium
+  author: huntgraph
+  tags:
+    - discovery
+    - account-discovery
+    - email
+    - exchange
+    - address-book
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1087/003
+    - https://attack.mitre.org/detectionstrategies/DET0229
+    - https://attack.mitre.org/techniques/T1087
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1087
+  sub_techniques:
+    - T1087.003
+  detection_strategies:
+    - DET0229
+  analytics:
+    - AN0641
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary holding a mailbox or an endpoint may enumerate the organisation's address
+    lists to build a roster of identities and reporting lines, which then directs internal
+    phishing, business email compromise and the selection of which accounts are worth
+    stealing next.
+  attacker_behavior:
+    - Runs Exchange recipient or address-list cmdlets from a shell on an ordinary endpoint.
+    - Opens a remote management session to an Exchange endpoint from a host with no mail administration role.
+    - Executes address-book enumeration tooling such as MailSniper or Ruler.
+    - Drives the Outlook object model from a script host to walk the address entries.
+    - Writes the resulting recipient list to a file for later use.
+  legitimate_behavior:
+    - Mail administrators run recipient and address-list cmdlets from administration hosts.
+    - Migration and coexistence tooling enumerates recipients throughout a mail migration.
+    - Address-book synchronisation and archiving products read recipient data by design.
+    - Outlook itself downloads the offline address book on a regular schedule.
+    - Distribution list reporting jobs export membership periodically.
+  risk_indicator:
+    - The enumerating host has no mail administration or mail server role.
+    - The Outlook object model is driven by a script host rather than by Outlook's own user interface.
+    - Named address-book attack tooling is present on the host.
+    - The recipient list is written to a file rather than read on screen.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: exchange-recipient-cmdlets
+        name: Exchange recipient and address-list cmdlets from a shell
+        purpose: >-
+          Surface the documented enumeration route, ranked by rarity, since these cmdlets are
+          entirely normal on an Exchange administration host and meaningless anywhere else.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Get-GlobalAddressList|Get-AddressList|Get-OfflineAddressBook|Get-Recipient|Get-Mailbox\b|Get-DistributionGroupMember|Get-EXORecipient|Get-EXOMailbox)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=queries), collect([CommandLine], limit=5)])
+          | sort(queries, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of Exchange servers and mail administration hosts"
+            - "ParentBaseFileName of mail migration, archiving and address-book synchronisation products"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: address-book-tooling
+        name: Named address-book enumeration tooling
+        purpose: >-
+          Catch the tools written specifically to dump an address list, where presence on the
+          host is the finding rather than any particular argument.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(mailsniper|Invoke-SelfSearch|Invoke-GlobalO365AddressList|Get-GlobalAddressList\s+-Exch|ruler(\.exe)?\s+.*\babk\b|ruler(\.exe)?\s+.*dump|emailstealer|Invoke-OpenInboxFinder)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Assessment periods agreed in advance with the security testing programme"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: outlook-object-model-walked-by-a-script
+        name: Outlook address entries walked by a script host
+        purpose: >-
+          Isolate the malware route, where a script drives Outlook's own automation interface
+          to read the address book — a thing Outlook does for itself and never asks a script
+          host to do for it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Outlook\.Application|GetNameSpace\(["']?MAPI|AddressLists|AddressEntries|ResolveAll|GetGlobalAddressList|MAPI\.Session|CDO\.Message)/i
+          | FileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=accesses), collect([CommandLine], limit=5)])
+          | sort(accesses, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Signed line-of-business scripts that automate Outlook as part of a documented workflow"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+evidence:
+  required:
+    - id: address_list_enumeration
+      name: Address list or recipient enumeration
+      description: >-
+        A command asked the mail platform for its recipient population, whether through the
+        Exchange management cmdlets, dedicated address-book tooling or Outlook's automation
+        interface.
+      source: process_creation
+      field: CommandLine
+      indicates: preparatory_enumeration
+
+  supporting:
+    - id: non_mail_administration_host
+      name: Host with no mail administration role
+      description: >-
+        The enumerating host is an ordinary workstation or server rather than an Exchange
+        server, a mail administration console or a migration host.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: address_book_tooling
+      name: Named address-book attack tooling
+      description: >-
+        Tooling written specifically to enumerate or dump address lists ran on the host,
+        such as MailSniper or Ruler's address-book functions.
+      source: process_creation
+      field: FileName
+      indicates: unusual_binary_in_environment
+    - id: scripted_address_book_access
+      name: Outlook automation driven by a script host
+      description: >-
+        A script host or proxy-execution binary drove the Outlook object model to walk
+        address entries, rather than Outlook performing its own address-book work.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: results_written_to_disk
+      name: Recipient list kept rather than read
+      description: >-
+        The enumeration output was exported or redirected to a file, which turns a lookup
+        into a roster that can be carried away and worked through.
+      source: process_creation
+      field: CommandLine
+      indicates: collection_staging
+
+  contradicting:
+    - id: exchange_administration_context
+      name: Mail administration host and account
+      description: >-
+        The activity originated on an Exchange server or mail administration console under
+        an account with a history of mail administration.
+      source: baseline
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: mail_client_normal_operation
+      name: Outlook performing its own address-book work
+      description: >-
+        The address-book access belongs to Outlook itself, which downloads and resolves the
+        offline address book as part of normal operation.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_application_component
+    - id: migration_or_sync_product
+      name: Migration, archiving or synchronisation product
+      description: >-
+        The parent is a mail migration, archiving or directory synchronisation product that
+        enumerates recipients continuously by design.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: recorded_mail_project
+      name: Recorded migration or reporting work
+      description: >-
+        A change record covers the activity, naming the migration, audit or reporting task
+        that required the recipient list.
+      source: change_management
+      field: UserName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - address_list_enumeration
+
+    supporting:
+      any:
+        - non_mail_administration_host
+        - address_book_tooling
+        - scripted_address_book_access
+        - results_written_to_disk
+      all:
+        - non_mail_administration_host
+        - scripted_address_book_access
+
+    contradicting:
+      any:
+        - exchange_administration_context
+        - mail_client_normal_operation
+        - migration_or_sync_product
+        - recorded_mail_project
+      all: []
+
+  verdict:
+    low_risk_when:
+      - address_list_enumeration
+      - exchange_administration_context
+      - mail_client_normal_operation
+      - migration_or_sync_product
+      - recorded_mail_project
+    suspicious_when:
+      - address_list_enumeration
+      - non_mail_administration_host
+    high_risk_when:
+      - address_list_enumeration
+      - non_mail_administration_host
+      - scripted_address_book_access
+      - results_written_to_disk
+
+  false_positive:
+    - condition: A mail administrator runs recipient cmdlets during routine work.
+      explanation: >-
+        These cmdlets are the normal vocabulary of Exchange administration and appear
+        constantly on the hosts where that work happens. The host role and the acting
+        account's history are the discriminators, not the cmdlet.
+    - condition: A migration or coexistence tool enumerates recipients throughout a project.
+      explanation: >-
+        Migration tooling reads the entire recipient population repeatedly for the duration
+        of a migration, which can run for months and will sit inside the baseline window. It
+        appears under a stable service identity from a small set of known hosts.
+    - condition: Outlook downloads the offline address book.
+      explanation: >-
+        Outlook fetches and resolves the address book as part of normal operation on every
+        client in the estate. This is why the script-host parent, rather than the address-book
+        access itself, carries the escalation.
+    - condition: A line-of-business script automates Outlook for a documented workflow.
+      explanation: >-
+        Some organisations genuinely automate Outlook from scripts for mail merges and
+        distribution list maintenance, reproducing the strongest supporting evidence here.
+        These should be identified once by script path and signature and excluded explicitly.
+    - condition: A distribution list membership report runs on a schedule.
+      explanation: >-
+        Reporting jobs combine recipient enumeration with writing the result to a file, which
+        is the same pairing an adversary produces. Cadence, the scheduler as parent and a
+        fixed output path separate them.
