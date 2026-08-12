@@ -1,0 +1,373 @@
+type: detection
+
+id: hg-win-channel-rotated-to-a-second-destination-after-repeated-failures-t1008
+
+version: 1.0.0
+
+info:
+  name: Command channel rotated to a second destination after repeated failures
+  description: >-
+    A fallback channel is what makes taking down command-and-control infrastructure
+    frustrating rather than decisive. The implant carries more than one way home, and when
+    the first stops answering — because the address was blocked, the domain was seized, or a
+    proxy rule started refusing it — it moves to the next without any operator involvement.
+    The interesting consequence for a hunter is that the moment of containment is also the
+    moment the implant becomes most visible. The observable is not a destination, it is a
+    transition: a run of contact attempts against one place, then contact with a different
+    one, from the same process. Connection telemetry carries that shape plainly, because a
+    session that establishes produces one record while a session that is refused or times
+    out produces a stream of them as the client retries. A high attempt count against a
+    small destination set, followed by a second destination appearing under the same process,
+    is a channel changing rather than an application working. The benign twin is ordinary
+    resilience — every well-written client retries and every cloud service publishes several
+    endpoints — so the discriminator is who is rotating and where to: a process with no user
+    interface, moving to a destination on a non-standard port that nothing else in the
+    estate has ever contacted.
+  severity: medium
+  author: huntgraph
+  tags:
+    - command-and-control
+    - fallback-channel
+    - beaconing
+    - network
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1008
+    - https://attack.mitre.org/detectionstrategies/DET0499
+    - https://attack.mitre.org/techniques/T1568/002
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1008
+  sub_techniques: []
+  detection_strategies:
+    - DET0499
+  analytics:
+    - AN1376
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may build alternate command-and-control destinations into an implant so
+    that blocking or seizing the primary channel only moves the traffic to a second one,
+    keeping access through the disruption that was meant to end it.
+  attacker_behavior:
+    - Retries a primary destination repeatedly once it stops answering.
+    - Moves to a second hardcoded address or name after a retry threshold.
+    - Uses a different port or transport for the alternate channel.
+    - Resolves a backup domain that the host has never queried before.
+  legitimate_behavior:
+    - Well-written clients retry endpoints through transient network faults.
+    - Cloud services publish several endpoints and clients try them in turn.
+    - Laptops roam between networks and reconnect everything on arrival.
+    - Captive portals refuse connections until the user authenticates.
+  risk_indicator:
+    - A high attempt count against one destination is followed by a different destination.
+    - The rotating process has no user interface and no service role on the host.
+    - The alternate destination is on a port unrelated to any published service.
+    - Nothing else in the estate has ever contacted the second destination.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - RemoteAddressIP4
+        - RemotePort
+        - Protocol
+        - ContextProcessId
+        - ContextBaseFileName
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - DomainName
+        - IP4Records
+        - ContextProcessId
+        - ContextBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: retry-burst-then-a-different-destination
+        name: Retry burst against one destination, then contact with another
+        purpose: >-
+          Express the transition itself, which is the whole technique. An established session
+          produces few connection records and a refused or unanswered one produces many, so a
+          large attempt count spread across a small destination set is a client that could
+          not get through — and the second destination in that set is where it went instead.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|169\.254\.|224\.)/
+          | ContextBaseFileName!=/^(msedge|chrome|firefox|iexplore|brave|opera|vivaldi|msedgewebview2|outlook|teams|onedrive)\.exe$/i
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName],
+                    function=[count(as=attempts),
+                              count(RemoteAddressIP4, distinct=true, as=destinations),
+                              collect([RemoteAddressIP4, RemotePort], limit=20)])
+          | attempts >= 30
+          | destinations >= 2
+          | destinations <= 6
+          | sort(attempts, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Update, telemetry and management agents that poll a published endpoint set"
+            - "Hosts reconnecting after a recorded network or proxy outage"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: same-destination-reached-over-several-ports
+        name: One destination reached over several ports or transports
+        purpose: >-
+          Catch the rotation that keeps the address and changes the route. An implant with an
+          alternate channel to the same infrastructure will try a different port, and
+          sometimes a different transport, when the first is refused — a shape that
+          configured clients, which know the one port their service listens on, do not
+          produce.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|169\.254\.|224\.)/
+          | ContextBaseFileName!=/^(msedge|chrome|firefox|iexplore|brave|opera|vivaldi|msedgewebview2)\.exe$/i
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName, RemoteAddressIP4],
+                    function=[count(RemotePort, distinct=true, as=ports),
+                              count(Protocol, distinct=true, as=protocols),
+                              collect([RemotePort, Protocol], limit=20),
+                              count(as=attempts)])
+          | ports >= 3
+          | sort(ports, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Media, conferencing and peer-to-peer clients that negotiate a port per session"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: backup-name-resolved-after-a-run-of-failed-contact
+        name: Backup name resolved after a run of failed contact
+        purpose: >-
+          Cover the form where the fallback is a name rather than an address. A process that
+          has been hammering an unreachable destination and then asks the resolver for
+          something new has just consulted its backup configuration, and pairing the two
+          sides makes that legible where either alone would not be.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|DnsRequest)$/
+          | ContextBaseFileName!=/^(msedge|chrome|firefox|iexplore|brave|opera|vivaldi|msedgewebview2|svchost)\.exe$/i
+          | case {
+              #event_simpleName=NetworkConnectIP4
+                | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|169\.254\.|224\.)/
+                | attempted_peer := RemoteAddressIP4 ;
+              #event_simpleName=DnsRequest
+                | fallback_name := DomainName ;
+            }
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName],
+                    function=[count(attempted_peer, distinct=true, as=peers),
+                              count(fallback_name, distinct=true, as=names),
+                              collect([attempted_peer, fallback_name], limit=20),
+                              count(as=events)])
+          | attempted_peer=/.+/ and fallback_name=/.+/
+          | events >= 25
+          | names <= 5
+          | sort(events, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Agents whose failover endpoint list is published by the vendor and resolved routinely"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - domain
+
+      - id: alternate-destination-nothing-else-in-the-estate-uses
+        name: Alternate destination on a non-standard port that no other host reaches
+        purpose: >-
+          Carry the discriminator between resilience and rotation. Every serious client has
+          a second endpoint, but those endpoints are published and the whole estate uses
+          them. A destination on an unusual port reached by one or two machines is not part
+          of any vendor's failover design.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|169\.254\.|224\.)/
+          | RemotePort!=/^(80|443|53|22|25|123|389|445|587|993|995|3389|8080|8443)$/
+          | groupBy([RemoteAddressIP4, RemotePort],
+                    function=[count(ComputerName, distinct=true, as=hosts),
+                              count(as=connections),
+                              collect([ContextBaseFileName], limit=10)])
+          | hosts <= 2
+          | connections >= 15
+          | sort(connections, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Internal services published on deliberately non-standard ports"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - remote_address
+            - organization
+
+evidence:
+  required:
+    - id: rotation_to_a_second_destination
+      name: Contact moved to a different destination after repeated attempts
+      description: >-
+        One process produced a run of contact attempts against a destination and then began
+        contacting a different one, which is a channel changing rather than an application
+        completing its work.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: channel_rotation
+
+  supporting:
+    - id: attempt_count_far_above_a_session
+      name: Attempt count far above what a working session produces
+      description: >-
+        The number of connection records against the first destination is many times what an
+        established session would generate, which is the retry behaviour of a client that
+        cannot get through.
+      source: network_connection
+      field: ContextProcessId
+      indicates: failed_contact_burst
+    - id: alternate_port_or_transport
+      name: Alternate port or transport to the same infrastructure
+      description: >-
+        The process reached the same destination over several ports, or changed transport,
+        which is a second route to the same place rather than a different service.
+      source: network_connection
+      field: RemotePort
+      indicates: alternate_channel
+    - id: backup_name_resolved
+      name: A previously unseen name resolved during the retries
+      description: >-
+        The process asked the resolver for a name it has not used before while failing to
+        reach its current destination, which is a backup configuration being consulted.
+      source: dns_request
+      field: DomainName
+      indicates: fallback_resolution
+    - id: destination_new_to_the_estate
+      name: Second destination unused by the rest of the estate
+      description: >-
+        No other host contacted the alternate destination during the baseline window, so it
+        is not part of a vendor's published endpoint set or the organisation's own design.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: unusual_destination
+
+  contradicting:
+    - id: client_riding_out_an_outage
+      name: Client retrying through a transient fault
+      description: >-
+        The rotating process is a recognisable application or agent reconnecting through a
+        network, proxy or service interruption, which produces retries and endpoint changes
+        for entirely ordinary reasons.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: legitimate_application_component
+    - id: vendor_published_failover_set
+      name: Vendor's published failover endpoints
+      description: >-
+        The destinations belong to a published endpoint set that many hosts in the estate
+        contact, so trying them in turn is the product's documented resilience.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: legitimate_enterprise_activity
+    - id: roaming_or_captive_network
+      name: Roaming host or captive network
+      description: >-
+        The machine changed network or sat behind a portal that refuses traffic until
+        authentication, so every client on it retried and re-resolved at once rather than one
+        process doing so alone.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_infrastructure_role
+
+  risk_logic:
+    required:
+      - rotation_to_a_second_destination
+
+    supporting:
+      any:
+        - attempt_count_far_above_a_session
+        - alternate_port_or_transport
+        - backup_name_resolved
+        - destination_new_to_the_estate
+      all:
+        - attempt_count_far_above_a_session
+        - destination_new_to_the_estate
+
+    contradicting:
+      any:
+        - client_riding_out_an_outage
+        - vendor_published_failover_set
+        - roaming_or_captive_network
+      all: []
+
+  verdict:
+    low_risk_when:
+      - rotation_to_a_second_destination
+      - client_riding_out_an_outage
+      - vendor_published_failover_set
+      - roaming_or_captive_network
+    suspicious_when:
+      - rotation_to_a_second_destination
+      - attempt_count_far_above_a_session
+    high_risk_when:
+      - rotation_to_a_second_destination
+      - attempt_count_far_above_a_session
+      - alternate_port_or_transport
+      - destination_new_to_the_estate
+
+  false_positive:
+    - condition: A management agent retries through a proxy or network outage.
+      explanation: >-
+        Deployed agents retry aggressively and then move to the next endpoint in their
+        configuration, reproducing both the attempt burst and the destination change. The
+        pattern appears on many hosts simultaneously during the outage, which a single
+        implant's rotation does not.
+    - condition: A cloud client tries several published endpoints in turn.
+      explanation: >-
+        Services with regional or failover endpoints expect clients to work through the list,
+        which is exactly the counted shape. The addresses belong to announced provider ranges
+        and are contacted by the rest of the estate on standard ports.
+    - condition: A laptop moves network and every client reconnects at once.
+      explanation: >-
+        Roaming produces a burst of failures followed by successful contact with different
+        addresses, often through a captive portal that refuses everything first. It affects
+        all networked processes on the host at the same moment rather than one process alone.
+    - condition: An internal service is reached on a deliberately non-standard port.
+      explanation: >-
+        Backup, replication and management services often sit outside registered port ranges
+        and can look like an alternate channel. They are documented, they appear in change
+        records, and more than a couple of hosts reach them.
