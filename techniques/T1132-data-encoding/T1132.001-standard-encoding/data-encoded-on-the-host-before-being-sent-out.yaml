@@ -1,0 +1,361 @@
+type: detection
+
+id: hg-win-data-encoded-before-being-sent-out-t1132-001
+
+version: 1.0.0
+
+info:
+  name: Data encoded on the host immediately before being sent out
+  description: >-
+    Whether a request body is base64 or hex is a property of the packet, and an endpoint
+    sensor never sees the packet. What it does see is that most implants and most hands-on
+    operators do not carry their own encoder — they use the one already on the box. The
+    encoding step is therefore a local execution with an argument list, and it happens in
+    the seconds before the data leaves. That is the whole hypothesis here: a process turns
+    file content or command output into a text blob, and then that same process talks to
+    something outside the estate. Neither half is remarkable alone. Administrators encode
+    certificates, installers unpack embedded resources, and every host on the network makes
+    outbound connections. It is the sequence, in one process, that has no ordinary reading.
+    Two neighbouring files already own the adjacent ground and this one is deliberately kept
+    off it: T1027.010 covers a command arriving encoded and being run, and T1027.013 covers
+    a delivered file being decoded on arrival. Both look inward. This file looks outward and
+    matches the encode direction only, because that is the direction data leaves in.
+  severity: high
+  author: huntgraph
+  tags:
+    - command-and-control
+    - data-encoding
+    - base64
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1132/001
+    - https://attack.mitre.org/detectionstrategies/DET0124
+    - https://attack.mitre.org/techniques/T1132
+    - https://attack.mitre.org/techniques/T1027/013
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1132
+  sub_techniques:
+    - T1132.001
+  detection_strategies:
+    - DET0124
+  analytics:
+    - AN0345
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may encode collected data or command output with a standard scheme such as
+    base64 or hex before sending it, so that the content of the command and control channel
+    survives text-oriented transports and defeats trivial inspection, obtaining a channel
+    whose payload carries nothing an inspecting control can read.
+  attacker_behavior:
+    - Converts the contents of a collected file into a base64 or hex string on the host.
+    - Encodes command output in memory and places the result directly into a request body.
+    - Uses certutil to write an encoded copy of a file that is then transferred out.
+    - Runs the encoding and the transfer from the same process so the data never touches disk in cleartext.
+    - Chunks a long encoded blob across several requests to keep each one small.
+  legitimate_behavior:
+    - Administrators export and exchange certificates in base64 form.
+    - Build and packaging scripts embed resources by encoding them into text.
+    - Configuration management encodes secrets and files for transport into templates.
+    - Applications post base64 attachments and images to their own APIs.
+    - Developers decode and encode tokens and payloads while debugging.
+  risk_indicator:
+    - The encoder reads a file it has no relationship with, such as a document or credential store.
+    - The same command line both encodes and posts, so the data is never written down.
+    - The process that encoded connects to an external address shortly afterwards.
+    - The encoding happens under an interpreter launched from a document, archive or mail path.
+    - Neither the host nor the user has encoded anything during the baseline window.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - RemoteAddressIP4
+        - RemotePort
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: file-content-encoded-into-a-text-blob
+        name: File contents converted to base64 or hex
+        purpose: >-
+          Surface the encode direction specifically, which is what precedes an outbound
+          message rather than what follows an inbound one. Requiring both a read of file
+          content and a conversion call keeps out the single short string an engineer
+          encodes on a console, and keeps in the case where a real file is being packaged.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\[Convert\]::ToBase64String|ToBase64String\s*\(|certutil(\.exe)?\s[^\n]*-encode(hex)?\b|\[System\.Text\.Encoding\]::\w+\.GetBytes|BitConverter::ToString)/i
+          | CommandLine=/(Get-Content|ReadAllBytes|ReadAllText|OpenRead|Get-ChildItem|\.(docx?|xlsx?|pptx?|pdf|pst|ost|kdbx|txt|csv|zip|7z|db|sqlite)\b)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=encodings), collect([CommandLine], limit=5)])
+          | sort(encodings, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Build, packaging and configuration-management jobs that encode resources on a schedule"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: encoded-and-transmitted-in-one-command
+        name: One command line that both encodes and transmits
+        purpose: >-
+          Catch the strongest form, where encoding and egress are the same invocation and the
+          plaintext never exists on disk at all. This is the case with no administrative
+          twin worth the name, because a person exporting a certificate writes it to a file
+          and a person debugging a token does not post the result to an external host.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\[Convert\]::ToBase64String|ToBase64String\s*\(|certutil(\.exe)?\s[^\n]*-encode\b|\|\s*base64\b)/i
+          | CommandLine=/(Invoke-RestMethod|Invoke-WebRequest|-Method\s+(Post|Put)|-Body\b|UploadString|UploadData|curl(\.exe)?\s[^\n]*(-d\b|--data|-F\b)|\.UploadValues)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=invocations), collect([CommandLine], limit=5)])
+          | sort(invocations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Internal API clients that post base64 attachments to endpoints inside the estate"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: encoder-launched-from-a-delivery-path
+        name: Encoding driven by an interpreter launched from a delivery path
+        purpose: >-
+          Place the encoding in a lineage that explains it. An operator who has just landed
+          through a document or an archive encodes what they collect using whatever is on
+          the host, and the parent is the tell — office applications, archive tools and mail
+          clients have no reason to be upstream of a base64 conversion.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|onenote|acrobat|acrord32|7z(fm|g)?|winrar|winzip|mshta|wscript|cscript|explorer)\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd|certutil|python(3|\d\.\d+)?|node)\.exe$/i
+          | CommandLine=/(\[Convert\]::ToBase64String|ToBase64String\s*\(|-encode(hex)?\b|GetBytes|\|\s*base64\b)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=encodings), collect([CommandLine], limit=5)])
+          | sort(encodings, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved document automation that runs scripts from Office applications"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - process
+
+      - id: egress-from-the-encoding-process
+        name: Outbound connection from the process that encoded
+        purpose: >-
+          Close the chain the analytic describes. Encoding alone is administrative noise and
+          an outbound connection alone is every process on the estate, so the finding is the
+          join: the identical process that performed the conversion then reached an address
+          outside the organisation's own ranges.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | CommandLine=/(\[Convert\]::ToBase64String|ToBase64String\s*\(|certutil(\.exe)?\s[^\n]*-encode(hex)?\b|\|\s*base64\b)/i
+                | encoder_pid := TargetProcessId ;
+              #event_simpleName=NetworkConnectIP4
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/ ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[count(as=connections),
+                              collect([CommandLine, FileName, RemoteAddressIP4, RemotePort])])
+          | encoder_pid = ContextProcessId
+        filters:
+          include: []
+          exclude:
+            - "RemoteAddressIP4 within approved vendor, update and telemetry ranges"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: content_encoded_on_the_host
+      name: File content or output converted to base64 or hex
+      description: >-
+        A process turned real content into an encoded text blob using a conversion call or
+        certutil, which is the local step that precedes putting data into a command and
+        control message.
+      source: process_creation
+      field: CommandLine
+      indicates: outbound_data_encoded
+
+  supporting:
+    - id: encoded_and_sent_together
+      name: Encoding and transmission in the same invocation
+      description: >-
+        The same command line both encoded and posted, so the plaintext was never written to
+        disk and the conversion had no purpose other than transport.
+      source: process_creation
+      field: FileName
+      indicates: encode_then_transmit
+    - id: delivery_parent
+      name: Encoder launched from a document, archive or mail application
+      description: >-
+        The interpreter performing the conversion was started by an application associated
+        with delivery rather than by a shell or an automation agent, which places the
+        encoding inside an intrusion lineage.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: egress_from_encoder
+      name: The encoding process connected outbound
+      description: >-
+        The process that performed the conversion opened a connection to an address outside
+        the organisation's own ranges, completing the chain from encoded data to a channel.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: execution_chain_progression
+    - id: unusual_for_host
+      name: No history of encoding on this host
+      description: >-
+        Nothing on this host has converted file content into base64 or hex during the
+        baseline window, so the operation is a deviation rather than routine tooling.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: build_or_packaging_pipeline
+      name: Recognised build or packaging job
+      description: >-
+        The encoding belongs to a build, packaging or configuration-management job that
+        embeds resources as text, runs on a schedule under a service account from an
+        installed path.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_business_activity
+    - id: certificate_handling
+      name: Certificate export or import work
+      description: >-
+        The conversion operates on certificate or key material with certutil in its ordinary
+        administrative role, and the output is a certificate file rather than something that
+        leaves the estate.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_administration
+    - id: estate_wide_identical_invocation
+      name: Same invocation across the estate
+      description: >-
+        The identical encoding command appears on many hosts at once, which makes it product
+        or agent behaviour distributed by software rather than an operator on one machine.
+      source: baseline
+      field: CommandLine
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - content_encoded_on_the_host
+
+    supporting:
+      any:
+        - encoded_and_sent_together
+        - delivery_parent
+        - egress_from_encoder
+        - unusual_for_host
+      all:
+        - encoded_and_sent_together
+        - egress_from_encoder
+
+    contradicting:
+      any:
+        - build_or_packaging_pipeline
+        - certificate_handling
+        - estate_wide_identical_invocation
+      all: []
+
+  verdict:
+    low_risk_when:
+      - content_encoded_on_the_host
+      - build_or_packaging_pipeline
+      - certificate_handling
+      - estate_wide_identical_invocation
+    suspicious_when:
+      - content_encoded_on_the_host
+      - unusual_for_host
+    high_risk_when:
+      - content_encoded_on_the_host
+      - encoded_and_sent_together
+      - egress_from_encoder
+      - delivery_parent
+
+  false_positive:
+    - condition: An administrator exports a certificate in base64 form with certutil.
+      explanation: >-
+        This is certutil's ordinary job and it produces the same encode argument. The input
+        and output are certificate files, the work happens on a management host under an
+        administrator's interactive session, and no outbound connection follows from the same
+        process.
+    - condition: A build or packaging script embeds a resource by encoding it into text.
+      explanation: >-
+        Build tooling encodes binaries into source and manifests constantly. It runs from a
+        build workspace under a service account, on a schedule, and the identical command line
+        recurs across builds and across build agents.
+    - condition: An application posts a base64 attachment or image to its own API.
+      explanation: >-
+        Line-of-business applications encode attachments before sending them, which satisfies
+        the encode-and-transmit case. The destination is the organisation's own endpoint or a
+        vendor API the product is licensed against, not an unfamiliar address.
+    - condition: Configuration management encodes files and secrets into templates.
+      explanation: >-
+        Agents that render configuration encode file content as a matter of course. They run
+        from the agent's installed path with a stable parent, and the same behaviour appears on
+        every host the agent manages.
+    - condition: A developer encodes or decodes a token while debugging.
+      explanation: >-
+        Interactive encoding of short strings is common on engineering hosts. It does not read
+        a document, mail store or credential file, and the result stays on the console rather
+        than being placed into a request to an external host.

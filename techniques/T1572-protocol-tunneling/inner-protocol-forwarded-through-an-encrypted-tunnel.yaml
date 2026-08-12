@@ -1,0 +1,390 @@
+type: detection
+
+id: hg-win-inner-protocol-forwarded-through-an-encrypted-tunnel-t1572
+
+version: 1.0.0
+
+info:
+  name: Inner protocol forwarded through an encrypted tunnel
+  description: >-
+    Tunnelling wraps one protocol inside another so that RDP, SMB or a C2 channel travels
+    where only SSH or HTTPS is permitted. The encapsulation itself is invisible to an
+    endpoint sensor — there is no packet content here — but the instruction to encapsulate
+    is not, because an operator has to state it. SSH port forwarding carries its whole
+    configuration on the command line: a listen port, a target host and a target port, in
+    that order, behind -L, -R or -D. The purpose-built tunnellers are the same; they take
+    the inner port as an argument. That argument is the discriminator, and it is why this
+    hunt reads the forwarding specification rather than the tool name. The second observable
+    is structural: a process that simultaneously holds a local listening socket and an
+    external connection is, by definition, moving bytes between them, and very little
+    legitimate desktop software does both at once. T1133 already asks whether a
+    remote-access route exists on a host; this file asks what is being carried through one,
+    so treat a hit in both as the same event seen from two ends rather than two findings.
+  severity: high
+  author: huntgraph
+  tags:
+    - command-and-control
+    - protocol-tunneling
+    - port-forwarding
+    - dns-tunnelling
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1572
+    - https://attack.mitre.org/detectionstrategies/DET0538
+    - https://attack.mitre.org/techniques/T1090
+    - https://attack.mitre.org/techniques/T1133
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1572
+  sub_techniques: []
+  detection_strategies:
+    - DET0538
+  analytics:
+    - AN1483
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may encapsulate an inner protocol inside SSH, HTTPS or DNS so that traffic
+    the network would otherwise filter reaches its destination, obtaining reachability to
+    internal services and a C2 path that survives egress controls without ever appearing on
+    the wire as the protocol it really is.
+  attacker_behavior:
+    - Invokes SSH with a forwarding specification naming a listen port and an inner target.
+    - Runs a tunnelling utility with an internal service port as its forwarded argument.
+    - Encodes command and response data into DNS labels resolved through the local resolver.
+    - Leaves a process holding a local listening socket while it maintains an outbound session.
+    - Forwards RDP, SMB or WinRM to a host the operator could not otherwise reach.
+  legitimate_behavior:
+    - Engineers forward database and application ports through bastion hosts by SSH.
+    - Administrators use tunnelling utilities to reach lab, build and cloud environments.
+    - Browsers and security agents perform DNS over HTTPS to their configured resolvers.
+    - Development servers and debuggers listen locally while talking to a remote service.
+    - Backup and replication products maintain long-lived encrypted sessions outward.
+  risk_indicator:
+    - The forwarded inner port belongs to a remote administration or file service.
+    - The tunnelling binary runs from a user-writable directory rather than an install path.
+    - The host has never run this tool or this forwarding pattern in the baseline window.
+    - One process holds a local listener and an external connection at the same time.
+    - A single process resolves many long encoded labels under one parent domain.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkListenIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - ContextBaseFileName
+        - RemoteAddressIP4
+        - RemotePort
+        - LocalPort
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - ContextBaseFileName
+        - DomainName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: ssh-forwarding-specification-given
+        name: SSH client invoked with a port forwarding specification
+        purpose: >-
+          The forwarding flags are the encapsulation instruction written out in full, so
+          this is the technique itself rather than a precursor. The match is deliberately
+          case-sensitive: -L, -R and -D request forwarding while -l names a login user, and
+          folding case would turn a precise hunt into a hit on every SSH session.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(ssh|autossh|plink|putty|sshpass)\w*\.exe$/i
+          | CommandLine=/\s-[A-Za-z]*[LRDW]\s*\d{1,5}(:[^\s:]+:\d{1,5})?/
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=invocations), collect([CommandLine], limit=5)])
+          | sort(invocations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Engineering hosts where bastion forwarding to development services is routine"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: inner-service-port-forwarded
+        name: Tunnelling utility carrying a remote administration or file service port
+        purpose: >-
+          Separate a tunnel that reaches a web service from one that reaches the estate's
+          own management plane. Forwarding 3389, 445, 5985 or 1433 through an outer protocol
+          is how an operator reaches a host the network would not let them reach directly,
+          and the inner port is stated in the invocation because the tool needs it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(ssh|autossh|plink|chisel|frpc|frps|gost|\biox\b|ngrok|socat|3proxy|\bnpc\b|\bnps\b|revsocks|\bligolo\b)/i
+          | CommandLine=/(:|=|,|\s)(3389|445|139|5985|5986|1433|5900|3306|1521)(\s|:|,|$)/
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=invocations), collect([CommandLine], limit=5)])
+          | sort(invocations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Database and remote-support teams whose documented workflow forwards these ports"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: data-carried-in-dns-labels
+        name: DNS tunnelling client or a run of long encoded query names
+        purpose: >-
+          DNS is permitted where nothing else is, so it is the fallback encapsulation. The
+          tool names catch the operator who brought a tunneller; the label shape catches the
+          one who wrote their own, because encoding payload into a name forces a long
+          high-entropy leftmost label and forces many of them, which a host asking ordinary
+          questions never produces.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2|DnsRequest)$/
+          | case {
+              #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+                | CommandLine=/(iodine|dnscat|dns2tcp|dnstt|chashell|ozymandns|--doh-url|dns-?over-?https)/i
+                | tunnel_client := FileName ;
+              #event_simpleName=DnsRequest
+                | DomainName=/^[a-z0-9+\/=_-]{28,}\./i
+                | encoded_query := DomainName ;
+            }
+          | groupBy([ComputerName],
+                    function=[count(field=encoded_query, distinct=true, as=encoded_names),
+                              collect([tunnel_client, encoded_query], limit=10)])
+          | encoded_names >= 25 or tunnel_client=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Reputation and telemetry services that hash lookups into the leftmost label"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - domain
+            - organization
+
+      - id: listener-and-external-peer-held-together
+        name: One process holding a local listener and an external connection
+        purpose: >-
+          Confirm the tunnel is live rather than merely configured. A process that accepts
+          on a local port and simultaneously maintains a session to a routable external
+          address is forwarding between the two, whatever it is called and whatever flags it
+          was given, which makes this the one case that survives an unfamiliar tool.
+        query: |
+          #event_simpleName=/^(NetworkListenIP4|NetworkConnectIP4)$/
+          | ContextBaseFileName!=/^(System|svchost\.exe|lsass\.exe|services\.exe|spoolsv\.exe|SearchIndexer\.exe|MsMpEng\.exe|CcmExec\.exe)$/i
+          | case {
+              #event_simpleName=NetworkListenIP4
+                | LocalPort!=/^(135|137|138|139|445|3389|5040|5985|5986|49\d{3})$/
+                | listening_port := LocalPort ;
+              #event_simpleName=NetworkConnectIP4
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/
+                | far_end := RemoteAddressIP4 ;
+            }
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName],
+                    function=[collect([listening_port, far_end, RemotePort], limit=10),
+                              count(as=events)])
+          | listening_port=/.+/ and far_end=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Developer tooling, local web servers and debuggers on engineering workstations"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - process
+
+evidence:
+  required:
+    - id: encapsulation_configured
+      name: Forwarding specification or tunnelling client invoked
+      description: >-
+        A command line stated an encapsulation: an SSH forwarding flag with its port
+        specification, or a tunnelling utility given the ports it should carry. This is the
+        instruction to wrap one protocol inside another.
+      source: process_creation
+      field: CommandLine
+      indicates: protocol_encapsulation_configured
+
+  supporting:
+    - id: inner_service_port_carried
+      name: Inner port belongs to a remote administration or file service
+      description: >-
+        The forwarded port is RDP, SMB, WinRM, VNC or a database service rather than a web
+        port, so the tunnel reaches the estate's management plane rather than the internet.
+      source: process_creation
+      field: FileName
+      indicates: management_protocol_tunnelled
+    - id: listener_with_external_peer
+      name: Local listener held alongside an external connection
+      description: >-
+        One process accepted on a local port while maintaining a session to a routable
+        external address, which is forwarding between the two regardless of the tool used.
+      source: network_connection
+      field: LocalPort
+      indicates: active_traffic_forwarding
+    - id: encoded_dns_labels
+      name: Long encoded labels resolved repeatedly
+      description: >-
+        A host resolved many long high-entropy leftmost labels, which is the shape produced
+        by encoding payload into query names rather than by asking for hostnames.
+      source: dns_request
+      field: DomainName
+      indicates: data_carried_in_resolution
+    - id: tunneller_in_writable_path
+      name: Tunnelling binary running from a user-writable directory
+      description: >-
+        The executable sits under a user profile, AppData, Temp or ProgramData rather than
+        an installation directory, which is a binary carried in rather than deployed.
+      source: process_creation
+      field: ImageFileName
+      indicates: untrusted_execution_location
+    - id: no_prior_tunnelling_on_host
+      name: Host has no history of this tunnelling pattern
+      description: >-
+        Neither this tool nor this forwarding pattern appears on the host during the
+        baseline window, so the capability arrived rather than being part of the build.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: engineering_workstation
+      name: Engineering or administration workstation
+      description: >-
+        The host belongs to a role where forwarding ports through bastions is part of the
+        daily job, which reproduces the required evidence exactly.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: recorded_maintenance_window
+      name: Tunnel covered by a change record
+      description: >-
+        A migration, vendor support session or scheduled maintenance record names this host
+        and the service being reached through the tunnel.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: resolver_client_dns
+      name: Encoded lookups belong to a browser or security agent
+      description: >-
+        The long labels are resolved by a browser, an endpoint agent or a reputation client
+        that hashes its lookups, which is a normal design rather than a covert channel.
+      source: dns_request
+      field: ContextBaseFileName
+      indicates: legitimate_application_component
+
+  risk_logic:
+    required:
+      - encapsulation_configured
+
+    supporting:
+      any:
+        - inner_service_port_carried
+        - listener_with_external_peer
+        - encoded_dns_labels
+        - tunneller_in_writable_path
+        - no_prior_tunnelling_on_host
+      all:
+        - inner_service_port_carried
+        - listener_with_external_peer
+
+    contradicting:
+      any:
+        - engineering_workstation
+        - recorded_maintenance_window
+        - resolver_client_dns
+      all: []
+
+  verdict:
+    low_risk_when:
+      - encapsulation_configured
+      - engineering_workstation
+      - recorded_maintenance_window
+      - resolver_client_dns
+    suspicious_when:
+      - encapsulation_configured
+      - no_prior_tunnelling_on_host
+    high_risk_when:
+      - encapsulation_configured
+      - inner_service_port_carried
+      - listener_with_external_peer
+      - tunneller_in_writable_path
+      - no_prior_tunnelling_on_host
+
+  false_positive:
+    - condition: An engineer forwards a database or application port through a bastion host.
+      explanation: >-
+        This is the same command with the same flags and often the same inner ports, and it
+        is the largest source of hits in any estate with a jump-host pattern. The
+        discriminators are host role and repetition: an engineer's forwarding is a recurring
+        pattern on their own workstation to the same bastion, where an operator's is new on
+        a host that has never done it.
+    - condition: A remote-support or monitoring product maintains a persistent outbound session.
+      explanation: >-
+        Support agents legitimately hold a local listener and an outbound connection at
+        once, satisfying the structural case on its own. They are recognisable by image path
+        and by being present fleet-wide rather than on one host.
+    - condition: A browser or endpoint agent performs DNS over HTTPS or hashed reputation lookups.
+      explanation: >-
+        Reputation services encode a hash into the leftmost label, producing long
+        high-entropy names in volume. The resolving process is the discriminator, which is
+        why the browser and agent images are excluded and the contradicting evidence names
+        them explicitly.
+    - condition: A developer runs a local server or debugger while talking to a cloud service.
+      explanation: >-
+        Development tooling routinely listens locally and connects outward, which reproduces
+        the structural case. It is confined to engineering hosts, uses recognisable
+        framework images, and is stable across the baseline window rather than new.
+    - condition: A CDN or telemetry endpoint uses long generated hostnames.
+      explanation: >-
+        Some content and telemetry providers generate long per-request hostnames that look
+        encoded. These resolve under a small number of stable parent domains that a baseline
+        establishes quickly, where a tunnel's parent domain is new to the estate.

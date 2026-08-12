@@ -1,0 +1,384 @@
+type: detection
+
+id: hg-win-media-files-exchanged-as-a-channel-t1001-002
+
+version: 1.0.0
+
+info:
+  name: Media files exchanged with one external host as a command channel
+  description: >-
+    Nothing an endpoint sensor collects can see bits hidden in pixels. The concealment
+    happens in memory, the carrier is a structurally valid image that renders correctly,
+    and the traffic is an ordinary HTTPS request for a picture. So the encoding is not the
+    observable and no query here pretends otherwise. What is observable is the shape of the
+    relationship: an implant that takes its orders from images has to keep going back for
+    new ones, and it has to send its answers back the same way, which means a process that
+    is not a browser repeatedly moving media files to and from a single external host. That
+    is a channel, not a download. The corpus already covers the delivery half of
+    steganography under T1027.003, where a carrier is decoded once and something executes;
+    this file deliberately takes the opposite case, where nothing executes at all and the
+    only trace is the sustained two-way traffic in pictures. The discriminator is
+    direction and repetition together. Browsers fetch thousands of images and never upload
+    them; asset pipelines upload images and never poll for them; an interpreter or transfer
+    utility doing both, with the same host, on a cadence, has no benign reading. Note that
+    the repetition tests are meaningless until the baseline window has history behind them.
+  severity: high
+  author: huntgraph
+  tags:
+    - command-and-control
+    - steganography
+    - covert-channel
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1001/002
+    - https://attack.mitre.org/detectionstrategies/DET0235
+    - https://attack.mitre.org/techniques/T1001
+    - https://attack.mitre.org/techniques/T1027/003
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1001
+  sub_techniques:
+    - T1001.002
+  detection_strategies:
+    - DET0235
+  analytics:
+    - AN0651
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may carry command and control inside image or media files so that the
+    traffic is indistinguishable from ordinary content retrieval, obtaining a channel that
+    survives content inspection because every message on the wire is a valid picture.
+  attacker_behavior:
+    - Polls a fixed remote location for an image and parses commands out of the file it gets back.
+    - Embeds task output into a second image and uploads it to the same host or service.
+    - Uses a script host or transfer utility rather than a browser, so the fetch is scripted.
+    - Keeps the cadence slow and the file sizes plausible so the exchange looks like content caching.
+    - Hosts the carriers on a public image or content service so the destination is reputable.
+  legitimate_behavior:
+    - Applications and updaters download branding, icon and banner assets over HTTPS.
+    - Design, marketing and publishing hosts upload images to content and asset services.
+    - Backup and sync clients move media files in both directions all day.
+    - Monitoring and reporting tooling posts rendered chart images to dashboards and chat.
+    - Browsers fetch enormous numbers of images from content delivery networks.
+  risk_indicator:
+    - The same process both retrieves and sends media, rather than only one direction.
+    - The process is an interpreter or a transfer LOLBin instead of an application that displays pictures.
+    - Contact repeats against a single external destination over hours or days.
+    - The destination is an image or paste hosting service with no relationship to installed software.
+    - The host has no history of scripted media transfer during the baseline window.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - RemoteAddressIP4
+        - RemotePort
+        - ContextProcessId
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - DomainName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: media-file-sent-to-an-external-host
+        name: Media file uploaded by a script host or transfer utility
+        purpose: >-
+          Catch the return leg of the channel, which is the half nothing benign explains
+          away easily. Downloading a picture is universal; scripting the upload of one to
+          an arbitrary endpoint is not, and it is the only direction in which the endpoint
+          is plausibly the source of the hidden content.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(powershell|pwsh|wscript|cscript|mshta|python(3|\d\.\d+)?|node|curl|bitsadmin|rundll32)\.exe$/i
+          | CommandLine=/(-Method\s+(Post|Put)|-InFile\b|UploadFile|UploadData|OpenWrite|\s-F\s|\s-T\s|--data-binary|--upload-file)/i
+          | CommandLine=/\.(png|jpe?g|bmp|gif|tiff?|webp|ico|wav|mp3|mp4)\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=uploads), collect([CommandLine], limit=5)])
+          | sort(uploads, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Publishing, design and asset-management workflows that script uploads to content services"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: media-moved-in-both-directions
+        name: One process both retrieving and sending media files
+        purpose: >-
+          Separate a channel from a transfer. A process that only pulls pictures is a
+          downloader and a process that only pushes them is a publisher, but a process
+          doing both against the same estate over a window is holding a conversation, which
+          is what steganographic command and control actually looks like from the host.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\.(png|jpe?g|bmp|gif|tiff?|webp|ico|wav|mp3|mp4)\b/i
+          | case {
+              CommandLine=/(DownloadFile|DownloadData|DownloadString|Invoke-WebRequest|OpenRead|\s-urlcache\b|\/transfer\b|\s-o\s)/i
+                | leg := "retrieve" ;
+              CommandLine=/(-Method\s+(Post|Put)|-InFile\b|UploadFile|UploadData|OpenWrite|\s-F\s|\s-T\s|--data-binary)/i
+                | leg := "send" ;
+              * | leg := "none" ;
+            }
+          | leg!="none"
+          | groupBy([ComputerName, UserName, FileName],
+                    function=[count(field=leg, distinct=true, as=legs),
+                              count(as=transfers),
+                              collect([leg, CommandLine], limit=8)])
+          | legs>=2
+          | sort(transfers, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Backup and file-synchronisation clients, which move media both ways by design"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - process
+
+      - id: media-hosting-service-resolved-by-a-script-engine
+        name: Image or paste hosting service resolved by a non-browser process
+        purpose: >-
+          Name the destination side of the channel. Public image and content hosts are the
+          natural home for stego carriers because they are reputable, free and reachable
+          through any proxy. Browsers reach them constantly and that is uninteresting; an
+          interpreter resolving them is a scripted relationship with a content service.
+        query: |
+          #event_simpleName=DnsRequest
+          | DomainName=/(imgur|imgbb|ibb\.co|postimg|imgbox|gyazo|prnt\.sc|catbox\.moe|litterbox|file\.io|anonfiles|pixeldrain|i\.redd\.it|cdn\.discordapp|media\.tenor|telegra\.ph|raw\.githubusercontent|gitlab\.io\/uploads)/i
+          | groupBy([ComputerName, ContextProcessId, DomainName],
+                    function=[count(as=lookups)])
+          | lookups>=3
+          | sort(lookups, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Browser and chat-client process identifiers, which reach these services as normal user activity"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - domain
+            - organization
+
+      - id: sustained-contact-from-a-media-handling-process
+        name: Repeated contact with one destination from the process handling media
+        purpose: >-
+          Confirm that the media handling is part of an ongoing relationship rather than a
+          one-off. Correlating the process that named a carrier file with its own outbound
+          connections, and keeping only those that return to a single external address many
+          times, is the closest an endpoint can get to observing a beacon carried in images.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | CommandLine=/\.(png|jpe?g|bmp|gif|tiff?|webp|ico|wav|mp3|mp4)\b/i
+                | FileName=/^(powershell|pwsh|wscript|cscript|mshta|python(3|\d\.\d+)?|node|curl|rundll32)\.exe$/i
+                | carrier_pid := TargetProcessId ;
+              #event_simpleName=NetworkConnectIP4
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/ ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[count(as=connections),
+                              count(field=RemoteAddressIP4, distinct=true, as=destinations),
+                              collect([CommandLine, FileName, RemoteAddressIP4, RemotePort])])
+          | carrier_pid = ContextProcessId
+          | connections>=6
+          | destinations<=2
+        filters:
+          include: []
+          exclude:
+            - "RemoteAddressIP4 within approved content delivery and vendor ranges"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: media_moved_by_a_non_browser_process
+      name: Media file transferred by a script host or transfer utility
+      description: >-
+        A process that exists to run scripts or move bytes, rather than to display pictures,
+        named a media file alongside a transfer verb, which is how a carrier enters or
+        leaves the host in this technique.
+      source: process_creation
+      field: CommandLine
+      indicates: media_carrier_transfer
+
+  supporting:
+    - id: both_directions_observed
+      name: Carrier moved in both directions
+      description: >-
+        The same process both retrieved and sent media files within the window, which is a
+        two-way exchange rather than a download or a publish and is the shape a command
+        channel takes.
+      source: process_creation
+      field: FileName
+      indicates: bidirectional_media_exchange
+    - id: media_hosting_service_contacted
+      name: Public media or paste host resolved
+      description: >-
+        A process resolved an image, paste or file-drop service repeatedly, which is where
+        stego carriers are commonly staged because the destination itself looks reputable.
+      source: dns_request
+      field: DomainName
+      indicates: content_service_contact
+    - id: repeated_contact_one_destination
+      name: Many connections, one external destination
+      description: >-
+        The process handling the carrier connected outbound repeatedly while returning to
+        the same address, which is a sustained relationship rather than content retrieval
+        spread across a delivery network.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: sustained_external_channel
+    - id: unusual_for_host
+      name: No history of scripted media transfer here
+      description: >-
+        Script hosts and transfer utilities have not moved media files on this host during
+        the baseline window, so the behaviour is new rather than part of an established
+        workflow.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: media_workflow_role
+      name: Host whose role is media or content publishing
+      description: >-
+        The host belongs to design, marketing, publishing or a media pipeline, where
+        scripted upload and download of images is the ordinary daily workload and both
+        directions are expected.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_business_activity
+    - id: product_asset_sync
+      name: Installed product synchronising its own assets
+      description: >-
+        The parent is a backup, synchronisation or content-management client whose stated
+        function is to move files including media in both directions on a schedule.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_application_component
+    - id: estate_wide_identical_invocation
+      name: Same invocation across the estate
+      description: >-
+        The identical command line appears on many hosts, which makes it software behaviour
+        distributed by a package rather than an operator working one machine.
+      source: baseline
+      field: CommandLine
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - media_moved_by_a_non_browser_process
+
+    supporting:
+      any:
+        - both_directions_observed
+        - media_hosting_service_contacted
+        - repeated_contact_one_destination
+        - unusual_for_host
+      all:
+        - both_directions_observed
+        - repeated_contact_one_destination
+
+    contradicting:
+      any:
+        - media_workflow_role
+        - product_asset_sync
+        - estate_wide_identical_invocation
+      all: []
+
+  verdict:
+    low_risk_when:
+      - media_moved_by_a_non_browser_process
+      - media_workflow_role
+      - product_asset_sync
+      - estate_wide_identical_invocation
+    suspicious_when:
+      - media_moved_by_a_non_browser_process
+      - unusual_for_host
+    high_risk_when:
+      - media_moved_by_a_non_browser_process
+      - both_directions_observed
+      - repeated_contact_one_destination
+      - media_hosting_service_contacted
+
+  false_positive:
+    - condition: An application updater downloads branding, icon or banner assets over HTTPS.
+      explanation: >-
+        Updaters fetch images constantly and some do it through transfer utilities. They only
+        ever retrieve, they go to the vendor's own domains, and the same command line appears
+        on every host carrying that product rather than on one machine.
+    - condition: A design, marketing or publishing host scripts uploads to a content service.
+      explanation: >-
+        These workflows genuinely upload images to asset and content services and can look
+        identical in a single event. They run under a named user in a project directory, the
+        destination is a service the organisation pays for, and there is no matching retrieval
+        leg from the same process.
+    - condition: A backup or synchronisation client moves media in both directions.
+      explanation: >-
+        Sync clients satisfy the bidirectional test by design. They are installed products with
+        stable paths and service accounts, they move every file type rather than only media, and
+        their destinations are the vendor's own storage endpoints.
+    - condition: Monitoring or reporting tooling posts rendered chart images to a dashboard or chat service.
+      explanation: >-
+        Chart images posted to chat webhooks produce a scripted media upload with an external
+        destination. The schedule is fixed, the destination is the organisation's own chat or
+        dashboard tenant, and nothing is retrieved in return.
+    - condition: A developer or administrator uses a paste or image host to share a screenshot.
+      explanation: >-
+        Ad hoc use of imgur or a file-drop service does happen from engineering hosts. It comes
+        from a browser or a screenshot tool rather than an interpreter, it is a single upload
+        rather than a repeating exchange, and no process keeps returning to the destination.

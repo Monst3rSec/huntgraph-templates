@@ -1,0 +1,365 @@
+type: detection
+
+id: hg-win-mailbox-used-as-a-command-drop-by-a-non-mail-process-t1071-003
+
+version: 1.0.0
+
+info:
+  name: Mailbox used as a command drop by a process that is not a mail client
+  description: >-
+    Running a command channel through a mailbox is attractive because the mailbox does the
+    hard part. The implant never listens, never needs a reachable address and never holds a
+    session with the operator: it submits results as mail and polls a mailbox for new
+    instructions, and a mail provider both hosts the rendezvous and keeps it available. None
+    of that content is visible to an endpoint sensor, and this template does not pretend
+    otherwise. What it uses instead is the fact that the set of programs on a Windows host
+    that legitimately speak SMTP, IMAP or POP3 is smaller and more stable than for any other
+    protocol in this family — smaller still in a Microsoft 365 estate, where Outlook reaches
+    Exchange over HTTPS and the retrieval ports go almost entirely unused. So a scripting
+    host, an interpreter or a proxy-execution binary opening a session on 993 or 587 is
+    outside the population by a wide margin. The second observable is specific to this shape
+    and has no benign equivalent: one process using both a submission port and a retrieval
+    port. Mail clients do that, but almost nothing else does, because ordinary automation
+    sends notifications and never reads a mailbox back. That pairing, from a process which is
+    not a mail client, is the channel rather than a hint of one. The benign twin worth naming
+    is the application that emails reports: backup software, monitoring, scan-to-email and
+    countless in-house scripts submit over 25 or 587 all day, which is why submission alone
+    is weak and the pairing carries the weight.
+  severity: medium
+  author: huntgraph
+  tags:
+    - command-and-control
+    - application-layer-protocol
+    - mail
+    - network
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1071/003
+    - https://attack.mitre.org/detectionstrategies/DET0135
+    - https://attack.mitre.org/techniques/T1071
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1071
+  sub_techniques:
+    - T1071.003
+  detection_strategies:
+    - DET0135
+  analytics:
+    - AN0379
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Connection Creation
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may run their command channel through a mailbox, submitting output as mail
+    and collecting instructions by polling for new messages, obtaining a rendezvous that needs
+    no reachable infrastructure and rides a protocol the organisation cannot block.
+  attacker_behavior:
+    - Polls a mailbox over IMAP or POP3 for messages carrying instructions.
+    - Submits results over SMTP to an account the operator controls.
+    - Implements the protocol inside a script or interpreter rather than using a mail client.
+    - Uses a public mail provider so the destination is one the organisation permits.
+  legitimate_behavior:
+    - Backup, monitoring and line-of-business software emails reports and alerts over SMTP.
+    - Administrative scripts send notifications using built-in mail cmdlets and libraries.
+    - Multifunction printers and scanners relay mail through a submission host.
+    - Legacy or third-party mail clients still retrieve mail over IMAP and POP3.
+  risk_indicator:
+    - A process that is not a mail client opens a session on a mail port.
+    - The same process uses both a submission port and a retrieval port.
+    - The mail host is a public provider rather than the organisation's own infrastructure.
+    - Retrieval ports are polled at a steady interval over many hours.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+        - Protocol
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: mail-port-opened-by-a-non-mail-process
+        name: Mail port session from a process that is not a mail client
+        purpose: >-
+          Establish the population. The list of binaries that should ever speak SMTP, IMAP or
+          POP3 on a managed workstation is short enough to write down, so excluding it leaves
+          a residue small enough to read. This is the one place in the application-layer
+          family where the process test alone produces a workable result set.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemotePort in (25, 110, 143, 465, 587, 993, 995)
+          | ContextBaseFileName!=/^(outlook|olk|hxoutlook|hxtsr|thunderbird|emclient|mailbird|em_client|msoia)\.exe$/i
+          | groupBy([ComputerName, ContextBaseFileName, RemoteAddressIP4, RemotePort],
+                    function=[count(as=sessions),
+                              count(ComputerName, distinct=true, as=hosts)])
+          | sort(sessions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved relay hosts and the applications configured to submit through them"
+            - "Scanner and multifunction device relays on the internal submission host"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: one-process-both-submitting-and-retrieving
+        name: Single process using a submission port and a retrieval port
+        purpose: >-
+          Carry the discriminator. Almost everything that touches mail on an endpoint does one
+          direction only: applications send notifications, and mail clients read. A process
+          which is not a mail client doing both is using the mailbox as a two-way rendezvous,
+          and that combination has no ordinary explanation.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | ContextBaseFileName!=/^(outlook|olk|hxoutlook|hxtsr|thunderbird|emclient|mailbird|em_client)\.exe$/i
+          | case {
+              RemotePort in (25, 465, 587)
+                | submitted := RemotePort ;
+              RemotePort in (110, 143, 993, 995)
+                | retrieved := RemotePort ;
+            }
+          | groupBy([ComputerName, ContextBaseFileName, ContextProcessId],
+                    function=[collect([submitted, retrieved, RemoteAddressIP4], limit=10),
+                              count(as=sessions)])
+          | submitted=/.+/
+          | retrieved=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Third-party mail clients deployed by the organisation but not in the name list"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: mail-submitted-from-a-scripted-command-line
+        name: Mail submission driven from a command line
+        purpose: >-
+          Reach the cases where the protocol is spoken by a library inside an interpreter, so
+          the network side names only the interpreter. The command line is where the intent is
+          legible, and it also separates a one-line notification from a script constructing a
+          message with attached output.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Send-MailMessage|System\.Net\.Mail|SmtpClient|MailKit|smtplib|imaplib|poplib|smtp:\/\/|imaps?:\/\/|pop3s?:\/\/|\bblat\b|sendemail|swaks)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Operational scripts whose notification command line is unchanged across the estate"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: steady-polling-of-a-retrieval-port
+        name: Retrieval port polled at a steady interval over hours
+        purpose: >-
+          Confirm the mailbox is being watched rather than read. A person checks mail in
+          bursts and a mail client syncs on push; an implant collects instructions on a timer,
+          which shows as an even spread of short sessions to one mail host across the whole
+          day.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemotePort in (110, 143, 993, 995)
+          | ContextBaseFileName!=/^(outlook|olk|hxoutlook|hxtsr|thunderbird|emclient|mailbird|em_client)\.exe$/i
+          | bucket(span=10m, field=[ComputerName, ContextBaseFileName, RemoteAddressIP4],
+                   function=[count(as=hits)])
+          | groupBy([ComputerName, ContextBaseFileName, RemoteAddressIP4],
+                    function=[count(as=windows_active),
+                              avg(hits, as=mean_hits),
+                              stdDev(hits, as=hits_deviation)])
+          | windows_active > 24
+          | hits_deviation < 1.5
+        filters:
+          include: []
+          exclude:
+            - "Mail synchronisation agents deployed as part of the standard build"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - remote_address
+
+evidence:
+  required:
+    - id: mail_port_from_a_non_mail_process
+      name: Mail port session opened by a process that is not a mail client
+      description: >-
+        A process outside the small set of deployed mail clients opened a session on an SMTP,
+        IMAP or POP3 port, which is the part of a mailbox-based channel the endpoint can see
+        without any view of the messages.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: mail_protocol_channel
+
+  supporting:
+    - id: submission_and_retrieval_paired
+      name: Same process both submits and retrieves mail
+      description: >-
+        One process used a submission port and a retrieval port, which is the two-way
+        rendezvous a mailbox-based channel needs and which ordinary notification software
+        never produces.
+      source: network_connection
+      field: ContextProcessId
+      indicates: bidirectional_dead_drop
+    - id: scripted_mail_submission
+      name: Mail constructed and sent from a command line
+      description: >-
+        A command line built a message through a mail cmdlet, library or command-line mailer,
+        showing that the protocol is being driven by a script rather than by a mail client.
+      source: process_creation
+      field: CommandLine
+      indicates: scripted_protocol_use
+    - id: steady_mailbox_polling
+      name: Retrieval port polled at a constant rate
+      description: >-
+        Sessions to one mail host recur evenly across many hours, which is a timer collecting
+        instructions rather than a person or a push-based client reading mail.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: beaconing_command_and_control
+    - id: mail_host_outside_the_organisation
+      name: Mail host is not part of the organisation's infrastructure
+      description: >-
+        The destination is a mail service the estate does not otherwise use during the
+        baseline window, so the mailbox belongs to somebody outside the organisation.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: unusual_destination_for_organization
+
+  contradicting:
+    - id: line_of_business_notifier
+      name: Application that emails reports or alerts
+      description: >-
+        The executable is backup, monitoring or line-of-business software whose documented
+        behaviour is to submit mail, and it only ever submits.
+      source: process_creation
+      field: FileName
+      indicates: legitimate_application_component
+    - id: corporate_mail_infrastructure
+      name: Session to the organisation's own mail host
+      description: >-
+        The destination is the organisation's mail or relay infrastructure recorded in the
+        asset inventory, which most hosts submit through.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: device_relay_pattern
+      name: Relay used by many hosts and devices
+      description: >-
+        The same submission host is used by a wide set of machines and devices across the
+        baseline window, which is a shared relay rather than an operator's mailbox.
+      source: baseline
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - mail_port_from_a_non_mail_process
+
+    supporting:
+      any:
+        - submission_and_retrieval_paired
+        - scripted_mail_submission
+        - steady_mailbox_polling
+        - mail_host_outside_the_organisation
+      all:
+        - submission_and_retrieval_paired
+        - mail_host_outside_the_organisation
+
+    contradicting:
+      any:
+        - line_of_business_notifier
+        - corporate_mail_infrastructure
+        - device_relay_pattern
+      all: []
+
+  verdict:
+    low_risk_when:
+      - mail_port_from_a_non_mail_process
+      - line_of_business_notifier
+      - corporate_mail_infrastructure
+      - device_relay_pattern
+    suspicious_when:
+      - mail_port_from_a_non_mail_process
+      - scripted_mail_submission
+    high_risk_when:
+      - mail_port_from_a_non_mail_process
+      - submission_and_retrieval_paired
+      - steady_mailbox_polling
+      - mail_host_outside_the_organisation
+
+  false_positive:
+    - condition: Backup or monitoring software emails a nightly report.
+      explanation: >-
+        This is the dominant benign case and it will account for most submission-only results.
+        It submits and never retrieves, it goes to the organisation's own relay, and the same
+        executable does the same thing on every host running the product, so the pairing case
+        and the estate comparison both clear it.
+    - condition: An administrative script sends a notification with Send-MailMessage.
+      explanation: >-
+        Scripted submission is ordinary and reproduces the command-line case exactly. The
+        command line is stable across hosts and across the baseline window, the recipient is
+        internal, and there is no retrieval side to the traffic.
+    - condition: A third-party or legacy mail client retrieves mail over IMAP.
+      explanation: >-
+        Any mail client not named in the exclusion list will appear to be a non-mail process
+        both submitting and retrieving. The fix is to extend the client list rather than to
+        tune the logic; the client is installed software, present in the inventory, and used
+        interactively by a person whose working hours the sessions follow.
+    - condition: A scanner or multifunction device relays through a workstation.
+      explanation: >-
+        Scan-to-email deployments sometimes submit through a host on the network, producing
+        SMTP from software nobody thinks of as a mail client. The destination is the internal
+        relay and the traffic follows office hours and document volume rather than a timer.

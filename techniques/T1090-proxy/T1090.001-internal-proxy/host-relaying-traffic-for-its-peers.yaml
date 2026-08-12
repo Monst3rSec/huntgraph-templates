@@ -1,0 +1,380 @@
+type: detection
+
+id: hg-win-host-relaying-traffic-for-its-peers-t1090-001
+
+version: 1.0.0
+
+info:
+  name: Host relaying command and control traffic for its peers
+  description: >-
+    An internal proxy turns one compromised machine into the egress point for several
+    others. It reduces the number of hosts talking to the internet, it gives implants on
+    segmented machines a way out, and the traffic it carries looks like ordinary east-west
+    activity. The shape it produces is genuinely unusual: a workstation that starts
+    accepting connections from its own peers. Client machines talk to servers, not to each
+    other, so an internal address that several unrelated hosts suddenly connect to on a port
+    no service owns is a relay rather than a client. The listener side is the pivot — a port
+    bound on a machine whose role does not include serving anything — and the built-in route
+    is nameable, because Windows will forward ports for an adversary through netsh portproxy
+    with no binary dropped at all. That command is the sharpest observable here and the
+    reason this file gates on the listener rather than on process lineage: portproxy
+    forwarding is performed by the IP Helper service, so no single user process ever holds
+    both ends, and a hunt grouped by process would miss the technique's most documented form.
+  severity: high
+  author: huntgraph
+  tags:
+    - command-and-control
+    - internal-proxy
+    - lateral-traffic-relay
+    - port-forwarding
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1090/001
+    - https://attack.mitre.org/detectionstrategies/DET0075
+    - https://attack.mitre.org/techniques/T1090
+    - https://attack.mitre.org/techniques/T1572
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1090
+  sub_techniques:
+    - T1090.001
+  detection_strategies:
+    - DET0075
+  analytics:
+    - AN0204
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Connection Creation
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may configure a compromised internal host to accept connections from other
+    infected machines and forward them onward, obtaining a single egress point for several
+    implants, a route out for hosts with no internet access, and traffic that stays inside
+    the estate's normal east-west patterns.
+  attacker_behavior:
+    - Configures a built-in port forward so the host relays without any binary being dropped.
+    - Binds a listening port on a workstation whose role includes serving nothing.
+    - Points implants on other hosts at the relay instead of at external infrastructure.
+    - Chooses a port that blends with existing peer traffic rather than an obvious one.
+    - Opens a host firewall exception so peers can reach the newly bound port.
+  legitimate_behavior:
+    - Peer caching and content distribution features let workstations serve each other.
+    - Collaboration, conferencing and screen-sharing tools bind local ports for peers.
+    - Developer tooling and local web servers listen on high ports on engineering machines.
+    - Administrators configure port forwards on jump hosts and lab machines deliberately.
+    - Management agents open listeners for remote assistance across the whole estate.
+  risk_indicator:
+    - The listening port is bound by a process with no server function.
+    - Several unrelated internal hosts connect to the same peer on a non-service port.
+    - The same host also holds connections outward to a routable external address.
+    - A built-in port forward was configured from a command line on a client machine.
+    - The host has never accepted peer connections during the baseline window.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+        - NetworkListenIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - ContextBaseFileName
+        - RemoteAddressIP4
+        - RemotePort
+        - LocalPort
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: builtin-port-forward-configured
+        name: Port forwarding configured through the built-in network shell
+        purpose: >-
+          Catch the relay that needs no malware. A portproxy entry makes Windows itself
+          forward a listening port to another address, which is why it appears in intrusions
+          where nothing else was dropped. It is rare enough on a client machine that the
+          configuration alone is the finding.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/netsh(\.exe)?\s+(-\S+\s+)*i(nterface)?\s+(portproxy|p(ortproxy)?)/i
+            or CommandLine=/portproxy\s+(add|set|delete)\s+v4tov4/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Jump hosts and lab machines where port forwarding is a documented function"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: listener-bound-by-a-non-server-process
+        name: Listening port bound by a process with no server role
+        purpose: >-
+          The listener side is where a relay becomes visible, because whatever forwards the
+          traffic has to accept it first. Excluding the platform services and the ephemeral
+          RPC range leaves binds that belong to something the host installed rather than
+          something the operating system runs.
+        query: |
+          #event_simpleName=NetworkListenIP4
+          | ContextBaseFileName!=/^(System|svchost\.exe|services\.exe|lsass\.exe|spoolsv\.exe|dns\.exe|w3wp\.exe|sqlservr\.exe|CcmExec\.exe|MsMpEng\.exe|SearchIndexer\.exe|OneDrive\.exe|Teams\.exe|chrome\.exe|msedge\.exe|firefox\.exe)$/i
+          | LocalPort!=/^(135|137|138|139|445|3389|5040|5353|5985|5986|49\d{3}|6553\d)$/
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName, LocalPort],
+                    function=[count(as=binds)])
+          | sort(binds, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Peer caching, conferencing and collaboration clients that serve other endpoints"
+            - "Engineering hosts running local development servers"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: internal-address-drawing-peer-connections
+        name: One internal address contacted by several peers on a non-service port
+        purpose: >-
+          This is the discriminator for the whole hypothesis and it is read from the client
+          side, since the sensor records the connection each peer makes rather than the
+          accept on the relay. Ordinary clients converge on servers, so an internal address
+          that unrelated hosts reach on a port belonging to no service is either an
+          undocumented application or a relay.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemoteAddressIP4=/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/
+          | RemotePort!=/^(53|80|88|123|135|137|138|139|389|443|445|464|636|1433|3268|3269|3389|5985|5986|8080|8443)$/
+          | ContextBaseFileName!=/^(System|svchost\.exe|CcmExec\.exe|MsMpEng\.exe|OneDrive\.exe|Teams\.exe|chrome\.exe|msedge\.exe)$/i
+          | groupBy([RemoteAddressIP4, RemotePort],
+                    function=[count(field=ComputerName, distinct=true, as=peer_hosts),
+                              count(as=sessions),
+                              collect([ComputerName, ContextBaseFileName], limit=15)])
+          | peer_hosts >= 5
+          | sort(peer_hosts, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Undocumented internal applications serving clients on non-standard ports"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - remote_address
+            - organization
+
+      - id: relay-host-listening-and-egressing
+        name: A host both accepting internally and connecting outward
+        purpose: >-
+          Confirm the relay is doing the job a relay exists to do. The grouping is by host
+          rather than by process on purpose: a built-in port forward is carried out by the
+          IP Helper service and no single user process holds both ends, so a
+          process-level correlation would miss the technique's most documented form.
+        query: |
+          #event_simpleName=/^(NetworkListenIP4|NetworkConnectIP4)$/
+          | case {
+              #event_simpleName=NetworkListenIP4
+                | LocalPort!=/^(135|137|138|139|445|3389|5040|5985|5986|49\d{3})$/
+                | bound_port := LocalPort ;
+              #event_simpleName=NetworkConnectIP4
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/
+                | external_peer := RemoteAddressIP4 ;
+            }
+          | groupBy([ComputerName],
+                    function=[collect([bound_port, external_peer, RemotePort, ContextBaseFileName],
+                                      limit=15),
+                              count(as=events)])
+          | bound_port=/.+/ and external_peer=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Servers whose documented role is to accept internally and call out externally"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - organization
+
+evidence:
+  required:
+    - id: unexpected_listener_bound
+      name: Listening port bound outside the host's service profile
+      description: >-
+        A port was bound on a host whose role does not include serving other machines, which
+        is the precondition for relaying anything and is produced both by a dropped relay
+        and by a built-in port forward.
+      source: network_connection
+      field: LocalPort
+      indicates: internal_relay_listener
+
+  supporting:
+    - id: builtin_forward_configured
+      name: Port forwarding configured with the built-in network shell
+      description: >-
+        A portproxy entry was added or changed from a command line, making the operating
+        system itself forward the listening port onward without any binary being installed.
+      source: process_creation
+      field: CommandLine
+      indicates: traffic_relay_configured
+    - id: peers_routed_through_host
+      name: Several internal hosts connecting to the same peer
+      description: >-
+        Unrelated internal machines opened sessions to one internal address on a port no
+        service owns, which is the fan-in a relay produces and which clients do not.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: internal_traffic_relay
+    - id: host_also_egresses_externally
+      name: The same host holds connections outward
+      description: >-
+        The machine accepting internally is also connected to a routable external address,
+        so it is positioned as the estate's egress point for whatever it accepts.
+      source: network_connection
+      field: ComputerName
+      indicates: egress_point_behaviour
+    - id: listening_process_untrusted
+      name: Listener bound by an unmanaged or unexpected image
+      description: >-
+        The process holding the port is not a platform service or a deployed agent, so the
+        listening capability arrived with something the host was not built with.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: untrusted_actor
+    - id: no_prior_peer_traffic
+      name: Host has never accepted peer connections
+      description: >-
+        Neither the bind nor the peer fan-in appears for this host during the baseline
+        window, so its role in the estate changed rather than being longstanding.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: server_or_infrastructure_role
+      name: Host is a server, jump host or infrastructure node
+      description: >-
+        The machine's documented role is to accept connections from other hosts, which
+        reproduces every element of the hypothesis by design.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_server_role
+    - id: peer_distribution_feature
+      name: Peer caching or collaboration feature
+      description: >-
+        The port belongs to a content distribution, update caching or conferencing feature
+        that deliberately lets endpoints serve each other, and it appears fleet-wide.
+      source: network_connection
+      field: RemotePort
+      indicates: legitimate_application_component
+    - id: recorded_forwarding_change
+      name: Forwarding covered by a change record
+      description: >-
+        A change or maintenance record names this host and the forward configured on it, for
+        example a temporary route during a migration or a lab reconfiguration.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - unexpected_listener_bound
+
+    supporting:
+      any:
+        - builtin_forward_configured
+        - peers_routed_through_host
+        - host_also_egresses_externally
+        - listening_process_untrusted
+        - no_prior_peer_traffic
+      all:
+        - peers_routed_through_host
+        - host_also_egresses_externally
+
+    contradicting:
+      any:
+        - server_or_infrastructure_role
+        - peer_distribution_feature
+        - recorded_forwarding_change
+      all: []
+
+  verdict:
+    low_risk_when:
+      - unexpected_listener_bound
+      - server_or_infrastructure_role
+      - peer_distribution_feature
+      - recorded_forwarding_change
+    suspicious_when:
+      - unexpected_listener_bound
+      - no_prior_peer_traffic
+    high_risk_when:
+      - unexpected_listener_bound
+      - builtin_forward_configured
+      - peers_routed_through_host
+      - host_also_egresses_externally
+      - no_prior_peer_traffic
+
+  false_positive:
+    - condition: Peer content caching lets workstations serve updates to each other.
+      explanation: >-
+        Delivery optimisation and similar caching features produce exactly the peer fan-in
+        this hunt is built on, on high ports, between client machines. They are recognisable
+        because the serving process is a platform service and because the behaviour is
+        estate-wide and continuous rather than confined to one host and new.
+    - condition: Conferencing or screen-sharing software binds a port for direct peer sessions.
+      explanation: >-
+        Collaboration clients open listeners and accept connections from colleagues on the
+        same network. The image holding the port names the product, and the peers are the
+        participants of a meeting rather than a stable set of machines.
+    - condition: An administrator configures a port forward on a jump host or lab machine.
+      explanation: >-
+        Portproxy is a legitimate administrative facility and this is its intended use. The
+        discriminator is the host: a forward on a designated jump host is expected, while
+        the same command on a user's workstation is not, which is why asset role is
+        contradicting evidence and the baseline compares across the estate.
+    - condition: A developer runs a local server that colleagues connect to.
+      explanation: >-
+        Engineering workstations legitimately listen and serve peers during testing. This is
+        confined to engineering hosts, uses framework images, and the connecting peers are a
+        small stable group rather than an unrelated set.
+    - condition: An undocumented internal application uses a non-standard port.
+      explanation: >-
+        Line-of-business software installed outside the standard build produces fan-in to an
+        address on an unfamiliar port. It resolves through the baseline quickly because the
+        same port and the same server appear consistently over months rather than appearing
+        once.

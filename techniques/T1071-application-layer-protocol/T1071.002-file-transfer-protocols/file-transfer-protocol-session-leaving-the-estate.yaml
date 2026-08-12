@@ -1,0 +1,361 @@
+type: detection
+
+id: hg-win-file-transfer-protocol-session-leaving-the-estate-t1071-002
+
+version: 1.0.0
+
+info:
+  name: File transfer protocol session opened to a host outside the estate
+  description: >-
+    FTP, TFTP and SMB are not like the web protocols they sit beside in this technique. What
+    is inside the session is just as invisible to an endpoint sensor, but the base rate is
+    nothing like as hopeless, because these protocols have a shape the estate imposes on
+    them. SMB is an internal protocol: it carries file shares and printers between machines
+    on the same network, and a session on 445 crossing the perimeter is almost always either
+    a misconfiguration or someone moving data out. FTP and TFTP are largely legacy, spoken by
+    a handful of named clients on a handful of known hosts, and TFTP in particular exists on
+    a modern Windows workstation only because an adversary enabled it. That gives two
+    discriminators the web case does not have. The first is direction: the destination is a
+    public address rather than a peer inside the network. The second is the actor: the set of
+    binaries that legitimately speak these protocols is short and stable, so a scripting host,
+    a proxy-execution binary or an office application opening a session on a transfer port is
+    outside the population regardless of what it sends. The benign twin is genuine and must
+    be excluded before this is useful — many organisations still exchange files with partners
+    over FTP on a schedule, and cloud file services accept SMB on 445 across the internet by
+    design. Both are stable, named destinations, which is why the estate baseline carries the
+    verdict rather than the protocol.
+  severity: medium
+  author: huntgraph
+  tags:
+    - command-and-control
+    - application-layer-protocol
+    - file-transfer
+    - network
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1071/002
+    - https://attack.mitre.org/detectionstrategies/DET0416
+    - https://attack.mitre.org/techniques/T1071
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1071
+  sub_techniques:
+    - T1071.002
+  detection_strategies:
+    - DET0416
+  analytics:
+    - AN1169
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Connection Creation
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may carry command and control over a file transfer protocol so that the
+    channel is handled by infrastructure built to move files rather than by anything watching
+    for interactive sessions, obtaining a route that survives web proxy inspection entirely.
+  attacker_behavior:
+    - Opens FTP, TFTP or SMB sessions from a compromised host to an address they control.
+    - Enables and uses the TFTP client, which no ordinary workstation workload needs.
+    - Drives a transfer client from a script host, macro or proxy-execution binary.
+    - Returns to the same external transfer endpoint repeatedly rather than once.
+  legitimate_behavior:
+    - Business processes exchange files with partner FTP servers on a schedule.
+    - Cloud file services accept SMB connections over the internet from managed hosts.
+    - Backup and replication products move data to an off-site target.
+    - Engineering and network teams use TFTP to move device images inside the network.
+  risk_indicator:
+    - The destination for a transfer protocol is a public address rather than an internal peer.
+    - The process opening the session is not a file transfer client.
+    - The client was launched by an office application, script host or proxy-execution binary.
+    - Sessions to the same external transfer endpoint recur on a steady interval.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+        - Protocol
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: transfer-protocol-crossing-the-perimeter
+        name: FTP, TFTP or SMB session to a public address
+        purpose: >-
+          Establish the finding on direction, which is the sharpest thing available here. SMB
+          is an internal protocol and FTP or TFTP to the internet is a deliberate act, so a
+          session on these ports whose peer is outside the private address space is already
+          the exception rather than the population.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemotePort in (20, 21, 69, 139, 445, 989, 990, 2121)
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/
+          | groupBy([ComputerName, ContextBaseFileName, RemoteAddressIP4, RemotePort],
+                    function=[count(as=sessions),
+                              count(ComputerName, distinct=true, as=hosts),
+                              min(@timestamp, as=first_seen),
+                              max(@timestamp, as=last_seen)])
+          | sort(sessions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Partner FTP and managed file transfer endpoints recorded in the egress list"
+            - "Cloud file service ranges that the organisation deliberately mounts over SMB"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - remote_address
+            - organization
+
+      - id: transfer-client-launched-by-an-unexpected-parent
+        name: Transfer client started by a script host or document application
+        purpose: >-
+          Isolate the actor. Running ftp.exe or tftp.exe is not itself remarkable on a network
+          team's machine, but the parent tells you whether a person chose to run it. A macro
+          host, a mail client or a proxy-execution binary starting a transfer client is a
+          chain nothing in the ordinary use of these tools produces.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(ftp|tftp|winscp|winscp\.com|pscp|psftp|lftp|ncftp|curl|bitsadmin)\.exe$/i
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|mshta|wscript|cscript|rundll32|regsvr32|powershell|pwsh|cmd|hh|7zfm|winrar)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=launches), collect([CommandLine], limit=5)])
+          | sort(launches, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Deployment and network automation scripts that drive transfer clients by design"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - parent_process
+            - command_line
+
+      - id: transfer-port-used-by-a-process-that-is-not-a-client
+        name: Transfer port reached by a process with no transfer role
+        purpose: >-
+          Catch the case where no transfer client is launched at all because the protocol is
+          implemented inside the payload. The port is then the only trace, and the process
+          holding it is one that has no business speaking a file transfer protocol whatever
+          it is carrying.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemotePort in (20, 21, 69, 139, 445, 989, 990, 2121)
+          | ContextBaseFileName=/^(powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|certutil|python|pythonw|node|winword|excel|outlook|msbuild|installutil)\.exe$/i
+          | groupBy([ComputerName, ContextBaseFileName, RemoteAddressIP4, RemotePort],
+                    function=[count(as=sessions),
+                              count(RemoteAddressIP4, distinct=true, as=peers)])
+          | sort(sessions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Administrative scripts that map internal shares as part of a documented job"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: repeat-sessions-to-one-external-transfer-endpoint
+        name: Repeated sessions to a single external transfer endpoint
+        purpose: >-
+          Distinguish a channel from a transfer. Moving files out is one or a few sessions;
+          using the protocol to carry commands means coming back to the same endpoint again
+          and again, spread across hours, which is the pattern a scheduled business transfer
+          does not produce because it runs and finishes.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemotePort in (20, 21, 69, 989, 990, 2121)
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/
+          | bucket(span=15m, field=[ComputerName, ContextBaseFileName, RemoteAddressIP4],
+                   function=[count(as=hits)])
+          | groupBy([ComputerName, ContextBaseFileName, RemoteAddressIP4],
+                    function=[count(as=windows_active),
+                              avg(hits, as=mean_hits),
+                              stdDev(hits, as=hits_deviation)])
+          | windows_active > 12
+          | hits_deviation < 2
+        filters:
+          include: []
+          exclude:
+            - "Scheduled managed file transfer jobs whose window and endpoint are documented"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - remote_address
+
+evidence:
+  required:
+    - id: transfer_protocol_to_a_public_address
+      name: File transfer protocol session to an address outside the estate
+      description: >-
+        A session was opened on an FTP, TFTP, FTPS or SMB port to a peer outside the private
+        address space, which for SMB in particular is a protocol leaving the network it was
+        designed to stay inside.
+      source: network_connection
+      field: RemotePort
+      indicates: file_transfer_channel_to_external_host
+
+  supporting:
+    - id: client_launched_by_unusual_parent
+      name: Transfer client started by a script host or document application
+      description: >-
+        The transfer client was launched by an office application, script host or
+        proxy-execution binary rather than by a user at a shell, which is a chain the ordinary
+        use of these tools does not produce.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: non_client_process_on_the_port
+      name: Transfer port held by a process with no transfer role
+      description: >-
+        The connection belongs to an interpreter or proxy-execution binary that implements the
+        protocol itself, so no recognisable transfer client was ever launched.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: unexpected_network_actor
+    - id: repeated_contact_with_the_endpoint
+      name: Sessions to the same endpoint recur over hours
+      description: >-
+        The host returns to the same external transfer endpoint across many time windows at a
+        steady rate, which is a maintained channel rather than a completed transfer.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: beaconing_command_and_control
+    - id: endpoint_new_to_the_estate
+      name: Transfer endpoint not seen before in the estate
+      description: >-
+        No host in the organisation contacted this address on a transfer port during the
+        baseline window, so it is not part of the standing partner or cloud file estate.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: unusual_destination_for_organization
+
+  contradicting:
+    - id: partner_transfer_arrangement
+      name: Recorded partner or managed file transfer
+      description: >-
+        The destination belongs to a documented file exchange arrangement, with a schedule and
+        an owner recorded against it.
+      source: change_management
+      field: RemoteAddressIP4
+      indicates: approved_change
+    - id: backup_or_replication_product
+      name: Backup or replication agent
+      description: >-
+        The process is a backup, replication or synchronisation client whose entire purpose is
+        to move data to an off-site target over these protocols.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: legitimate_application_component
+    - id: cloud_file_service_endpoint
+      name: Cloud file service reached by many hosts
+      description: >-
+        The address is a cloud file service that accepts SMB across the internet and is mounted
+        by many machines in the estate, not by this one alone.
+      source: baseline
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - transfer_protocol_to_a_public_address
+
+    supporting:
+      any:
+        - client_launched_by_unusual_parent
+        - non_client_process_on_the_port
+        - repeated_contact_with_the_endpoint
+        - endpoint_new_to_the_estate
+      all:
+        - non_client_process_on_the_port
+        - endpoint_new_to_the_estate
+
+    contradicting:
+      any:
+        - partner_transfer_arrangement
+        - backup_or_replication_product
+        - cloud_file_service_endpoint
+      all: []
+
+  verdict:
+    low_risk_when:
+      - transfer_protocol_to_a_public_address
+      - partner_transfer_arrangement
+      - backup_or_replication_product
+      - cloud_file_service_endpoint
+    suspicious_when:
+      - transfer_protocol_to_a_public_address
+      - endpoint_new_to_the_estate
+    high_risk_when:
+      - transfer_protocol_to_a_public_address
+      - non_client_process_on_the_port
+      - client_launched_by_unusual_parent
+      - repeated_contact_with_the_endpoint
+
+  false_positive:
+    - condition: A scheduled business transfer sends files to a partner FTP server.
+      explanation: >-
+        This produces external sessions on port 21 from a real transfer client, and in some
+        estates it is the only thing this template ever sees. It is distinguished by having a
+        fixed destination present throughout the baseline window, an owner, and a run window
+        that starts and finishes rather than persisting.
+    - condition: A managed host mounts a cloud file share over SMB across the internet.
+      explanation: >-
+        Cloud file services publish SMB endpoints on 445 and this is a supported deployment,
+        so the perimeter-crossing test alone will flag it. The addresses belong to published
+        provider ranges and many hosts in the estate reach them, which the estate comparison
+        exposes immediately.
+    - condition: A network engineer uses TFTP to move a device image.
+      explanation: >-
+        TFTP is still normal in network operations, but almost always to an internal target
+        such as a switch or a staging server, so the direction test filters it. Where the
+        target is genuinely external, the operator and the change record explain it.
+    - condition: A deployment script drives a transfer client from PowerShell.
+      explanation: >-
+        Automation legitimately launches transfer clients from a script host, which reproduces
+        the parent-process case exactly. These recur with an identical command line on the
+        same set of hosts throughout the baseline, and the destination is internal or a known
+        partner rather than an address seen once.

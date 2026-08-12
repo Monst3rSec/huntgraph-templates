@@ -1,0 +1,360 @@
+type: detection
+
+id: hg-win-sustained-callbacks-to-a-single-web-destination-t1071-001
+
+version: 1.0.0
+
+info:
+  name: Sustained fixed-cadence callbacks to a single web destination
+  description: >-
+    HTTP and HTTPS are the two protocols an enterprise cannot filter, so they are where
+    command-and-control lives. The content of that traffic is out of reach from an endpoint
+    sensor — there are no headers, no URIs and no certificates in this telemetry — and any
+    template that claims to read them is lying. What the sensor does record is the shape of
+    the conversation: which process opened each connection, to which address and port, and
+    when. That is enough, because a maintained channel has a shape ordinary web traffic does
+    not. A browser fans out to dozens of hosts in bursts that follow the working day and go
+    quiet when the desk is empty. An implant holds one destination, returns to it on a timer
+    that barely varies, and keeps returning through the night. The discriminator here is
+    therefore regularity plus concentration, not the protocol: connections spread evenly
+    across many consecutive windows, to one peer, from a process that talks to nothing else.
+    The benign twin is real and large — update, telemetry and monitoring agents poll on
+    fixed schedules and look almost identical — so the destination is what separates them.
+    A polling agent calls a vendor endpoint that hundreds of hosts also call; a channel calls
+    somewhere the estate has never been. That comparison is the whole file, which means this
+    template is worth nothing until the baseline history exists to make it.
+  severity: medium
+  author: huntgraph
+  tags:
+    - command-and-control
+    - application-layer-protocol
+    - beaconing
+    - network
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1071/001
+    - https://attack.mitre.org/detectionstrategies/DET0027
+    - https://attack.mitre.org/techniques/T1071
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1071
+  sub_techniques:
+    - T1071.001
+  detection_strategies:
+    - DET0027
+  analytics:
+    - AN0075
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may run their command channel over HTTP or HTTPS so that it passes egress
+    controls untouched, obtaining reliable two-way control of a host inside traffic no
+    organisation can afford to block and no endpoint sensor can read the contents of.
+  attacker_behavior:
+    - Configures an implant to call one address on a web port at a fixed sleep interval.
+    - Keeps the channel alive across the whole day rather than in bursts of user activity.
+    - Uses a single destination so the channel does not depend on wider infrastructure.
+    - Chooses ports 80, 443, 8080 or 8443 so the traffic is indistinguishable from browsing.
+  legitimate_behavior:
+    - Update and telemetry agents poll vendor endpoints on a fixed schedule all day.
+    - Monitoring and management agents keep a heartbeat to their console.
+    - Long-polling web applications hold repeated connections to one service.
+    - Backup and licensing clients check in overnight from unattended machines.
+  risk_indicator:
+    - Connections recur in nearly every time window over many hours with little variation.
+    - The originating process contacts one destination and no other peer at all.
+    - The destination has been contacted by only one or two hosts in the whole estate.
+    - The rhythm continues through the night on a machine with no overnight workload.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+        - Protocol
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: fixed-cadence-contact-sustained-over-hours
+        name: Web-port contact repeating evenly across many hours
+        purpose: >-
+          Carry the primary observable. Split the day into fixed windows and keep only the
+          process-destination pairs that appear in almost every window with nearly the same
+          number of connections each time. Human browsing is uneven and stops; an automated
+          callback is flat, and flatness measured over hours is the one property of a C2
+          channel that survives having no visibility into the traffic itself.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemotePort in (80, 443, 8080, 8443)
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/
+          | bucket(span=10m, field=[ComputerName, ContextBaseFileName, RemoteAddressIP4],
+                   function=[count(as=hits)])
+          | groupBy([ComputerName, ContextBaseFileName, RemoteAddressIP4],
+                    function=[count(as=windows_active),
+                              avg(hits, as=mean_hits),
+                              stdDev(hits, as=hits_deviation)])
+          | windows_active > 36
+          | hits_deviation < 1.5
+          | sort(hits_deviation, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Update, telemetry and monitoring agents whose poll interval is set by the build"
+            - "Long-polling internal web applications on the approved egress list"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: one-process-holding-a-single-peer
+        name: Process making many web connections to one peer and no other
+        purpose: >-
+          Separate a channel from browsing by fan-out rather than by timing. Anything that
+          genuinely renders the web reaches a wide spread of hosts, because pages pull
+          content from many origins. A process that has opened a hundred web sessions and
+          touched one address has no web workload at all — it has a correspondent.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemotePort in (80, 443, 8080, 8443)
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/
+          | groupBy([ComputerName, ContextBaseFileName, ContextProcessId],
+                    function=[count(as=connections),
+                              count(RemoteAddressIP4, distinct=true, as=peers),
+                              collect([RemoteAddressIP4, RemotePort], limit=5)])
+          | connections > 100
+          | peers <= 2
+          | sort(connections, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Single-endpoint agents such as licensing, antivirus console and MDM clients"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: web-destination-seen-on-almost-no-hosts
+        name: Web destination reached by only one or two hosts in the estate
+        purpose: >-
+          Supply the discriminator that separates a beacon from a polling agent, since the
+          two are indistinguishable by cadence alone. A vendor endpoint is called by the
+          whole population that runs the product. Infrastructure stood up for one intrusion
+          is called by the machines that were compromised, and by nothing else.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemotePort in (80, 443, 8080, 8443)
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/
+          | groupBy([RemoteAddressIP4, RemotePort],
+                    function=[count(ComputerName, distinct=true, as=hosts),
+                              count(as=connections),
+                              collect([ComputerName, ContextBaseFileName], limit=5)])
+          | hosts <= 2
+          | connections > 50
+          | sort(hosts, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Destinations already present in the approved egress and vendor endpoint lists"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - remote_address
+            - organization
+
+      - id: callbacks-continuing-through-the-night
+        name: Web-port contact continuing across the overnight hours
+        purpose: >-
+          Test whether the rhythm depends on a person. Browsing collapses when the user goes
+          home; a channel does not, and neither does the operator's ability to reach the host.
+          Contact spread across several overnight hours on a workstation with no scheduled
+          overnight workload is the same channel observed at the point where the benign
+          explanations thin out.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemotePort in (80, 443, 8080, 8443)
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/
+          | formatTime("%H", field=@timestamp, as=hour)
+          | hour=/^(22|23|00|01|02|03|04|05)$/
+          | groupBy([ComputerName, ContextBaseFileName, RemoteAddressIP4],
+                    function=[count(as=connections),
+                              count(hour, distinct=true, as=night_hours),
+                              min(@timestamp, as=first_seen),
+                              max(@timestamp, as=last_seen)])
+          | night_hours >= 4
+          | connections > 40
+          | sort(connections, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Servers and build agents whose workload is scheduled outside office hours"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - remote_address
+
+evidence:
+  required:
+    - id: fixed_cadence_web_contact
+      name: Web-port contact repeating at a near-constant rate
+      description: >-
+        The same host, process and destination appear in nearly every time window over many
+        hours with almost the same number of connections in each, which is a timer rather
+        than a person or a page load.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: beaconing_command_and_control
+
+  supporting:
+    - id: single_peer_process
+      name: Originating process talks to one destination only
+      description: >-
+        The process has opened a large number of web sessions and reached one or two
+        addresses in total, so it has a correspondent rather than a web workload.
+      source: network_connection
+      field: ContextProcessId
+      indicates: dedicated_channel
+    - id: destination_rare_in_the_estate
+      name: Destination contacted by almost no other host
+      description: >-
+        Across the baseline window the address has been reached by one or two machines, which
+        is the shape of infrastructure stood up for a specific intrusion rather than a shared
+        service.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: unusual_destination_for_organization
+    - id: contact_through_the_night
+      name: Contact continues across overnight hours
+      description: >-
+        The rhythm persists through the hours when the machine has no user and no scheduled
+        work, so it does not depend on anybody being at the keyboard.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: activity_without_a_user
+    - id: uncommon_web_port
+      name: Channel runs on a secondary web port
+      description: >-
+        The traffic uses an alternate web port rather than 443, which is chosen to stay
+        inside permitted egress while attracting less attention than the main port.
+      source: network_connection
+      field: RemotePort
+      indicates: egress_filter_evasion
+
+  contradicting:
+    - id: polling_agent
+      name: Update, telemetry or monitoring agent
+      description: >-
+        The originating process is a deployed agent whose function is to poll a service
+        endpoint on a fixed interval, which reproduces the cadence exactly.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: legitimate_application_component
+    - id: shared_service_destination
+      name: Destination used across the estate
+      description: >-
+        Many hosts contact the same address during the baseline window, which makes it a
+        vendor or platform endpoint rather than a destination chosen for one victim.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: legitimate_enterprise_activity
+    - id: documented_integration
+      name: Recorded integration or deployment
+      description: >-
+        A change record covers the software that produces this traffic and names the endpoint
+        it is expected to call.
+      source: change_management
+      field: ComputerName
+      indicates: approved_change
+
+  risk_logic:
+    required:
+      - fixed_cadence_web_contact
+
+    supporting:
+      any:
+        - single_peer_process
+        - destination_rare_in_the_estate
+        - contact_through_the_night
+        - uncommon_web_port
+      all:
+        - single_peer_process
+        - destination_rare_in_the_estate
+
+    contradicting:
+      any:
+        - polling_agent
+        - shared_service_destination
+        - documented_integration
+      all: []
+
+  verdict:
+    low_risk_when:
+      - fixed_cadence_web_contact
+      - polling_agent
+      - shared_service_destination
+      - documented_integration
+    suspicious_when:
+      - fixed_cadence_web_contact
+      - single_peer_process
+    high_risk_when:
+      - fixed_cadence_web_contact
+      - single_peer_process
+      - destination_rare_in_the_estate
+      - contact_through_the_night
+
+  false_positive:
+    - condition: A management or telemetry agent polls its console on a fixed interval.
+      explanation: >-
+        This is the exact benign twin and it will dominate the first results. The agent runs
+        on every machine in the estate and calls the same endpoint from all of them, so the
+        estate-wide host count for that destination is high rather than one or two. Confirm
+        by checking whether the same process and address pair appears on unrelated hosts.
+    - condition: A long-polling web application holds repeated sessions to one service.
+      explanation: >-
+        Chat, ticketing and dashboard clients keep a connection open to a single origin and
+        re-establish it steadily, which produces both the flat cadence and the single peer.
+        The destination is an internal or well-known service reachable by other users, and
+        the activity stops when the application is closed.
+    - condition: A workstation left running overnight continues its scheduled checks.
+      explanation: >-
+        Licensing, backup and patch clients deliberately work overnight, which defeats the
+        overnight case on its own. It does not defeat the destination comparison, and those
+        products are identifiable by process name across the fleet.
+    - condition: A host behind a forward proxy shows all web traffic going to one address.
+      explanation: >-
+        Where egress is forced through a proxy every process appears to contact a single peer,
+        which makes the fan-out case fire everywhere. Exclude the proxy address before this
+        template is deployed, or the single-peer signal carries no information at all.

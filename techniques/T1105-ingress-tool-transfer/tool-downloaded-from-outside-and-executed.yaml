@@ -1,0 +1,460 @@
+type: detection
+
+id: hg-win-tool-downloaded-from-outside-and-executed-t1105
+
+version: 1.0.0
+
+info:
+  name: Tool fetched from outside the estate and then executed
+  description: >-
+    Almost every intrusion has to bring something in. Whatever the first foothold provides,
+    the capability the operator actually wants — a beacon, a credential dumper, a tunneller,
+    an archiver — is rarely already sitting on the host, so it has to cross the boundary.
+    That makes ingress transfer close to universal, and it is one of the few command and
+    control steps whose observable is genuinely good rather than merely plausible. Three
+    events line up: a process reaches out to something outside the estate, executable or
+    script content appears on disk that was not there before, and shortly afterwards that
+    same content runs. Individually each event is ordinary — browsers download files all
+    day, installers write executables, users run what they downloaded — so no single one of
+    them is the finding. The chain is, and its strongest link is the last: a hash first seen
+    being written by a process that had just been on the network, which then starts as a
+    process in its own right. That pairing is about as good as endpoint telemetry gets,
+    because it does not depend on recognising the download utility, the destination or the
+    file name. The discriminator against managed software delivery is where the content came
+    from and who asked for it: packages arrive on managed endpoints from a distribution
+    point or a vendor endpoint, through an agent, into an installation directory — not from
+    an arbitrary address, through a script host, into a temporary one. Two well-covered
+    routes are deliberately left to their own templates: BITS jobs, and the PowerShell
+    cradle that pipes a downloaded string straight into the interpreter without ever
+    touching disk. What this file owns is content that lands.
+  severity: high
+  author: huntgraph
+  tags:
+    - command-and-control
+    - ingress-transfer
+    - payload-delivery
+    - staging
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1105
+    - https://attack.mitre.org/detectionstrategies/DET0060
+    - https://attack.mitre.org/techniques/T1570
+    - https://lolbas-project.github.io/
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1105
+  sub_techniques: []
+  detection_strategies:
+    - DET0060
+  analytics:
+    - AN0165
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Connection Creation
+    - File Creation
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may pull tooling from an external system onto a host they already control
+    so that capability they could not otherwise reach is present locally, obtaining a
+    payload that runs from a directory they can write to rather than one the estate manages.
+  attacker_behavior:
+    - Invokes a native download utility with a remote URL and an explicit local output path.
+    - Uses a file transfer client over an alternate protocol such as FTP, TFTP, SCP or rsync.
+    - Pushes the file down an already established remote-access or management session.
+    - Writes the payload into a temporary or user-writable directory rather than an install path.
+    - Executes the transferred file shortly after it lands, often from the same directory.
+  legitimate_behavior:
+    - Patching and software distribution agents download packages onto every managed endpoint.
+    - Developers and build agents fetch archives, installers and dependencies constantly.
+    - Browsers write user downloads into the profile and users then run them.
+    - Administrators retrieve vendor diagnostic tools when troubleshooting a specific host.
+    - Application updaters fetch and stage their own new versions before swapping them in.
+  risk_indicator:
+    - The fetching process is a script host or a signed proxy binary rather than an agent or browser.
+    - The destination is an address or domain the estate has no history of contacting.
+    - The file lands in a temporary, public or profile directory rather than an installation path.
+    - The same hash is written and then executed within a short window on the same host.
+    - The lineage above the fetch implies delivered content rather than administration.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - SHA256HashData
+        - TargetProcessId
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - DomainName
+        - ContextProcessId
+        - ContextBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: download-utility-invoked-with-a-remote-source
+        name: Native download utility given a URL and a local output path
+        purpose: >-
+          The most legible route. Windows ships several utilities that will fetch a remote
+          file and write it wherever they are told, and none of them are how managed
+          software normally arrives. Requiring both a remote source and an output-producing
+          switch separates a transfer from the many other things these binaries do, and the
+          in-memory cradle forms are excluded because a separate template owns them.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(certutil|curl|wget|esentutl|expand|extrac32|replace|finger|hh|ieexec|msiexec|winget|powershell|pwsh|cmd)\.exe$/i
+          | CommandLine=/(?<source_url>(https?|ftps?|tftp)\s*:?\s*(\[:\])?\/\/[^\s"']+)/i
+          | CommandLine=/(-urlcache|-split|--output|-OutFile|DownloadFile|WebClient|-Uri\b|\s-o\s|\s-O\s|\/y\b|\/download\b)/i
+          | CommandLine!=/(DownloadString|DownloadData|Invoke-Expression|\biex\b)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName, source_url],
+                    function=[count(as=transfers), collect([CommandLine], limit=3)])
+          | sort(transfers, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "source_url on the internal distribution points, package registries and approved vendor endpoints"
+            - "ParentBaseFileName of the patching and software-distribution agents"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - domain
+            - command_line
+
+      - id: transfer-client-pulling-over-an-alternate-protocol
+        name: File transfer client retrieving content from an external host
+        purpose: >-
+          Cover the routes that are not HTTP at all. FTP, TFTP, SCP, SFTP and rsync clients
+          are present or trivially portable, they are almost never part of managed software
+          delivery on a workstation, and they are commonly reached for precisely because
+          web filtering does not look at them. The point is not the protocol but that the
+          estate has no reason to move software this way.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(ftp|tftp|scp|sftp|pscp|psftp|rsync|rclone|ncat|nc|socat)\.exe$/i
+          | CommandLine=/(\s-s\s*:|\s-i\s|\s-get\b|\bget\s|\bmget\b|copy\b|\bsync\b|@|:\/)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=transfers), collect([CommandLine], limit=5)])
+          | sort(transfers, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Engineering hosts where rsync and scp are part of the standard toolchain"
+            - "Backup and replication jobs that move data over these clients by design"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - process
+            - organization
+
+      - id: outbound-connection-followed-by-an-executable-write
+        name: Process that was on the network wrote executable content
+        purpose: >-
+          The route-agnostic core, and the case that survives an operator who does not use
+          any recognisable utility. Correlating the network activity and the file write to
+          the same process identifier catches a custom implant, a remote-access agent
+          dropping a file down an established session, and anything else where there is no
+          command line worth matching. Restricting the write to staging directories keeps
+          installers writing into their own program directories out of the result.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6|PeFileWritten|NewExecutableWritten|NewScriptWritten)$/
+          | case {
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+                | fetch_destination := RemoteAddressIP4 ;
+              #event_simpleName=/^(PeFileWritten|NewExecutableWritten|NewScriptWritten)$/
+                | TargetFileName=/\\(Temp|AppData|ProgramData|Downloads|PerfLogs|Users\\Public)\\/i
+                | TargetFileName!=/\\(ccmcache|SoftwareDistribution|Installer|WinSxS|servicing|Package Cache)\\/i
+                | dropped_payload := TargetFileName ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([fetch_destination, dropped_payload], limit=10),
+                              count(as=events)])
+          | fetch_destination=/.+/ and dropped_payload=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Browser processes writing user downloads into the profile Downloads directory"
+            - "ContextProcessId of approved deployment, patching and update agents"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - path
+            - remote_address
+
+      - id: fetched-payload-executed
+        name: Content written to a staging path then started as a process
+        purpose: >-
+          The confirmation, and the sharpest thing in this file. Joining the write and the
+          execution on the content hash removes any dependence on the file name, the path
+          it was later moved to, or the utility that brought it in. A hash that this estate
+          first observed being written into a staging directory and which then appears as a
+          running image is a payload that arrived and took effect, which is a materially
+          different finding from a download nobody opened.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten|ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+                | TargetFileName=/\\(Temp|AppData|ProgramData|Downloads|PerfLogs|Users\\Public)\\/i
+                | written_path := TargetFileName ;
+              #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+                | executed_image := ImageFileName ;
+            }
+          | groupBy([ComputerName, SHA256HashData],
+                    function=[collect([written_path, executed_image, CommandLine,
+                                       ParentBaseFileName], limit=5),
+                              count(as=events)])
+          | written_path=/.+/ and executed_image=/.+/
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "SHA256HashData of signed vendor installers staged by the update mechanism"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: destination-resolved-by-a-transfer-utility
+        name: External name resolved by a download or transfer process
+        purpose: >-
+          Give the destination a name so it can be reasoned about and baselined. A hash and
+          an address are hard to triage; a domain tells an analyst immediately whether this
+          is a vendor endpoint, a package registry or somewhere nothing in the estate has
+          been before. Scoping the resolution to processes that exist to move files keeps
+          this from becoming a general DNS feed.
+        query: |
+          #event_simpleName=/^DnsRequest$/
+          | ContextBaseFileName=/^(certutil|curl|wget|esentutl|bitsadmin|ftp|tftp|scp|sftp|pscp|rsync|rclone|powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|python|pythonw|node|msbuild)\.exe$/i
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName, DomainName],
+                    function=[count(as=lookups)])
+          | sort(lookups, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "DomainName on the approved package registry, vendor update and internal distribution allowlist"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - domain
+            - process
+            - organization
+
+evidence:
+  required:
+    - id: payload_written_after_external_contact
+      name: Executable content written by a process that had been on the network
+      description: >-
+        Executable or script content appeared in a staging directory, written by a process
+        that had made an outbound connection outside the estate, which is content arriving
+        from beyond the boundary rather than being produced locally.
+      source: file_creation
+      field: TargetFileName
+      indicates: external_payload_delivered
+
+  supporting:
+    - id: download_command_observed
+      name: Transfer explicitly requested on a command line
+      description: >-
+        A command line names a remote source and a local destination, which identifies the
+        route, the operator's tool of choice and the exact address the content came from.
+      source: process_creation
+      field: CommandLine
+      indicates: possible_payload_retrieval
+    - id: external_destination_contacted
+      name: Connection to an address outside the estate
+      description: >-
+        The writing process opened a session to a public address, tying the file on disk to
+        a specific external destination that can be pivoted on and blocked.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: active_command_and_control_attempt
+    - id: destination_resolved_by_the_fetcher
+      name: External name resolved by the transferring process
+      description: >-
+        The same process resolved a domain that is not a vendor update endpoint, an
+        internal distribution point or an approved package registry.
+      source: dns_request
+      field: DomainName
+      indicates: unapproved_external_destination
+    - id: fetched_payload_executed
+      name: The content that landed subsequently ran
+      description: >-
+        A hash first seen being written into a staging directory later appears as a running
+        image on the same host, confirming the transfer produced execution rather than an
+        unopened file.
+      source: process_creation
+      field: SHA256HashData
+      indicates: execution_chain_progression
+    - id: delivery_lineage
+      name: Fetch issued from a delivery-shaped lineage
+      description: >-
+        The transfer was requested by a document handler, archive tool, mail client, script
+        host or another interpreter rather than by an administrator shell or a management
+        agent, which implies delivered content rather than operations work.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+
+  contradicting:
+    - id: managed_distribution_agent
+      name: Managed distribution or patching agent performed the transfer
+      description: >-
+        The approved deployment, patching or update agent fetched and staged the content,
+        which is precisely its function and produces this shape continuously.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: vendor_or_registry_destination
+      name: Destination is a vendor endpoint or package registry
+      description: >-
+        The name resolved belongs to a software vendor's update service, a public package
+        registry the estate depends on, or an internal distribution point.
+      source: dns_request
+      field: DomainName
+      indicates: legitimate_software_supply
+    - id: fleetwide_identical_payload
+      name: Same content staged across the estate at once
+      description: >-
+        The identical hash appears on many hosts within one window, which is a distribution
+        wave rather than a transfer aimed at a particular machine.
+      source: baseline
+      field: SHA256HashData
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - payload_written_after_external_contact
+
+    supporting:
+      any:
+        - download_command_observed
+        - external_destination_contacted
+        - destination_resolved_by_the_fetcher
+        - fetched_payload_executed
+        - delivery_lineage
+      all:
+        - external_destination_contacted
+        - fetched_payload_executed
+
+    contradicting:
+      any:
+        - managed_distribution_agent
+        - vendor_or_registry_destination
+        - fleetwide_identical_payload
+      all: []
+
+  verdict:
+    low_risk_when:
+      - payload_written_after_external_contact
+      - managed_distribution_agent
+      - vendor_or_registry_destination
+      - fleetwide_identical_payload
+    suspicious_when:
+      - payload_written_after_external_contact
+      - external_destination_contacted
+      - download_command_observed
+    high_risk_when:
+      - payload_written_after_external_contact
+      - external_destination_contacted
+      - download_command_observed
+      - fetched_payload_executed
+      - delivery_lineage
+
+  false_positive:
+    - condition: A software distribution or patching agent downloads and stages a package.
+      explanation: >-
+        This is the single largest source of the required evidence in any managed estate,
+        and it produces the full chain including execution. It is separable on three counts
+        at once: the writing process is the agent, the source is an internal distribution
+        point or a vendor endpoint, and the identical content lands on many hosts in the
+        same window.
+    - condition: A user downloads an installer through a browser and runs it.
+      explanation: >-
+        A browser writing into the profile Downloads directory followed by the user
+        double-clicking the result is the benign twin of the whole chain. The writing
+        process is a browser, the destination is a resolvable vendor site, and there is a
+        real interactive session around it. Excluding browser-written downloads is the
+        first tuning step, and doing so does not lose much, because an operator working
+        through a remote-access session is not driving a browser.
+    - condition: A developer or build agent fetches dependencies and archives.
+      explanation: >-
+        Engineering hosts pull code and packages continuously, often with curl, and
+        sometimes execute what they fetch as part of a build. These target public package
+        registries and the same fetches repeat on every pipeline run, which is why the
+        destination and its baseline history carry more weight here than the utility.
+    - condition: An administrator retrieves a vendor diagnostic tool to troubleshoot a host.
+      explanation: >-
+        A one-off download of a support utility to a temporary directory, followed by
+        running it, is genuinely indistinguishable from the technique on the evidence
+        alone. It is separated by context rather than telemetry: an authenticated
+        administrator session, a change or incident record, and a destination belonging to
+        a vendor already in the estate.
+    - condition: An application updater stages its own new version before swapping it in.
+      explanation: >-
+        Self-updating software downloads into a temporary or profile directory and then
+        executes the staged binary, which is the full chain. The writing process is the
+        application itself, the hash is signed by the same publisher as the running
+        version, and the behaviour recurs on the vendor's release cadence.

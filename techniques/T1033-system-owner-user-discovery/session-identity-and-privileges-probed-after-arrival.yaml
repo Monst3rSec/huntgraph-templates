@@ -1,0 +1,383 @@
+type: detection
+
+id: hg-win-session-identity-and-privileges-probed-after-arrival-t1033
+
+version: 1.0.0
+
+info:
+  name: Session identity and privileges probed after arrival
+  description: >-
+    This template is for enriching a lead you already have, not for generating one. whoami
+    is close to the most executed command in any Windows estate — it is in logon scripts,
+    installers, health checks, deployment tooling and the muscle memory of every engineer
+    who has ever opened a shell — and there is no standalone form of it that separates from
+    that traffic. Severity is low deliberately, and the intended use is a host, account or
+    lineage already interesting for another reason, where the question is what the operator
+    established about themselves before deciding what to do next.
+    Three things make it worth writing. The first is that not all of this technique is
+    equally common: bare whoami is universal, but asking the token what privileges it holds
+    is a narrower question with a narrower audience, and it is the standard preparation for
+    privilege escalation because it tells the operator which escalation routes the current
+    token already permits. That case leads the file. The second is clustering — the current
+    identity, then the token privileges, then who else is logged on, then which profiles
+    exist, inside a couple of minutes, is somebody working out where they have landed rather
+    than a script checking one thing it needs. The third is ancestry, which is the only
+    discriminator left when the command itself is universal.
+    Two boundaries matter here and are easy to blur. Listing the accounts and groups that
+    exist in the domain or the local account database is account discovery and belongs to
+    that hypothesis, not this one; this file is about the identity of the current session and
+    the people using this particular host. And the interactive session listings kept here —
+    query user, qwinsta and the logon session classes, which are the tools the MITRE analytic
+    for this technique names — are deliberately separated from net session and net use, which
+    enumerate inbound and outbound network sessions and belong to system network connections
+    discovery.
+  severity: low
+  author: huntgraph
+  tags:
+    - discovery
+    - system-owner-user-discovery
+    - session-identity
+    - enrichment
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1033
+    - https://attack.mitre.org/detectionstrategies/DET0093
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1033
+  sub_techniques: []
+  detection_strategies:
+    - DET0093
+  analytics:
+    - AN0254
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:PowerShell
+  data_components:
+    - Process Creation
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    An adversary who has just obtained execution may establish whose context they are running
+    in and what that context is permitted to do, asking the token for its privileges and
+    groups and finding out who else is using the host, before choosing between escalating,
+    moving or collecting.
+  attacker_behavior:
+    - Asks the current token which privileges it holds to judge escalation options.
+    - Lists the group memberships of the running context to see what it already permits.
+    - Enumerates the interactive sessions on the host to find another user worth impersonating.
+    - Lists the user profiles present to learn who normally uses this machine.
+    - Works through several identity questions in one short burst after arriving.
+  legitimate_behavior:
+    - Logon scripts and profile configuration read the current user name at every sign-in.
+    - Installers and applications check identity and elevation before proceeding.
+    - Management and deployment agents confirm the context they are executing in.
+    - Support engineers check who is logged on before restarting or patching a machine.
+    - Health check and compliance scripts record the executing account in their output.
+  risk_indicator:
+    - The token was asked for its privileges or group memberships rather than just its name.
+    - Several unrelated identity questions were asked under one lineage in one window.
+    - The probing process was launched by a document handler, archive tool or script host.
+    - Sessions belonging to other users were enumerated on this or another host.
+    - The lineage is one already implicated by another finding on the same host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: token-privileges-and-groups-enumerated
+        name: Token asked for its privileges or group memberships
+        purpose: >-
+          The one case here with a genuinely narrower population than the technique as a
+          whole. Asking for a name is universal; asking the token which privileges it holds
+          is a question with one obvious use, because the answer decides which escalation
+          routes are already open. Scripts that need identity ask for the name and stop.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(whoami(\.exe)?\s+\/(priv|priv(ilege)?s|groups|all|user\s+\/priv)|whoami.{0,20}-priv|Get-Acl.{0,30}\$env:USERNAME|\[Security\.Principal\.WindowsIdentity\]::GetCurrent|WindowsPrincipal.{0,30}IsInRole|Get-Process.{0,30}-IncludeUserName)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=probes), collect([CommandLine], limit=10)])
+          | sort(probes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Installers and elevation-aware applications that check privileges before proceeding"
+            - "Compliance and privilege audit tooling deployed across the estate"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: identity-questions-in-one-burst
+        name: Several unrelated identity questions under one lineage
+        purpose: >-
+          The clustering case, and a ranking device rather than an alert. Tag each command by
+          which identity question it answers and collapse per host, account and parent. A
+          logon script asks the one thing it branches on; an operator asks who am I, what can
+          I do, who else is here and whose machine is this, in quick succession. Order
+          matters in the tagging below — the privilege form is matched before the bare name
+          form so that the sharper question is not absorbed by the common one.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(whoami(\.exe)?\s+\/(priv|privs|privileges|groups|all)|WindowsIdentity\]::GetCurrent|IsInRole)/i
+                | probe := "token_privileges" ;
+              CommandLine=/(\bquser\b|query\s+user|query\s+session|\bqwinsta\b|PsLoggedon|Get-CimInstance.{0,30}Win32_LogonSession|Win32_LoggedOnUser)/i
+                | probe := "session_listing" ;
+              CommandLine=/(\bdir\b\s+[a-z]:\\+Users\\*\s*$|Get-ChildItem\s+[a-z]:\\+Users|Get-ChildItem\s+\$env:SystemDrive\\+Users|Win32_UserProfile)/i
+                | probe := "profile_owners" ;
+              CommandLine=/(whoami(\.exe)?\s+\/(upn|fqdn)|USERDNSDOMAIN|USERDOMAIN\b|LOGONSERVER)/i
+                | probe := "domain_context" ;
+              CommandLine=/(\bwhoami\b|echo\s+%USERNAME%|\$env:USERNAME|\[Environment\]::UserName|Win32_ComputerSystem.{0,30}UserName)/i
+                | probe := "current_identity" ;
+            }
+          | probe=/.+/
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(probe, distinct=true, as=probe_categories),
+                              count(as=commands),
+                              collect([probe, CommandLine], limit=15)])
+          | probe_categories >= 3
+          | sort(probe_categories, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Logon scripts and profile configuration that read identity at every sign-in"
+            - "Deployment and management agents confirming their execution context"
+            - "Health check and compliance scripts that record the executing account"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - parent_process
+
+      - id: identity-probe-from-a-delivery-parent
+        name: Identity probe run from a document handler, archive tool or script host
+        purpose: >-
+          Where the command is universal the parent is the only real discriminator, and this
+          case says so rather than pretending whoami is suspicious. A spreadsheet, a mail
+          client, an archive utility or a script host asking who it is running as is a
+          payload establishing its context on arrival. No breadth is required.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\bwhoami\b|%USERNAME%|\$env:USERNAME|\bquser\b|query\s+user|\bqwinsta\b|USERDOMAIN|\[Environment\]::UserName)/i
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|onenote|msaccess|visio|acrord32|acrobat|7zfm|7z|winrar|winzip|mshta|wscript|cscript|hh|chrome|msedge|firefox|teams|equation)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=probes), collect([CommandLine], limit=10)])
+          | sort(probes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Add-in and plugin installers launched from within an office application"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - parent_process
+            - command_line
+
+      - id: other-user-sessions-enumerated
+        name: Sessions belonging to other users enumerated
+        purpose: >-
+          Asking who else is on the machine is a different and more purposeful question than
+          asking who you are. It has an operational use for support staff, but it is also how
+          an operator finds a privileged session worth impersonating, and the remote form —
+          asking the same question about another host — narrows the legitimate population
+          considerably. Scoped to interactive logon sessions only; net session and net use
+          enumerate network sessions and belong to system network connections discovery.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\bquser\b|query(\.exe)?\s+(user|session)|\bqwinsta\b|\bPsLoggedon\b|Get-CimInstance.{0,40}Win32_LogonSession|Get-WmiObject.{0,40}Win32_LoggedOnUser)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=queries), collect([CommandLine], limit=10)])
+          | sort(queries, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Service desk and remote assistance tooling that checks sessions before connecting"
+            - "Patch and reboot orchestration that verifies nobody is logged on before acting"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+evidence:
+  required:
+    - id: user_identity_enumerated
+      name: Session identity enumerated
+      description: >-
+        A process asked the host who the current session belongs to, what that token is
+        permitted to do, or who else is using the machine.
+      source: process_creation
+      field: CommandLine
+      indicates: session_identity_discovery
+
+  supporting:
+    - id: token_privileges_enumerated
+      name: Token privileges or groups requested
+      description: >-
+        The command asked the token which privileges it holds or which groups it belongs to,
+        which is the question that decides whether escalation is needed and by which route.
+      source: process_creation
+      field: CommandLine
+      indicates: privilege_escalation_survey
+    - id: multiple_identity_categories
+      name: Several unrelated identity questions in one window
+      description: >-
+        One lineage asked three or more unrelated identity questions inside the window, which
+        is somebody establishing where they have landed rather than a script reading the one
+        value it branches on.
+      source: process_creation
+      field: CommandLine
+      indicates: orientation_burst
+    - id: delivery_parent
+      name: Launched from a delivery or script parent
+      description: >-
+        The probing process was started by a document handler, mail client, browser, archive
+        utility or script host rather than by a logon process or management agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: other_sessions_enumerated
+      name: Other users' sessions listed
+      description: >-
+        Interactive sessions belonging to other users were enumerated on this or another
+        host, which is how a privileged session worth impersonating is located.
+      source: process_creation
+      field: FileName
+      indicates: session_hijack_survey
+    - id: rare_for_host
+      name: Pattern unprecedented on this host
+      description: >-
+        No comparable identity probing has run on this host and account during the baseline
+        window, unlike logon script activity which recurs at every sign-in.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: management_or_deployment_agent
+      name: Management or deployment agent
+      description: >-
+        The probing process belongs to an approved management, deployment or compliance agent
+        that confirms its execution context as a matter of course.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_enterprise_activity
+    - id: support_or_change_activity
+      name: Recorded support or change activity
+      description: >-
+        The probing falls inside a recorded ticket, patch window or change record for this
+        host, where checking identity and logged-on users is the expected first step.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_administrative_activity
+    - id: fleetwide_recurring_pattern
+      name: Same probing across the estate on a cycle
+      description: >-
+        The identical command sequence appears on many hosts at every sign-in or on a stable
+        interval, which is a logon script or agent rather than one operator orienting.
+      source: baseline
+      field: CommandLine
+      indicates: scheduled_automation_job
+
+  risk_logic:
+    required:
+      - user_identity_enumerated
+
+    supporting:
+      any:
+        - token_privileges_enumerated
+        - multiple_identity_categories
+        - delivery_parent
+        - other_sessions_enumerated
+        - rare_for_host
+      all:
+        - token_privileges_enumerated
+        - delivery_parent
+
+    contradicting:
+      any:
+        - management_or_deployment_agent
+        - support_or_change_activity
+        - fleetwide_recurring_pattern
+      all: []
+
+  verdict:
+    low_risk_when:
+      - user_identity_enumerated
+      - management_or_deployment_agent
+      - support_or_change_activity
+      - fleetwide_recurring_pattern
+    suspicious_when:
+      - user_identity_enumerated
+      - token_privileges_enumerated
+    high_risk_when:
+      - user_identity_enumerated
+      - token_privileges_enumerated
+      - multiple_identity_categories
+      - delivery_parent
+
+  false_positive:
+    - condition: A logon script reads the current user name at every sign-in.
+      explanation: >-
+        Identity reads at logon are universal and will dominate any result set built on this
+        technique. The parent is the logon process or policy engine, the command is identical
+        on every host in the estate, and it repeats at every sign-in for every account rather
+        than appearing once under an unusual lineage.
+    - condition: An installer or elevation-aware application checks privileges before proceeding.
+      explanation: >-
+        Checking whether the current token is elevated is normal application behaviour and
+        reproduces the sharpest evidence in this file. The parent is an installer or the
+        application itself, and the check is immediately followed by installation or a
+        legitimate elevation prompt rather than by further enumeration.
+    - condition: Support staff check who is logged on before restarting a machine.
+      explanation: >-
+        Session enumeration is the correct first step before a disruptive action, so it is
+        genuinely common on service desk workstations. It is tied to a named engineer and
+        usually a ticket, and it is followed by a reboot, a patch or a remote assistance
+        session rather than by privilege enumeration.
+    - condition: A deployment or management agent confirms its execution context.
+      explanation: >-
+        Agents routinely record which account they are running as, sometimes alongside the
+        domain and logon server, which can trip the clustering case. The acting process is the
+        agent's own binary and the pattern appears identically across the whole fleet.
+    - condition: A health check or compliance script records the executing account.
+      explanation: >-
+        Audit scripts commonly capture identity, group membership and logged-on users together
+        in one pass, which is the clustering signal exactly. They run on a published schedule
+        under a service account and write their output to a reporting location.

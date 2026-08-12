@@ -1,0 +1,429 @@
+type: detection
+
+id: hg-win-loader-and-implant-calling-separate-destinations-t1104
+
+version: 1.0.0
+
+info:
+  name: Loader and follow-on process calling separate external destinations
+  description: >-
+    Splitting command and control across stages is an operational choice, not a stealth
+    trick in itself. The first stage is cheap and disposable: it calls home, reports what
+    it landed on, and pulls down whatever comes next. The second stage is the one worth
+    protecting, so it is hosted somewhere with no relationship to the first — different
+    provider, different network, registered separately — precisely so that burning the
+    loader's infrastructure does not burn the implant's. That separation is the thing an
+    endpoint can see. Not the payload, not the protocol, but the handoff: one process holds
+    a session with an external destination, a second process appears beneath it, and that
+    second process talks to somewhere completely unrelated. The benign twin is real and
+    common — an updater downloads from a content network and launches an installer that
+    calls the vendor's licensing service — but the two destinations in that story belong to
+    the same organisation and the estate has years of history with both. Here they do not
+    and it does not. This file is deliberately scoped to the process boundary. Where the
+    pivot happens inside a single process and the first hop is a well-known public web
+    service holding nothing but a pointer, that is a dead drop resolver and a separate
+    template owns it; the two shapes overlap in intent but not in what the sensor records.
+  severity: high
+  author: huntgraph
+  tags:
+    - command-and-control
+    - multi-stage
+    - loader
+    - beaconing
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1104
+    - https://attack.mitre.org/detectionstrategies/DET0228
+    - https://attack.mitre.org/techniques/T1105
+    - https://attack.mitre.org/techniques/T1102/001
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1104
+  sub_techniques: []
+  detection_strategies:
+    - DET0228
+  analytics:
+    - AN0637
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Connection Creation
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may run their command and control across two stages hosted on unrelated
+    infrastructure so that a loader retrieves and launches an implant which then calls a
+    different destination entirely, obtaining a channel that survives the discovery and
+    blocking of the first one.
+  attacker_behavior:
+    - Runs a first-stage loader that contacts staging infrastructure and reports host details.
+    - Retrieves a second, fuller tool and launches it as a separate process.
+    - Points the second stage at a destination sharing no network or provider with the first.
+    - Hands the follow-on process a hardcoded address so it never resolves a name of its own.
+    - Lets the loader exit once the implant is established, leaving only the second channel.
+  legitimate_behavior:
+    - Updaters download from a content network and start an installer that calls a licensing service.
+    - Bootstrappers fetch a real client from one endpoint which then registers with another.
+    - Management agents pull configuration from one service and telemetry to another.
+    - Browsers launch helper applications that make their own unrelated connections.
+    - Installers spawn setup processes which contact activation and telemetry endpoints.
+  risk_indicator:
+    - The two destinations sit on unrelated networks with no shared ownership.
+    - The follow-on process runs from a temporary or user-writable directory.
+    - The second destination was never resolved on the host, implying an embedded address.
+    - Neither destination has any history in the estate over the baseline window.
+    - The handoff completes within a few minutes and the first process then exits.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - DomainName
+        - ContextProcessId
+        - ContextBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: external-session-handed-to-a-spawned-process
+        name: Process on the network spawned a child that went to a different destination
+        purpose: >-
+          The shape of the technique stated directly. Tying a parent's external session and
+          its child's external session together through the process identifiers is what
+          separates a staged channel from two unrelated pieces of network activity that
+          happened on the same host, and it is the only form of this that a sensor can
+          assert rather than infer.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6|ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+                | stage_destination := RemoteAddressIP4 ;
+              #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+                | spawned_image := ImageFileName ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[count(field=stage_destination, distinct=true, as=destinations),
+                              collect([stage_destination, spawned_image, ParentBaseFileName],
+                                      limit=10)])
+          | destinations >= 2
+          | sort(destinations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Browser and mail client lineages, where helper processes routinely call elsewhere"
+            - "Approved management, patching and telemetry agent lineages"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - remote_address
+            - organization
+
+      - id: staged-image-in-a-user-writable-path-calling-out
+        name: Follow-on process running from a staging directory holds its own channel
+        purpose: >-
+          Name the second stage. Software that legitimately hands off between stages runs
+          both of them from an installation directory, because that is where software
+          lives. An implant launched by a loader typically runs from wherever the loader
+          could write, so a process image under a temporary, profile or public path that
+          maintains external sessions of its own is the follow-on stage rather than a
+          transient helper.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6|ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+                | ImageFileName=/\\(Temp|AppData|ProgramData|Downloads|PerfLogs|Users\\Public)\\/i
+                | ImageFileName!=/\\(ccmcache|SoftwareDistribution|Package Cache|Installer)\\/i
+                | staged_image := ImageFileName ;
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | RemotePort in (53, 80, 443, 8080, 8443, 4444, 8000)
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+                | channel_destination := RemoteAddressIP4 ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([staged_image, channel_destination, ParentBaseFileName],
+                                      limit=10),
+                              count(as=events)])
+          | staged_image=/.+/ and channel_destination=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Self-updating applications that stage and run their own new version"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+            - remote_address
+
+      - id: second-destination-never-resolved-on-the-host
+        name: Follow-on channel opened to an address with no name resolution behind it
+        purpose: >-
+          Separate an address that was looked up from one that was handed over. Stage one
+          resolving a staging domain while stage two connects straight to a numeric address
+          the host has never queried is what an embedded or delivered address looks like,
+          and it is the difference between software following its own configuration and a
+          process being told where to go.
+        query: |
+          #event_simpleName=/^(DnsRequest|NetworkConnectIP4|NetworkConnectIP6)$/
+          | case {
+              #event_simpleName=/^DnsRequest$/
+                | resolved_name := DomainName ;
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+                | direct_destination := RemoteAddressIP4 ;
+            }
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName],
+                    function=[count(field=resolved_name, distinct=true, as=names_resolved),
+                              collect([direct_destination, resolved_name], limit=10)])
+          | direct_destination=/.+/ and names_resolved = 0
+          | sort(names_resolved, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Processes using a proxy or a resolver cache populated by another process"
+            - "Connectivity and captive-portal probes that target fixed addresses"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - remote_address
+            - organization
+
+      - id: one-lineage-reaching-unrelated-networks
+        name: Single process lineage contacting addresses on unrelated networks
+        purpose: >-
+          Approach the same behaviour from the destination side rather than the process
+          side, which catches the case where the handoff is an injection into an existing
+          process and no obvious parent-child edge exists. Legitimate multi-endpoint
+          software talks to a set of addresses belonging to one provider; a two-stage
+          channel deliberately does not, because shared infrastructure is exactly what the
+          adversary was avoiding.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|224\.)/
+          | ContextBaseFileName!=/^(chrome|msedge|firefox|iexplore|brave|opera|outlook|teams|onedrive|svchost|MsMpEng|CcmExec|SearchIndexer)\.exe$/i
+          | RemoteAddressIP4=/^(?<network_prefix>\d{1,3}\.\d{1,3})\./
+          | groupBy([ComputerName, ContextBaseFileName],
+                    function=[count(field=network_prefix, distinct=true, as=networks),
+                              count(field=RemoteAddressIP4, distinct=true, as=addresses),
+                              collect([RemoteAddressIP4, RemotePort], limit=10)])
+          | networks >= 2
+          | sort(networks, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Multi-region cloud clients and content-delivery aware applications"
+            - "ContextBaseFileName of monitoring and telemetry agents with several endpoints"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - remote_address
+            - organization
+
+evidence:
+  required:
+    - id: two_stage_handoff
+      name: Second external destination reached across a process boundary
+      description: >-
+        A process holding an external session was followed by a second process in the same
+        lineage opening a session to a different external destination, which is the channel
+        moving from one stage to the next rather than one application using several
+        endpoints.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: staged_command_and_control
+
+  supporting:
+    - id: loader_child_relationship
+      name: Follow-on process launched by the process on the network
+      description: >-
+        The second stage was created directly by the process that held the first channel,
+        establishing the handoff rather than leaving two coincident activities to be
+        assumed related.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: staged_image_location
+      name: Follow-on process runs from a staging directory
+      description: >-
+        The image behind the second channel lives in a temporary, profile or public
+        directory rather than an installation path, which is where a loader can write and
+        where installed software does not run from.
+      source: process_creation
+      field: ImageFileName
+      indicates: payload_executed_from_staging_path
+    - id: unresolved_second_destination
+      name: Second destination never resolved on the host
+      description: >-
+        No name resolution on this host accounts for the address the follow-on process
+        connected to, so the address was embedded in or delivered to the second stage
+        rather than discovered by it.
+      source: dns_request
+      field: DomainName
+      indicates: hardcoded_destination
+    - id: unrelated_networks
+      name: Destinations on networks with no relationship
+      description: >-
+        The two addresses sit in different network ranges with no common ownership, which
+        is the infrastructure separation the technique exists to achieve.
+      source: derived
+      field: network_prefix
+      indicates: non_overlapping_infrastructure
+    - id: destinations_new_to_the_estate
+      name: Neither destination has estate history
+      description: >-
+        Nothing in the organisation contacted either address during the baseline window, so
+        this is not a pair of endpoints belonging to software already in use.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: unusual_activity_for_organization
+
+  contradicting:
+    - id: vendor_installer_chain
+      name: Installer or updater chain
+      description: >-
+        The parent is a known installer, updater or bootstrapper whose documented behaviour
+        is to fetch from one endpoint and launch a component that registers with another.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: shared_vendor_infrastructure
+      name: Both destinations belong to the same vendor
+      description: >-
+        The names behind the two addresses resolve within a single vendor's or provider's
+        service, which is a multi-endpoint application rather than two separated stages.
+      source: dns_request
+      field: DomainName
+      indicates: legitimate_application_component
+    - id: fleetwide_handoff_pattern
+      name: Same handoff across many hosts
+      description: >-
+        The identical parent, child and destination pair appears broadly across the estate
+        in one window, which is a deployment or update wave rather than a targeted channel.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - two_stage_handoff
+
+    supporting:
+      any:
+        - loader_child_relationship
+        - staged_image_location
+        - unresolved_second_destination
+        - unrelated_networks
+        - destinations_new_to_the_estate
+      all:
+        - loader_child_relationship
+        - staged_image_location
+        - destinations_new_to_the_estate
+
+    contradicting:
+      any:
+        - vendor_installer_chain
+        - shared_vendor_infrastructure
+        - fleetwide_handoff_pattern
+      all: []
+
+  verdict:
+    low_risk_when:
+      - two_stage_handoff
+      - vendor_installer_chain
+      - shared_vendor_infrastructure
+      - fleetwide_handoff_pattern
+    suspicious_when:
+      - two_stage_handoff
+      - loader_child_relationship
+      - destinations_new_to_the_estate
+    high_risk_when:
+      - two_stage_handoff
+      - loader_child_relationship
+      - staged_image_location
+      - unresolved_second_destination
+      - destinations_new_to_the_estate
+
+  false_positive:
+    - condition: A bootstrapper downloads a full client which then registers elsewhere.
+      explanation: >-
+        Small installers that fetch the real product from a content network and hand off to
+        it produce this shape exactly, including the second process with its own channel.
+        They are separated by ownership and history: the download host and the registration
+        service belong to the same vendor, and the estate has been talking to both for as
+        long as the product has been deployed.
+    - condition: A management agent pulls configuration from one service and posts telemetry to another.
+      explanation: >-
+        Split-endpoint architectures are normal in monitoring and management products, and
+        the two endpoints can genuinely be on different providers. The distinguishing facts
+        are that the same pair appears on every host running the agent and that the agent
+        runs from its installation directory, not a staging one.
+    - condition: A browser launches a helper application that makes unrelated connections.
+      explanation: >-
+        Protocol handlers, document viewers and meeting clients are started by browsers and
+        immediately contact their own services, which satisfies both the parent-child edge
+        and the second destination. Browser lineages are the noisiest contributor here and
+        excluding them is the first tuning step.
+    - condition: A connectivity or captive-portal check connects to a fixed address.
+      explanation: >-
+        Several components deliberately connect to hardcoded addresses without resolving a
+        name, which alone satisfies the unresolved-destination evidence. These are a small,
+        stable, well-known set and they are not preceded by another external session in the
+        same lineage.
+    - condition: A resolver cache or proxy hides the lookup that preceded a connection.
+      explanation: >-
+        When one process resolves a name and another connects to the cached address, or
+        when a proxy performs resolution on the host's behalf, the connection looks
+        unresolved even though it was not. This is why the unresolved destination is
+        supporting evidence rather than required, and it should be read together with the
+        process that opened the session.
