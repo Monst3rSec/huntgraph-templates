@@ -1,0 +1,380 @@
+type: detection
+
+id: hg-win-staged-data-pushed-out-over-a-cleartext-transfer-protocol-t1048-003
+
+version: 1.0.0
+
+info:
+  name: Staged data pushed out over a cleartext file transfer protocol
+  description: >-
+    Of the three ways to leave over an alternative protocol, this is the only one an endpoint
+    sensor can actually name. Encryption is invisible to it — a session on port 443 looks the
+    same whether the key exchange was asymmetric or the payload was already ciphertext — but
+    the absence of encryption is not invisible, because protocols that carry data in the
+    clear announce themselves with the port they run on. A connection to 21 or 69 or 23 leaving
+    the estate is FTP, TFTP or telnet, and it is that regardless of what any header says.
+    That gives this leaf a discriminator the other two do not have, and it is the reason this
+    template exists as its own file rather than as a third variation on a common shape. Two
+    things make the observation worth acting on. First, these protocols have almost no
+    remaining legitimate outbound use in a modern estate: internally they survive in network
+    device imaging and a handful of legacy integrations, but a workstation opening FTP to the
+    internet is either a misconfiguration or somebody moving files. Second, the sending half
+    is visible too — cleartext transfer is driven by a small, nameable set of clients and by
+    upload switches that say outright that a file is going out, so the intent appears on the
+    command line rather than having to be inferred from volume. The encoding step MITRE
+    describes for this leaf, base64 or similar in place of encryption, is likewise a local
+    command and not a property of the traffic.
+  severity: high
+  author: huntgraph
+  tags:
+    - exfiltration
+    - alternative-protocol
+    - cleartext-transfer
+    - network
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1048/003
+    - https://attack.mitre.org/detectionstrategies/DET0149
+    - https://attack.mitre.org/techniques/T1048
+
+mitre:
+  tactics:
+    - TA0010
+  techniques:
+    - T1048
+  sub_techniques:
+    - T1048.003
+  detection_strategies:
+    - DET0149
+  analytics:
+    - AN0423
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may move collected data out over a protocol that carries it in the clear,
+    separate from the command and control channel, obtaining a route that needs no
+    infrastructure of their own beyond a listener and that often crosses egress controls
+    written only with web traffic in mind.
+  attacker_behavior:
+    - Drives a built-in FTP or TFTP client with a script file to push staged material out.
+    - Uses a fetcher's upload switch to put a file to an external host over plain HTTP or FTP.
+    - Encodes the data with a local utility instead of encrypting it, then sends the result.
+    - Launches the transfer client from whatever process they already control on the host.
+  legitimate_behavior:
+    - Network device configuration and imaging still relies on TFTP inside many estates.
+    - Legacy partner integrations exchange files over FTP on a schedule.
+    - Deployment and monitoring scripts fetch and post over plain HTTP internally.
+    - Engineers use command-line transfer clients as part of normal work.
+  risk_indicator:
+    - The destination is outside the estate rather than an internal file or device server.
+    - The client is launched by a document application, mail client or script host.
+    - An encoding step over user data immediately precedes the transfer.
+    - No other host in the estate has ever contacted the destination.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: outbound-session-on-a-cleartext-transfer-port
+        name: External session on a port that carries data in the clear
+        purpose: >-
+          Establish the behaviour with the only property of the traffic the endpoint can
+          state as fact. These ports are the protocol, not a guess about it, and an external
+          destination on one of them is the whole of what this leaf describes. Ranking by how
+          few hosts reach each destination puts the legacy integrations, which are shared, at
+          the bottom and the one-off egress path at the top.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemotePort in (20, 21, 23, 25, 69, 110, 143, 873)
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+          | groupBy([RemoteAddressIP4, RemotePort],
+                    function=[count(field=ComputerName, distinct=true, as=hosts),
+                              count(as=connections),
+                              collect([ComputerName, ContextBaseFileName], limit=5)])
+          | sort(hosts, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Legacy partner FTP endpoints recorded on the approved egress list"
+            - "Mail relays and monitoring collectors the organisation operates externally"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - remote_address
+            - organization
+
+      - id: command-line-upload-over-a-cleartext-protocol
+        name: Transfer client invoked with an upload argument
+        purpose: >-
+          Read the intent off the command line rather than inferring it from the connection.
+          Fetchers and built-in clients distinguish getting from putting with an explicit
+          switch, so an upload is stated rather than deduced, and requiring a cleartext
+          scheme or a raw address alongside it keeps ordinary downloads out.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/\bcurl\b/i and CommandLine=/(-T\b|--upload-file\b|-F\b|--data-binary\s+@)/i
+                | upload_route := "curl_put" ;
+              CommandLine=/\b(ftp|tftp)(\.exe)?\b/i and CommandLine=/(-s\s*:|\bput\b|-i\b)/i
+                | upload_route := "builtin_ftp_client" ;
+              CommandLine=/(Invoke-WebRequest|Invoke-RestMethod|iwr\b|wget\b)/i and CommandLine=/(-InFile\b|-Method\s+(Put|Post)\b|--post-file\b)/i
+                | upload_route := "scripted_http_put" ;
+              CommandLine=/\bbitsadmin\b/i and CommandLine=/\/(upload|transfer)\b/i
+                | upload_route := "bits_upload" ;
+              CommandLine=/\b(ftp|tftp|http):\/\//i and CommandLine=/\b(put|upload|send)\b/i
+                | upload_route := "explicit_cleartext_scheme" ;
+            }
+          | upload_route=/.+/
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=uploads), collect([upload_route, CommandLine], limit=8)])
+          | sort(uploads, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Deployment scripts posting artefacts to internal services over plain HTTP"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: data-encoded-then-pushed-out-in-the-clear
+        name: Local encoding of user data followed by a cleartext transfer
+        purpose: >-
+          Cover the form of this leaf that substitutes obfuscation for encryption. Turning a
+          file into base64 with a local utility and then sending it is a step that has no
+          benign purpose in the middle of an egress sequence, and unlike encryption it is
+          entirely visible: the encoding is a command, not a property of the traffic.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2|NetworkConnectIP4|NetworkConnectIP6)$/
+          | case {
+              #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+                | CommandLine=/(\bcertutil\b[^\n]*-encode(hex)?\b|\[Convert\]::ToBase64String|ToBase64String\s*\(\s*\[System\.IO\.File\]::ReadAllBytes)/i
+                | encoded := FileName ;
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | RemotePort in (20, 21, 23, 25, 69, 80, 110, 143, 873)
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+                | peer := RemoteAddressIP4 ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([encoded, peer, ContextBaseFileName, CommandLine], limit=10),
+                              count(as=events)])
+          | encoded=/.+/
+          | peer=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Certificate handling workflows that encode and then submit to an internal authority"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - remote_address
+
+      - id: transfer-client-launched-by-a-process-that-should-not
+        name: Cleartext transfer client spawned by a document or script host
+        purpose: >-
+          Take the parent as the discriminator where the command itself is defensible. An
+          engineer running the FTP client from a shell is ordinary; the same client started
+          by a word processor, a mail client, a macro host or a proxy-execution binary is
+          somebody else's automation using a tool that happens to be present, and no
+          legitimate workflow puts those two programs in that order.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(ftp|tftp|curl|wget|bitsadmin)\.exe$/i
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|onenote|acrord32|mshta|wscript|cscript|rundll32|regsvr32|hh|msaccess)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=launches), collect([CommandLine], limit=8)])
+          | sort(launches, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - parent_process
+            - organization
+
+evidence:
+  required:
+    - id: external_session_on_a_cleartext_port
+      name: Session to an external host on a cleartext transfer port
+      description: >-
+        A connection left the estate on a port whose protocol carries its payload in the
+        clear, which is the alternative unencrypted channel this leaf describes and the one
+        property of the traffic the endpoint can assert directly.
+      source: network_connection
+      field: RemotePort
+      indicates: cleartext_egress_channel
+
+  supporting:
+    - id: upload_argument_on_the_command_line
+      name: Transfer client invoked to send rather than fetch
+      description: >-
+        The client was run with an upload switch or a put verb, so the direction of the
+        transfer is stated in the command rather than inferred from the connection record.
+      source: process_creation
+      field: CommandLine
+      indicates: outbound_file_transfer_intent
+    - id: local_encoding_before_the_transfer
+      name: Data encoded locally shortly before the session
+      description: >-
+        A file was converted to base64 or a similar encoding on the host before the transfer,
+        which is the obfuscation this leaf substitutes for encryption and has no other role
+        in an egress sequence.
+      source: process_creation
+      field: ImageFileName
+      indicates: payload_obfuscated_without_encryption
+    - id: transfer_client_with_an_unexpected_parent
+      name: Client launched by a document application or script host
+      description: >-
+        The transfer client was started by a program that has no workflow involving file
+        transfer, which places the invocation outside anything a user or an administrator
+        would do deliberately.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: destination_new_to_the_estate
+      name: Destination contacted by no other host
+      description: >-
+        The external address has not been reached by any other machine during the baseline
+        window, which rules out the legacy integrations that account for most remaining
+        cleartext transfer.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: unusual_destination
+
+  contradicting:
+    - id: legacy_partner_integration
+      name: Recorded legacy FTP or file exchange integration
+      description: >-
+        The destination is a partner endpoint the organisation exchanges files with on a
+        schedule, reached by the same host or hosts across the baseline window.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: network_device_imaging
+      name: Network device configuration or imaging activity
+      description: >-
+        TFTP and cleartext copy operations remain the normal way to move configurations and
+        images to network equipment, and the host is one used for that work.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: approved_transfer_client
+      name: Deployed transfer product on the approved egress list
+      description: >-
+        The session belongs to a managed file transfer client whose destination and schedule
+        are part of the build rather than to an ad hoc invocation.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: legitimate_application_component
+
+  risk_logic:
+    required:
+      - external_session_on_a_cleartext_port
+
+    supporting:
+      any:
+        - upload_argument_on_the_command_line
+        - local_encoding_before_the_transfer
+        - transfer_client_with_an_unexpected_parent
+        - destination_new_to_the_estate
+      all:
+        - upload_argument_on_the_command_line
+        - destination_new_to_the_estate
+
+    contradicting:
+      any:
+        - legacy_partner_integration
+        - network_device_imaging
+        - approved_transfer_client
+      all: []
+
+  verdict:
+    low_risk_when:
+      - external_session_on_a_cleartext_port
+      - legacy_partner_integration
+      - network_device_imaging
+      - approved_transfer_client
+    suspicious_when:
+      - external_session_on_a_cleartext_port
+      - destination_new_to_the_estate
+    high_risk_when:
+      - external_session_on_a_cleartext_port
+      - upload_argument_on_the_command_line
+      - transfer_client_with_an_unexpected_parent
+      - local_encoding_before_the_transfer
+      - destination_new_to_the_estate
+
+  false_positive:
+    - condition: Network engineers move configurations and images over TFTP.
+      explanation: >-
+        Device imaging is the largest remaining honest use of a cleartext transfer protocol
+        and it produces the port, the client and the upload switch together. The destination
+        is a device inside the estate rather than an external address, which is why the
+        external filter carries most of the separation here.
+    - condition: A legacy partner integration exchanges files over FTP on a schedule.
+      explanation: >-
+        These integrations are real and they leave the estate, so the port filter alone will
+        not remove them. They repeat identically across the baseline window from the same
+        host to the same endpoint, whereas the hypothesis needs a destination with no
+        history behind it.
+    - condition: A deployment script posts an artefact to an internal service over plain HTTP.
+      explanation: >-
+        Internal HTTP posting is common in build and configuration tooling and matches the
+        upload-switch case. The destination is internal, the parent is a build agent or a
+        shell rather than a document application, and the same command runs on every
+        deployment.
+    - condition: An engineer uses a command-line transfer client interactively.
+      explanation: >-
+        Command-line fetchers are ordinary tools and their use is not itself a finding. The
+        parent is a shell or terminal in an interactive session, the account belongs to
+        somebody whose role explains it, and there is no encoding step over user documents
+        immediately beforehand.

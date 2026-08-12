@@ -1,0 +1,366 @@
+type: detection
+
+id: hg-win-bluetooth-transfer-path-opened-on-a-host-with-no-use-for-one-t1011-001
+
+version: 1.0.0
+
+info:
+  name: Bluetooth transfer path opened on a host with no use for one
+  description: >-
+    The reason to exfiltrate over Bluetooth is that nothing watching the network sees it. The
+    data does not traverse a switch, a proxy, a firewall or a DNS resolver, so every control
+    an organisation has built around egress is bypassed not by defeating it but by going
+    around it. That is also the honest limit of this template, and it should be said plainly:
+    the transfer itself is not observable here. The Windows Bluetooth stack reports pairings
+    and connections through system service events that this pipeline does not collect, and no
+    process, file or network record is produced when bytes move to a paired device. What is
+    observable is everything that has to happen first. Bluetooth on a managed Windows machine
+    is normally driven by hand through the Settings app, and the radio and service are often
+    off or absent entirely on servers and desktops; turning them on, pairing a device and
+    invoking the file transfer wizard are all process creations with recognisable command
+    lines. So this file hunts the preparation, not the exfiltration, and its value is
+    correspondingly specific: on a laptop where somebody pairs headphones it will say
+    nothing useful, but a host that has never touched the Bluetooth stack in ninety days
+    suddenly enabling the service from a script, minutes after a document tree was archived,
+    is a finding worth having and there is no other place in the corpus that will produce it.
+    Treat a hit as a prompt to look at the machine physically, because that is where the rest
+    of the evidence is.
+  severity: medium
+  author: huntgraph
+  tags:
+    - exfiltration
+    - other-network-medium
+    - bluetooth
+    - local-tooling
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1011/001
+    - https://attack.mitre.org/detectionstrategies/DET0554
+    - https://attack.mitre.org/techniques/T1011
+
+mitre:
+  tactics:
+    - TA0010
+  techniques:
+    - T1011
+  sub_techniques:
+    - T1011.001
+  detection_strategies:
+    - DET0554
+  analytics:
+    - AN1531
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary with proximity to a compromised host may enable and pair a Bluetooth device
+    and push collected data to it, obtaining a route out that never reaches the wired network
+    and is therefore invisible to every control the organisation has placed on egress.
+  attacker_behavior:
+    - Starts or reconfigures the Bluetooth support service from a command line.
+    - Enables the radio or the adapter through a device management command.
+    - Pairs a device without going through the interactive Settings flow.
+    - Invokes the file transfer wizard from a script rather than from a shell context menu.
+  legitimate_behavior:
+    - Users pair headsets, mice and keyboards on laptops constantly.
+    - Support scripts re-enable a Bluetooth service after a driver problem.
+    - Build images and provisioning runs configure peripheral services during setup.
+    - Conference room and kiosk machines pair presentation devices routinely.
+  risk_indicator:
+    - The host class has no peripheral role and no history of Bluetooth activity.
+    - The commands are issued by a script host rather than by an interactive shell or the Settings app.
+    - Archiving or copying of user data happened on the same host shortly before.
+    - The file transfer wizard is launched by something other than the shell.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: bluetooth-stack-enabled-from-a-command-line
+        name: Bluetooth service, adapter or radio enabled from a command line
+        purpose: >-
+          Catch the step that has to come first on a machine where the medium is off. Users
+          turn Bluetooth on through Settings; a service reconfiguration, a device enable or a
+          radio call issued as a command is automation, and on a host where the stack was
+          dormant it is somebody deliberately opening a path that was closed.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/\b(bthserv|BthAvctpSvc|bthhfsrv)\b/i and CommandLine=/\b(sc|net|Set-Service|Start-Service|config|start)\b/i
+                | bt_action := "service_enabled" ;
+              CommandLine=/(Enable-PnpDevice|Get-PnpDevice)[^\n]*\bBluetooth\b/i
+                | bt_action := "adapter_enabled" ;
+              CommandLine=/(Windows\.Devices\.Radios|RadioAccessStatus|Radio\]::(GetRadios|RequestAccess))/i
+                | bt_action := "radio_toggled" ;
+              CommandLine=/\bdevcon\b[^\n]*\b(enable|install)\b[^\n]*\bBTH\b/i
+                | bt_action := "driver_enabled" ;
+              CommandLine=/\bbthprops\.cpl\b/i
+                | bt_action := "control_panel_invoked" ;
+            }
+          | bt_action=/.+/
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=actions), collect([bt_action, CommandLine], limit=8)])
+          | sort(actions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Provisioning and imaging runs that configure peripheral services during build"
+            - "Support scripts re-enabling a Bluetooth service against a recorded ticket"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: transfer-wizard-launched-without-a-user-behind-it
+        name: Bluetooth file transfer wizard started by something other than the shell
+        purpose: >-
+          Separate a person sending a file from a program doing it. The transfer wizard is
+          reached from an Explorer context menu or the Settings app, so those are its normal
+          parents; a script host, a proxy-execution binary or a scheduled task starting it is
+          the closest thing this telemetry has to witnessing the transfer, because it is the
+          last step before bytes move.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(fsquirt|DevicePairingWizard|btpanui)\.exe$/i
+          | ParentBaseFileName!=/^(explorer\.exe|shellexperiencehost\.exe|systemsettings\.exe|sihost\.exe|searchapp\.exe|dllhost\.exe)$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=launches), collect([CommandLine, ImageFileName], limit=8)])
+          | sort(launches, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - parent_process
+            - organization
+
+      - id: collection-then-bluetooth-activity-on-one-host
+        name: Data packaged and Bluetooth tooling touched in the same window
+        purpose: >-
+          Give the Bluetooth activity a reason. Enabling a radio is not exfiltration on its
+          own and neither is building an archive, but the two together on one host inside one
+          window is the whole sequence this leaf describes, with only its final step missing
+          from the record. This is the case that makes the file worth deploying rather than
+          an inventory of peripheral commands.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/\b(rar|winrar|7z|7za|makecab|tar|Compress-Archive|robocopy|xcopy|Copy-Item)\b/i
+                and CommandLine=/\.(docx?|xlsx?|pptx?|pdf|csv|pst|ost|msg|kdbx)\b|\\+Users\\+[^\\]+\\+(Documents|Desktop|Downloads|OneDrive)/i
+                | stage := "collection" ;
+              CommandLine=/(\bbthserv\b|Enable-PnpDevice[^\n]*Bluetooth|Windows\.Devices\.Radios|\bbthprops\.cpl\b|\bfsquirt\b|\bDevicePairingWizard\b)/i
+                | stage := "bluetooth" ;
+            }
+          | stage=/.+/
+          | groupBy([ComputerName, UserName],
+                    function=[count(field=stage, distinct=true, as=stages),
+                              collect([stage, FileName, CommandLine], limit=10)])
+          | stages >= 2
+        filters:
+          include: []
+          exclude:
+            - "Workstation refresh tooling that both copies profiles and configures peripherals"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: bluetooth-tooling-on-a-host-that-never-uses-it
+        name: Bluetooth command surface touched on a host with no peripheral history
+        purpose: >-
+          Carry the rarity, which is where nearly all of this file's separation comes from.
+          Pairing peripherals is unremarkable on a laptop and essentially never happens on a
+          server, a virtual desktop or a fixed workstation. Ranking each host's Bluetooth
+          command activity against the estate puts the machines that have no business with
+          the medium at the top of the list.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\bbthserv\b|\bBthAvctpSvc\b|Enable-PnpDevice[^\n]*Bluetooth|Get-PnpDevice[^\n]*Bluetooth|Windows\.Devices\.Radios|\bbthprops\.cpl\b|\bdevcon\b[^\n]*\bBTH\b)/i
+          | groupBy([ComputerName],
+                    function=[count(as=commands),
+                              count(field=UserName, distinct=true, as=accounts),
+                              min(@timestamp, as=first_seen),
+                              max(@timestamp, as=last_seen),
+                              collect([FileName, ParentBaseFileName, CommandLine], limit=10)])
+          | commands <= 5
+          | sort(commands, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Laptops and conference room machines where peripheral pairing is expected"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - organization
+
+evidence:
+  required:
+    - id: bluetooth_transfer_path_prepared
+      name: Bluetooth service, adapter or transfer tooling invoked from a command line
+      description: >-
+        A command was executed that enables the Bluetooth stack, pairs a device or starts the
+        file transfer wizard, which is the preparation the medium requires before any data can
+        leave over it.
+      source: process_creation
+      field: CommandLine
+      indicates: off_network_channel_prepared
+
+  supporting:
+    - id: wizard_launched_non_interactively
+      name: Transfer wizard started by a process that is not the shell
+      description: >-
+        The Bluetooth file transfer or pairing wizard was launched by a script host or another
+        program rather than from Explorer or Settings, which is not how a person sends a file.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: collection_preceded_the_bluetooth_activity
+      name: User data packaged shortly before the Bluetooth commands
+      description: >-
+        Archiving or bulk copying of documents happened on the same host in the same window,
+        which supplies the material the channel would carry.
+      source: process_creation
+      field: FileName
+      indicates: collection_preceding_egress
+    - id: no_bluetooth_history_on_this_host
+      name: Host has no record of Bluetooth activity
+      description: >-
+        Nothing has touched the Bluetooth command surface on this machine during the baseline
+        window, so the medium is being brought into use rather than being used.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: host_has_no_peripheral_role
+      name: Host class has no reason to use Bluetooth
+      description: >-
+        The machine is a server, virtual desktop or fixed workstation where peripheral pairing
+        is not part of how it is used.
+      source: asset_inventory
+      field: ComputerName
+      indicates: unexpected_capability_for_asset
+
+  contradicting:
+    - id: interactive_peripheral_pairing
+      name: A person pairing a peripheral
+      description: >-
+        The activity belongs to a logged-on user on a portable machine and follows the
+        interactive path through Settings or Explorer, which is how headsets, mice and
+        keyboards are connected.
+      source: process_creation
+      field: UserName
+      indicates: legitimate_user_activity
+    - id: provisioning_or_support_action
+      name: Recorded provisioning or support action
+      description: >-
+        A build, imaging run or support ticket covers the peripheral configuration on this
+        host, which explains a service or driver being enabled from a script.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: bluetooth_routine_for_this_host_class
+      name: Bluetooth activity is normal for this population
+      description: >-
+        Comparable machines in the estate touch the same commands regularly across the
+        baseline window, which makes the activity a property of the fleet rather than of this
+        host.
+      source: baseline
+      field: UserName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - bluetooth_transfer_path_prepared
+
+    supporting:
+      any:
+        - wizard_launched_non_interactively
+        - collection_preceded_the_bluetooth_activity
+        - no_bluetooth_history_on_this_host
+        - host_has_no_peripheral_role
+      all:
+        - collection_preceded_the_bluetooth_activity
+        - no_bluetooth_history_on_this_host
+
+    contradicting:
+      any:
+        - interactive_peripheral_pairing
+        - provisioning_or_support_action
+        - bluetooth_routine_for_this_host_class
+      all: []
+
+  verdict:
+    low_risk_when:
+      - bluetooth_transfer_path_prepared
+      - interactive_peripheral_pairing
+      - provisioning_or_support_action
+      - bluetooth_routine_for_this_host_class
+    suspicious_when:
+      - bluetooth_transfer_path_prepared
+      - no_bluetooth_history_on_this_host
+    high_risk_when:
+      - bluetooth_transfer_path_prepared
+      - collection_preceded_the_bluetooth_activity
+      - no_bluetooth_history_on_this_host
+      - host_has_no_peripheral_role
+      - wizard_launched_non_interactively
+
+  false_positive:
+    - condition: A user pairs a headset, mouse or keyboard on a laptop.
+      explanation: >-
+        This is the overwhelming majority of Bluetooth activity in any estate and it will
+        match the command surface whenever the Settings app shells out. It differs in the
+        parent being the shell or Settings, in the account being an interactively logged-on
+        user, and in the host having a long history of the same activity.
+    - condition: A support script re-enables the Bluetooth service after a driver fault.
+      explanation: >-
+        Service reconfiguration from a script is exactly the first case, and support tooling
+        does it. The ticket or change record accounts for it, and the same script typically
+        runs across several machines rather than once on one.
+    - condition: Provisioning or imaging configures peripheral services during build.
+      explanation: >-
+        Build automation touches device and service configuration broadly, including
+        Bluetooth. It happens in a narrow window near the machine's first appearance and it is
+        identical across every host built from the same image.
+    - condition: A conference room or presentation machine pairs a device.
+      explanation: >-
+        Shared meeting-room machines pair displays, clickers and speakers as a matter of
+        routine, which defeats the host-class argument for that population. Those machines
+        are identifiable from the inventory and belong on the exclusion list rather than
+        being triaged repeatedly.

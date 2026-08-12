@@ -1,0 +1,380 @@
+type: detection
+
+id: hg-win-ide-tunnel-opened-to-a-vendor-relay-for-remote-access-t1219-001
+
+version: 1.0.0
+
+info:
+  name: IDE tunnel opened to a vendor relay for remote access
+  description: >-
+    An IDE tunnel is inbound access dressed as a developer feature. The command that starts
+    it is a signed vendor binary, the traffic goes outbound over HTTPS to the vendor's own
+    relay infrastructure on a reputable domain, and no port is opened on the host, so
+    perimeter controls and application allow-lists see nothing worth stopping. Once the
+    tunnel is registered, the operator reaches a shell and the file system through the
+    vendor's web portal, authenticating with an account of their own rather than with
+    anything belonging to the victim, and the IDE will re-establish the tunnel after a
+    reboot if asked to. Every property that makes it attractive also makes signature-based
+    controls useless: there is nothing unsigned, nothing unusual on the wire, and nothing
+    listening. What remains observable is the intent written into the command line. The CLI
+    has to be told to tunnel, it has to be told to register as a service if the access is to
+    survive a restart, and on a host that has never done development the CLI binary has to
+    arrive from somewhere first. The discriminator is therefore the role of the machine
+    rather than the behaviour in isolation: on an engineering workstation this is a normal
+    working day, and on a file server or a domain controller it is an operator holding the
+    box open. This is distinct from a malicious IDE extension, which runs inside the editor
+    rather than exposing the host.
+  severity: high
+  author: huntgraph
+  tags:
+    - command-and-control
+    - remote-access
+    - ide-tunnelling
+    - developer-tools
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1219/001
+    - https://attack.mitre.org/detectionstrategies/DET0133
+    - https://attack.mitre.org/techniques/T1219
+    - https://attack.mitre.org/techniques/T1176/002
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1219
+  sub_techniques:
+    - T1219.001
+  detection_strategies:
+    - DET0133
+  analytics:
+    - AN0375
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - NSM:Flow
+  data_components:
+    - Process Creation
+    - File Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may start an IDE tunnel on a compromised host so that they reach an
+    interactive shell and the file system through the vendor's relay and web portal,
+    obtaining inbound access over a signed binary and a reputable domain without opening a
+    listener or deploying any tooling of their own.
+  attacker_behavior:
+    - Runs the IDE command-line tool with a tunnel argument to register the host with the vendor relay.
+    - Authenticates the tunnel against an account the adversary controls rather than the victim's.
+    - Installs the tunnel as a service so it re-establishes after a restart.
+    - Fetches the CLI binary onto a host where the IDE was never installed.
+    - Uses the compromised host as a jump point into the rest of the network.
+  legitimate_behavior:
+    - Engineers use remote development tunnels to work on build machines and servers.
+    - Platform teams expose development containers through the same feature.
+    - Developers run the CLI locally as part of their normal editor workflow.
+    - Support staff open a tunnel briefly to diagnose a problem on a remote machine.
+  risk_indicator:
+    - The host has no development role and no history of IDE tooling.
+    - The tunnel is registered as a service so it survives a reboot.
+    - The CLI binary was written into a temporary or user-writable directory shortly before.
+    - The command was issued by a shell or a remote-execution channel rather than an interactive editor.
+    - Nothing else in the estate has contacted the vendor's tunnel relay.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - DomainName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: ide-cli-invoked-with-tunnel-arguments
+        name: IDE command-line tool run with tunnelling arguments
+        purpose: >-
+          Carry the core observable. Nothing about the binary is unusual, so the finding is
+          the instruction it was given: the CLI only exposes the host when it is explicitly
+          told to tunnel or to serve.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(code|code-insiders|code-tunnel|codium|jetbrains-gateway|remote-dev-server)(\.exe|\.cmd)?\b/i
+          | CommandLine=/(\btunnel\b|\bserve-web\b|--remote\b|\bremoteDev\b)/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=launches), collect([CommandLine], limit=5)])
+          | sort(launches, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Engineering workstations and build agents where remote development is the sanctioned workflow"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: tunnel-registered-to-survive-a-restart
+        name: Tunnel installed as a service or named for reconnection
+        purpose: >-
+          Separate a session from a foothold. A developer opens a tunnel while they are
+          working and it ends when they stop; registering it as a service, naming it and
+          suppressing sleep turns the same feature into access that comes back on its own.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\btunnel\b/i
+          | CommandLine=/(service\s+install|--accept-server-license-terms|--no-sleep|--random-name|--name\s+\S+|user\s+login\s+--provider)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=registrations), collect([CommandLine], limit=5)])
+          | sort(registrations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Managed development containers whose tunnels are provisioned by the platform team"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: tunnel-relay-contacted-from-this-host
+        name: Vendor tunnel relay resolved and connected to
+        purpose: >-
+          Confirm the tunnel came up rather than merely being requested. The relay domain is
+          specific to the tunnelling feature, so contacting it shows the host actually
+          registered and is reachable through the vendor's portal.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6|DnsRequest)$/
+          | case {
+              #event_simpleName=DnsRequest
+                | DomainName=/(^|\.)(devtunnels\.ms|tunnels\.api\.visualstudio\.com|gateway\.jetbrains\.com|code\.visualstudio\.dev)$/i
+                | tunnel_domain := DomainName ;
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | RemotePort in (443, 8443)
+                | peer := RemoteAddressIP4 ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([ContextBaseFileName, tunnel_domain, peer]),
+                              count(as=events)])
+          | tunnel_domain=/.+/
+          | peer=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Development subnets and asset groups where tunnel relays are reached routinely"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - domain
+            - organization
+
+      - id: ide-cli-binary-written-to-a-user-writable-path
+        name: IDE command-line binary dropped outside an installation directory
+        purpose: >-
+          Catch the arrival of the tooling on hosts that never had it. Where the IDE is
+          genuinely in use it is installed; where the tunnel is being abused the CLI is
+          usually fetched into a temporary or profile directory minutes before it runs.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+          | TargetFileName=/\\(code|code-insiders|code-tunnel|vscode-server|codium|jetbrains-gateway|remote-dev-server)[^\\]*\.exe$/i
+          | TargetFileName=/\\(Users|AppData|Temp|ProgramData|Public|Downloads|PerfLogs)\\/i
+          | groupBy([ComputerName, TargetFileName, SHA256HashData],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Per-user IDE installations distributed by the software deployment platform"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+evidence:
+  required:
+    - id: ide_tunnel_command_executed
+      name: IDE tool instructed to open a tunnel
+      description: >-
+        The IDE command-line tool was run with an argument that registers the host with the
+        vendor's tunnel relay, which is the remote access channel itself rather than a
+        precursor to one.
+      source: process_creation
+      field: CommandLine
+      indicates: remote_access_channel_established
+
+  supporting:
+    - id: tunnel_registered_for_reconnection
+      name: Tunnel installed as a service or named for reuse
+      description: >-
+        The tunnel was registered so it re-establishes without anyone starting it, turning an
+        interactive session into access that survives a restart.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: persistent_remote_access
+    - id: tunnel_relay_resolved
+      name: Vendor tunnel relay resolved from this machine
+      description: >-
+        The host looked up the domain the tunnelling feature uses, showing the registration
+        reached the vendor rather than failing locally.
+      source: dns_request
+      field: DomainName
+      indicates: external_service_contacted
+    - id: relay_session_held_open
+      name: Session held with the tunnel relay
+      description: >-
+        A process on the host maintained a connection to the relay, which is what makes the
+        machine reachable through the vendor's portal.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: inbound_access_available
+    - id: cli_binary_dropped
+      name: IDE command-line binary written outside an installation path
+      description: >-
+        The tunnelling binary was written into a temporary or profile directory rather than
+        being present as part of an installed development environment.
+      source: file_creation
+      field: TargetFileName
+      indicates: tooling_staged_on_host
+    - id: no_tunnelling_history_here
+      name: No tunnelling activity on this host in the baseline window
+      description: >-
+        Neither this host nor the estate around it has used the tunnelling feature during the
+        baseline window, so the capability is new rather than newly noticed.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: development_asset_role
+      name: Host is a registered development or build system
+      description: >-
+        The machine belongs to an engineering asset group where remote development tunnels
+        are the sanctioned way of working on it.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+    - id: sanctioned_remote_development
+      name: Recorded remote development or support work
+      description: >-
+        A change or support record covers opening a tunnel to this machine during the window
+        in which the registration occurred.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: interactive_editor_session
+      name: Tunnel started from an interactive editor session
+      description: >-
+        The command was issued by the IDE running in the logged-on user's desktop session
+        rather than by a shell, a script host or a remote-execution channel.
+      source: process_creation
+      field: FileName
+      indicates: expected_interactive_use
+
+  risk_logic:
+    required:
+      - ide_tunnel_command_executed
+
+    supporting:
+      any:
+        - tunnel_registered_for_reconnection
+        - tunnel_relay_resolved
+        - relay_session_held_open
+        - cli_binary_dropped
+        - no_tunnelling_history_here
+      all:
+        - tunnel_registered_for_reconnection
+        - cli_binary_dropped
+
+    contradicting:
+      any:
+        - development_asset_role
+        - sanctioned_remote_development
+        - interactive_editor_session
+      all: []
+
+  verdict:
+    low_risk_when:
+      - ide_tunnel_command_executed
+      - development_asset_role
+      - sanctioned_remote_development
+      - interactive_editor_session
+    suspicious_when:
+      - ide_tunnel_command_executed
+      - no_tunnelling_history_here
+    high_risk_when:
+      - ide_tunnel_command_executed
+      - tunnel_registered_for_reconnection
+      - cli_binary_dropped
+      - relay_session_held_open
+
+  false_positive:
+    - condition: An engineer opens a remote development tunnel to a build machine.
+      explanation: >-
+        This is the feature working as designed and produces the required evidence exactly.
+        It is separated by asset role and by history: the host is an engineering asset, the
+        IDE is installed rather than dropped, and the account tunnels regularly.
+    - condition: A platform team provisions development containers reachable over tunnels.
+      explanation: >-
+        Managed development environments register tunnels automatically. The same command
+        appears across a whole pool of identical hosts at provisioning time, rather than once
+        on a single machine with no development role.
+    - condition: A support engineer opens a tunnel briefly to diagnose a remote problem.
+      explanation: >-
+        Short-lived diagnostic tunnels look the same at the command line. They are tied to a
+        support record, are not registered as a service, and end when the work does.
+    - condition: The IDE updates its own command-line component.
+      explanation: >-
+        Updates write the CLI binary and can trigger the file case. The write lands in the
+        installed product directory rather than a temporary path, and no tunnel argument
+        follows it.

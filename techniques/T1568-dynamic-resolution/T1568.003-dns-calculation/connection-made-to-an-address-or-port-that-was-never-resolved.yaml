@@ -1,0 +1,411 @@
+type: detection
+
+id: hg-win-connection-made-to-an-address-or-port-that-was-never-resolved-t1568-003
+
+version: 1.0.0
+
+info:
+  name: Connection made to an address or port that was never resolved
+  description: >-
+    DNS calculation treats a name lookup as a message rather than a directory entry. The
+    implant resolves a domain, takes the octets it gets back, and computes from them the
+    port — sometimes the address as well — that it will actually connect to. The published
+    example multiplies the first two octets of the answer and adds the third to obtain a
+    port. The point is egress filtering: a channel that never uses the resolved address or a
+    registered service port is difficult to describe in a firewall rule, and the operator can
+    move the channel by changing one DNS record. What makes this worth hunting from an
+    endpoint is that the mismatch is structural. The process asks the resolver a question,
+    receives an answer, and then connects somewhere the answer did not point to. Pairing DNS
+    telemetry with connection telemetry for the same process makes that visible without any
+    packet inspection at all. The honest complication is caching: Windows resolves once and
+    reuses the result, another process may have done the lookup, and browsers increasingly
+    resolve over channels the sensor does not attribute — so a connection with no matching
+    lookup is common on its own. This file therefore keys on processes that demonstrably do
+    resolve names and still connect elsewhere, and on the port shape, which is where the
+    calculation actually shows.
+  severity: medium
+  author: huntgraph
+  tags:
+    - command-and-control
+    - dynamic-resolution
+    - dns
+    - egress-filtering
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1568/003
+    - https://attack.mitre.org/detectionstrategies/DET0262
+    - https://attack.mitre.org/techniques/T1568
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1568
+  sub_techniques:
+    - T1568.003
+  detection_strategies:
+    - DET0262
+  analytics:
+    - AN0728
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Connection Creation
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may derive the port or address for command and control by computing over
+    the octets returned in a DNS answer, so that the channel uses a destination no record
+    ever published and egress rules written against resolved names and standard ports do not
+    describe it.
+  attacker_behavior:
+    - Resolves a domain purely to obtain octets to calculate with.
+    - Computes a destination port from the answer rather than using a service port.
+    - Connects to an address or port that appears in no answer the host received.
+    - Changes the published record to move the channel without touching the implant.
+  legitimate_behavior:
+    - Cached and pre-resolved names mean connections often have no matching lookup.
+    - Peer-to-peer, conferencing and game clients use high ephemeral destination ports.
+    - Software configured with literal addresses connects without resolving anything.
+    - Proxy and tunnel clients connect on behalf of processes that did the resolving.
+  risk_indicator:
+    - The same process both resolves names and connects to addresses it never received.
+    - The destination port sits outside every registered service range.
+    - The port for one destination changes repeatedly while the name stays the same.
+    - The process descends from a document application, script host or archive tool.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - DomainName
+        - IP4Records
+        - ContextProcessId
+        - ContextBaseFileName
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - RemoteAddressIP4
+        - RemotePort
+        - ContextProcessId
+        - ContextBaseFileName
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: resolving-process-connecting-on-an-unregistered-port
+        name: Process resolves names but connects on a port no service uses
+        purpose: >-
+          Pair the two halves for one process. Requiring that the process did perform name
+          resolution removes the large benign population of software configured with literal
+          addresses, and requiring the destination port to fall outside every registered
+          service range isolates the part of the technique that a calculation produces.
+        query: |
+          #event_simpleName=/^(DnsRequest|NetworkConnectIP4|NetworkConnectIP6)$/
+          | ContextBaseFileName!=/^(msedge|chrome|firefox|iexplore|brave|opera|vivaldi|msedgewebview2|teams|onedrive)\.exe$/i
+          | case {
+              #event_simpleName=DnsRequest
+                | IP4Records=/.+/
+                | looked_up := DomainName ;
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|169\.254\.|224\.)/
+                | RemotePort!=/^(80|443|53|22|25|110|143|389|445|465|587|636|993|995|123|3389|8080|8443)$/
+                | derived_port := RemotePort ;
+            }
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName],
+                    function=[count(derived_port, distinct=true, as=distinct_ports),
+                              collect([looked_up, derived_port, RemoteAddressIP4], limit=20),
+                              count(as=events)])
+          | looked_up=/.+/ and derived_port=/.+/
+          | sort(distinct_ports, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Conferencing, peer-to-peer and game clients whose media paths use high ephemeral ports"
+            - "Backup, replication and database clients with documented non-standard service ports"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: external-address-that-never-appeared-in-an-answer
+        name: External address contacted that no answer on this host contained
+        purpose: >-
+          Express the address half of the mismatch. Keying on the destination address and
+          asking whether that same address was ever returned to this host separates a
+          computed destination from one that was looked up. Answers carrying several
+          addresses will not join to a single-address key, so results from multi-address
+          services need discarding — this case is meant to be read alongside the port cases
+          rather than on its own.
+        query: |
+          #event_simpleName=/^(DnsRequest|NetworkConnectIP4)$/
+          | case {
+              #event_simpleName=DnsRequest
+                | IP4Records=/.+/
+                | dst := IP4Records
+                | answered := "yes" ;
+              #event_simpleName=NetworkConnectIP4
+                | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|169\.254\.|224\.)/
+                | dst := RemoteAddressIP4
+                | contacted := "yes" ;
+            }
+          | groupBy([ComputerName, dst],
+                    function=[collect([ContextBaseFileName, RemotePort, answered, contacted], limit=10),
+                              count(as=events)])
+          | contacted=/yes/
+          | answered!=/yes/
+          | sort(events, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Addresses returned inside multi-address answers, which do not join to a single-address key"
+            - "Cached resolutions from before the search window, and names resolved by a different process"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - remote_address
+            - organization
+
+      - id: port-changing-while-the-name-stays-the-same
+        name: Destination port changing repeatedly behind one stable name
+        purpose: >-
+          Isolate the signature of the calculation itself. If the port is computed from the
+          answer, then republishing the record changes the port without changing the name,
+          so one process talking to a small number of destinations over a steadily growing
+          set of unregistered ports is the arithmetic showing through.
+        query: |
+          #event_simpleName=/^(DnsRequest|NetworkConnectIP4|NetworkConnectIP6)$/
+          | case {
+              #event_simpleName=DnsRequest
+                | IP4Records=/.+/
+                | stable_name := DomainName ;
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|169\.254\.|224\.)/
+                | RemotePort!=/^(80|443|53|22|25|123|445|3389|8080|8443)$/
+                | odd_port := RemotePort ;
+            }
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName],
+                    function=[count(odd_port, distinct=true, as=distinct_ports),
+                              count(stable_name, distinct=true, as=distinct_names),
+                              count(RemoteAddressIP4, distinct=true, as=distinct_peers),
+                              collect([stable_name, odd_port, RemoteAddressIP4], limit=20)])
+          | stable_name=/.+/ and odd_port=/.+/
+          | distinct_names <= 2
+          | distinct_ports >= 4
+          | sort(distinct_ports, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Media and conferencing clients that negotiate a new port per session"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - domain
+
+      - id: computed-destination-from-a-delivery-lineage
+        name: Lookup and unregistered-port connection alongside delivered code
+        purpose: >-
+          Attach an actor. Nothing about a resolve-then-connect pair identifies the code
+          doing it, so the surrounding lineage carries the weight: an interpreter or
+          proxy-execution binary started by a document application, mail client or archive
+          tool is code that arrived, and the same host performing this connection shape at
+          the same time is worth far more than either observation alone.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              #event_simpleName=NetworkConnectIP4
+                | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|169\.254\.|224\.)/
+                | RemotePort!=/^(80|443|53|22|25|123|445|3389|8080|8443)$/
+                | odd_destination := RemoteAddressIP4 ;
+              #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+                | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|mshta|wscript|cscript|7z|winrar|winzip|explorer)\.exe$/i
+                | FileName=/^(powershell|pwsh|python|pythonw|node|rundll32|regsvr32|mshta|wscript|cscript|cmd)\.exe$/i
+                | delivery_parent := ParentBaseFileName ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([odd_destination, RemotePort, delivery_parent, FileName, CommandLine], limit=20),
+                              count(as=events)])
+          | odd_destination=/.+/ and delivery_parent=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Packaging and automation hosts where interpreters are routinely started by archive tooling"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - remote_address
+
+evidence:
+  required:
+    - id: destination_never_resolved
+      name: Destination address or port absent from every answer received
+      description: >-
+        A process opened an outbound session to an external address, or on a port, that no
+        DNS answer delivered to this host pointed at, while that same process was actively
+        resolving names — the structural mismatch the technique creates.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: computed_destination
+
+  supporting:
+    - id: unregistered_destination_port
+      name: Port outside every registered service range
+      description: >-
+        The session was opened on a high port that corresponds to no service, which is what
+        an arithmetic result looks like and what a configured client rarely produces.
+      source: network_connection
+      field: RemotePort
+      indicates: non_standard_channel
+    - id: process_did_resolve_names
+      name: The same process was resolving names at the time
+      description: >-
+        The connecting process performed its own lookups in the same window, so the missing
+        match is not simply a cached or externally resolved name but a destination this
+        process chose without reference to what it received.
+      source: dns_request
+      field: DomainName
+      indicates: resolution_result_unused
+    - id: port_set_churn_behind_one_name
+      name: Port changing while the name stays fixed
+      description: >-
+        The process reached one or two destinations over an expanding set of unregistered
+        ports, which is what recomputing from a republished record produces.
+      source: network_connection
+      field: ContextProcessId
+      indicates: recomputed_channel
+    - id: delivery_lineage
+      name: Activity alongside code from a delivery chain
+      description: >-
+        An interpreter or proxy-execution binary started by a document application, mail
+        client or archive tool was running on the host at the time, which is the shape of
+        code that arrived rather than code that was installed.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+
+  contradicting:
+    - id: media_or_peer_to_peer_client
+      name: Conferencing, media or peer-to-peer client
+      description: >-
+        The connecting process negotiates a fresh high port per session as part of its
+        design, which reproduces both the unregistered port and the changing port set.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: legitimate_application_component
+    - id: resolution_performed_elsewhere
+      name: Name resolved by another process or served from cache
+      description: >-
+        The address was resolved earlier, by a proxy client, or by a component whose lookups
+        the sensor does not attribute to the connecting process, so no matching answer
+        appears without anything unusual having happened.
+      source: derived
+      field: resolution_attribution
+      indicates: telemetry_gap
+    - id: documented_service_port
+      name: Documented internal service on a non-standard port
+      description: >-
+        The destination and port belong to a backup, replication, database or management
+        service the organisation runs deliberately outside the registered ranges.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - destination_never_resolved
+
+    supporting:
+      any:
+        - unregistered_destination_port
+        - process_did_resolve_names
+        - port_set_churn_behind_one_name
+        - delivery_lineage
+      all:
+        - unregistered_destination_port
+        - process_did_resolve_names
+
+    contradicting:
+      any:
+        - media_or_peer_to_peer_client
+        - resolution_performed_elsewhere
+        - documented_service_port
+      all: []
+
+  verdict:
+    low_risk_when:
+      - destination_never_resolved
+      - media_or_peer_to_peer_client
+      - resolution_performed_elsewhere
+      - documented_service_port
+    suspicious_when:
+      - destination_never_resolved
+      - unregistered_destination_port
+    high_risk_when:
+      - destination_never_resolved
+      - unregistered_destination_port
+      - process_did_resolve_names
+      - port_set_churn_behind_one_name
+
+  false_positive:
+    - condition: A connection uses a cached resolution from outside the search window.
+      explanation: >-
+        Windows caches answers and reuses them, so a long-lived process can connect for
+        hours with no lookup in the data. This is the single largest source of noise here,
+        which is why the file requires the connecting process to be resolving names of its
+        own rather than simply lacking a match.
+    - condition: The name was resolved by a different process or component.
+      explanation: >-
+        Proxy clients, resolver services and browsers using encrypted resolution perform
+        lookups that are not attributed to the process that eventually connects. The pattern
+        is stable across the estate and involves ordinary service ports, unlike a computed
+        destination.
+    - condition: A conferencing or peer-to-peer client negotiates high ports per session.
+      explanation: >-
+        Media clients connect to relay addresses on ephemeral ports that change constantly,
+        reproducing both the unregistered port and the churn. The process is a recognisable
+        product, the addresses belong to announced provider ranges, and many hosts do the
+        same thing.
+    - condition: An internal service is published on a deliberately non-standard port.
+      explanation: >-
+        Backup, replication and management services frequently sit outside registered
+        ranges. They are reached by many hosts, appear in change records, and their port set
+        is fixed rather than expanding over time.

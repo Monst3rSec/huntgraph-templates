@@ -1,0 +1,403 @@
+type: detection
+
+id: hg-lin-scheduled-read-only-poll-of-a-public-web-service-t1102-003
+
+version: 1.0.0
+
+info:
+  name: Scheduled read-only poll of a public web service
+  description: >-
+    A one-way channel is the quietest form of web-service command and control, because the
+    victim never publishes anything. The implant reads instructions from a page, a message
+    channel or a raw file on a service the organisation cannot block, and whatever it
+    produces either goes nowhere or leaves by a completely different route. There is no
+    upload to correlate, no session to characterise, and nothing about the destination that
+    is even mildly unusual. On Linux the honest observable is not the traffic but the
+    invocation, and it is unusually good: the fetch is almost always a command line, and a
+    command line says which direction the data was meant to go. A retrieval with no request
+    body and no upload option is a read, and a read on a fixed schedule from a scheduler
+    parent rather than a terminal is a poll. That combination — a non-interactive, recurring,
+    body-less fetch of a public content service, whose output is redirected to a file or
+    piped straight into a shell — is what a one-way channel looks like when you can see the
+    process table but not the packets. Its sibling technique, where the same service carries
+    the results back, produces a much broader and busier relationship and is covered
+    separately; the difference between them is genuinely visible here, in whether the
+    request carries anything. The benign twin is substantial: cron jobs fetch configuration,
+    health checks call APIs, and installation instructions across the ecosystem still tell
+    people to pipe a downloaded script into a shell. The discriminators are the destination
+    class, the absence of any packaging or configuration management around the job, and the
+    fact that the job is new.
+  severity: medium
+  author: huntgraph
+  tags:
+    - command-and-control
+    - web-service
+    - one-way-channel
+    - scheduled-task
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1102/003
+    - https://attack.mitre.org/detectionstrategies/DET0581
+    - https://attack.mitre.org/techniques/T1102
+    - https://attack.mitre.org/techniques/T1102/002
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1102
+  sub_techniques:
+    - T1102.003
+  detection_strategies:
+    - DET0581
+  analytics:
+    - AN1600
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+    - iptables:LOG
+  data_components:
+    - Process Creation
+    - Network Traffic Flow
+
+hypothesis:
+  statement: >-
+    An adversary may have an implant read instructions from a legitimate public web service
+    without ever returning results through it, so that the host only ever receives, and the
+    channel offers a defender no upload, no session and no suspicious destination to work
+    from.
+  attacker_behavior:
+    - Fetches a paste, raw file, profile field or message channel on a recurring schedule.
+    - Issues the request with no body and no upload option, so nothing leaves through it.
+    - Runs the fetch from cron, a systemd timer or another scheduler rather than a terminal.
+    - Redirects the response to a file or pipes it directly into a shell for execution.
+    - Sends any results out through a different destination, or produces none at all.
+  legitimate_behavior:
+    - Cron jobs pull configuration, allowlists and feeds from external services.
+    - Health checks and monitoring probes call public endpoints on a fixed interval.
+    - Installation and bootstrap instructions pipe a downloaded script into a shell.
+    - Configuration management fetches manifests and templates from a repository host.
+    - Container and CI tooling retrieves files from code-hosting services during builds.
+  risk_indicator:
+    - The destination is a paste, profile, messaging or raw-content service rather than a vendor.
+    - The invocation carries no upload or request-body option at all.
+    - The parent is a scheduler and there is no packaged job or configuration entry behind it.
+    - The retrieved content is piped into an interpreter rather than stored and read.
+    - The job has no history on the host and does not appear anywhere else in the estate.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: content-service-fetched-by-a-command-line-client
+        name: Paste, raw-file or messaging service retrieved with a fetch utility
+        purpose: >-
+          Establish the population. These services are chosen precisely because they cannot
+          be blocked, so the domain alone proves nothing; what narrows it is that a
+          command-line HTTP client is reaching them at all. A person reads a paste in a
+          browser. Something reading one with curl on a server is either automation
+          somebody wrote down, or automation nobody wrote down.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(curl|wget|python[0-9.]*|perl|ruby|php|busybox|fetch|aria2c)$/i
+          | CommandLine=/(pastebin\.com|paste\.ee|pastes\.io|ghostbin|hastebin|rentry\.co|controlc\.com|justpaste\.it|dpaste\.|0bin\.net|privatebin|termbin\.com|ix\.io|gist\.github\.com|raw\.githubusercontent\.com|gitee\.com|gitlab\.com\/[^\s]+\/raw|bitbucket\.org|telegra\.ph|api\.telegram\.org|discord(app)?\.com\/api|t\.me\/|steamcommunity\.com|blogspot\.com|livejournal\.com|imgur\.com|notion\.so|docs\.google\.com|drive\.google\.com)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=fetches), collect([CommandLine], limit=5)])
+          | sort(fetches, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Build agents and container image builds that retrieve source from code hosts"
+            - "Documented jobs whose configuration references one of these endpoints"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+            - organization
+
+      - id: fetch-parented-by-a-scheduler
+        name: Retrieval running from cron or a timer rather than a session
+        purpose: >-
+          Separate a poll from a person. A fetch typed at a prompt happens once and has a
+          shell and a login behind it; a fetch under cron, atd or a systemd timer recurs on
+          its own and is how a one-way channel receives tasking without anyone present. This
+          is also the form MITRE's own Linux analytic describes, and it is the difference
+          between an administrator retrieving something and a host being told what to do.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(cron|crond|anacron|atd|at|systemd|systemd-run|run-parts|incrond|fcron)$/i
+          | CommandLine=/(curl|wget|python[0-9.]*|perl|fetch|aria2c)\b/i
+          | CommandLine=/(https?|ftp):\/\//i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=invocations), collect([CommandLine, FileName], limit=5)])
+          | sort(invocations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Scheduled jobs installed by packages or configuration management"
+            - "Monitoring and health-check probes with a recorded owner"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+            - organization
+
+      - id: body-less-fetch-whose-output-is-captured-or-executed
+        name: Retrieval with no upload option whose response is stored or piped to a shell
+        purpose: >-
+          The direction test, and the sharpest thing available here. An HTTP client that is
+          given no request body, no form, no file to upload and no state-changing method is
+          doing one thing only: receiving. Pairing that with an option that captures the
+          response — a redirect to a file, an output path, or a pipe into an interpreter —
+          describes a host that takes instructions and returns nothing through the same
+          channel, which is exactly what distinguishes this from its bidirectional sibling.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(curl|wget|fetch|aria2c)\b/i
+          | CommandLine=/(https?):\/\//i
+          | CommandLine!=/(\s-d\b|--data|--data-binary|--data-raw|\s-F\b|--form|\s-T\b|--upload-file|--post-file|--post-data|-X\s*(POST|PUT|PATCH)|\s-u\s+[^\s]+:)/i
+          | CommandLine=/(\s-o\s|\s-O\b|--output|-sS?L?\s*[^\s|]+\s*\|\s*(ba)?sh|\|\s*(ba|z|k)?sh\b|\|\s*python|>\s*\/(tmp|dev\/shm|var\/tmp|home)\/)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=fetches), collect([CommandLine], limit=5)])
+          | sort(fetches, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Vendor installation bootstraps run once during a recorded provisioning window"
+            - "Package registry and mirror endpoints belonging to the distribution in use"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+            - organization
+
+      - id: repeated-short-contact-with-one-external-endpoint
+        name: Fetch utility contacting the same external address again and again
+        purpose: >-
+          Corroborate on the wire what the command lines imply, and catch the poll whose
+          arguments were read from a file rather than written out. One connection per
+          invocation, to one address, repeated many times, is the network footprint of a
+          scheduled read; it is also what a health check looks like, which is why this case
+          is corroboration for the invocation evidence rather than a finding in its own
+          right.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | ContextBaseFileName=/^(curl|wget|python[0-9.]*|perl|ruby|php|busybox|fetch|aria2c)$/i
+          | RemotePort in (80, 443, 8080, 8443)
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+          | groupBy([ComputerName, ContextBaseFileName, RemoteAddressIP4],
+                    function=[count(as=connections),
+                              count(field=ContextProcessId, distinct=true, as=invocations)])
+          | invocations >= 5
+          | sort(connections, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Package mirrors, distribution repositories and approved vendor endpoints"
+            - "Monitoring probes whose target is recorded in the monitoring configuration"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - remote_address
+            - organization
+
+evidence:
+  required:
+    - id: scheduled_read_only_fetch
+      name: Recurring body-less retrieval of a public content service
+      description: >-
+        A command-line HTTP client repeatedly retrieved content from a public paste,
+        repository, profile or messaging service with no upload option present, so the host
+        is receiving through that channel and never sending.
+      source: process_creation
+      field: CommandLine
+      indicates: one_way_command_channel
+
+  supporting:
+    - id: scheduler_parent
+      name: Fetch run by a scheduler rather than a session
+      description: >-
+        The retrieval was launched by cron, atd or a systemd timer rather than typed into a
+        shell, which makes it a poll that continues without anyone present.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: unattended_recurring_execution
+    - id: response_executed
+      name: Retrieved content piped into an interpreter
+      description: >-
+        The response was passed straight to a shell or interpreter instead of being stored
+        and read, which turns a retrieval into the execution of whatever the page currently
+        contains.
+      source: process_creation
+      field: FileName
+      indicates: remote_content_executed
+    - id: repeated_contact_with_one_endpoint
+      name: Same external address contacted by many separate invocations
+      description: >-
+        Numerous short-lived fetch processes connected to the same public address, which is
+        the network footprint of a scheduled read and corroborates the invocation evidence.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: polling_cadence_observed
+    - id: unmanaged_job
+      name: No package or configuration management behind the job
+      description: >-
+        The scheduled entry driving the fetch does not correspond to anything the
+        organisation installed or configured, unlike the jobs shipped by packages and
+        configuration management.
+      source: change_management
+      field: CommandLine
+      indicates: unauthorised_scheduled_job
+    - id: new_to_host_and_estate
+      name: Neither the job nor the destination has history
+      description: >-
+        This command line and this destination were not seen on the host or anywhere in the
+        estate during the baseline window, so the poll is new rather than long-standing
+        automation.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_organization
+
+  contradicting:
+    - id: packaged_or_managed_automation
+      name: Job installed by a package or configuration management
+      description: >-
+        The scheduled entry was placed by a distribution package, a configuration-management
+        run or a monitoring deployment, which is the ordinary way recurring fetches arrive
+        on a server.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: distribution_or_vendor_endpoint
+      name: Destination is a mirror, registry or vendor endpoint
+      description: >-
+        The address retrieved from belongs to the distribution's package mirrors, a public
+        registry the estate depends on, or a vendor whose product is installed here.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_software_supply
+    - id: identical_job_across_the_estate
+      name: Same job present on many hosts
+      description: >-
+        The identical command line runs on a large number of hosts on the same schedule,
+        which is standard build automation rather than a channel aimed at one machine.
+      source: baseline
+      field: ComputerName
+      indicates: standard_build_configuration
+
+  risk_logic:
+    required:
+      - scheduled_read_only_fetch
+
+    supporting:
+      any:
+        - scheduler_parent
+        - response_executed
+        - repeated_contact_with_one_endpoint
+        - unmanaged_job
+        - new_to_host_and_estate
+      all:
+        - scheduler_parent
+        - unmanaged_job
+        - new_to_host_and_estate
+
+    contradicting:
+      any:
+        - packaged_or_managed_automation
+        - distribution_or_vendor_endpoint
+        - identical_job_across_the_estate
+      all: []
+
+  verdict:
+    low_risk_when:
+      - scheduled_read_only_fetch
+      - packaged_or_managed_automation
+      - distribution_or_vendor_endpoint
+      - identical_job_across_the_estate
+    suspicious_when:
+      - scheduled_read_only_fetch
+      - scheduler_parent
+      - new_to_host_and_estate
+    high_risk_when:
+      - scheduled_read_only_fetch
+      - scheduler_parent
+      - response_executed
+      - unmanaged_job
+      - new_to_host_and_estate
+
+  false_positive:
+    - condition: A cron job pulls a configuration file or feed from an external service.
+      explanation: >-
+        This satisfies every structural element of the hypothesis — scheduler parent,
+        body-less fetch, output redirected to a file — and it is common on servers. What
+        separates it is provenance: the job was installed deliberately, it appears in
+        configuration management or a package manifest, and it has been running since long
+        before the baseline window opened.
+    - condition: An installation bootstrap pipes a downloaded script into a shell.
+      explanation: >-
+        A large part of the ecosystem still documents installation this way, so the
+        strongest supporting evidence here also has an entirely routine explanation. It
+        differs in being a one-off during provisioning rather than recurring, and in
+        targeting a vendor or registry endpoint rather than a paste or profile service.
+    - condition: A health check or uptime probe calls a public endpoint on a fixed interval.
+      explanation: >-
+        Probes produce exactly the repeated-short-contact footprint, which is why that item
+        is corroborating rather than required evidence. Their targets are recorded in the
+        monitoring configuration and the same probe runs identically across the estate.
+    - condition: Build or container tooling retrieves source and files from a code host.
+      explanation: >-
+        Raw file retrieval from repository hosts is routine during builds and will match the
+        destination list. It is tied to a build lineage rather than a scheduler, it recurs
+        with pipeline activity rather than on a clock, and it happens on hosts whose role is
+        building.
+    - condition: An administrator retrieves a snippet from a paste site while troubleshooting.
+      explanation: >-
+        A one-off interactive fetch is a genuine possibility on a server that people log
+        into. It has a shell and a login session above it rather than a scheduler, and it
+        does not recur, which is why the scheduler parent and the repetition carry the
+        escalation rather than the destination.

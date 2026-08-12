@@ -1,0 +1,394 @@
+type: detection
+
+id: hg-win-outbound-channel-carried-over-icmp-or-bare-udp-t1095
+
+version: 1.0.0
+
+info:
+  name: Outbound channel carried over ICMP or bare UDP
+  description: >-
+    Everything built to inspect command-and-control traffic assumes there is an application
+    protocol to inspect. Proxies parse HTTP, decryption stacks parse TLS, and content
+    controls sit at the application layer. An implant that carries its traffic in ICMP echo
+    payloads, in bare UDP datagrams to a port nothing serves, or inside a tunnelling
+    protocol, walks past all of it — not by defeating the controls but by never entering
+    them. What an endpoint sensor can offer here is narrow and worth stating plainly. It
+    cannot read a packet, so nothing about what the datagrams contain is available. What it
+    does record for each flow is the protocol number, the owning process, the destination and
+    the cadence, and those four are enough for a real hunt: ICMP on a workstation belongs to
+    ping and to monitoring agents and to almost nothing else, so sustained ICMP to an
+    external address from any other process is anomalous on its face. Bare UDP is noisier,
+    which is why the UDP cases exclude the service ports that carry the legitimate traffic
+    and lean on volume and destination rarity. The limitation to keep in view is that a
+    sender which never calls connect may not produce a connection record at all, and traffic
+    crafted below the IP stack produces none — this file finds implants that use the
+    ordinary socket interface with an unusual protocol, not ones that bypass it.
+  severity: medium
+  author: huntgraph
+  tags:
+    - command-and-control
+    - covert-channel
+    - icmp
+    - network
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1095
+    - https://attack.mitre.org/detectionstrategies/DET0457
+    - https://attack.mitre.org/techniques/T1071
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1095
+  sub_techniques: []
+  detection_strategies:
+    - DET0457
+  analytics:
+    - AN1254
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may carry command-and-control traffic in ICMP, bare UDP or a tunnelling
+    protocol rather than over an application protocol, so that proxies, decryption stacks and
+    content controls built to parse application traffic never see the channel at all.
+  attacker_behavior:
+    - Sends and receives command data inside ICMP echo request and reply payloads.
+    - Uses bare UDP datagrams to a port that serves no application protocol.
+    - Wraps the channel in a tunnelling protocol that carries no application layer.
+    - Keeps the destination fixed and the cadence regular so the channel stays reachable.
+  legitimate_behavior:
+    - Monitoring and availability agents ping endpoints continuously.
+    - Administrators troubleshoot connectivity with ping and traceroute.
+    - Conferencing, VPN and game clients carry media and tunnels over UDP.
+    - Network appliances and management agents use GRE and IPsec transports.
+  risk_indicator:
+    - Sustained ICMP to an external address from a process that is not a diagnostic tool.
+    - UDP volume to one external address on a port that serves nothing.
+    - No name resolution preceded the flow, so the destination was carried in the payload.
+    - Only one or two hosts in the estate have ever used that protocol to that destination.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - RemoteAddressIP4
+        - RemotePort
+        - Protocol
+        - ContextProcessId
+        - ContextBaseFileName
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - DomainName
+        - ContextProcessId
+        - ContextBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: sustained-icmp-to-an-external-address
+        name: Sustained ICMP to an external address
+        purpose: >-
+          Take the cleanest signal first. ICMP leaving a workstation towards the internet in
+          volume is rare and belongs to a very short list of processes, so ranking by flow
+          count per process and destination surfaces a tunnel without needing to know
+          anything about what the packets carry.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | Protocol=/^(1|58|icmp|icmpv6)$/i
+          | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|169\.254\.|224\.)/
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName, RemoteAddressIP4],
+                    function=[count(as=flows)])
+          | flows >= 20
+          | sort(flows, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Availability and monitoring agents that probe external endpoints on a schedule"
+            - "Administrative workstations running connectivity diagnostics during an incident"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: bare-udp-to-a-port-that-serves-nothing
+        name: Sustained bare UDP to a port no service uses
+        purpose: >-
+          Cover the transport-layer form while keeping the noise out. Excluding the ports
+          that carry name resolution, time, discovery, media negotiation and QUIC leaves
+          UDP traffic that corresponds to no protocol the estate runs, and requiring volume
+          separates a channel from a stray datagram.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | Protocol=/^(17|udp)$/i
+          | RemotePort!=/^(53|67|68|69|88|123|137|138|161|162|443|500|514|1900|3478|4500|5353|5355)$/
+          | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|169\.254\.|224\.)/
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName, RemoteAddressIP4, RemotePort],
+                    function=[count(as=datagrams)])
+          | datagrams >= 50
+          | sort(datagrams, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Conferencing and media clients whose relay traffic uses high UDP ports"
+            - "Game and peer-to-peer clients on user workstations where they are permitted"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: non-tcp-flow-with-no-name-resolution-behind-it
+        name: Non-TCP flow to a destination the process never resolved
+        purpose: >-
+          Separate a covert channel from an ordinary client. Software reaches a service by
+          name; an implant carrying its destination in configuration connects without ever
+          asking the resolver, and that missing lookup is visible even though the flow's
+          contents are not.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|DnsRequest)$/
+          | case {
+              #event_simpleName=DnsRequest
+                | resolved := DomainName ;
+              #event_simpleName=NetworkConnectIP4
+                | Protocol=/^(1|17|58|icmp|icmpv6|udp)$/i
+                | RemotePort!=/^(53|67|68|123|137|138|443|500|4500|5353)$/
+                | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|169\.254\.|224\.)/
+                | raw_peer := RemoteAddressIP4 ;
+            }
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName],
+                    function=[collect([resolved, raw_peer, RemotePort, Protocol], limit=20),
+                              count(as=events)])
+          | raw_peer=/.+/
+          | resolved!=/.+/
+          | events >= 20
+        filters:
+          include: []
+          exclude:
+            - "Agents built with literal endpoint addresses by the organisation's own packaging"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: tunnelling-protocol-to-a-destination-nobody-else-uses
+        name: Tunnelling protocol to a destination almost no host reaches
+        purpose: >-
+          Catch the transports that carry no application layer at all — encapsulation,
+          encryption and tunnelling protocol numbers — and rank them by estate rarity. Where
+          these are legitimate they are part of a sanctioned network design and many hosts
+          use them; a pair of hosts speaking one of them to a single external address is not
+          part of any design.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | Protocol=/^(41|47|50|51|gre|esp|ah)$/i
+          | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|169\.254\.|224\.)/
+          | groupBy([RemoteAddressIP4, Protocol],
+                    function=[count(ComputerName, distinct=true, as=hosts),
+                              count(as=flows),
+                              collect([ContextBaseFileName], limit=10)])
+          | hosts <= 2
+          | flows >= 10
+          | sort(flows, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Sanctioned VPN concentrators and site-to-site tunnel endpoints"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - remote_address
+            - organization
+
+      - id: one-process-holding-both-a-tcp-and-a-non-tcp-path
+        name: One process using both TCP and a non-TCP protocol outbound
+        purpose: >-
+          Surface the process that keeps a conventional session and a second path that no
+          application inspection will read. Ordinary clients pick one transport for one
+          purpose; a process holding both towards the internet is either a network product
+          or something keeping an alternative route open.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemoteAddressIP4!=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|169\.254\.|224\.)/
+          | ContextBaseFileName!=/^(msedge|chrome|firefox|iexplore|brave|opera|vivaldi|msedgewebview2|teams)\.exe$/i
+          | groupBy([ComputerName, ContextProcessId, ContextBaseFileName],
+                    function=[count(Protocol, distinct=true, as=protocols),
+                              count(RemoteAddressIP4, distinct=true, as=peers),
+                              collect([Protocol, RemoteAddressIP4, RemotePort], limit=20),
+                              count(as=flows)])
+          | protocols >= 2
+          | flows >= 30
+          | sort(flows, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Network, VPN and monitoring products whose function is to speak several transports"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+
+evidence:
+  required:
+    - id: non_tcp_egress_from_a_process
+      name: Outbound flow on a protocol that carries no application layer
+      description: >-
+        A process sent traffic to an external address over ICMP, bare UDP outside the
+        service ports, or a tunnelling protocol, which is a transport that application-layer
+        inspection does not read.
+      source: network_connection
+      field: Protocol
+      indicates: non_application_layer_channel
+
+  supporting:
+    - id: sustained_flow_to_one_destination
+      name: Flow sustained against a single destination
+      description: >-
+        The traffic continued at volume against one external address rather than appearing
+        as a handful of records, which is a maintained channel rather than a diagnostic or a
+        stray datagram.
+      source: network_connection
+      field: ContextProcessId
+      indicates: sustained_covert_flow
+    - id: no_name_resolution_behind_it
+      name: No name resolution preceded the flow
+      description: >-
+        The process never asked the resolver for anything before connecting, so the
+        destination came from configuration rather than from a service the host looked up.
+      source: dns_request
+      field: DomainName
+      indicates: hardcoded_destination
+    - id: process_with_no_network_role
+      name: Sending process has no networking function
+      description: >-
+        The flow was produced by an interpreter, proxy-execution binary or unnamed process
+        rather than by a diagnostic utility, monitoring agent or network product.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: untrusted_actor
+    - id: destination_new_to_the_estate
+      name: Destination unused by the rest of the estate
+      description: >-
+        No other host has reached this address over this protocol during the baseline
+        window, so it is not part of a sanctioned network design.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: unusual_destination
+
+  contradicting:
+    - id: monitoring_or_availability_agent
+      name: Monitoring or availability agent
+      description: >-
+        The sending process is a deployed agent whose job is to probe reachability, which
+        produces continuous ICMP and UDP to external endpoints as its normal function.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: legitimate_application_component
+    - id: sanctioned_tunnel_endpoint
+      name: Sanctioned VPN or tunnel endpoint
+      description: >-
+        The host or the destination is part of a remote-access or site-to-site design where
+        encapsulation and encryption protocols are exactly what is expected.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: estate_wide_protocol_use
+      name: The same protocol and destination used across the estate
+      description: >-
+        Many hosts speak this protocol to this destination during the baseline window, which
+        is a shared service rather than a channel built for one machine.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - non_tcp_egress_from_a_process
+
+    supporting:
+      any:
+        - sustained_flow_to_one_destination
+        - no_name_resolution_behind_it
+        - process_with_no_network_role
+        - destination_new_to_the_estate
+      all:
+        - sustained_flow_to_one_destination
+        - process_with_no_network_role
+
+    contradicting:
+      any:
+        - monitoring_or_availability_agent
+        - sanctioned_tunnel_endpoint
+        - estate_wide_protocol_use
+      all: []
+
+  verdict:
+    low_risk_when:
+      - non_tcp_egress_from_a_process
+      - monitoring_or_availability_agent
+      - sanctioned_tunnel_endpoint
+      - estate_wide_protocol_use
+    suspicious_when:
+      - non_tcp_egress_from_a_process
+      - process_with_no_network_role
+    high_risk_when:
+      - non_tcp_egress_from_a_process
+      - sustained_flow_to_one_destination
+      - no_name_resolution_behind_it
+      - destination_new_to_the_estate
+
+  false_positive:
+    - condition: A monitoring agent pings external endpoints continuously.
+      explanation: >-
+        Availability monitoring is the dominant source of outbound ICMP in most estates and
+        it is sustained, regular and aimed at fixed addresses — the same three properties
+        this file keys on. It is separable because the process is a recognisable product
+        deployed to many hosts, all of which produce the identical pattern.
+    - condition: A conferencing or game client carries media over high UDP ports.
+      explanation: >-
+        Media traffic is bare UDP to relay addresses on ports outside the service list, at
+        far higher volume than any covert channel. The process is a known client, the
+        addresses belong to announced provider ranges, and the traffic follows meetings or
+        play sessions rather than a fixed cadence.
+    - condition: An administrator diagnoses connectivity with ping or traceroute.
+      explanation: >-
+        Troubleshooting produces exactly the ICMP shape, sometimes in bursts large enough to
+        clear the volume threshold. It is short-lived, tied to an incident, and comes from
+        the diagnostic binaries rather than from an interpreter or an unnamed process.
+    - condition: A VPN or site-to-site tunnel carries encapsulated traffic.
+      explanation: >-
+        Remote access and network integration legitimately use encapsulation and encryption
+        protocol numbers. These endpoints are documented, shared by many hosts, and belong
+        to the network design rather than to a single machine reaching one external address.

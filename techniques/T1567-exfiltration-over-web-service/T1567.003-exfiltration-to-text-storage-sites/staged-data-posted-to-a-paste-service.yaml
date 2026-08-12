@@ -1,0 +1,375 @@
+type: detection
+
+id: hg-win-staged-data-posted-to-a-paste-service-t1567-003
+
+version: 1.0.0
+
+info:
+  name: Staged data posted to a paste service
+  description: >-
+    Paste services are the cheapest exfiltration destination in existence. They accept
+    content without an account, they need no infrastructure, and they are reachable from
+    almost any network because blocking them tends to break something an engineer needs. The
+    trade-off the adversary accepts is size: pastes are capped, so anything substantial has
+    to be split into many small posts, and that shows. The other thing that shows is who is
+    doing it. A person using a paste site does so in a browser, because reading and sharing
+    a snippet is the entire purpose of the product. There is essentially no legitimate
+    reason for a scripting host, an office application or a command-line fetcher on a
+    corporate machine to hold a session with a paste service at all, and that is the
+    discriminator this template is built on rather than the destination by itself. This is
+    the mirror image of the far more common use of these sites, which is to fetch a payload
+    down rather than push data out; the endpoint cannot see the direction of an HTTPS
+    request, so the template keys on the originating process and on the repetition that
+    chunking forces, and it says plainly that it cannot prove the direction. Severity is
+    deliberately moderate: the volumes involved are small, and the honest use of this file is
+    to enrich a lead rather than to open one.
+  severity: medium
+  author: huntgraph
+  tags:
+    - exfiltration
+    - web-service
+    - text-storage
+    - paste-site
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1567/003
+    - https://attack.mitre.org/detectionstrategies/DET0284
+    - https://attack.mitre.org/techniques/T1567
+    - https://attack.mitre.org/techniques/T1036/012
+    - https://attack.mitre.org/techniques/T1074/001
+
+mitre:
+  tactics:
+    - TA0010
+  techniques:
+    - T1567
+  sub_techniques:
+    - T1567.003
+  detection_strategies:
+    - DET0284
+  analytics:
+    - AN0787
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may post collected data to a public paste service so that it leaves the
+    network through an unauthenticated web form, obtaining a destination that costs nothing,
+    needs no account and leaves no infrastructure to attribute or seize.
+  attacker_behavior:
+    - Posts credentials, tokens or a system inventory to a paste site from a script.
+    - Splits a larger collection across many pastes to stay under the size cap.
+    - Uses an unauthenticated endpoint so nothing on the host has to hold a session or a key.
+    - Retrieves the paste later from outside the network, leaving no callback to block.
+  legitimate_behavior:
+    - Engineers paste logs and stack traces into a browser to share them.
+    - Support staff share configuration snippets with a vendor through a paste link.
+    - Security tooling pulls indicator lists that are published on paste sites.
+    - Some development tooling offers a paste integration for sharing output.
+  risk_indicator:
+    - The session with the paste service belongs to an interpreter rather than a browser.
+    - The command line names a paste endpoint together with a request body.
+    - The same paste service is contacted many times in quick succession by one process.
+    - Files were read or packaged on the host shortly before the posts began.
+    - Neither the host nor the account has ever contacted a paste service before.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - DomainName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: paste-service-reached-by-a-non-browser-process
+        name: Paste service contacted by a process with no browser in it
+        purpose: >-
+          Carry the discriminator. A paste site exists to be read and written by a person in
+          a browser, so a session held by an interpreter, an office application or a fetcher
+          is already outside the shape of legitimate use regardless of what is sent.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6|DnsRequest)$/
+          | case {
+              #event_simpleName=DnsRequest
+                | DomainName=/(^|\.)(pastebin\.com|paste\.ee|hastebin\.com|hasteb\.in|ghostbin\.com|controlc\.com|rentry\.co|dpaste\.org|dpaste\.com|justpaste\.it|termbin\.com|privatebin\.net|paste\.rs|telegra\.ph|0x0\.st|ix\.io)$/i
+                | paste_domain := DomainName ;
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | ContextBaseFileName=/^(powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin|curl|wget|python|pythonw|node|winword|excel|powerpnt|outlook)\.exe$/i
+                | RemotePort in (443, 8443)
+                | peer := RemoteAddressIP4 ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([ContextBaseFileName, paste_domain, peer]),
+                              count(as=events)])
+          | paste_domain=/.+/
+          | peer=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Threat intelligence tooling that ingests indicator lists published on paste sites"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - domain
+
+      - id: command-line-carrying-a-paste-upload
+        name: Paste endpoint named together with a request body
+        purpose: >-
+          Recover the direction the network layer cannot show. The endpoint sees only an
+          encrypted session, but a command line that pairs a paste endpoint with a body,
+          form or data argument states outright that content is being sent rather than fetched.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(pastebin\.com|paste\.ee|hastebin\.com|hasteb\.in|ghostbin\.com|controlc\.com|rentry\.co|dpaste\.(com|org)|justpaste\.it|termbin\.com|privatebin|paste\.rs|0x0\.st|ix\.io)/i
+          | CommandLine=/(-Method\s+Post|Invoke-RestMethod|Invoke-WebRequest|-Body\b|-InFile\b|--data|--data-binary|-d\s|-F\s|--form|UploadString|UploadFile|UploadData)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=posts), collect([CommandLine], limit=5)])
+          | sort(posts, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Developer tooling with a documented paste-sharing integration"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: repeated-contact-with-one-paste-service
+        name: One process contacting the same paste service repeatedly
+        purpose: >-
+          Exploit the size cap. Paste services limit how much a single post may carry, so
+          moving a collection of any size forces the same process to go back many times,
+          which is a rhythm no person sharing a snippet produces.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6|DnsRequest)$/
+          | case {
+              #event_simpleName=DnsRequest
+                | DomainName=/(^|\.)(pastebin\.com|paste\.ee|hastebin\.com|ghostbin\.com|controlc\.com|rentry\.co|dpaste\.org|justpaste\.it|termbin\.com|0x0\.st|ix\.io)$/i
+                | paste_domain := DomainName ;
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | RemotePort in (443, 8443)
+                | peer := RemoteAddressIP4 ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([ContextBaseFileName, paste_domain, peer]),
+                              count(as=events)])
+          | paste_domain=/.+/
+          | events > 10
+        filters:
+          include: []
+          exclude:
+            - "Feed collectors that poll a published paste on a fixed interval"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: collection-preceded-the-post
+        name: Files read or packaged shortly before the paste activity
+        purpose: >-
+          Anchor the post to the collection that fed it. A paste carrying exfiltrated content
+          is normally preceded by something reading credentials, configuration or documents
+          on the same host under the same lineage.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/\b(Get-Content|Get-ChildItem|findstr\s+\/s|dir\s+\/s|7z|7za|Compress-Archive|tar|ToBase64String)\b/i
+                | collected := CommandLine ;
+              CommandLine=/(pastebin\.com|paste\.ee|hastebin\.com|ghostbin\.com|controlc\.com|rentry\.co|dpaste\.(com|org)|termbin\.com|0x0\.st|ix\.io)/i
+                | posted := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[collect([collected, posted, FileName]), count(as=steps)])
+          | collected=/.+/
+          | posted=/.+/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: paste_service_reached_without_a_browser
+      name: Paste service session held by a process that is not a browser
+      description: >-
+        An interpreter, office application or command-line fetcher opened a session with a
+        public paste service, which is the part of this technique the endpoint can see and
+        which no legitimate use of the product produces.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: unexpected_process_web_session
+
+  supporting:
+    - id: paste_domain_resolved
+      name: Paste service resolved from this machine
+      description: >-
+        The host looked up a paste service domain, tying the session to a named destination
+        class rather than to an unattributed address.
+      source: dns_request
+      field: DomainName
+      indicates: external_service_contacted
+    - id: upload_shape_in_the_command_line
+      name: Paste endpoint named together with a request body
+      description: >-
+        The command line pairs a paste endpoint with a body, file or form argument, which
+        establishes that content was being sent rather than retrieved.
+      source: process_creation
+      field: CommandLine
+      indicates: outbound_data_transfer
+    - id: repeated_posts_to_one_service
+      name: The same service contacted many times by one process
+      description: >-
+        A single process went back to the same paste service repeatedly, which is the
+        chunking that the service's size limit forces on anything larger than a snippet.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: chunked_transfer
+    - id: collection_preceded_the_post
+      name: Files read or packaged before the posts began
+      description: >-
+        The same lineage read or compressed local content shortly before contacting the paste
+        service, which is what makes the post an exfiltration step rather than a lookup.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: collection_then_exfiltration
+    - id: no_paste_service_history
+      name: No history of paste service use on this host or account
+      description: >-
+        Neither this machine nor this account has contacted a paste service during the
+        baseline window, so the destination class is new rather than newly noisy.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: browser_originated_visit
+      name: Session belongs to a browser
+      description: >-
+        The connection to the paste service was opened by a browser, which is a person
+        reading or sharing a snippet and is the product being used as intended.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: expected_interactive_use
+    - id: intelligence_feed_collector
+      name: Host is a threat intelligence collector
+      description: >-
+        The machine is a registered intelligence or research system that ingests indicator
+        lists published on paste services as part of its function.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_security_tooling
+    - id: sanctioned_internal_paste_service
+      name: Destination is an internally hosted paste service
+      description: >-
+        The organisation runs its own snippet-sharing service and the destination recorded is
+        that service rather than a public one.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - paste_service_reached_without_a_browser
+
+    supporting:
+      any:
+        - paste_domain_resolved
+        - upload_shape_in_the_command_line
+        - repeated_posts_to_one_service
+        - collection_preceded_the_post
+        - no_paste_service_history
+      all:
+        - upload_shape_in_the_command_line
+        - collection_preceded_the_post
+
+    contradicting:
+      any:
+        - browser_originated_visit
+        - intelligence_feed_collector
+        - sanctioned_internal_paste_service
+      all: []
+
+  verdict:
+    low_risk_when:
+      - paste_service_reached_without_a_browser
+      - browser_originated_visit
+      - intelligence_feed_collector
+      - sanctioned_internal_paste_service
+    suspicious_when:
+      - paste_service_reached_without_a_browser
+      - no_paste_service_history
+    high_risk_when:
+      - paste_service_reached_without_a_browser
+      - upload_shape_in_the_command_line
+      - collection_preceded_the_post
+      - repeated_posts_to_one_service
+
+  false_positive:
+    - condition: An engineer pastes a log or stack trace to share it with a colleague.
+      explanation: >-
+        This is the normal use of the product and it happens in a browser, which is why the
+        required evidence is the absence of a browser rather than the destination. A browser
+        session to the same site is explicitly contradicting evidence.
+    - condition: Security tooling downloads indicator lists published on a paste site.
+      explanation: >-
+        Intelligence feeds are frequently distributed this way, and the collector is often a
+        script rather than a browser. It is separated by asset role, by fetching the same
+        small set of URLs repeatedly over months, and by the absence of any local collection
+        preceding the requests.
+    - condition: A developer tool offers a built-in paste-sharing feature.
+      explanation: >-
+        Some editors and CLIs can publish output to a paste service directly. That produces
+        the same command-line shape, but from a named product on an engineering host, with a
+        history of the same integration being used.
+    - condition: A user opens a paste link received in an email or a chat message.
+      explanation: >-
+        The click resolves and connects to the paste domain, but the session belongs to the
+        browser and there is a single request rather than the repeated posts that moving a
+        collection requires.

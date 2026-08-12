@@ -1,0 +1,373 @@
+type: detection
+
+id: hg-win-staged-data-posted-to-a-chat-or-automation-webhook-t1567-004
+
+version: 1.0.0
+
+info:
+  name: Staged data posted to a chat or automation webhook
+  description: >-
+    A webhook endpoint is the least demanding exfiltration destination available: it accepts
+    an unauthenticated POST, the URL itself is the only credential, and a single request can
+    carry the data out with no account to create, no session to maintain and nothing on the
+    host to revoke. Chat platforms and automation services are the usual form, which means
+    the traffic terminates at a reputable domain that most estates permit for genuine
+    integrations. The destination therefore proves nothing on its own. What is distinctive is
+    that the endpoint has to be named in full, and the shape of that name is unmistakable: a
+    webhook URL carries a long opaque token in its path, and it has to appear somewhere the
+    process can read it, which in practice means the command line or a script the command
+    line invokes. That literal is close to unambiguous, and it is far more specific than the
+    domain. Around it sit two weaker but useful signals: the endpoint being reached by a
+    scripting host rather than by the chat client the domain belongs to, and the same
+    endpoint being contacted over and over as an automated loop ships data on a timer.
+    Knowing which integrations the organisation actually operates is what turns this from an
+    interesting pattern into a verdict, so estate history is a precondition.
+  severity: high
+  author: huntgraph
+  tags:
+    - exfiltration
+    - web-service
+    - webhook
+    - automation
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1567/004
+    - https://attack.mitre.org/detectionstrategies/DET0153
+    - https://attack.mitre.org/techniques/T1567
+    - https://attack.mitre.org/techniques/T1020
+    - https://attack.mitre.org/techniques/T1074/001
+
+mitre:
+  tactics:
+    - TA0010
+  techniques:
+    - T1567
+  sub_techniques:
+    - T1567.004
+  detection_strategies:
+    - DET0153
+  analytics:
+    - AN0436
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may post collected data to a chat or automation webhook endpoint so that it
+    leaves the network in a single unauthenticated request to a permitted service, obtaining
+    a channel that needs no account, no attacker infrastructure and no persistent session on
+    the host.
+  attacker_behavior:
+    - Posts credentials, tokens or a host inventory directly to a webhook URL.
+    - Embeds the webhook URL and its token in the script or command line that sends the data.
+    - Repeats the post on a timer so newly collected material keeps flowing out.
+    - Chooses a chat or automation platform the organisation already permits through egress.
+  legitimate_behavior:
+    - Build pipelines and monitoring tools post status messages to chat webhooks.
+    - Automation platforms receive events from internal systems through registered hooks.
+    - Administrators script alerting into a team channel from management hosts.
+    - Developers test integrations against request-capture services.
+  risk_indicator:
+    - A webhook URL with its token appears in a process command line.
+    - The endpoint is reached by an interpreter rather than by the platform's own client.
+    - The same endpoint is contacted repeatedly by one process on a steady cadence.
+    - Data was packaged or encoded on the host shortly before the posts began.
+    - The organisation operates no integration with the service being contacted.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - DomainName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: webhook-endpoint-named-in-a-command-line
+        name: Webhook URL and token appearing in a process command line
+        purpose: >-
+          Carry the sharpest observable this technique has. The endpoint cannot be reached
+          without naming it, and a webhook path with its opaque token is a far more specific
+          artefact than the domain it sits on.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(discord(app)?\.com\/api\/(v\d+\/)?webhooks\/|hooks\.slack\.com\/services\/|webhook\.site\/|api\.telegram\.org\/bot\d+|hooks\.zapier\.com\/hooks\/|hook\.(eu|us)\d*\.make\.com\/|\.webhook\.office\.com\/webhookb2\/|\.pipedream\.net\/|requestbin\.com\/r\/|beeceptor\.com)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=posts), collect([CommandLine], limit=5)])
+          | sort(posts, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Registered integration endpoints operated by the organisation's own automation"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: webhook-service-reached-by-a-scripting-host
+        name: Webhook service contacted by a process that is not its client
+        purpose: >-
+          Separate an integration from an exfiltration. A chat platform reached by its own
+          desktop client or a browser is a person; the same platform reached by an interpreter
+          or an office application is something posting on that person's behalf.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6|DnsRequest)$/
+          | case {
+              #event_simpleName=DnsRequest
+                | DomainName=/(^|\.)(discord\.com|discordapp\.com|webhook\.site|hooks\.slack\.com|api\.telegram\.org|hooks\.zapier\.com|make\.com|webhook\.office\.com|pipedream\.net|requestbin\.com|beeceptor\.com)$/i
+                | webhook_domain := DomainName ;
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | ContextBaseFileName=/^(powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin|curl|wget|python|pythonw|node|winword|excel|powerpnt)\.exe$/i
+                | RemotePort in (443, 8443)
+                | peer := RemoteAddressIP4 ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([ContextBaseFileName, webhook_domain, peer]),
+                              count(as=events)])
+          | webhook_domain=/.+/
+          | peer=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Monitoring and build agents that post status messages to approved channels"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - domain
+
+      - id: repeated-automated-posts-to-one-endpoint
+        name: One process posting to the same webhook host on a steady cadence
+        purpose: >-
+          Pick out automated exfiltration rather than a one-off message. An integration posts
+          when something happens; a collector posts on a timer, and the volume from a single
+          process over a short window is what separates the two.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6|DnsRequest)$/
+          | case {
+              #event_simpleName=DnsRequest
+                | DomainName=/(^|\.)(discord\.com|discordapp\.com|webhook\.site|hooks\.slack\.com|api\.telegram\.org|pipedream\.net|requestbin\.com|beeceptor\.com)$/i
+                | webhook_domain := DomainName ;
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | RemotePort in (443, 8443)
+                | peer := RemoteAddressIP4 ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([ContextBaseFileName, webhook_domain, peer]),
+                              count(as=events)])
+          | webhook_domain=/.+/
+          | events > 15
+        filters:
+          include: []
+          exclude:
+            - "Chat clients maintaining their normal session with the platform"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: staging-or-encoding-preceded-the-post
+        name: Data packaged or encoded shortly before the webhook post
+        purpose: >-
+          Anchor the post to the collection that fed it. Webhook bodies are small, so material
+          is usually compressed or base64-encoded first, and that step under the same lineage
+          is what makes the request an exfiltration rather than a notification.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/\b(Compress-Archive|7z|7za|rar|tar|makecab|ToBase64String|certutil\s+-encode)\b/i
+                | staged := CommandLine ;
+              CommandLine=/(discord(app)?\.com\/api\/(v\d+\/)?webhooks\/|hooks\.slack\.com\/services\/|webhook\.site\/|api\.telegram\.org\/bot\d+|hooks\.zapier\.com\/hooks\/|\.pipedream\.net\/)/i
+                | posted := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[collect([staged, posted, FileName]), count(as=steps)])
+          | staged=/.+/
+          | posted=/.+/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: webhook_endpoint_in_a_command_line
+      name: Webhook URL with its token named by a process
+      description: >-
+        A process command line contained a full webhook endpoint including the opaque token
+        that authorises posting to it, which is the transfer channel itself rather than a
+        precursor to one.
+      source: process_creation
+      field: CommandLine
+      indicates: data_transfer_to_external_service
+
+  supporting:
+    - id: webhook_domain_resolved
+      name: Webhook service resolved from this machine
+      description: >-
+        The host looked up the chat or automation platform hosting the endpoint, tying the
+        command line to egress that actually occurred.
+      source: dns_request
+      field: DomainName
+      indicates: external_service_contacted
+    - id: session_from_a_scripting_host
+      name: Webhook session opened by an interpreter or office application
+      description: >-
+        The connection to the platform came from a scripting host or a document application
+        rather than from the platform's own client or a browser.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: abnormal_execution_chain
+    - id: repeated_posts_to_the_same_endpoint
+      name: The same endpoint contacted repeatedly by one process
+      description: >-
+        A single process kept posting to the same webhook host at a volume consistent with an
+        automated loop rather than with event-driven notifications.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: automated_exfiltration
+    - id: staging_preceded_the_post
+      name: Data packaged or encoded before the post
+      description: >-
+        The same lineage compressed or base64-encoded content shortly before the request,
+        which is how material is fitted into a webhook body.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: collection_then_exfiltration
+    - id: no_integration_with_this_service
+      name: No history of this service being used by the estate
+      description: >-
+        The organisation has no recorded integration with the platform and no host has
+        contacted it during the baseline window, so the endpoint is not part of any workflow.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_destination
+
+  contradicting:
+    - id: registered_integration
+      name: Endpoint belongs to a registered integration
+      description: >-
+        The webhook is one the organisation operates deliberately, recorded against a team or
+        a pipeline, and receives the traffic it was created for.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: build_or_monitoring_host
+      name: Host is a build or monitoring system
+      description: >-
+        The machine is a registered automation asset whose function includes posting status
+        and alert messages to chat channels.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_automation
+    - id: chat_client_originated
+      name: Session belongs to the platform's own client
+      description: >-
+        The traffic to the chat service was opened by the installed desktop client or a
+        browser, which is a person using the platform rather than something posting through it.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: expected_interactive_use
+
+  risk_logic:
+    required:
+      - webhook_endpoint_in_a_command_line
+
+    supporting:
+      any:
+        - webhook_domain_resolved
+        - session_from_a_scripting_host
+        - repeated_posts_to_the_same_endpoint
+        - staging_preceded_the_post
+        - no_integration_with_this_service
+      all:
+        - staging_preceded_the_post
+        - session_from_a_scripting_host
+
+    contradicting:
+      any:
+        - registered_integration
+        - build_or_monitoring_host
+        - chat_client_originated
+      all: []
+
+  verdict:
+    low_risk_when:
+      - webhook_endpoint_in_a_command_line
+      - registered_integration
+      - build_or_monitoring_host
+      - chat_client_originated
+    suspicious_when:
+      - webhook_endpoint_in_a_command_line
+      - no_integration_with_this_service
+    high_risk_when:
+      - webhook_endpoint_in_a_command_line
+      - staging_preceded_the_post
+      - session_from_a_scripting_host
+      - repeated_posts_to_the_same_endpoint
+
+  false_positive:
+    - condition: A build pipeline posts results to a team chat channel through a webhook.
+      explanation: >-
+        This produces the required evidence exactly, including the token in the command line.
+        It is separated by the endpoint being a registered integration, by the host being a
+        build asset, and by the same endpoint appearing in every run over months.
+    - condition: An administrator scripts alerting into a channel from a management host.
+      explanation: >-
+        Operational scripting uses interpreters and webhook URLs together routinely. The
+        account and host have a history of the same endpoint, and no packaging or encoding
+        step precedes the post.
+    - condition: A developer tests an integration against a request-capture service.
+      explanation: >-
+        Services such as request-capture endpoints are used deliberately during development
+        and produce short bursts of posts from an engineering host. The activity is confined
+        to development assets and stops when the work does.
+    - condition: A user has a chat client running that keeps a session with the platform.
+      explanation: >-
+        The desktop client holds a long-lived connection to the same domains, which is why
+        the network cases require a non-client originator and why a client-originated session
+        is contradicting evidence.

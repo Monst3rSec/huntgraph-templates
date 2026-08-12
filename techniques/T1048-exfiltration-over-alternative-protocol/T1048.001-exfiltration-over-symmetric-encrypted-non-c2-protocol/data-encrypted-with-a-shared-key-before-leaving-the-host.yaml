@@ -1,0 +1,389 @@
+type: detection
+
+id: hg-win-data-encrypted-with-a-shared-key-before-leaving-the-host-t1048-001
+
+version: 1.0.0
+
+info:
+  name: Data encrypted with a shared key on the host before being sent out
+  description: >-
+    Whether traffic leaving a machine is encrypted, and with what, is not something an
+    endpoint sensor can answer — it sees a peer, a port and a process, never a cipher suite.
+    So a template that claimed to tell symmetric encryption from asymmetric encryption on the
+    wire would be inventing its own evidence, and this file does not attempt it. What makes
+    this sub-technique reachable at all is the part of it that happens before the traffic
+    exists. Using a shared secret rather than a protocol's own key exchange means the
+    adversary has to perform the encryption themselves, on the victim host, with something
+    that runs there: a cipher utility, a crypto library called from a script, a key or
+    passphrase that has to be supplied. That invocation is an ordinary process creation, and
+    it carries the one thing that distinguishes a shared key from a public one — the secret
+    is a parameter. An openssl enc run with a passphrase, a gpg symmetric operation, a
+    scripted AES block with a byte-array key: these say plainly that both ends already hold
+    the same value, which is precisely what MITRE separates this leaf on. The pairing with an
+    outbound session is what makes it exfiltration rather than local encryption, and the
+    password-protected-archive route is deliberately left to the T1560.001 template, which
+    already owns it. This template requires the transmission, not the packaging.
+  severity: high
+  author: huntgraph
+  tags:
+    - exfiltration
+    - alternative-protocol
+    - symmetric-encryption
+    - data-egress
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1048/001
+    - https://attack.mitre.org/detectionstrategies/DET0503
+    - https://attack.mitre.org/techniques/T1048
+
+mitre:
+  tactics:
+    - TA0010
+  techniques:
+    - T1048
+  sub_techniques:
+    - T1048.001
+  detection_strategies:
+    - DET0503
+  analytics:
+    - AN1389
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may encrypt collected data on the victim host with a key they already share
+    with their own infrastructure and then send it over a channel separate from command and
+    control, obtaining confidentiality that does not depend on the transport and a route out
+    that no inspection of the primary channel will show.
+  attacker_behavior:
+    - Runs a cipher utility over staged material with the passphrase supplied on the command line.
+    - Calls a symmetric algorithm from a script so no cipher binary appears on disk.
+    - Sends the resulting ciphertext to a destination different from the command and control peer.
+    - Deletes the plaintext and the intermediate file once the transfer completes.
+  legitimate_behavior:
+    - Administrators encrypt backups and exports before moving them between systems.
+    - Build and release pipelines encrypt artefacts with a shared deployment secret.
+    - Support processes protect a collected bundle before sending it to a vendor.
+    - Developers exercise crypto libraries routinely on engineering workstations.
+  risk_indicator:
+    - The passphrase or key material is literal on the command line rather than referenced.
+    - The encryption runs over a directory of user documents rather than a build artefact.
+    - An outbound session to an external peer follows the cipher run within minutes.
+    - The same process performs the encryption and then opens the connection.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: symmetric-cipher-invoked-with-a-key-on-the-command-line
+        name: Cipher utility run with a passphrase or key supplied inline
+        purpose: >-
+          This is the observable that belongs to this leaf and to no other. Asymmetric
+          encryption names a recipient; symmetric encryption names a secret, and the flags
+          that carry it are distinct and few. Requiring a shared-secret flag rather than
+          merely the presence of a crypto tool is what stops this becoming a match on every
+          use of openssl.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/\bopenssl\b[^\n]*\benc\b/i and CommandLine=/(-k\b|-kfile\b|-pass\s+(pass|file|env):|-aes-\d{3}|-des3|-rc4)/i
+                | cipher_tool := "openssl_enc" ;
+              CommandLine=/\bgpg2?\b/i and CommandLine=/(--symmetric\b|\s-c\b|--cipher-algo\b|--passphrase)/i
+                | cipher_tool := "gpg_symmetric" ;
+              CommandLine=/(AesManaged|AesCryptoServiceProvider|RijndaelManaged|TripleDESCryptoServiceProvider|\[System\.Security\.Cryptography\.Aes\])/i
+                | cipher_tool := "scripted_aes" ;
+              CommandLine=/ConvertTo-SecureString[^\n]*-Key\s*(\(|\[byte\[\]\]|\$)/i
+                | cipher_tool := "scripted_shared_key" ;
+            }
+          | cipher_tool=/.+/
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=runs), collect([cipher_tool, CommandLine], limit=8)])
+          | sort(runs, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Build and release agents encrypting artefacts with a pipeline secret"
+            - "Backup products that encrypt their own output as a configured option"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: shared-key-cipher-run-then-external-contact
+        name: Shared-key encryption followed by an outbound session
+        purpose: >-
+          Make the finding exfiltration rather than local protection. Encrypting a file and
+          leaving it where it is has an innocent reading; encrypting it and then talking to
+          an address outside the estate in the same window does not. Tagging both streams and
+          collapsing them per host and account is what supplies the second half without
+          inventing anything about the traffic.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2|NetworkConnectIP4|NetworkConnectIP6)$/
+          | case {
+              #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+                | CommandLine=/(\bopenssl\b[^\n]*\benc\b|--symmetric\b|--cipher-algo\b|AesManaged|AesCryptoServiceProvider|RijndaelManaged)/i
+                | encrypted := FileName ;
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+                | peer := RemoteAddressIP4 ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([encrypted, peer, ContextBaseFileName, CommandLine], limit=10),
+                              count(as=events)])
+          | encrypted=/.+/
+          | peer=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Release pipelines that encrypt and then publish artefacts to a known repository"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - remote_address
+
+      - id: encrypting-process-owns-the-outbound-session
+        name: The process that encrypted the data also opens the connection
+        purpose: >-
+          Remove the coincidence the host-and-window pairing cannot. Matching the identifier
+          of the process that performed the encryption against the process that owns the
+          outbound session yields the tightest form of the behaviour: one program that
+          encrypted material with a shared secret and then sent it, with no transfer client
+          in between.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2|NetworkConnectIP4|NetworkConnectIP6)$/
+          | case {
+              #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+                | CommandLine=/(\bopenssl\b[^\n]*\benc\b|--symmetric\b|--cipher-algo\b|AesManaged|AesCryptoServiceProvider|RijndaelManaged|ConvertTo-SecureString[^\n]*-Key)/i
+                | cipher_proc := FileName
+                | pid := TargetProcessId ;
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+                | peer := RemoteAddressIP4
+                | pid := ContextProcessId ;
+            }
+          | groupBy([ComputerName, pid],
+                    function=[collect([cipher_proc, peer, ContextBaseFileName, ParentBaseFileName], limit=5),
+                              count(as=events)])
+          | cipher_proc=/.+/
+          | peer=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Backup and vault clients that encrypt and upload from a single process by design"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: encrypting-host-contacting-a-peer-nothing-else-uses
+        name: Destination reached only by the host that ran the encryption
+        purpose: >-
+          Supply the rarity that separates a second channel from the organisation's own
+          services. This leaf specifies a destination other than the command and control
+          server, so the alternate peer is part of the definition rather than an
+          embellishment. A peer contacted by a single machine, by a single non-client
+          process, is that alternate route.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | ContextBaseFileName=/^(powershell|pwsh|wscript|cscript|python|pythonw|node|curl|wget|openssl|gpg|gpg2|bitsadmin|certutil)\.exe$/i
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+          | groupBy([RemoteAddressIP4, RemotePort],
+                    function=[count(field=ComputerName, distinct=true, as=hosts),
+                              count(as=connections),
+                              collect([ComputerName, ContextBaseFileName], limit=5)])
+          | hosts = 1
+          | sort(connections, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Single-purpose hosts with a documented one-to-one integration to an external partner"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - remote_address
+            - organization
+
+evidence:
+  required:
+    - id: shared_key_encryption_on_the_host
+      name: Data encrypted locally with a shared secret
+      description: >-
+        A cipher utility or scripted crypto routine was invoked with a passphrase or key
+        supplied as a parameter, which means both ends already hold the same value rather
+        than a key having been exchanged by a protocol.
+      source: process_creation
+      field: CommandLine
+      indicates: local_symmetric_encryption
+
+  supporting:
+    - id: outbound_contact_after_encryption
+      name: External session opened after the encryption ran
+      description: >-
+        An address outside the estate was contacted from the same host within the correlation
+        window, which is what makes the encryption preparation for removal rather than
+        protection in place.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: egress_following_encryption
+    - id: same_process_encrypted_and_sent
+      name: One process performed both the encryption and the transfer
+      description: >-
+        The process identifier behind the cipher invocation matches the one owning the
+        outbound session, so the two actions are the same program rather than two unrelated
+        events on a busy host.
+      source: process_creation
+      field: TargetProcessId
+      indicates: encryption_and_egress_in_one_process
+    - id: session_held_by_a_non_client_process
+      name: The session belongs to an interpreter or cipher tool
+      description: >-
+        The outbound connection is owned by a script host, fetcher or crypto utility rather
+        than by an application whose job involves talking to external services.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: abnormal_network_originator
+    - id: destination_unique_to_this_host
+      name: Destination reached by no other machine
+      description: >-
+        The peer appears against one host across the baseline window, which is the alternate
+        location this leaf describes rather than a service the organisation shares.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: unusual_destination
+
+  contradicting:
+    - id: pipeline_artefact_encryption
+      name: Build or release pipeline encrypting artefacts
+      description: >-
+        The host is a build agent and the cipher invocation is part of a pipeline that
+        protects artefacts with a shared deployment secret before publishing them.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: backup_product_encryption
+      name: Backup or vault product encrypting its own output
+      description: >-
+        The encryption is performed by a deployed product as a configured option, and the
+        same binary and destination appear wherever the product is installed.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: legitimate_application_component
+    - id: recorded_secure_transfer
+      name: Recorded secure transfer to a vendor or partner
+      description: >-
+        A change record or ticket covers an encrypted export from this host in this window,
+        which explains both the cipher run and the destination.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - shared_key_encryption_on_the_host
+
+    supporting:
+      any:
+        - outbound_contact_after_encryption
+        - same_process_encrypted_and_sent
+        - session_held_by_a_non_client_process
+        - destination_unique_to_this_host
+      all:
+        - outbound_contact_after_encryption
+        - same_process_encrypted_and_sent
+        - destination_unique_to_this_host
+
+    contradicting:
+      any:
+        - pipeline_artefact_encryption
+        - backup_product_encryption
+        - recorded_secure_transfer
+      all: []
+
+  verdict:
+    low_risk_when:
+      - shared_key_encryption_on_the_host
+      - pipeline_artefact_encryption
+      - backup_product_encryption
+      - recorded_secure_transfer
+    suspicious_when:
+      - shared_key_encryption_on_the_host
+      - outbound_contact_after_encryption
+    high_risk_when:
+      - shared_key_encryption_on_the_host
+      - outbound_contact_after_encryption
+      - same_process_encrypted_and_sent
+      - destination_unique_to_this_host
+      - session_held_by_a_non_client_process
+
+  false_positive:
+    - condition: A release pipeline encrypts an artefact with a shared secret and publishes it.
+      explanation: >-
+        This reproduces the whole sequence, including the process identity match, because
+        encrypting and uploading in one job is exactly how artefact publication works. It is
+        distinguishable by the host being a build agent, by the destination being a
+        repository other hosts also reach, and by the run repeating on every build.
+    - condition: An administrator encrypts an export before moving it between systems.
+      explanation: >-
+        Protecting a database dump or a report with a passphrase before transfer is good
+        practice and produces an identical command line. The material is usually an
+        operational export rather than a document tree, the destination is internal, and the
+        account belongs to someone whose role explains it.
+    - condition: A developer exercises crypto libraries on an engineering workstation.
+      explanation: >-
+        Scripted AES appears constantly on machines where people write software, and the
+        scripted-cipher pattern will match test code. These runs are not followed by contact
+        with an external peer that no other host uses, which is why the egress evidence
+        rather than the cipher call carries the escalation.
+    - condition: A support process encrypts a diagnostic bundle before sending it to a vendor.
+      explanation: >-
+        This is the sequence performed openly and against a ticket. The vendor endpoint is
+        reached from other hosts over time, the activity is interactive and one-off, and the
+        change record covers it.

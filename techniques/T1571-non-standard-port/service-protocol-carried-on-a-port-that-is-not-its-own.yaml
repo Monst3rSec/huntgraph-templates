@@ -1,0 +1,384 @@
+type: detection
+
+id: hg-win-service-protocol-carried-on-a-port-that-is-not-its-own-t1571
+
+version: 1.0.0
+
+info:
+  name: Service protocol carried on a port that is not its own
+  description: >-
+    Moving a protocol off its assigned port defeats controls that are written in terms of
+    ports, and it costs the adversary nothing. There is no packet inspection available here,
+    so the mismatch cannot be read from the traffic; it has to be read from the pairing of a
+    process and a port, which the endpoint does record. That gives two symmetrical questions.
+    A protocol's own client appearing on a port that is not that protocol's — a remote
+    desktop client somewhere other than 3389, a fetch utility somewhere other than the web
+    ports — is the first. A well-known port carrying a process that has no relationship with
+    the protocol it belongs to is the second. Both are honest, and both are noisy in any
+    estate that runs internal applications on arbitrary ports, which is most of them. That is
+    why the third case is a pure rarity question against the whole organisation rather than
+    against the host: a port used by three machines out of thirty thousand is interesting
+    whatever it is, while the same port used by three thousand is a line-of-business
+    application nobody documented. Deployed without that estate-wide baseline this file will
+    return the entire internal application estate, so treat it as enrichment for an existing
+    lead until the history exists.
+  severity: medium
+  author: huntgraph
+  tags:
+    - command-and-control
+    - non-standard-port
+    - egress-analysis
+    - port-protocol-mismatch
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1571
+    - https://attack.mitre.org/detectionstrategies/DET0227
+    - https://attack.mitre.org/techniques/T1572
+    - https://attack.mitre.org/techniques/T1090
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1571
+  sub_techniques: []
+  detection_strategies:
+    - DET0227
+  analytics:
+    - AN0633
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Connection Creation
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may run a protocol on a port it is not normally paired with, obtaining
+    passage through controls written in terms of ports, analysis tooling that parses the
+    traffic as the wrong protocol, and a channel that survives the blocking of the port the
+    protocol is expected on.
+  attacker_behavior:
+    - Runs command and control over a high port chosen to avoid port-based filtering.
+    - Relocates a service listener so remote administration reaches an unexpected port.
+    - Uses a protocol's own client against a port the protocol does not normally use.
+    - Sends traffic to a well-known port from a process with no relationship to that protocol.
+    - Picks a port that is open outbound rather than one that is obviously suspicious.
+  legitimate_behavior:
+    - Internal applications are deployed on arbitrary high ports as a matter of course.
+    - Administrators relocate remote desktop or management listeners to reduce exposure.
+    - Software as a service and conferencing products use wide ranges of high ports.
+    - Development and test environments run services on whatever port was free.
+    - Vendors publish alternate ports for clients behind restrictive firewalls.
+  risk_indicator:
+    - The port is used by only a handful of hosts across the whole estate.
+    - The connecting image is a protocol client operating outside its own port.
+    - A well-known service port is contacted by a process unrelated to that service.
+    - A service listener was relocated from a command line rather than by policy.
+    - Sessions on the unusual port repeat rather than occurring once.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - ContextBaseFileName
+        - RemoteAddressIP4
+        - RemotePort
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: egress-port-rare-across-the-estate
+        name: Outbound port used by only a handful of hosts
+        purpose: >-
+          The central case, and the only one that scales. Rather than deciding in advance
+          which ports are unusual, ask the estate: a destination port that three machines use
+          and nothing else does is a candidate whatever its number, while the same port on
+          thousands of machines is an application nobody wrote down. This inverts the usual
+          allow-list problem and is why the baseline is mandatory here.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|224\.)/
+          | RemotePort!=/^(20|21|22|25|53|80|110|123|143|389|443|465|587|636|993|995|1433|3128|3389|5222|5228|8080|8443)$/
+          | groupBy([RemotePort],
+                    function=[count(field=ComputerName, distinct=true, as=hosts_using),
+                              count(as=sessions),
+                              collect([ComputerName, ContextBaseFileName, RemoteAddressIP4],
+                                      limit=15)])
+          | hosts_using <= 3
+          | sort(hosts_using, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Ports belonging to documented line-of-business and vendor applications"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - organization
+            - remote_address
+
+      - id: protocol-client-off-its-own-port
+        name: A protocol's client connecting on a port that is not that protocol's
+        purpose: >-
+          Where the process names the protocol, the mismatch can be stated exactly. A remote
+          desktop client that is not talking to 3389, or a fetch utility that is not talking
+          to a web port, is either being pointed through a relocated service or being used as
+          a general-purpose transport, and both are the technique.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | case {
+              ContextBaseFileName=/^mstsc\.exe$/i and RemotePort!=/^3389$/
+                | mismatch := ContextBaseFileName ;
+              ContextBaseFileName=/^(ssh|plink|putty|sftp|scp)\.exe$/i and RemotePort!=/^(22|443)$/
+                | mismatch := ContextBaseFileName ;
+              ContextBaseFileName=/^(curl|wget|certutil|bitsadmin)\.exe$/i and RemotePort!=/^(80|443|8080|8443)$/
+                | mismatch := ContextBaseFileName ;
+              ContextBaseFileName=/^(outlook|thunderbird)\.exe$/i and RemotePort!=/^(25|110|143|443|465|587|993|995)$/
+                | mismatch := ContextBaseFileName ;
+            }
+          | mismatch=/.+/
+          | groupBy([ComputerName, ContextBaseFileName, RemoteAddressIP4, RemotePort],
+                    function=[count(as=sessions)])
+          | sort(sessions, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Vendor alternate ports published for clients behind restrictive firewalls"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: well-known-port-carrying-an-unrelated-process
+        name: A service port contacted by a process with no relationship to it
+        purpose: >-
+          The mirror image of the previous case. Nothing but the resolver should be talking
+          to 53, nothing but a database client to 1433, and nothing but the remote desktop
+          client to 3389. When something else is, either the port is being borrowed as a
+          transport or the process is impersonating a client, and both are worth an analyst's
+          attention even though neither can be confirmed from the traffic itself.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemotePort=/^(22|23|53|123|445|1433|3306|3389|5985|5986)$/
+          | ContextBaseFileName!=/^(System|svchost\.exe|services\.exe|lsass\.exe|dns\.exe|mstsc\.exe|ssh\.exe|plink\.exe|putty\.exe|sqlcmd\.exe|sqlservr\.exe|Ssms\.exe|CcmExec\.exe|MsMpEng\.exe|explorer\.exe|wsmprovhost\.exe|WmiPrvSE\.exe|w3wp\.exe|OneDrive\.exe|Teams\.exe)$/i
+          | groupBy([ComputerName, ContextBaseFileName, RemotePort],
+                    function=[count(field=RemoteAddressIP4, distinct=true, as=destinations),
+                              count(as=sessions),
+                              collect([RemoteAddressIP4], limit=10)])
+          | sort(sessions, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Backup, monitoring and database tooling with a documented protocol role"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: service-listener-relocated
+        name: Remote administration listener moved to another port
+        purpose: >-
+          The host-side half of the technique, where the victim system is changed rather than
+          the traffic. Relocating remote desktop or remote management is a documented
+          intrusion step because it keeps the service reachable while removing it from every
+          control and every scan written against the standard port.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(WinStations\\+RDP-Tcp[^\s]*.*PortNumber|PortNumber.*WinStations|winrm.*Transport=HTTPS?.*Port=|Set-Item.*WSMan.*Port|sshd_config)/i
+            or CommandLine=/netsh(\.exe)?\s+advfirewall\s+firewall\s+add\s+rule.*localport=\d{4,5}/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Hardening baselines that relocate management listeners across a server group"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+evidence:
+  required:
+    - id: port_protocol_mismatch
+      name: Traffic on a port that does not match the process or the protocol
+      description: >-
+        A session ran on a destination port that is unusual for the estate, unusual for the
+        connecting protocol client, or belongs to a service the connecting process has no
+        relationship with.
+      source: network_connection
+      field: RemotePort
+      indicates: port_protocol_mismatch
+
+  supporting:
+    - id: initiator_has_no_protocol_role
+      name: Connecting image has no relationship with the port
+      description: >-
+        The process holding the session is neither the client nor the server of the protocol
+        that owns the port, so the port is being borrowed rather than used.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: untrusted_actor
+    - id: service_listener_relocated
+      name: A management listener was moved from a command line
+      description: >-
+        Remote desktop, remote management or SSH was configured to listen on a different
+        port from a command line, keeping the service reachable while removing it from
+        port-based controls.
+      source: process_creation
+      field: CommandLine
+      indicates: service_port_relocated
+    - id: destination_is_external
+      name: Sessions run to a routable external address
+      description: >-
+        The unusual port is used outbound to the internet rather than between internal
+        systems, which is where port choice is being used to pass a control.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: external_egress
+    - id: port_rare_in_estate
+      name: Port used by very few hosts organisation-wide
+      description: >-
+        Across the baseline window only a handful of machines have used this destination
+        port, so it is not an undocumented internal application in wide use.
+      source: baseline
+      field: RemotePort
+      indicates: unusual_activity_for_organization
+    - id: sessions_repeat_on_the_odd_port
+      name: The unusual pairing repeats rather than occurring once
+      description: >-
+        The process returned to the same port and destination many times, which is a channel
+        being used rather than a single misdirected connection or a probe.
+      source: network_connection
+      field: ContextProcessId
+      indicates: sustained_channel
+
+  contradicting:
+    - id: documented_application_port
+      name: Port belongs to a known internal application
+      description: >-
+        The destination port is part of a line-of-business or vendor application recorded in
+        inventory, which is the single largest population this hunt returns.
+      source: asset_inventory
+      field: RemotePort
+      indicates: legitimate_application_component
+    - id: approved_listener_relocation
+      name: Listener move covered by a hardening standard
+      description: >-
+        A change record or hardening baseline accounts for the management service being moved
+        to a different port across a group of systems.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: managed_agent_traffic
+      name: Traffic belongs to a deployed management agent
+      description: >-
+        The connecting process is a backup, monitoring or deployment agent whose documented
+        function includes talking on this port, and it behaves identically fleet-wide.
+      source: network_connection
+      field: ContextProcessId
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - port_protocol_mismatch
+
+    supporting:
+      any:
+        - initiator_has_no_protocol_role
+        - service_listener_relocated
+        - destination_is_external
+        - port_rare_in_estate
+        - sessions_repeat_on_the_odd_port
+      all:
+        - port_rare_in_estate
+        - destination_is_external
+
+    contradicting:
+      any:
+        - documented_application_port
+        - approved_listener_relocation
+        - managed_agent_traffic
+      all: []
+
+  verdict:
+    low_risk_when:
+      - port_protocol_mismatch
+      - documented_application_port
+      - approved_listener_relocation
+      - managed_agent_traffic
+    suspicious_when:
+      - port_protocol_mismatch
+      - port_rare_in_estate
+    high_risk_when:
+      - port_protocol_mismatch
+      - port_rare_in_estate
+      - destination_is_external
+      - initiator_has_no_protocol_role
+      - sessions_repeat_on_the_odd_port
+
+  false_positive:
+    - condition: An internal application is deployed on an arbitrary high port.
+      explanation: >-
+        This is the dominant source of hits and it is not a defect in the hypothesis but a
+        property of every real estate. The rarity case handles it directly, because an
+        application in use is used by many hosts consistently, where a channel is used by
+        one or two and appears for the first time inside the window.
+    - condition: An administrator relocates remote desktop or remote management as hardening.
+      explanation: >-
+        Moving a management service off its default port is a recommended control in some
+        standards, so the relocation command is legitimate. It arrives across a group of
+        systems through policy or a build script, where an intrusion's version is applied to
+        a single host from an interactive session.
+    - condition: A conferencing or software-as-a-service client uses a wide range of high ports.
+      explanation: >-
+        Media and collaboration products negotiate ports dynamically and legitimately produce
+        rare pairings. The connecting image names the product, the destinations belong to the
+        provider's ranges, and the same behaviour appears on every host running the client.
+    - condition: A vendor publishes an alternate port for clients behind restrictive firewalls.
+      explanation: >-
+        Some products offer their protocol on a second port precisely so it passes egress
+        controls, which reproduces the protocol-client case. The pairing is stable and
+        documented, and it appears wherever the product is installed.
+    - condition: A backup or monitoring agent talks on a well-known service port.
+      explanation: >-
+        Management tooling legitimately speaks to database, SSH and management ports on
+        behalf of an administrator, satisfying the unrelated-process case. These agents are
+        deployed fleet-wide, so their pairings are established in the baseline rather than new.
