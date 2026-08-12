@@ -1,0 +1,410 @@
+type: detection
+
+id: hg-any-database-bulk-extraction-by-a-client-process-t1213-006
+
+version: 1.0.0
+
+info:
+  name: Database bulk extraction by a client process
+  description: >-
+    A database is the one place in most estates where a single command returns the whole
+    customer list. That is what makes it worth hunting and also what makes it difficult: the
+    application queries the same tables all day and nothing about the database itself
+    distinguishes an adversary's read from the application's. Be honest about where the
+    boundary of endpoint telemetry falls here, because MITRE's analytics for this
+    sub-technique reach well past it. The sensor does not see queries. It has no view of what
+    the application server sends over an established connection, no view of how many rows
+    came back, and no view of a session inside a GUI client where the operator types into a
+    query window. Everything AN0679 and AN0680 describe — RDS ExecuteStatement, Snowflake
+    query history, row and duration thresholds — belongs to cloud and platform audit logs
+    that no endpoint agent supplies. What the sensor does see is the client process and its
+    arguments, and that turns out to be enough for one specific and genuinely valuable case:
+    extraction driven from a command line. A dump utility invoked with its target, or a
+    client passed a query with the -e, -c or -Q switch, puts the whole intent in the process
+    arguments where it is fully captured. That covers mysqldump, pg_dump, mongodump, bcp and
+    sqlcmd, and it covers the Oracle unloader SQLULDR2 that APT41 used against victim
+    databases. It does not cover the interactive session, and it does not cover the
+    application. One further limit is worth stating rather than glossing: this deployment's
+    file-creation telemetry records executable and script writes, not arbitrary files, so the
+    .sql or .csv the dump produces is not observed being written. Its path is known only
+    because the command line named it, which is why the redirect argument is treated as
+    evidence and the file itself is not. The legitimate twin is the nightly backup, which
+    runs the same binaries with the same arguments, and separating them is mostly a question
+    of who the parent is, whether the host has a database role, and whether the same command
+    has run on a schedule before. A dump parented by a web server process or a shell is not a
+    backup, whatever it looks like in isolation.
+  severity: medium
+  author: huntgraph
+  tags:
+    - collection
+    - information-repositories
+    - databases
+    - data-staging
+    - windows
+    - linux
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1213/006
+    - https://attack.mitre.org/detectionstrategies/DET0242
+    - https://attack.mitre.org/techniques/T1213
+
+mitre:
+  tactics:
+    - TA0009
+  techniques:
+    - T1213
+  sub_techniques:
+    - T1213.006
+  detection_strategies:
+    - DET0242
+  analytics:
+    - AN0676
+    - AN0677
+    - AN0678
+  platforms:
+    - Windows
+    - Linux
+    - macOS
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+    - auditd:SYSCALL
+    - auditd:PATH
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+    - File Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary with access to a host that can reach a database may use a command-line
+    client or a dump utility to extract whole tables or whole schemas to a local file,
+    obtaining in one command the volume of records an application would only ever return a
+    page at a time.
+  attacker_behavior:
+    - Invokes a dump utility such as mysqldump, pg_dump or mongodump against a whole database.
+    - Passes an unbounded read to a client through the -e, -c, -Q or --eval switch.
+    - Enumerates schemas and tables through the catalogue before deciding what to take.
+    - Redirects the client's output to a file in a temp or staging directory.
+    - Runs the client from a web server process or a shell after exploiting an application.
+    - Transfers the resulting dump outbound from the same host shortly afterwards.
+  legitimate_behavior:
+    - Scheduled backup jobs run dump utilities nightly with the same arguments every time.
+    - Database administrators export a schema before a migration or a version upgrade.
+    - Reporting and analytics jobs extract tables into a warehouse on a fixed schedule.
+    - Developers dump a database to reproduce a defect against a local copy.
+    - Monitoring agents run small catalogue queries to collect health metrics.
+  risk_indicator:
+    - The client is parented by a web server, a shell or an interpreter rather than a scheduler.
+    - The host has no database, backup or analytics role in the asset inventory.
+    - The query is unbounded, with no row limit, or enumerates the catalogue first.
+    - Output is written to a temp or user directory rather than to the backup target.
+    - The same host connects to an external address shortly after the extraction.
+
+requires:
+  platforms:
+    - windows
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: bulk-dump-utility-invoked
+        name: Dump utility invoked against a database
+        purpose: >-
+          Establish the base observable on the sharpest form of it. A dump utility exists to
+          serialise a database to a file, so its invocation is extraction by definition and
+          the question is only whether this one was sanctioned. Ranking by rarity is what
+          makes the case usable, because the nightly backup will dominate the results.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(mysqldump|mysqlpump|mariadb-dump|pg_dump|pg_dumpall|mongodump|mongoexport|sqlite3|bcp|sqlcmd|sqlldr|sqluldr2|expdp|exp|impdp|snowsql|clickhouse-client|cqlsh|redis-cli)(\.exe)?$/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=runs), collect([CommandLine], limit=5)])
+          | sort(runs, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Scheduled backup and warehouse-load jobs running under their own service account"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - parent_process
+            - command_line
+
+      - id: unbounded-read-on-the-command-line
+        name: Client passed an unbounded read or a catalogue sweep
+        purpose: >-
+          Separate a query that answers a question from one that takes the table. A read with
+          no row limit, or a walk of the catalogue to find out what tables exist, is the
+          shape of somebody deciding what is worth taking rather than an application serving
+          a page of results.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(mysql|mariadb|psql|mongo|mongosh|sqlite3|sqlcmd|osql|isql|clickhouse-client|cqlsh|snowsql|redis-cli|python|python3|pwsh|powershell)(\.exe)?$/i
+          | CommandLine=/\s-(e|c|Q|q|E)\b|--(eval|command|query|execute)\b|Invoke-Sqlcmd/i
+          | CommandLine=/\bselect\b[^;]{0,200}?\bfrom\b|\binformation_schema\b|\bpg_catalog\b|\bsysobjects\b|\bsys\.tables\b|\bshow\s+(databases|tables|schemas)\b|\bsp_(help|tables|databases)\b|\.getCollectionNames\(|\bkeys\s+\*/i
+          | CommandLine!=/\b(limit|top|fetch\s+first|rownum\s*<)\s*\(?\s*\d{1,3}\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=queries), collect([CommandLine], limit=5)])
+          | sort(queries, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Monitoring agents that poll the catalogue for health and capacity metrics"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: client-run-by-an-unexpected-parent
+        name: Database client launched by a web server or a shell
+        purpose: >-
+          Use the parent as the discriminator where the command itself cannot be one. A
+          backup job is parented by a scheduler and an administrator's session by a shell on
+          an admin host, but a database client parented by a web server process is the
+          signature of an application that has been made to run commands.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(mysql|mysqldump|mariadb|psql|pg_dump|mongo|mongosh|mongodump|mongoexport|sqlite3|sqlcmd|bcp|osql|isql|sqluldr2|snowsql|redis-cli)(\.exe)?$/i
+          | ParentBaseFileName=/^(w3wp|httpd|apache2|nginx|php-fpm|php-cgi|php|java|tomcat|node|cmd|sh|bash|dash|zsh|powershell|pwsh|wscript|cscript|python|python3|perl|ruby)(\.exe)?$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName, ImageFileName],
+                    function=[count(as=runs), collect([CommandLine], limit=5)])
+          | sort(runs, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Application deployment and schema-migration steps run from the build agent"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - parent_process
+            - organization
+
+      - id: extraction-followed-by-egress
+        name: Extracting process connecting to an external address
+        purpose: >-
+          Close the chain by joining the client that performed the extraction to a connection
+          it then made outside the estate. Without this the finding is a large local read;
+          with it the records have left, and the response changes from investigation to
+          notification.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | FileName=/^(mysqldump|mysqlpump|pg_dump|pg_dumpall|mongodump|mongoexport|sqlite3|bcp|sqlcmd|sqluldr2|snowsql|mysql|psql|mongosh)(\.exe)?$/i
+                | CommandLine=/\s>\s*\S+|-o\s+\S+|--result-file|--out\b|queryout|\.sql\b|\.csv\b|\.bak\b|\.dmp\b/i
+                | extractor_pid := TargetProcessId ;
+              #event_simpleName=NetworkConnectIP4
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/ ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([CommandLine, FileName, RemoteAddressIP4, RemotePort]),
+                              count(as=events)])
+          | extractor_pid = ContextProcessId
+        filters:
+          include: []
+          exclude:
+            - "RemoteAddressIP4 within the approved warehouse, backup and managed-database ranges"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: bulk_extraction_command
+      name: Database client invoked to extract in bulk
+      description: >-
+        A database client or dump utility was executed with arguments that extract a whole
+        database, a whole table, or an unbounded result set, rather than opened for an
+        interactive session or a bounded query.
+      source: process_creation
+      field: CommandLine
+      indicates: bulk_database_extraction
+
+  supporting:
+    - id: unbounded_or_catalogue_query
+      name: Query is unbounded or walks the catalogue
+      description: >-
+        The query carries no row limit, or enumerates schemas and tables through the
+        catalogue, which is the shape of deciding what to take rather than serving a request.
+      source: process_creation
+      field: CommandLine
+      indicates: data_reconnaissance
+    - id: output_redirected_to_a_file
+      name: Output written to a file the command names
+      description: >-
+        The client was told to write its results to a file, which is collection for transfer
+        rather than a read whose output is displayed and discarded.
+      source: process_creation
+      field: CommandLine
+      indicates: collection_staging
+    - id: unexpected_parent_process
+      name: Client launched by a web server, shell or interpreter
+      description: >-
+        The database client was started by a web server process, a shell or a script host
+        rather than by a scheduler or a database management tool, which is the shape of an
+        application driven to run commands on an adversary's behalf.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: unexpected_parent_process
+    - id: host_has_no_database_role
+      name: Host has no database or analytics role
+      description: >-
+        The asset inventory records no database, backup or reporting role for this host, so
+        there is no standing reason for a database client to run on it at all.
+      source: asset_inventory
+      field: ComputerName
+      indicates: unexpected_host_role
+    - id: egress_after_extraction
+      name: Extracting process connected to an external address
+      description: >-
+        The process that performed the extraction subsequently opened a connection to an
+        address outside the estate, indicating the extracted records did not stay on the host.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: outbound_transfer
+    - id: no_extraction_history
+      name: No precedent for this extraction on this host
+      description: >-
+        No comparable extraction command has run on this host during the baseline window, so
+        the activity is new rather than part of a standing backup or reporting job.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: scheduled_backup_agent
+      name: Run by a scheduler or backup agent
+      description: >-
+        The client was started by the task scheduler, cron, or a backup product's own agent,
+        which is how every sanctioned nightly dump in the estate reaches the database.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: scheduled_automation
+    - id: recurring_scheduled_extraction
+      name: Same extraction recurs on a fixed interval
+      description: >-
+        The identical command shape has run at a fixed interval throughout the baseline
+        window, which is a backup or warehouse-load schedule rather than a one-off read.
+      source: baseline
+      field: CommandLine
+      indicates: bulk_administrative_operation
+    - id: recorded_maintenance_window
+      name: Recorded migration or maintenance work
+      description: >-
+        A change record covers database export work on this host, such as a schema migration,
+        a version upgrade or a restore rehearsal.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - bulk_extraction_command
+
+    supporting:
+      any:
+        - unbounded_or_catalogue_query
+        - output_redirected_to_a_file
+        - unexpected_parent_process
+        - host_has_no_database_role
+        - egress_after_extraction
+        - no_extraction_history
+      all:
+        - unexpected_parent_process
+        - egress_after_extraction
+
+    contradicting:
+      any:
+        - scheduled_backup_agent
+        - recurring_scheduled_extraction
+        - recorded_maintenance_window
+      all: []
+
+  verdict:
+    low_risk_when:
+      - bulk_extraction_command
+      - scheduled_backup_agent
+      - recurring_scheduled_extraction
+      - recorded_maintenance_window
+    suspicious_when:
+      - bulk_extraction_command
+      - no_extraction_history
+    high_risk_when:
+      - bulk_extraction_command
+      - unbounded_or_catalogue_query
+      - output_redirected_to_a_file
+      - unexpected_parent_process
+      - host_has_no_database_role
+      - egress_after_extraction
+
+  false_positive:
+    - condition: The nightly backup job dumps every database on the host.
+      explanation: >-
+        This is the dominant source of hits and runs the same binaries with the same
+        arguments an adversary would use. It is separated by the parent being the scheduler
+        or the backup agent, by the destination being the backup target rather than a temp
+        directory, and by the same command appearing at the same time every day throughout
+        the baseline window.
+    - condition: A database administrator exports a schema before a migration.
+      explanation: >-
+        Genuine one-off interactive work that has no schedule to vouch for it and will look
+        novel against any baseline. It is confirmed by a change record, by the host holding a
+        database role, and by the operator being a known administrator working from an admin
+        session rather than from a web server process.
+    - condition: A reporting or warehouse job extracts tables on a fixed schedule.
+      explanation: >-
+        Analytics extraction is unbounded by nature, since the point is to take the whole
+        table, so it matches the strongest supporting evidence here. It is identified by a
+        service account, a consistent destination inside the estate, and a schedule.
+    - condition: A developer dumps a database to reproduce a defect locally.
+      explanation: >-
+        This produces an interactive dump on a workstation with no database role, which is a
+        combination that scores highly. It is distinguished by the target being a development
+        or staging instance rather than production, and it is worth confirming rather than
+        assuming, because the same shape on a production instance is the finding.
+    - condition: The extraction happened inside an application or an interactive client.
+      explanation: >-
+        This is the coverage gap rather than a false positive. A query sent over an
+        application's existing connection, or typed into a GUI client's query window, puts
+        nothing on any command line and is invisible here. Database audit logging, and for
+        managed platforms the cloud provider's query history, are the authority for those.

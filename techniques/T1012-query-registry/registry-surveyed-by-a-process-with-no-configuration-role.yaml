@@ -1,0 +1,394 @@
+type: detection
+
+id: hg-win-registry-surveyed-by-a-process-with-no-configuration-role-t1012
+
+version: 1.0.0
+
+info:
+  name: Registry surveyed by a process with no configuration role
+  description: >-
+    The registry is the fastest way to find out what a Windows host is without running a
+    single discovery utility. Build number, installed products, which security agents are
+    present, what starts at boot, whether remote desktop is enabled, which runtimes are
+    available — all of it is readable by an ordinary user and all of it answers the
+    questions an operator asks in the first minutes on a new host. Reads leave no
+    modification trace, so there is no registry event to key on; the only observable is the
+    process that asked and what it asked for, which is exactly where the MITRE analytic for
+    this technique puts its tunables.
+    That makes the actor the anchor rather than the act. Configuration reads are constant
+    in any estate, but almost all of them come from installers reading their own keys,
+    management agents reading keys they were deployed to read, and the operating system
+    reading itself. A shell, script host, document handler or archive tool walking
+    configuration keys has no such standing, and one lineage touching several unrelated
+    configuration areas in a short window is orientation rather than a lookup.
+    Two nearby hypotheses own ground this one deliberately leaves alone: searching the
+    registry for password keywords or reading keys whose only content is a stored secret is
+    credential access under unsecured credentials in registry, and enumerating the installed
+    software estate as a subject in its own right belongs with software discovery. This file
+    is about the registry used as the instrument of orientation.
+  severity: medium
+  author: huntgraph
+  tags:
+    - discovery
+    - query-registry
+    - host-orientation
+    - registry
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1012
+    - https://attack.mitre.org/detectionstrategies/DET0209
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1012
+  sub_techniques: []
+  detection_strategies:
+    - DET0209
+  analytics:
+    - AN0589
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:PowerShell
+  data_components:
+    - Process Creation
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    An adversary may read configuration values from the registry to establish what the host
+    is, what protects it and what it can reach, using a shell or script host that has no
+    configuration role and touching several unrelated areas of the hive in one short window.
+  attacker_behavior:
+    - Reads the build and version keys to establish the operating system and patch level.
+    - Enumerates the installed products key to learn what software the host carries.
+    - Reads the keys belonging to security agents to see what is watching the host.
+    - Walks a configuration hive recursively rather than reading a value by name.
+    - Queries the registry of another host over the remote registry service.
+  legitimate_behavior:
+    - Installers and applications read their own product keys at startup and during upgrade.
+    - Inventory, patching and compliance agents enumerate configuration keys on a schedule.
+    - Imaging and provisioning scripts read configuration to decide what to install.
+    - Administrators check a specific setting while diagnosing a fault on a host.
+    - Monitoring agents read version and configuration values to report host state.
+  risk_indicator:
+    - The querying process is a shell, script host, document handler or archive tool.
+    - Several unrelated configuration areas were queried under one lineage in one window.
+    - The hive was walked recursively rather than a named value being read.
+    - The query addressed the registry of a remote host rather than the local one.
+    - The pattern is unprecedented for this host and does not recur on a cycle.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: configuration-areas-queried-in-one-burst
+        name: Several unrelated configuration areas queried under one lineage
+        purpose: >-
+          The discriminator for the hypothesis. Tag each query by which area of the
+          configuration it answers for and collapse them per host, account and parent, so
+          that a lineage which asked for the build number, the installed products, the
+          security agents and the remote desktop setting stands apart from the very many
+          processes that read exactly one key for a reason. Raise the area threshold in
+          estates with chatty management tooling; three unrelated areas is a deliberately
+          conservative floor.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(reg(\.exe)?\s+query|Get-ItemProperty|Get-ItemPropertyValue|Get-ChildItem\s+.{0,20}HK|Registry::|HKLM:|HKCU:|\[Microsoft\.Win32\.Registry\]|OpenSubKey)/i
+          | case {
+              CommandLine=/(Windows NT\\+CurrentVersion|CurrentBuild|ProductName|ReleaseId|DisplayVersion|InstallDate)/i
+                | area := "os_build" ;
+              CommandLine=/(\\+Uninstall\b|App Paths|SOFTWARE\\+Classes\\+Installer|InstalledVersion)/i
+                | area := "installed_software" ;
+              CommandLine=/(Windows Defender|SecurityCenter|AntiVirusProduct|CrowdStrike|Sophos|McAfee|Symantec|SentinelOne|Carbon ?Black|ESET|Kaspersky|TrendMicro)/i
+                | area := "security_products" ;
+              CommandLine=/(CurrentVersion\\+Run(Once)?\b|Winlogon\\+(Shell|Userinit)|CurrentVersion\\+Policies\\+Explorer\\+Run)/i
+                | area := "autostart_configuration" ;
+              CommandLine=/(Terminal Server|fDenyTSConnections|WinStations\\+RDP-Tcp|LanmanServer\\+Shares|Services\\+(WinRM|RemoteRegistry))/i
+                | area := "remote_access_configuration" ;
+              CommandLine=/(NET Framework Setup|PowerShell\\+\d\\+PowerShellEngine|ScriptBlockLogging|Windows Script Host)/i
+                | area := "runtime_availability" ;
+              CommandLine=/(TimeZoneInformation|Control\\+Nls|ComputerName\\+ComputerName|Environment\b|SystemInformation|BIOS\b)/i
+                | area := "host_environment" ;
+            }
+          | area=/.+/
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(area, distinct=true, as=areas),
+                              count(as=queries),
+                              collect([area, CommandLine], limit=15)])
+          | areas >= 3
+          | sort(areas, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Inventory, patching and compliance agents that enumerate configuration keys on a fixed schedule"
+            - "Imaging and provisioning pipelines during a build window"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - parent_process
+
+      - id: registry-queried-from-a-delivery-parent
+        name: Registry queried by a process launched from a delivery or shell parent
+        purpose: >-
+          The actor case, and the one that matches how the MITRE analytic for this technique
+          is tuned. A single configuration read is unremarkable; the same read parented by a
+          document handler, mail client, browser, archive utility or script host is a
+          process asking about the host it just arrived on. This case deliberately does not
+          require breadth, so it will surface single reads from the wrong ancestry.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(reg(\.exe)?\s+query|Get-ItemProperty|Get-ItemPropertyValue|Registry::|HKLM:|HKCU:|OpenSubKey)/i
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|onenote|msaccess|visio|acrord32|acrobat|7zfm|winrar|winzip|explorer|mshta|wscript|cscript|hh|chrome|msedge|firefox|teams|onedrive)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=queries), collect([CommandLine], limit=10)])
+          | sort(queries, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Application launchers and add-in loaders that read their own product keys at startup"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - parent_process
+            - command_line
+
+      - id: hive-walked-recursively
+        name: Configuration hive walked recursively rather than read by name
+        purpose: >-
+          Separate searching from reading. Software knows the name of the value it wants and
+          asks for it; a recursive walk of a configuration subtree is someone finding out
+          what is there. The same reasoning applied to password keywords belongs to the
+          unsecured credentials hypothesis, so this case stays on configuration subtrees and
+          leaves credential keys to it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(reg(\.exe)?\s+query.{0,80}\/s\b|Get-ChildItem.{0,80}-Recurse|gci.{0,60}-Recurse|Get-ChildItem\s+-Path\s+HK)/i
+          | CommandLine=/(HKLM|HKCU|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER|Registry::)/i
+          | CommandLine!=/(password|passwd|pwd|credential|secret|apikey|token)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=walks), collect([CommandLine], limit=10)])
+          | sort(walks, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Configuration audit and compliance scanners whose function is enumerating hives"
+            - "Software packaging and application discovery tooling"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: remote-registry-queried
+        name: Registry of another host queried across the network
+        purpose: >-
+          The sharpest case in this file. Reading the local registry is ordinary; reaching
+          into another machine's registry is a deliberate act with a very small legitimate
+          population, and it is how an operator surveys hosts they have credentials for but
+          have not yet moved to. The remote registry service is disabled by default on
+          modern builds, which narrows the population further.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(reg(\.exe)?\s+query\s+\\\\\\\\[^\\\s]+|OpenRemoteBaseKey|Get-ItemProperty.{0,40}-ComputerName|Invoke-Command.{0,60}(Get-ItemProperty|reg\s+query)|StdRegProv)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=remote_queries), collect([CommandLine], limit=10)])
+          | sort(remote_queries, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Configuration management and monitoring servers that poll host registries by design"
+            - "Directory and endpoint administration jump hosts"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - organization
+
+evidence:
+  required:
+    - id: registry_queried_for_configuration
+      name: Registry read for host configuration
+      description: >-
+        A process read configuration values from the registry — build, installed products,
+        security agents, autostart, remote access or runtime availability — rather than
+        reading a value belonging to itself.
+      source: process_creation
+      field: CommandLine
+      indicates: registry_environment_discovery
+
+  supporting:
+    - id: multiple_areas_queried
+      name: Several unrelated configuration areas in one window
+      description: >-
+        One lineage queried three or more unrelated areas of configuration inside the
+        window, which is a survey of the host rather than a lookup with a purpose.
+      source: process_creation
+      field: CommandLine
+      indicates: broad_configuration_survey
+    - id: recursive_hive_walk
+      name: Hive walked recursively
+      description: >-
+        The query enumerated a configuration subtree recursively instead of addressing a
+        named value, which is how a search behaves and not how software reads a setting.
+      source: process_creation
+      field: CommandLine
+      indicates: enumeration_rather_than_lookup
+    - id: remote_hive_queried
+      name: Another host's registry read
+      description: >-
+        The query addressed the registry of a remote machine, which surveys a host the
+        operator has credentials for but has not yet moved to.
+      source: process_creation
+      field: FileName
+      indicates: remote_configuration_enumeration
+    - id: untrusted_parent
+      name: Launched from a delivery or shell parent
+      description: >-
+        The querying process was started by a document handler, mail client, browser,
+        archive utility or script host rather than by an installer or management agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: non_interactive_context
+      name: Run under a non-interactive or unexpected account
+      description: >-
+        The query ran under a service or machine context that has no configuration reading
+        role, or under an interactive account with no history of administrative work.
+      source: process_creation
+      field: UserName
+      indicates: unexpected_account_context
+    - id: rare_for_host
+      name: Survey unprecedented on this host
+      description: >-
+        No comparable configuration survey has run on this host during the baseline window,
+        unlike agent activity which recurs at a predictable interval.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: inventory_or_audit_agent
+      name: Inventory, patching or compliance agent
+      description: >-
+        The querying process belongs to an approved management, patching or compliance agent
+        whose deployed function includes enumerating configuration keys.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_enterprise_activity
+    - id: product_self_read
+      name: An application reading its own keys
+      description: >-
+        An installed product read the keys belonging to itself during startup, licensing or
+        upgrade, which is the intended use of those keys.
+      source: asset_inventory
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: fleetwide_identical_query
+      name: Identical query across the estate
+      description: >-
+        The same command line appears on a large share of hosts within one window, which is
+        a distributed script or deployment wave rather than one host being surveyed.
+      source: baseline
+      field: CommandLine
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - registry_queried_for_configuration
+
+    supporting:
+      any:
+        - multiple_areas_queried
+        - recursive_hive_walk
+        - remote_hive_queried
+        - untrusted_parent
+        - non_interactive_context
+        - rare_for_host
+      all:
+        - multiple_areas_queried
+        - untrusted_parent
+
+    contradicting:
+      any:
+        - inventory_or_audit_agent
+        - product_self_read
+        - fleetwide_identical_query
+      all: []
+
+  verdict:
+    low_risk_when:
+      - registry_queried_for_configuration
+      - inventory_or_audit_agent
+      - product_self_read
+      - fleetwide_identical_query
+    suspicious_when:
+      - registry_queried_for_configuration
+      - rare_for_host
+    high_risk_when:
+      - registry_queried_for_configuration
+      - multiple_areas_queried
+      - recursive_hive_walk
+      - untrusted_parent
+      - non_interactive_context
+
+  false_positive:
+    - condition: An inventory or compliance agent enumerates configuration keys on a schedule.
+      explanation: >-
+        Audit tooling reads build numbers, installed products and security agent keys in one
+        pass, which reproduces both the required evidence and the breadth evidence exactly.
+        The agent is the acting process, the cadence is fixed, and the identical pattern
+        appears across the whole fleet rather than on one host once.
+    - condition: An installer or application reads its own product keys at startup.
+      explanation: >-
+        Almost every installed product reads configuration belonging to itself whenever it
+        starts. The reader is the product's own binary rather than a shell or script host,
+        and the keys addressed sit under the product's own path.
+    - condition: An imaging or provisioning script queries configuration during a build.
+      explanation: >-
+        Provisioning scripts branch on build number, installed runtimes and hardware, so they
+        legitimately touch several unrelated areas in one window. They run under the
+        provisioning account during a build window and appear identically on every machine
+        that passes through the pipeline.
+    - condition: A configuration management server polls host registries across the estate.
+      explanation: >-
+        Remote registry reads are the normal working method for some management platforms,
+        which reproduces the strongest case in this file. The source is a small set of known
+        management servers using a dedicated service account, and the reads are periodic.
+    - condition: An administrator checks a setting while diagnosing a fault.
+      explanation: >-
+        Support work legitimately involves reading remote desktop, autostart and agent keys.
+        It is a small number of targeted reads by a named engineer, usually with a ticket
+        behind it, and it does not walk subtrees recursively or sweep unrelated areas.

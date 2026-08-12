@@ -1,0 +1,332 @@
+type: detection
+
+id: hg-lin-microphone-recording-started-by-a-shell-t1123
+version: 1.0.0
+
+info:
+  name: Microphone recording started from a shell on a Linux host
+  description: >-
+    Audio capture is mostly an API technique. MITRE's Windows analytic for it rests on
+    process handles into the multimedia libraries and its macOS analytic on framework calls
+    and TCC microphone grants — neither has a process-creation leg at all, and neither is
+    collectable here, so this file makes no claim about Windows or macOS. The Linux analytic
+    is different: it names execution of capture binaries such as arecord alongside access to
+    the sound devices, and command-line audio capture on Linux is both fully observable and
+    genuinely odd. Server and workstation Linux estates are largely headless and often have
+    no microphone at all, so a process opening a capture device is a question worth asking
+    on its own terms rather than a needle in a haystack. The audio files themselves stay
+    invisible — this sensor reports executable and script writes, not the creation of a WAV —
+    so the destination has to come from the command line, and it usually does.
+  severity: medium
+  author: huntgraph
+  tags:
+    - collection
+    - audio-capture
+    - surveillance
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1123
+    - https://attack.mitre.org/detectionstrategies/DET0221
+    - https://attack.mitre.org/techniques/T1125
+    - https://attack.mitre.org/techniques/T1113
+
+mitre:
+  tactics:
+    - TA0009
+  techniques:
+    - T1123
+  sub_techniques: []
+  detection_strategies:
+    - DET0221
+  analytics:
+    - AN0620
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+    - linux:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary with a foothold on a Linux host starts a microphone recording to listen to
+    the room or the conversations around a device, using a capture utility or a general
+    purpose tool pointed at a sound device, and typically leaves it running unattended with
+    the output written somewhere temporary rather than sitting in front of the machine.
+  attacker_behavior:
+    - Runs arecord, parecord, pw-record, rec or sox against the default capture device.
+    - Uses ffmpeg or gstreamer with an ALSA or PulseAudio input to record the microphone.
+    - Reads a sound device directly with a general purpose tool such as dd or cat.
+    - Leaves the recording unbounded or sets a duration measured in hours.
+    - Writes the recording to a temporary, shared-memory or hidden path.
+    - Starts the recording from cron, a systemd unit or an inbound remote shell.
+  legitimate_behavior:
+    - Conferencing and softphone software records or streams audio on a workstation.
+    - Media, broadcast and transcription pipelines capture audio as their function.
+    - Audio and driver troubleshooting uses arecord briefly to prove a device works.
+    - Voice assistant and accessibility software listens by design.
+    - Engineering and lab hosts exercise capture hardware during development and test.
+  risk_indicator:
+    - The host has no role that involves recording audio.
+    - The recording is unbounded or runs for hours rather than seconds.
+    - Output is written to a temporary, shared-memory or hidden path.
+    - The parent is a scheduler, service manager or remote shell rather than a terminal.
+    - A general purpose tool, not an audio utility, is what opens the sound device.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: unattended-recording-to-a-scratch-path
+        name: Capture utility left running or writing to a temporary path
+        purpose: >-
+          Separate a recording made to be listened to from one made to be collected. Proving
+          a microphone works takes a few seconds and the file is written where the engineer
+          is standing; surveillance is unbounded or measured in hours and lands in /tmp,
+          /dev/shm, /var/tmp or a dot-directory. Requiring the duration or the destination to
+          be wrong keeps a one-off diagnostic out of the results.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(arecord|parecord|pw-record|pw-cat|rec|sox|ffmpeg|avconv|gst-launch-1\.0)$/i
+          | CommandLine=/(-f\s+(alsa|pulse|oss)|alsasrc|pulsesrc|autoaudiosrc|-D\s+(default|hw:|plughw:)|--device\s*=?\s*(default|hw:)|\bdefault\b.*\.wav|-d\b.*\.(wav|raw|mp3|ogg|flac))/i
+          | case {
+              CommandLine=/(\/tmp\/|\/var\/tmp\/|\/dev\/shm\/|\/run\/user\/|\/var\/spool\/|\/[A-Za-z0-9_\/.-]*\/\.[A-Za-z0-9_-]+\/)/i
+                | scratch_output := CommandLine ;
+              CommandLine=/(-d\s*[1-9]\d{3,}|-t\s*[1-9]\d{3,}|--duration\s*[1-9]\d{3,}|\btrim\b\s+0\s+[1-9]\d{3,}|nohup|&\s*$|\s-\s*$)/i
+                | long_or_unbounded := CommandLine ;
+            }
+          | scratch_output=/.+/ or long_or_unbounded=/.+/
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=recordings), collect([scratch_output, long_or_unbounded], limit=10)])
+          | sort(recordings, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Transcription and broadcast pipelines whose function is continuous capture"
+            - "Conferencing clients recording a scheduled meeting"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - path
+            - organization
+
+      - id: recording-started-without-a-terminal
+        name: Capture utility started by a scheduler, service or remote shell
+        purpose: >-
+          Establish the actor. Someone testing a microphone is sitting at a terminal; a
+          recording started by cron, a systemd unit, an inbound SSH session or an interpreter
+          running a dropped script is recording a room nobody asked it to. On a host where the
+          capture command itself might be defensible, this lineage is the discriminator that
+          makes it worth an analyst's attention.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(arecord|parecord|pw-record|pw-cat|rec|sox|ffmpeg|avconv|gst-launch-1\.0)$/i
+          | CommandLine=/(-f\s+(alsa|pulse|oss)|alsasrc|pulsesrc|autoaudiosrc|-D\s+(default|hw:|plughw:)|\barecord\b|\bparecord\b|\bpw-record\b)/i
+          | ParentBaseFileName=/^(crond?|systemd|systemd-user|atd|sshd|python\d?(\.\d+)?|perl|ruby|php|node|nohup|screen|tmux|sh|dash|busybox)$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Audio service units on media appliances and conferencing room systems"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - parent_process
+            - organization
+
+      - id: sound-device-opened-by-a-generic-tool
+        name: Sound device read by something that is not an audio utility
+        purpose: >-
+          Cover the case where no recognisable capture utility appears at all. An operator who
+          finds no audio tooling installed can read the ALSA or OSS device directly with dd,
+          cat or a small interpreter script, which produces raw audio without ever naming a
+          capture binary. The device path in the command line is what makes this visible, and
+          nothing in normal administration reads /dev/snd or /dev/dsp that way.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\/dev\/snd\/|\/dev\/dsp\b|\/dev\/audio\b|\/proc\/asound\/)/i
+          | CommandLine=/(\b(dd|cat|head|tail|cp|nc|ncat|socat|base64|gzip|tee)\b|\bopen\s*\(|pyaudio|sounddevice|soundcard|ossaudiodev)/i
+          | FileName!=/^(arecord|parecord|pw-record|aplay|alsactl|alsamixer|pulseaudio|pipewire|wireplumber)$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Driver and hardware diagnostics that enumerate /proc/asound during support cases"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: audio_capture_invoked
+      name: Microphone capture started from a command line
+      description: >-
+        A capture utility was run against a sound device, or a sound device was opened
+        directly by another tool, which is the observable start of an audio recording.
+      source: process_creation
+      field: CommandLine
+      indicates: audio_recording_started
+
+  supporting:
+    - id: unbounded_or_long_recording
+      name: Recording unbounded or measured in hours
+      description: >-
+        The command sets no duration, backgrounds the capture, or asks for a duration far
+        longer than any diagnostic would need.
+      source: process_creation
+      field: CommandLine
+      indicates: sustained_surveillance
+    - id: output_to_scratch_path
+      name: Recording written to a temporary, shared-memory or hidden path
+      description: >-
+        The destination in the command line is a temporary, shared-memory or dot-directory
+        location rather than a media or working directory.
+      source: process_creation
+      field: CommandLine
+      indicates: collection_staging
+    - id: no_terminal_parent
+      name: Started by a scheduler, service manager or remote shell
+      description: >-
+        The parent is cron, systemd, an inbound SSH session or an interpreter rather than a
+        terminal the user is sitting at.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: untrusted_execution_lineage
+    - id: generic_tool_reads_sound_device
+      name: Sound device opened by a non-audio tool
+      description: >-
+        A general purpose utility or interpreter, rather than an audio application, is what
+        opens the ALSA or OSS device, which is how capture is done where no tooling exists.
+      source: process_creation
+      field: CommandLine
+      indicates: living_off_the_land_capture
+    - id: capture_binary_from_writable_path
+      name: Capture binary running from a user-writable path
+      description: >-
+        The executable is a copy of a capture tool under a temporary, home or shared path
+        rather than a package-managed binary in a system directory.
+      source: process_creation
+      field: ImageFileName
+      indicates: untrusted_execution_location
+
+  contradicting:
+    - id: media_or_conferencing_workload
+      name: Conferencing, transcription or broadcast workload
+      description: >-
+        The acting process belongs to an approved conferencing, transcription or media
+        pipeline whose stated function is capturing audio.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: interactive_terminal_session
+      name: Run from the console user's own terminal
+      description: >-
+        The parent is a login shell or terminal belonging to the interactive user, which is
+        an engineer testing a device rather than an unattended recording.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: expected_user_activity
+    - id: media_or_lab_host
+      name: Media, lab or conferencing-room host
+      description: >-
+        The host belongs to an asset group where audio hardware is exercised as normal work,
+        such as a lab bench, a room system or a media encoder.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - audio_capture_invoked
+
+    supporting:
+      any:
+        - unbounded_or_long_recording
+        - output_to_scratch_path
+        - no_terminal_parent
+        - generic_tool_reads_sound_device
+        - capture_binary_from_writable_path
+      all:
+        - unbounded_or_long_recording
+        - no_terminal_parent
+
+    contradicting:
+      any:
+        - media_or_conferencing_workload
+        - interactive_terminal_session
+        - media_or_lab_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - audio_capture_invoked
+      - interactive_terminal_session
+      - media_or_conferencing_workload
+      - media_or_lab_host
+    suspicious_when:
+      - audio_capture_invoked
+      - no_terminal_parent
+    high_risk_when:
+      - audio_capture_invoked
+      - no_terminal_parent
+      - unbounded_or_long_recording
+      - output_to_scratch_path
+      - generic_tool_reads_sound_device
+
+  false_positive:
+    - condition: An engineer runs arecord briefly to prove a microphone works.
+      explanation: >-
+        This is the commonest benign match and it produces the required evidence exactly. It
+        is short, runs from an interactive terminal, and writes where the engineer is working,
+        which is why duration, destination and parent carry the weight here.
+    - condition: A transcription or broadcast pipeline captures audio continuously.
+      explanation: >-
+        Continuous capture is the pipeline's function, so it reproduces the unbounded-recording
+        evidence permanently and at higher volume than any implant. It runs under a service
+        account on a named group of hosts and its output path is stable.
+    - condition: A conferencing room system records a scheduled meeting.
+      explanation: >-
+        Room systems are started by a service manager rather than a terminal, matching the
+        lineage evidence. The recording coincides with a booked meeting and the host belongs
+        to a conferencing asset group.
+    - condition: A lab or test host exercises capture hardware during development.
+      explanation: >-
+        Audio driver and hardware work involves repeated capture from scripts, which matches
+        both the lineage and the temporary-path evidence. Asset group membership is the
+        discriminator rather than anything in the command.
+    - condition: Hardware diagnostics enumerate /proc/asound during a support case.
+      explanation: >-
+        Support scripts read the ALSA procfs entries to report device state, which touches the
+        same paths as the generic-tool case without ever reading audio. Reading /proc/asound
+        alone is inventory; reading /dev/snd or /dev/dsp is capture.

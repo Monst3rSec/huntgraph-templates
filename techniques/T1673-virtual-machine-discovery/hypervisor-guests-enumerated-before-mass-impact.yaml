@@ -1,0 +1,341 @@
+type: detection
+
+id: hg-any-hypervisor-guests-enumerated-before-mass-impact-t1673
+
+version: 1.0.0
+
+info:
+  name: Hypervisor guest inventory enumerated before mass power control
+  description: >-
+    Most Discovery techniques enumerate a host. This one enumerates an estate. A single
+    command on a hypervisor returns every workload it carries, and because those workloads
+    are files on a datastore rather than machines with their own defences, the operator who
+    obtains that list has reached a position where one action affects everything at once —
+    which is why `esxcli vm process list` and `vim-cmd vmsvc/getallvms` appear in the
+    reporting on Cheerscrypt, Qilin and UNC3886 immediately before guests are powered off
+    and their disk files encrypted. Powering a guest off first is not incidental: a running
+    virtual machine holds its disk open, so mass encryption of a datastore is preceded by
+    mass shutdown, and mass shutdown is preceded by the inventory. That is the sequence this
+    file is built around. The honest limitation is placed where it matters: the bare
+    hypervisor is usually not sensored, so the enumeration is caught either on a Linux
+    management host that issues it remotely — over SSH, through govc, through a Python SDK —
+    or on a Windows administration host running the PowerCLI and Hyper-V equivalents. That
+    is a real and common vantage point rather than a compromise, because the operator
+    reaching a hypervisor almost always arrives through one of those managed systems, but a
+    hunt run only against endpoints will not see activity that begins and ends on the ESXi
+    shell itself.
+  severity: high
+  author: huntgraph
+  tags:
+    - discovery
+    - virtualisation
+    - hypervisor
+    - esxi
+    - ransomware-precursor
+    - windows
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1673
+    - https://attack.mitre.org/detectionstrategies/DET0199
+    - https://attack.mitre.org/techniques/T1059/012
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1673
+  sub_techniques: []
+  detection_strategies:
+    - DET0199
+  analytics:
+    - AN0573
+    - AN0574
+  platforms:
+    - Linux
+    - Windows
+  data_sources:
+    - auditd:SYSCALL
+    - WinEventLog:Security
+  data_components:
+    - Command Execution
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary who has reached a hypervisor or a host that manages one may enumerate the
+    guest virtual machines it carries, obtaining in a single command the full inventory of
+    workloads that can then be powered off and encrypted together, or selected individually
+    for further compromise.
+  attacker_behavior:
+    - Lists running guests on an ESXi host with esxcli vm process list or vim-cmd vmsvc/getallvms.
+    - Issues those hypervisor commands remotely over SSH from a managed Linux host.
+    - Enumerates guests through a vSphere client, govc or a Python SDK script from a management system.
+    - Lists domains on a Linux virtualisation host with virsh, or machines with VBoxManage or qemu tooling.
+    - Enumerates Hyper-V or VMware guests on Windows with Get-VM, vmrun or the virtualisation WMI classes.
+    - Follows the inventory with power-off or termination commands against many guests at once.
+  legitimate_behavior:
+    - Virtualisation administrators list guests constantly as the ordinary work of managing the platform.
+    - Backup and replication products enumerate guests before every protection run.
+    - Monitoring and capacity tooling inventories virtual machines on a schedule.
+    - Automation and orchestration platforms query inventory as part of provisioning and patching.
+    - Engineers run local hypervisor tooling on development workstations.
+  risk_indicator:
+    - The enumeration is followed by power-off or termination commands against many guests.
+    - The command is issued from a host that has no history of managing that hypervisor.
+    - Hypervisor commands are pushed remotely over SSH rather than run by the platform's own tooling.
+    - The invoking account is not one that administers virtualisation.
+    - The enumeration coincides with storage or snapshot enumeration under the same lineage.
+
+requires:
+  platforms:
+    - linux
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: guest-inventory-listed
+        name: Guest virtual machines listed on a host or hypervisor
+        purpose: >-
+          Surface the inventory command across the platforms a sensored host can issue it
+          on — the ESXi shell verbs, the libvirt and VirtualBox equivalents on Linux, and
+          the Hyper-V and VMware cmdlets on Windows. Ascending order puts the hosts that do
+          this rarely at the top, because in any estate with virtualisation the bulk of the
+          volume comes from a small and stable set of management systems.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(esxcli\b.{0,30}\bvm\s+process\s+list|vim-cmd\b.{0,20}vmsvc\/getallvms|vim-cmd\b.{0,20}vmsvc\/get\.summary|\bvirsh\b\s+(-c\s+\S+\s+)?list\b|\bVBoxManage\b\s+list\s+(vms|runningvms)|\bprlctl\b\s+list\b|Get-VM\b|Get-VMHost\b|Get-SCVirtualMachine\b|\bvmrun\b\s+list\b|Msvm_ComputerSystem|\bgovc\b\s+(vm\.info|ls\b|find\b))/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=enumerations), collect([CommandLine], limit=5)])
+          | sort(enumerations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the backup, replication, monitoring and orchestration agents"
+            - "ComputerName of virtualisation management servers and administration jump hosts"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - parent_process
+            - command_line
+
+      - id: hypervisor-commands-pushed-remotely
+        name: Hypervisor commands issued to another host over a remote session
+        purpose: >-
+          Recover the visibility the unsensored hypervisor costs. When the ESXi shell verbs
+          appear inside an SSH or remote-execution command line on a managed host, the
+          enumeration is happening on a machine this deployment cannot see but the intent is
+          fully legible on the machine that sent it — and pushing hypervisor commands over
+          SSH rather than using the platform's own management path is itself unusual.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(ssh|plink|sshpass|pwsh|powershell|python[0-9.]*|perl|bash|sh)(\.exe)?$/i
+          | CommandLine=/(esxcli\b|vim-cmd\b|vmsvc\/getallvms|\/sbin\/vmdumper|vmware-cmd\b|Connect-VIServer\b|Get-VM\b|\bgovc\b|pyVmomi|vim25)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=invocations), collect([CommandLine], limit=5)])
+          | sort(invocations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Automation and configuration management hosts that manage the virtualisation estate by design"
+            - "UserName of the service accounts used by backup and orchestration platforms"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: inventory-then-power-control
+        name: Guest inventory followed by power-off or termination of guests
+        purpose: >-
+          Join the enumeration to the action it enables. A running guest holds its disk file
+          open, so mass encryption of a datastore has to be preceded by mass shutdown, and
+          mass shutdown has to be preceded by the list. Inventory alone is administration;
+          inventory followed by bulk power control on the same host is the opening of an
+          impact sequence.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(esxcli\b.{0,30}\bvm\s+process\s+list|vmsvc\/getallvms|\bvirsh\b\s+list\b|\bVBoxManage\b\s+list\s+(vms|runningvms)|Get-VM\b|\bvmrun\b\s+list\b|\bgovc\b\s+(vm\.info|ls\b))/i
+                | guest_inventory := CommandLine ;
+              CommandLine=/(esxcli\b.{0,30}\bvm\s+process\s+kill|vmsvc\/power\.(off|shutdown)|\bvirsh\b\s+(destroy|shutdown)\b|\bVBoxManage\b\s+controlvm\b.{0,20}poweroff|Stop-VM\b|\bvmrun\b\s+stop\b|\bgovc\b\s+vm\.power\b.{0,10}-off)/i
+                | guest_power_control := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([guest_inventory, guest_power_control, ParentBaseFileName], limit=12),
+                              count(as=commands)])
+          | guest_inventory=/.+/ and guest_power_control=/.+/
+          | sort(commands, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Scheduled maintenance and patching automation that cycles guests during a change window"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - process
+
+evidence:
+  required:
+    - id: guest_enumeration
+      name: Guest virtual machines enumerated
+      description: >-
+        A command listed the virtual machines present or running on a hypervisor, either
+        locally or by issuing the hypervisor's own verbs to it from a managed host.
+      source: process_creation
+      field: CommandLine
+      indicates: virtual_machine_discovery
+
+  supporting:
+    - id: power_control_follows
+      name: Guests powered off or terminated afterwards
+      description: >-
+        The enumeration was followed by power-off or process-kill commands against guests on
+        the same host, which is the shutdown that must precede encryption of the disk files.
+      source: process_creation
+      field: FileName
+      indicates: impact_sequence_in_progress
+    - id: remote_push
+      name: Hypervisor verbs pushed over a remote session
+      description: >-
+        The hypervisor commands were carried inside an SSH or scripted remote-execution
+        command line rather than issued through the virtualisation platform's own management
+        path.
+      source: process_creation
+      field: ImageFileName
+      indicates: out_of_band_hypervisor_access
+    - id: unusual_manager
+      name: Host or account does not manage virtualisation
+      description: >-
+        The enumeration came from a host or under an account with no history of managing
+        this virtualisation estate during the baseline window.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: scripted_parent
+      name: Interpreter or remote-execution parent
+      description: >-
+        The enumerating process was launched by a command interpreter or remote-execution
+        service rather than by the virtualisation management tooling or an interactive
+        administrative session.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+
+  contradicting:
+    - id: virtualisation_management_host
+      name: Virtualisation management or administration host
+      description: >-
+        The host is a virtualisation management server or administration jump host where
+        enumerating guests is the routine work the machine exists to do.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: backup_or_orchestration_agent
+      name: Backup, replication or orchestration agent
+      description: >-
+        The approved backup, replication, monitoring or orchestration platform performed the
+        enumeration as part of its scheduled protection or inventory run.
+      source: process_creation
+      field: UserName
+      indicates: legitimate_enterprise_activity
+    - id: maintenance_window
+      name: Activity within an approved maintenance window
+      description: >-
+        The enumeration and any power control fall inside a recorded patching or maintenance
+        change, where cycling guests in bulk is the expected activity.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_change
+
+  risk_logic:
+    required:
+      - guest_enumeration
+
+    supporting:
+      any:
+        - power_control_follows
+        - remote_push
+        - unusual_manager
+        - scripted_parent
+      all:
+        - power_control_follows
+        - unusual_manager
+
+    contradicting:
+      any:
+        - virtualisation_management_host
+        - backup_or_orchestration_agent
+        - maintenance_window
+      all: []
+
+  verdict:
+    low_risk_when:
+      - guest_enumeration
+      - virtualisation_management_host
+      - backup_or_orchestration_agent
+      - maintenance_window
+    suspicious_when:
+      - guest_enumeration
+      - unusual_manager
+      - remote_push
+    high_risk_when:
+      - guest_enumeration
+      - unusual_manager
+      - remote_push
+      - scripted_parent
+      - power_control_follows
+
+  false_positive:
+    - condition: A backup or replication product enumerates every guest before each protection run.
+      explanation: >-
+        Backup tooling produces the required evidence on a schedule, at the largest volume of
+        any source in the estate, and from the hosts that matter most. It is excluded by the
+        agent's own service account and parent process rather than by any property of the
+        command.
+    - condition: A virtualisation administrator lists guests as ordinary daily work.
+      explanation: >-
+        On a management host this is the machine's entire purpose, which is why host role is
+        the primary contradicting signal and why the file leans on enumeration arriving from
+        hosts that have no such role.
+    - condition: Scheduled patching automation cycles guests through shutdown and restart.
+      explanation: >-
+        Maintenance automation reproduces the inventory-then-power-control sequence that
+        carries the most weight here. It is bounded by a recorded change window, restarts
+        what it stops, and runs under an automation account.
+    - condition: An engineer runs local hypervisor tooling on a development workstation.
+      explanation: >-
+        VBoxManage and vmrun on an engineering endpoint are unremarkable and would otherwise
+        generate volume proportional to how many developers run local virtual machines. The
+        scale is one or two guests rather than a datastore.
+    - condition: A monitoring or capacity platform inventories virtual machines on a schedule.
+      explanation: >-
+        Capacity tooling queries inventory repeatedly and often from a host that is not
+        formally a virtualisation manager, which weakens the host-role separator. It recurs
+        on a fixed interval and never issues power control.

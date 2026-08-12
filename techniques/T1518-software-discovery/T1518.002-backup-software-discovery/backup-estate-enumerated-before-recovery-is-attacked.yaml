@@ -1,0 +1,410 @@
+type: detection
+
+id: hg-any-backup-estate-enumerated-before-recovery-is-attacked-t1518-002
+version: 1.0.0
+
+info:
+  name: Backup estate enumerated before recoverability is attacked
+  description: >-
+    Finding the backup agent has one purpose that matters. Encryption is only leverage if
+    restoring is impossible, so the operator asks what protects this host — Veeam,
+    Acronis, Commvault, NetBackup, Time Machine, restic — before deciding what to destroy,
+    and the answer determines whether the intrusion becomes an incident or a negotiation.
+    That makes this the one Discovery technique that reads less like reconnaissance and more
+    like the first line of a ransomware playbook. The observables are unusually good for
+    Discovery as well: naming backup vendors in a service, package or registry query is
+    specific, and inspecting recovery state through `vssadmin list shadows`, `wbadmin get
+    versions` or `tmutil listbackups` is close to unheard of outside the backup software
+    itself. Deleting shadow copies and backup catalogues is hunted by the indicator-removal
+    template and is not restated here; what this file owns is the enumeration, and the
+    pairing of enumeration with the destruction that follows it, which together are worth
+    pitching high.
+  severity: high
+  author: huntgraph
+  tags:
+    - discovery
+    - backup-software-discovery
+    - ransomware-precursor
+    - recovery-inhibition
+    - windows
+    - linux
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1518/002
+    - https://attack.mitre.org/detectionstrategies/DET0088
+    - https://attack.mitre.org/techniques/T1518
+    - https://attack.mitre.org/techniques/T1490
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1518
+  sub_techniques:
+    - T1518.002
+  detection_strategies:
+    - DET0088
+  analytics:
+    - AN0240
+    - AN0241
+    - AN0242
+  platforms:
+    - Windows
+    - Linux
+    - macOS
+  data_sources:
+    - WinEventLog:Security
+    - auditd:SYSCALL
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary preparing to encrypt or destroy data may first enumerate the backup agents,
+    backup configuration files and available restore points on a host, in order to establish
+    how recoverable the environment is and to remove that recoverability before the
+    destructive stage runs.
+  attacker_behavior:
+    - Names several backup vendors in one service, process, package or registry query.
+    - Searches configuration directories for backup agent files and catalogue paths.
+    - Lists shadow copies, backup versions or Time Machine destinations to assess restore points.
+    - Follows the enumeration with deletion of shadow copies, catalogues or restore points.
+    - Stops or disables the backup agent shortly after confirming it is installed.
+  legitimate_behavior:
+    - Backup software enumerates its own services, jobs and restore points as normal operation.
+    - Monitoring checks that the backup agent is running and that recent restore points exist.
+    - Storage and infrastructure engineers inspect shadow copy usage while managing capacity.
+    - Disaster-recovery testing enumerates backups and performs restores under a change record.
+    - Migration work inventories a legacy backup product before decommissioning it.
+  risk_indicator:
+    - Several distinct backup vendors are named by one lineage within a short window.
+    - Recovery state is read on an endpoint that is not itself backup infrastructure.
+    - The querying process is an interpreter, document handler or remote-execution service.
+    - Shadow copies, catalogues or restore points are deleted after being listed.
+    - The enumeration is unprecedented for the host and is not covered by a change record.
+
+requires:
+  platforms:
+    - windows
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: backup-vendors-named-in-an-enumeration
+        name: Backup products named in a service, package or registry query
+        purpose: >-
+          The core discriminator, ranked on breadth. Backup software names itself; an
+          operator names a list, because they do not yet know which product the estate
+          uses and are working through the candidates.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\bsc(\.exe)?\s+(query|queryex|qc)|\bnet(\.exe)?\s+start\b|Get-Service\b|Win32_Service\b|\bwmic\s+(service|product)\b|\btasklist(\.exe)?\b|Get-Process\b|\bps\s+-?(aux|ef|A|e)\b|\bpgrep\b|\bsystemctl\s+(status|list-units|is-active)\b|\blaunchctl\s+list\b|\breg(\.exe)?\s+query\b|Get-ItemProperty\b|\bdpkg\s+-l\b|\brpm\s+-qa\b|\bbrew\s+list\b|Get-Package\b|\bfindstr\b|\bgrep\b)/i
+          | case {
+              CommandLine=/(\bveeam\b)/i                                          | vendor := "veeam" ;
+              CommandLine=/(acronis|\bti_?service\b)/i                            | vendor := "acronis" ;
+              CommandLine=/(commvault|\bsimpana\b|\bcvd\b)/i                      | vendor := "commvault" ;
+              CommandLine=/(netbackup|\bveritas\b|backup ?exec|\bbengine\b)/i     | vendor := "veritas" ;
+              CommandLine=/(\brubrik\b|\bcohesity\b|\bzerto\b|\bunitrends\b|\bvembu\b)/i | vendor := "modern_appliance" ;
+              CommandLine=/(crashplan|\bcode42\b|carbonite|backblaze|\bdatto\b|msp360|cloudberry)/i | vendor := "cloud_backup" ;
+              CommandLine=/(arcserve|\bnakivo\b|\baltaro\b|storagecraft|shadowprotect|macrium|\baomei\b|easeus|\bparagon\b)/i | vendor := "imaging" ;
+              CommandLine=/(\bbacula\b|\bbareos\b|\bamanda\b|\bborg(backup)?\b|\brestic\b|\bduplicity\b|duplicati|rsnapshot|\brdiff-backup\b|\bburp\b)/i | vendor := "unix_backup" ;
+              CommandLine=/(time ?machine|\btmutil\b|carbon copy cloner|\bccc\b|superduper|backupd)/i | vendor := "macos_backup" ;
+              CommandLine=/(\bwbadmin\b|windowsserverbackup|\bvssadmin\b|\bswprv\b|\bvss\b|active backup)/i | vendor := "windows_native" ;
+            }
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(vendor, distinct=true, as=distinct_vendors),
+                              collect([vendor, CommandLine], limit=20),
+                              min(@timestamp, as=first_seen),
+                              max(@timestamp, as=last_seen)])
+          | distinct_vendors >= 1
+          | sort(distinct_vendors, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the backup product's own agent, scheduler and reporting components"
+            - "ComputerName of the backup servers and media agents, where naming the product is the job"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: recovery-state-inspected
+        name: Shadow copies, backup versions and restore points listed
+        purpose: >-
+          The sharpest single question in this file. Reading how much is recoverable —
+          shadow copies, backup versions, Time Machine destinations, restore points — has
+          almost no interactive use outside the backup product itself, and it is the
+          measurement an operator takes before deciding what to destroy.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\bvssadmin(\.exe)?\s+list\s+(shadows|shadowstorage|writers|providers)|\bwmic\s+shadowcopy\s+(list|get)|Win32_ShadowCopy\b|Get-CimInstance\s+.*Win32_ShadowCopy|\bwbadmin(\.exe)?\s+get\s+(versions|items|status|disks)|Get-WBSummary\b|Get-WBBackupSet\b|Get-ComputerRestorePoint\b|\bdiskshadow\b.*\blist\b|\btmutil\s+(listbackups|destinationinfo|latestbackup)|\brestic\s+snapshots\b|\bborg\s+list\b|\bduplicity\s+collection-status\b|\bbconsole\b.*\blist\b)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=inspections), collect([CommandLine], limit=10)])
+          | sort(inspections, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Backup and imaging products inspecting their own restore points as part of a scheduled job"
+            - "Storage capacity monitoring that reports shadow copy usage on file servers"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - parent_process
+
+      - id: backup-configuration-and-catalogue-paths-searched
+        name: Backup configuration files and catalogue paths searched for
+        purpose: >-
+          Catch the search that precedes the vendor being known. Recursively hunting `/etc`,
+          `/opt` and the program directories for anything matching backup keywords is how a
+          product is located when the operator cannot simply ask the service manager.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\bfind\b|\bgrep\b|\begrep\b|\bls\b|\bdir\b|Get-ChildItem\b|\bgci\b|Test-Path\b|\bmdfind\b|\blocate\b|\bstat\b)/i
+          | CommandLine=/(\/etc\/(rsnapshot\.conf|bacula|bareos|amanda|duplicity|restic|borgmatic)|\/opt\/(veeam|acronis|commvault|netbackup|simpana)|\/usr\/openv\b|\/var\/lib\/(bacula|bareos)|Program Files[^"]*\\(Veeam|Acronis|CommVault|Veritas|Backup Exec|Windows Server Backup|Arcserve|Macrium)|SOFTWARE\\+(Veeam|Acronis|CommVault|Veritas|Arcserve|Macrium)|~?\/Library\/Preferences\/com\.apple\.TimeMachine|com\.bombich\.ccc|\bbackup[a-z0-9_.-]*\.(conf|cfg|ini|xml|json|plist)\b)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=searches), collect([CommandLine], limit=10)])
+          | sort(searches, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Configuration management reading backup agent configuration during a convergence run"
+            - "Backup agent installers and their own configuration validation steps"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - path
+
+      - id: discovery-then-recovery-inhibition
+        name: Enumeration followed by destruction of recovery
+        purpose: >-
+          The pairing that makes this technique an alarm rather than a data point. The
+          destruction half is hunted in its own right by the indicator-removal template;
+          what this case contributes is that the destruction was preceded by somebody
+          measuring what there was to destroy.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(\bveeam\b|acronis|commvault|netbackup|\bveritas\b|backup ?exec|\brubrik\b|\bcohesity\b|crashplan|\bdatto\b|arcserve|macrium|\bbacula\b|\bbareos\b|\bborg(backup)?\b|\brestic\b|\bduplicity\b|rsnapshot|time ?machine|\btmutil\b|\bwbadmin\b|\bvssadmin\b)/i
+                | CommandLine=/(\bsc(\.exe)?\s+(query|queryex|qc)|Get-Service\b|\btasklist(\.exe)?\b|Get-Process\b|\bps\s+-?(aux|ef)\b|\bpgrep\b|\bsystemctl\s+(status|is-active|list-units)\b|\blaunchctl\s+list\b|\breg(\.exe)?\s+query\b|\blist\b|\bget\b|\bfind\b|\bdir\b|\bls\b|\bsnapshots\b)/i
+                | enumerated := CommandLine ;
+              CommandLine=/(\bvssadmin(\.exe)?\s+delete\s+shadows|\bwmic\s+shadowcopy\s+delete|Win32_ShadowCopy.*Delete|\bwbadmin(\.exe)?\s+delete\s+(catalog|systemstatebackup|backup)|\bbcdedit(\.exe)?\s+.*(recoveryenabled\s+no|bootstatuspolicy\s+ignoreallfailures)|Disable-ComputerRestore\b|\btmutil\s+(delete|disable|removedestination)\b|\brestic\s+forget\b.*--prune|\bborg\s+delete\b|\bsc(\.exe)?\s+(stop|delete|config)\s+.*(veeam|acronis|backup|commvault|netbackup)|\bnet(\.exe)?\s+stop\s+.*(veeam|acronis|backup)|\bsystemctl\s+(stop|disable|mask)\s+.*(bacula|bareos|restic|borg|duplicity|veeam))/i
+                | inhibited := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([enumerated, inhibited, ParentBaseFileName, FileName], limit=10),
+                              min(@timestamp, as=first_seen),
+                              max(@timestamp, as=last_seen)])
+          | enumerated=/.+/ and inhibited=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Backup retention jobs that list and then prune their own expired snapshots on schedule"
+            - "Approved decommissioning of a legacy backup product under a change record"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - process
+
+evidence:
+  required:
+    - id: backup_product_named
+      name: A backup product named in an enumeration command
+      description: >-
+        An enumeration command referenced a backup agent, backup service, backup package or
+        backup configuration path by name, rather than listing services or files generically.
+      source: process_creation
+      field: CommandLine
+      indicates: backup_estate_enumerated
+
+  supporting:
+    - id: breadth_of_backup_vendors
+      name: Several distinct backup vendors named together
+      description: >-
+        More than one backup product was named by the same lineage within the window, which
+        is an operator working through candidates rather than a product or a script that
+        already knows which agent this estate runs.
+      source: process_creation
+      field: CommandLine
+      indicates: broad_vendor_sweep
+    - id: recovery_state_inspected
+      name: Restore points and shadow copies listed
+      description: >-
+        Shadow copies, backup versions, snapshots or Time Machine destinations were listed,
+        which measures how much of the host could be recovered and has almost no interactive
+        use outside the backup product itself.
+      source: process_creation
+      field: CommandLine
+      indicates: recoverability_assessed
+    - id: config_or_catalogue_path_searched
+      name: Backup configuration or catalogue paths searched
+      description: >-
+        Configuration directories and program paths were searched for backup agent files or
+        catalogues, which locates a product whose name the caller did not know in advance.
+      source: process_creation
+      field: CommandLine
+      indicates: backup_configuration_located
+    - id: non_administrative_parent
+      name: Parent process with no backup or administrative role
+      description: >-
+        The enumeration was launched by an interpreter, document handler, archive utility or
+        remote-execution service rather than by a backup agent, scheduler or management tool.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: recovery_inhibition_followup
+      name: Recovery destroyed after being measured
+      description: >-
+        Shadow copies, backup catalogues or restore points were deleted, or a backup service
+        was stopped, shortly after the same user enumerated them on the same host.
+      source: process_creation
+      field: FileName
+      indicates: recovery_destruction_attempt
+    - id: rare_for_host
+      name: Enumeration unprecedented for this host
+      description: >-
+        No comparable backup enumeration has been seen for this host and user during the
+        baseline window, unlike backup jobs which recur on a fixed and visible schedule.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: backup_product_tooling
+      name: The backup product's own components
+      description: >-
+        The backup agent, scheduler, console or reporting component performed the query,
+        which necessarily names its own services, paths and restore points.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: scheduled_backup_cycle
+      name: Recurring backup or monitoring cycle
+      description: >-
+        The same enumeration recurs on a stable schedule and across the hosts the backup
+        policy covers, which is the backup estate operating rather than being surveyed.
+      source: baseline
+      field: ComputerName
+      indicates: scheduled_automation_job
+    - id: backup_infrastructure_host
+      name: Host or account belongs to backup infrastructure
+      description: >-
+        The host is a backup server, media agent or storage system, or the account is a
+        backup operations identity for which this enumeration is the work itself.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_administrative_activity
+    - id: restore_or_dr_change
+      name: Approved restore, migration or DR test
+      description: >-
+        A change record covers a restore, a disaster-recovery exercise or the
+        decommissioning of a legacy backup product on this host, which accounts for the
+        enumeration and for any deletion that followed it.
+      source: change_management
+      field: ComputerName
+      indicates: approved_change_window
+
+  risk_logic:
+    required:
+      - backup_product_named
+
+    supporting:
+      any:
+        - breadth_of_backup_vendors
+        - recovery_state_inspected
+        - config_or_catalogue_path_searched
+        - non_administrative_parent
+        - recovery_inhibition_followup
+        - rare_for_host
+      all:
+        - recovery_state_inspected
+        - recovery_inhibition_followup
+
+    contradicting:
+      any:
+        - backup_product_tooling
+        - scheduled_backup_cycle
+        - backup_infrastructure_host
+        - restore_or_dr_change
+      all: []
+
+  verdict:
+    low_risk_when:
+      - backup_product_named
+      - backup_product_tooling
+      - scheduled_backup_cycle
+      - backup_infrastructure_host
+      - restore_or_dr_change
+    suspicious_when:
+      - backup_product_named
+      - recovery_state_inspected
+      - rare_for_host
+    high_risk_when:
+      - backup_product_named
+      - breadth_of_backup_vendors
+      - recovery_state_inspected
+      - non_administrative_parent
+      - recovery_inhibition_followup
+
+  false_positive:
+    - condition: The backup agent enumerates its own services and restore points on every run.
+      explanation: >-
+        A backup product naming itself and listing its own snapshots reproduces both the
+        required evidence and the sharpest supporting evidence in this file, and it does so
+        on every scheduled job. It must be excluded by parent process rather than by command
+        line, so that the same strings issued from an interpreter still surface.
+    - condition: Monitoring verifies that a recent restore point exists.
+      explanation: >-
+        Backup health checks legitimately run `vssadmin list shadows` or `wbadmin get
+        versions` on a schedule. They recur at a fixed interval across the hosts the backup
+        policy covers, which the baseline window makes obvious.
+    - condition: Storage engineers inspect shadow copy usage while managing capacity.
+      explanation: >-
+        Shadow storage consumption is a normal capacity question on file servers, and the
+        command used is identical. It is tied to a named engineer, to a file server rather
+        than a workstation, and usually accompanies a capacity or incident record.
+    - condition: A disaster-recovery test enumerates backups and then deletes test artefacts.
+      explanation: >-
+        DR exercises reproduce the strongest pairing in this file — measure recoverability,
+        then destroy what was created — and do so deliberately. They are covered by a change
+        record and run inside a scheduled exercise window on hosts designated for the test.
+    - condition: A retention job lists snapshots and then prunes the expired ones.
+      explanation: >-
+        List-then-delete is the defining shape of retention management in restic, borg and
+        Veeam alike. It is distinguished by running under the backup identity, from the
+        backup tooling, on a fixed cycle, and by deleting only what the policy has expired.
+    - condition: A migration project inventories a legacy backup product before removing it.
+      explanation: >-
+        Decommissioning names several vendors and ends with services being stopped, which is
+        close to the pattern being hunted. It is identified by the change record, the
+        deployment window and a consistent sweep across many hosts rather than depth on one.

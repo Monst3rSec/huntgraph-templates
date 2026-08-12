@@ -1,0 +1,366 @@
+type: detection
+
+id: hg-any-attached-volumes-enumerated-before-collection-t1680
+
+version: 1.0.0
+
+info:
+  name: Attached volumes and removable media enumerated before collection
+  description: >-
+    Enumerating drives is the least distinctive thing in this batch and the file is built
+    accordingly. `df`, `Get-PSDrive` and `wmic logicaldisk get` run constantly in a healthy
+    estate — in login scripts, in monitoring agents, in installers checking whether there is
+    room — so a template that returns every occurrence returns nothing useful. What is worth
+    hunting is narrower and rests on why an adversary asks. They are not interested in the
+    system drive, which they are already standing on. They want to know what else is
+    attached: the USB stick a user left plugged in, the mapped share that leads somewhere
+    else, the second volume that holds the data worth taking. So the distinguishing question
+    is not whether drives were enumerated but whether the enumeration discriminated by drive
+    type — removable, network, fixed-but-not-C — because filtering on the type is what
+    separates a search for targets from a check for free space. The second discriminator is
+    what happens next: enumeration followed by free-space checks and shadow copy queries is
+    ransomware sizing a host, and enumeration followed by recursive archiving is collection
+    staging its haul. Deployed alone this file is an enrichment template that adds context to
+    a lead an analyst already has; deployed with its follow-on case it stands on its own.
+  severity: low
+  author: huntgraph
+  tags:
+    - discovery
+    - local-storage
+    - removable-media
+    - collection-precursor
+    - windows
+    - linux
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1680
+    - https://attack.mitre.org/detectionstrategies/DET0188
+    - https://attack.mitre.org/techniques/T1074/001
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1680
+  sub_techniques: []
+  detection_strategies:
+    - DET0188
+  analytics:
+    - AN0536
+    - AN0537
+    - AN0538
+  platforms:
+    - Windows
+    - Linux
+    - macOS
+  data_sources:
+    - WinEventLog:Sysmon
+    - auditd:SYSCALL
+    - auditd:EXECVE
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    An adversary may enumerate the drives, volumes and removable media attached to a host in
+    order to locate storage beyond the system drive that is worth collecting from, or to
+    size the host's disks before encrypting them, using the drive type rather than the drive
+    itself to select what is worth pursuing.
+  attacker_behavior:
+    - Lists logical drives and their free space through wmic, PowerShell or the fsutil drive query.
+    - Filters the enumeration by drive type to isolate removable or network-mapped volumes.
+    - Lists block devices, partitions or mounted filesystems on Linux with lsblk, fdisk, parted or df.
+    - Enumerates volumes on macOS with diskutil or the storage section of system_profiler.
+    - Reads volume serial numbers or labels to identify a specific device.
+    - Follows the enumeration with free-space checks and shadow copy queries before encryption.
+    - Follows the enumeration by archiving content recursively from a non-system volume.
+  legitimate_behavior:
+    - Login scripts and monitoring agents report free space on every host continuously.
+    - Installers and updaters check available space before writing.
+    - Backup and imaging tooling enumerates volumes before every run.
+    - Administrators inspect partitions while provisioning or troubleshooting storage.
+    - Endpoint management inventories attached drives as part of asset reporting.
+  risk_indicator:
+    - The enumeration filters on drive type to isolate removable or network volumes.
+    - Free space and shadow copies are queried together in the same lineage.
+    - An archive utility runs recursively over a non-system volume shortly afterwards.
+    - The enumerating process was launched by a delivery-chain or remote-execution parent.
+    - Several distinct storage-profiling commands appear under one lineage in a short window.
+
+requires:
+  platforms:
+    - windows
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: removable-or-network-volumes-singled-out
+        name: Enumeration filtered to removable or network volumes
+        purpose: >-
+          Carry the discriminating question rather than the common one. Asking how much
+          space is left is ordinary; asking specifically which volumes are removable or
+          network-mapped is a search for storage other than the one the process is standing
+          on, and the drive-type constants and mount-point paths that express it have almost
+          no benign use outside inventory tooling.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(DriveType\s*=\s*[24]|DriveType\s*-eq\s*[24]|drivetype\s*=\s*'?[24]|\bRemovable\b.{0,20}\b(Drive|Disk|Volume)|Get-Volume\b.{0,40}DriveType|Get-PSDrive\b.{0,40}(-PSProvider\s+FileSystem|Where)|\bnet\s+use\b\s*$|\bmount\b.{0,30}(\/media|\/mnt|usb)|\/Volumes\/|\bdiskutil\b\s+list\s+(external|physical)|\blsblk\b.{0,30}(RM|HOTPLUG|TRAN))/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=enumerations), collect([CommandLine], limit=5)])
+          | sort(enumerations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the asset inventory, backup and endpoint management agents"
+            - "Removable-media control and data-loss-prevention agents that enumerate attached devices by design"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - parent_process
+            - command_line
+
+      - id: storage-profile-clustered
+        name: Several distinct storage-profiling commands under one lineage
+        purpose: >-
+          Apply the clustering shape to the noisiest half of the technique. One free-space
+          check is meaningless. Logical drives, partition tables, mounted filesystems and
+          volume identifiers all queried from one parent inside a short window is a process
+          building a picture of the host's storage, and the count of distinct categories is
+          the only thing that separates it from the background.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(\blogicaldisk\b|Win32_LogicalDisk|Get-PSDrive\b|Get-Volume\b|fsutil\b.{0,20}fsinfo\s+drives|\bdf\b\s+-|\bdiskutil\b\s+list)/i
+                | storage_volumes := CommandLine ;
+              CommandLine=/(\blsblk\b|\bfdisk\b\s+-l|\bparted\b.{0,20}(-l|print)|\blshw\b.{0,20}disk|Get-Partition\b|Get-Disk\b|Win32_DiskDrive|\bdiskpart\b)/i
+                | storage_partitions := CommandLine ;
+              CommandLine=/(VolumeSerialNumber|volumeserialnumber|\bvol\s+[a-z]:|Get-Volume\b.{0,40}(FileSystemLabel|UniqueId)|\bblkid\b|system_profiler\s+SPStorageDataType)/i
+                | storage_identity := CommandLine ;
+              CommandLine=/(fsutil\b.{0,20}volume\s+diskfree|freespace|FreeSpace|\bdu\b\s+-s|Get-PSDrive\b.{0,30}(Free|Used))/i
+                | storage_capacity := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[collect([storage_volumes, storage_partitions, storage_identity, storage_capacity], limit=12),
+                              count(as=commands)])
+          | commands >= 3
+          | sort(commands, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Monitoring, inventory and backup agents as the parent process"
+            - "ComputerName of storage administration and imaging hosts"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - parent_process
+
+      - id: enumeration-then-shadow-copy-or-archive
+        name: Volume enumeration followed by shadow copy query or recursive archiving
+        purpose: >-
+          Distinguish the two things this reconnaissance leads to. Sizing the disks and then
+          asking about shadow copies is a host being prepared for encryption; enumerating
+          volumes and then running an archive utility recursively over one of them is
+          collection staging its haul. Either follow-on turns an unremarkable enumeration
+          into a finding.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(\blogicaldisk\b|Win32_LogicalDisk|Get-PSDrive\b|Get-Volume\b|fsutil\b.{0,20}fsinfo\s+drives|\blsblk\b|\bfdisk\b\s+-l|\bdiskutil\b\s+list|\bdf\b\s+-)/i
+                | volume_enumeration := CommandLine ;
+              CommandLine=/(\bvssadmin\b.{0,30}(list|delete)\s+shadows|Win32_ShadowCopy|Get-CimInstance\b.{0,40}ShadowCopy|\bwbadmin\b.{0,20}get\s+versions|fsutil\b.{0,20}usn)/i
+                | shadow_copy_query := CommandLine ;
+              CommandLine=/((7z|7za|rar|winrar|zip|tar)(\.exe)?\b.{0,60}(-r\b|--recursive|\bcf?\b)|Compress-Archive\b.{0,40}-Recurse)/i
+                | recursive_archive := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([volume_enumeration, shadow_copy_query, recursive_archive, ParentBaseFileName], limit=12),
+                              count(as=commands)])
+          | volume_enumeration=/.+/
+          | shadow_copy_query=/.+/ or recursive_archive=/.+/
+          | sort(commands, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Backup agents that enumerate volumes and query shadow copies as their normal operation"
+            - "Software packaging and release tooling that archives build output recursively"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - process
+
+evidence:
+  required:
+    - id: volume_enumeration
+      name: Drives or volumes enumerated
+      description: >-
+        A command enumerated the logical drives, partitions, block devices or mounted
+        volumes attached to the host, or read their identifiers and free space.
+      source: process_creation
+      field: CommandLine
+      indicates: local_storage_discovery
+
+  supporting:
+    - id: removable_or_network_filtered
+      name: Removable or network volumes singled out
+      description: >-
+        The enumeration filtered on drive type or mount path to isolate removable media or
+        network-mapped volumes, which is a search for storage other than the system drive
+        rather than a capacity check.
+      source: process_creation
+      field: ImageFileName
+      indicates: collection_target_selection
+    - id: clustered_storage_profiling
+      name: Several storage categories profiled together
+      description: >-
+        Volumes, partitions, identifiers and capacity were all queried from one parent in a
+        short window, which is a process building a picture of the host's storage rather
+        than answering one operational question.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: hands_on_keyboard_reconnaissance
+    - id: encryption_preparation_follows
+      name: Shadow copies queried after enumeration
+      description: >-
+        Shadow copy or backup version queries followed the volume enumeration on the same
+        host, which is the sizing and recovery-removal step that precedes encryption.
+      source: process_creation
+      field: FileName
+      indicates: impact_preparation
+    - id: recursive_archive_follows
+      name: Recursive archiving after enumeration
+      description: >-
+        An archive utility ran recursively on the same host shortly after the enumeration,
+        which is collection staging content from the volumes that were just discovered.
+      source: process_creation
+      field: UserName
+      indicates: collection_staging
+    - id: rare_for_host
+      name: No history of this enumeration on the host
+      description: >-
+        Nothing comparable has been seen on this host during the baseline window, in
+        contrast to the free-space reporting that recurs on every managed endpoint.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: inventory_or_backup_agent
+      name: Inventory, backup or monitoring agent
+      description: >-
+        The approved asset inventory, backup, imaging or monitoring agent performed the
+        enumeration as part of its scheduled collection of storage state.
+      source: process_creation
+      field: FileName
+      indicates: legitimate_enterprise_activity
+    - id: storage_administration_host
+      name: Storage administration or imaging host
+      description: >-
+        The host administers storage or builds images, where enumerating partitions and
+        volumes in detail is the work the machine exists to do.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: recurring_capacity_report
+      name: Recurring capacity reporting
+      description: >-
+        The same enumeration recurs on a stable interval across many hosts, which is capacity
+        reporting rather than a one-off survey of a single machine.
+      source: baseline
+      field: ComputerName
+      indicates: scheduled_automation_job
+
+  risk_logic:
+    required:
+      - volume_enumeration
+
+    supporting:
+      any:
+        - removable_or_network_filtered
+        - clustered_storage_profiling
+        - encryption_preparation_follows
+        - recursive_archive_follows
+        - rare_for_host
+      all:
+        - removable_or_network_filtered
+        - rare_for_host
+
+    contradicting:
+      any:
+        - inventory_or_backup_agent
+        - storage_administration_host
+        - recurring_capacity_report
+      all: []
+
+  verdict:
+    low_risk_when:
+      - volume_enumeration
+      - inventory_or_backup_agent
+      - storage_administration_host
+      - recurring_capacity_report
+    suspicious_when:
+      - volume_enumeration
+      - rare_for_host
+      - clustered_storage_profiling
+    high_risk_when:
+      - volume_enumeration
+      - rare_for_host
+      - clustered_storage_profiling
+      - removable_or_network_filtered
+      - encryption_preparation_follows
+
+  false_positive:
+    - condition: A login script or monitoring agent reports free space on every host.
+      explanation: >-
+        This is the dominant benign source and it is why the required evidence alone is close
+        to worthless. It recurs continuously across the whole estate and must be excluded by
+        parent process rather than by any property of the command.
+    - condition: An installer or updater checks available space before writing.
+      explanation: >-
+        Space checks precede almost every software installation, appear from arbitrary
+        parents, and are indistinguishable at the command line from an operator sizing a
+        disk. They cluster around software deployment activity on the same host.
+    - condition: Backup tooling enumerates volumes and queries shadow copies on every run.
+      explanation: >-
+        Backup reproduces the enumeration-then-shadow-copy sequence that carries the most
+        weight in the third case, on a schedule and on every protected host. The backup agent
+        as the invoking process is the only reliable separator.
+    - condition: A data-loss-prevention or device-control agent enumerates attached removable media.
+      explanation: >-
+        These agents filter precisely on removable drive type, which is the strongest
+        supporting evidence here, and they do so continuously. They run from a known product
+        installation path.
+    - condition: Packaging or release tooling archives build output recursively after checking disk space.
+      explanation: >-
+        Build systems check space and then archive, which matches the collection half of the
+        third case. It is confined to engineering and build hosts and recurs with every
+        pipeline run.

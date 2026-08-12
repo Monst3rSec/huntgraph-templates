@@ -1,0 +1,368 @@
+type: detection
+
+id: hg-any-stored-wireless-profiles-and-keys-recovered-t1016-002
+
+version: 1.0.0
+
+info:
+  name: Stored wireless profiles and their keys recovered
+  description: >-
+    This target is filed under Discovery but it does not stop at enumeration, and that is
+    the point worth making about it. Listing saved wireless profiles tells an adversary
+    which networks the machine has joined — home, hotel, partner site, the corporate SSID
+    — which is a map of where the user goes. Adding `key=clear` on Windows, or asking the
+    keychain for the profile's password on macOS, returns the pre-shared key itself. That
+    is credential material, reusable from the car park by anyone within radio range, and
+    it survives the host being cleaned. Treat a hit that includes the key step as a
+    credential exposure with a rotation consequence, not as reconnaissance. The
+    enumeration half is genuinely produced by support staff and by the user's own network
+    troubleshooting, so this file leans on the pairing of the two steps and on the parent
+    process rather than on either command alone. Note that the macOS path prompts for
+    administrator authentication, which is itself a visible event to the user.
+  severity: medium
+  author: huntgraph
+  tags:
+    - discovery
+    - wifi-discovery
+    - wireless-profiles
+    - credential-exposure
+    - windows
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1016/002
+    - https://attack.mitre.org/techniques/T1016
+    - https://attack.mitre.org/detectionstrategies/DET0464
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1016
+  sub_techniques:
+    - T1016.002
+  detection_strategies:
+    - DET0464
+  analytics:
+    - AN1280
+    - AN1282
+  platforms:
+    - Windows
+    - macOS
+  data_sources:
+    - WinEventLog:Sysmon
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    An adversary may enumerate the wireless networks a host has saved and then extract
+    their stored keys, turning a record of where the machine has been into reusable
+    credentials for networks the adversary can reach physically or through a nearby
+    compromised device.
+  attacker_behavior:
+    - Lists every saved wireless profile to learn which networks the host has joined.
+    - Re-queries each profile with the option that prints its key in the clear.
+    - Asks the keychain for a named network's password on macOS.
+    - Surveys wireless networks and interfaces currently in range of the host.
+    - Runs both the listing and the key extraction from one script in quick succession.
+  legitimate_behavior:
+    - Support staff read saved profiles while fixing a user's connectivity problem.
+    - Users retrieve a forgotten wireless key to join another of their own devices.
+    - Endpoint management tooling inventories wireless configuration on managed laptops.
+    - Site survey and diagnostic utilities enumerate networks and interfaces in range.
+    - Imaging and provisioning steps write and verify the corporate wireless profile.
+  risk_indicator:
+    - Profile enumeration and key extraction occur together in one short window.
+    - Every saved profile is queried rather than the one the user is troubleshooting.
+    - The parent is a document application, mail client, archive tool or script host.
+    - The account is not a support account and the host is not being provisioned.
+    - The host and account have no history of wireless commands in the baseline window.
+
+requires:
+  platforms:
+    - windows
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: profile-keys-printed-in-the-clear
+        name: Stored wireless keys returned in plaintext
+        purpose: >-
+          The credential step, and the one that changes what a verdict means. These
+          invocations do not describe a network, they return its pre-shared key. Anything
+          this case returns should be triaged on the assumption that the key is now known
+          and needs rotating, regardless of how the rest of the file scores.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/netsh(\.exe)?\s+wlan\s+show\s+profile.*\bkey\s*=\s*clear\b/i
+            or CommandLine=/security\s+find-generic-password\s+.*-\w*w\w*\s/i
+            or CommandLine=/(WlanGetProfile|Get-WiFiProfile.*-ClearKey|wifi-?password)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=extractions), collect([CommandLine], limit=10)])
+          | sort(extractions, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Service desk accounts recovering a key against a recorded support ticket"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: profiles-listed-then-keys-extracted
+        name: Enumeration followed by key extraction in one lineage
+        purpose: >-
+          This is the discriminator for the whole hypothesis and it mirrors what the
+          published tooling actually does: list every saved profile, then loop the list
+          asking for each key. Support staff do the second step for the one network that
+          is broken; harvesting code does it for all of them, and the two steps appear
+          together under a single parent within moments.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/netsh(\.exe)?\s+wlan\s+show\s+profiles?\s*($|[^=]*$)/i
+                | step := "list_profiles" ;
+              CommandLine=/(networksetup\s+-listpreferredwirelessnetworks|system_profiler\s+SPAirPortDataType)/i
+                | step := "list_profiles" ;
+              CommandLine=/netsh(\.exe)?\s+wlan\s+show\s+profile.*\bkey\s*=\s*clear\b/i
+                | step := "extract_key" ;
+              CommandLine=/security\s+find-generic-password\s+.*-\w*w\w*\s/i
+                | step := "extract_key" ;
+            }
+          | step=/.+/
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(field=step, distinct=true, as=steps),
+                              count(as=commands),
+                              collect([step, CommandLine], limit=20)])
+          | steps >= 2
+          | sort(commands, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Imaging and provisioning sequences that write then verify the corporate profile"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - parent_process
+            - organization
+
+      - id: wireless-commands-under-an-unrelated-parent
+        name: Wireless enumeration parented by software with no such role
+        purpose: >-
+          Name the actor. Support tooling and the user's own troubleshooting run these
+          commands from a console, a shell or a management agent. A document application,
+          mail client, archive tool or script host asking which networks this laptop has
+          saved is the delivery chain of a credential stealer, and a single command from
+          that lineage outweighs a burst from an administrator.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|onenote|acrord32|7zg|7zfm|winrar|mshta|wscript|cscript|regsvr32|rundll32|msbuild)\.exe$/i
+            or ParentBaseFileName=/^(soffice|python\d*|perl|php|osascript|node)$/i
+          | CommandLine=/(netsh(\.exe)?\s+wlan\s+show|networksetup\s+-list(preferredwirelessnetworks|allhardwareports)|security\s+find-generic-password|system_profiler\s+SPAirPortDataType|\bairport\b\s+-)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=commands), collect([CommandLine], limit=8)])
+          | sort(commands, order=desc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: networks-in-range-surveyed
+        name: Nearby wireless networks and interfaces enumerated
+        purpose: >-
+          A different outcome from the saved-profile hunt: what is in radio range right
+          now, rather than where the machine has been. This is how a foothold is used to
+          find an adjacent network to jump to, or to place the host geographically from
+          the access points around it, and it needs no stored credential to be useful.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(netsh(\.exe)?\s+wlan\s+show\s+(networks|interfaces?|all)|netsh(\.exe)?\s+wlan\s+show\s+networks\s+mode\s*=\s*bssid|\bairport\b\s+-s|networksetup\s+-listallhardwareports)/i
+          | ParentBaseFileName!=/^(CcmExec\.exe|MonitoringHost\.exe|jamf)$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=surveys), collect([CommandLine], limit=6)])
+          | sort(surveys, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Site survey utilities and wireless diagnostic tooling used by the network team"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+evidence:
+  required:
+    - id: wireless_profile_enumeration
+      name: Saved or in-range wireless networks enumerated
+      description: >-
+        A command was executed that lists the wireless profiles the host has saved, or the
+        networks and interfaces currently within range of it.
+      source: process_creation
+      field: CommandLine
+      indicates: wireless_configuration_enumeration
+
+  supporting:
+    - id: key_material_revealed
+      name: Stored keys returned in plaintext
+      description: >-
+        The invocation asked for the profile's pre-shared key in the clear, so the output
+        is credential material rather than a description of the network.
+      source: process_creation
+      field: CommandLine
+      indicates: credential_material_exposure
+    - id: enumerate_then_extract
+      name: Listing and extraction paired in one lineage
+      description: >-
+        Both the profile listing and the key extraction ran under the same parent in the
+        same window, which is the harvesting loop rather than a single lookup.
+      source: derived
+      field: steps
+      indicates: systematic_credential_harvest
+    - id: unrelated_parent_process
+      name: Parent has no wireless configuration role
+      description: >-
+        The commands were launched by a document application, mail client, archive tool or
+        script host rather than by a console, shell or endpoint management agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: in_range_survey
+      name: Networks currently in range enumerated
+      description: >-
+        The host surveyed the access points around it, which supports movement to an
+        adjacent network or physical location of the machine.
+      source: process_creation
+      field: FileName
+      indicates: physical_proximity_mapping
+    - id: new_for_host_and_account
+      name: New for this host and account
+      description: >-
+        Neither the host nor the account ran wireless configuration commands during the
+        baseline window, so this is not routine support or provisioning activity.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: support_ticket_recovery
+      name: Recorded support ticket for wireless connectivity
+      description: >-
+        The activity matches an open support record covering a wireless fault or a key
+        recovery request for the same user and host.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: management_agent_inventory
+      name: Endpoint management agent inventorying configuration
+      description: >-
+        The commands descend from an endpoint management or imaging agent that collects
+        or writes wireless configuration as part of its documented function.
+      source: process_creation
+      field: FileName
+      indicates: legitimate_application_component
+    - id: device_owner_activity
+      name: The user acting on their own device
+      description: >-
+        The account is the primary user of the machine, working interactively, retrieving
+        one key rather than sweeping every saved profile.
+      source: identity_context
+      field: UserName
+      indicates: legitimate_user_activity
+
+  risk_logic:
+    required:
+      - wireless_profile_enumeration
+
+    supporting:
+      any:
+        - key_material_revealed
+        - enumerate_then_extract
+        - unrelated_parent_process
+        - in_range_survey
+        - new_for_host_and_account
+      all:
+        - key_material_revealed
+        - enumerate_then_extract
+
+    contradicting:
+      any:
+        - support_ticket_recovery
+        - management_agent_inventory
+        - device_owner_activity
+      all: []
+
+  verdict:
+    low_risk_when:
+      - wireless_profile_enumeration
+      - support_ticket_recovery
+      - management_agent_inventory
+      - device_owner_activity
+    suspicious_when:
+      - wireless_profile_enumeration
+      - in_range_survey
+      - new_for_host_and_account
+    high_risk_when:
+      - wireless_profile_enumeration
+      - key_material_revealed
+      - enumerate_then_extract
+      - unrelated_parent_process
+      - new_for_host_and_account
+
+  false_positive:
+    - condition: Support staff read saved profiles while fixing a connectivity problem.
+      explanation: >-
+        This is the common benign case and it can include the key step, because recovering
+        a forgotten key is a normal request. It is distinguishable by the ticket, by the
+        support account, and by touching one profile rather than every profile.
+    - condition: A user retrieves their own wireless key to join another device.
+      explanation: >-
+        Users look this up on their own laptops, usually finding the instruction online
+        and pasting the exact netsh command with key=clear. It runs interactively under
+        the machine's primary user against a single named network.
+    - condition: Endpoint management tooling inventories wireless configuration.
+      explanation: >-
+        Managed laptops report wireless configuration as part of routine inventory, which
+        reproduces the enumeration at estate scale. The parent is the management agent and
+        the cadence is fixed.
+    - condition: Imaging or provisioning writes and verifies the corporate profile.
+      explanation: >-
+        Provisioning sequences add the corporate profile then read it back to confirm,
+        producing both steps under one parent and so triggering the pairing case. They
+        occur during build, on newly enrolled hosts, under the build account.
+    - condition: A site survey utility enumerates networks and interfaces in range.
+      explanation: >-
+        Network teams run surveys deliberately, and the commands are identical to the
+        in-range case. These come from known utilities on known engineering hosts.
