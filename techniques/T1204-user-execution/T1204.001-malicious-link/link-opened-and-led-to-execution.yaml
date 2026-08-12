@@ -1,0 +1,285 @@
+type: detection
+
+id: hg-win-link-opened-and-led-to-execution-t1204-001
+version: 1.0.0
+
+info:
+  name: Malicious link opened and led to execution
+  description: >-
+    A malicious link is only the first stage. The real risk appears when the user's browser
+    follows it to a remote site, downloads or launches a file, or hands control to a
+    script host or system utility. The hunt therefore has to connect the click to the
+    effect, not just note that a browser existed.
+  severity: high
+  author: huntgraph
+  tags:
+    - execution
+    - user-execution
+    - malicious-link
+    - browser
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1204/001
+    - https://attack.mitre.org/detectionstrategies/DET0066
+    - https://attack.mitre.org/techniques/T1204
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1204
+  sub_techniques:
+    - T1204.001
+  detection_strategies:
+    - DET0066
+  analytics:
+    - AN0178
+  platforms:
+    - Windows
+  data_sources:
+    - NSM:Flow
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - File Creation
+    - Network Connection Creation
+    - Network Traffic Content
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    A user may click a malicious link that causes the browser to retrieve content or hand
+    execution to a local utility, turning ordinary browsing into the first stage of code
+    execution.
+  attacker_behavior:
+    - Sends a user to a link that downloads a file into a user-writable location.
+    - Uses a browser-to-utility handoff such as mshta, rundll32 or a custom URI handler.
+    - Delivers an archive or document that is executed shortly after download.
+    - Relies on the browser process as the normal-looking parent of the first local step.
+  legitimate_behavior:
+    - Users download installers, documents and archives from approved vendors.
+    - Internal web apps can start helpers, meeting clients and enterprise tools.
+    - Security training platforms intentionally lead users to simulated lures.
+  risk_indicator:
+    - The browser spawns a script host or execution utility.
+    - A file is created in Downloads, Temp or the browser cache and then executed quickly.
+    - The destination host or download path is first-seen for the user or host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+        - PeFileWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: browser-spawns-execution-utility
+        name: Browser spawns an execution utility
+        purpose: >-
+          Catch the direct handoff where a browser click leads straight into a utility or
+          script host that is capable of execution.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(chrome\.exe|msedge\.exe|firefox\.exe|iexplore\.exe|brave\.exe|opera\.exe)$/i
+          | FileName=/^(mshta\.exe|rundll32\.exe|powershell\.exe|pwsh\.exe|cmd\.exe|wscript\.exe|cscript\.exe|regsvr32\.exe)$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=launches), collect([CommandLine], limit=5)])
+          | sort(launches, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Known approved browser-launched enterprise tools and meeting clients"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - parent_process
+
+      - id: download-followed-by-execution
+        name: Downloaded file followed by execution
+        purpose: >-
+          Surface the common lure shape where a browser writes a file into a delivery
+          directory and that file is then opened or executed shortly afterwards.
+        query: |
+          #event_simpleName=/^(NewScriptWritten|PeFileWritten)$/
+          | TargetFileName=/\\(Downloads|Temp|INetCache|AppData\\Local\\Temp)\\/i
+          | TargetFileName=/\.(exe|dll|js|vbs|ps1|hta|lnk|zip|iso|img|docm|xlsm)$/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved software distribution and browser-managed update paths"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - path
+
+      - id: browser-first-seen-destination
+        name: Browser reaches a first-seen destination before execution
+        purpose: >-
+          Capture the network side of the lure when a browser contacts a destination that
+          is new for the user or host and is followed by local process creation.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | ContextBaseFileName=/^(chrome\.exe|msedge\.exe|firefox\.exe|iexplore\.exe|brave\.exe|opera\.exe)$/i
+          | groupBy([ComputerName, ContextBaseFileName, RemoteAddressIP4, RemotePort],
+                    function=[count(as=connections)])
+          | sort(connections, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Known internal web applications and sanctioned software repositories"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - remote_address
+
+evidence:
+  required:
+    - id: browser_handoff_or_download
+      name: Browser handoff or download in the user-execution chain
+      description: >-
+        The browser either launched an execution-capable utility or wrote a file into a
+        delivery path that can then be opened locally.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: link_led_to_local_execution_path
+
+  supporting:
+    - id: execution_utility_child
+      name: Browser launched an execution utility
+      description: >-
+        A browser directly spawned mshta, rundll32, PowerShell, cmd or another execution
+        utility, which is unusual for ordinary browsing.
+      source: process_creation
+      field: FileName
+      indicates: browser_to_execution_handoff
+    - id: downloaded_file_in_delivery_path
+      name: File created in a delivery directory
+      description: >-
+        A browser-associated process created a file in Downloads, Temp or the browser cache
+        immediately before local execution.
+      source: file_creation
+      field: TargetFileName
+      indicates: staged_payload_delivery
+    - id: first_seen_destination
+      name: Browser contacted a first-seen destination
+      description: >-
+        The destination was not part of the user or host's normal browsing or software
+        retrieval pattern during the baseline window.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: unusual_activity_for_host
+    - id: spawned_process_egress
+      name: Outbound connection from the process the link produced
+      description: >-
+        The process launched after the link was followed opened its own connection to a
+        routable external address, which separates a live retrieval or beacon from a page
+        that merely rendered.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: active_command_and_control_attempt
+
+  contradicting:
+    - id: approved_enterprise_handoff
+      name: Approved browser-launched enterprise workflow
+      description: >-
+        The process chain matches a sanctioned enterprise application or meeting platform
+        that legitimately launches a helper from the browser.
+      source: baseline
+      field: CommandLine
+      indicates: legitimate_enterprise_activity
+    - id: approved_repository
+      name: Approved software repository or internal web app
+      description: >-
+        The destination belongs to a sanctioned internal app or approved download source
+        with stable historical use.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: expected_user_behavior
+
+  risk_logic:
+    required:
+      - browser_handoff_or_download
+    supporting:
+      any:
+        - execution_utility_child
+        - downloaded_file_in_delivery_path
+        - first_seen_destination
+        - spawned_process_egress
+      all:
+        - execution_utility_child
+        - first_seen_destination
+    contradicting:
+      any:
+        - approved_enterprise_handoff
+        - approved_repository
+      all: []
+
+  verdict:
+    low_risk_when:
+      - approved_enterprise_handoff
+      - approved_repository
+    suspicious_when:
+      - browser_handoff_or_download
+      - execution_utility_child
+    high_risk_when:
+      - browser_handoff_or_download
+      - execution_utility_child
+      - first_seen_destination
+
+  false_positive:
+    - condition: Browser launches approved enterprise helper applications
+      explanation: >-
+        Meeting, remote support and managed software-delivery platforms can legitimately
+        hand off from the browser into a local helper process.
+    - condition: Users download approved installers and open them immediately
+      explanation: >-
+        Software installs from sanctioned vendors can mimic the download-then-open shape
+        unless repository and path baselines are maintained.
+

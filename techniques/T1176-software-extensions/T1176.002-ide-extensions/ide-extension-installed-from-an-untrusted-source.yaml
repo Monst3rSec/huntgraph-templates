@@ -1,0 +1,281 @@
+type: detection
+
+id: hg-win-ide-extension-installed-from-an-untrusted-source-t1176-002
+version: 1.0.0
+
+info:
+  name: IDE extension installed from an untrusted source
+  description: >-
+    An IDE extension executes inside a developer tool that already has local source,
+    secrets, build access and often deployment credentials. That makes extension
+    installation unusually sensitive: a malicious extension inherits a trusted place in the
+    workflow and can persist for as long as the IDE remains in use.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - ide-extension
+    - developer-tools
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1176/002
+    - https://attack.mitre.org/detectionstrategies/DET0561
+    - https://attack.mitre.org/techniques/T1176
+
+mitre:
+  tactics:
+    - TA0003
+  techniques:
+    - T1176
+  sub_techniques:
+    - T1176.002
+  detection_strategies:
+    - DET0561
+  analytics:
+    - AN1548
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - File Creation
+    - Network Connection Creation
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may install a malicious IDE extension from an untrusted marketplace,
+    local package or unpacked directory, gaining persistence inside the development tool
+    and access to the projects, credentials and automation the developer already uses.
+  attacker_behavior:
+    - Installs a Visual Studio Code, JetBrains or Visual Studio extension from outside the approved marketplace.
+    - Loads an extension from a local archive or unpacked directory.
+    - Relies on the IDE to persist and run the extension each time the tool is opened.
+    - Uses the extension to read workspace files, tokens or build scripts rather than to drop a new process.
+  legitimate_behavior:
+    - Developers install sanctioned extensions from the vendor marketplace.
+    - Build or platform teams may distribute internal extensions to engineering hosts.
+    - Developers load locally built extensions while authoring or testing them.
+  risk_indicator:
+    - An extension is installed on a non-engineering host.
+    - The source is a local package, writable path or rare external endpoint.
+    - The extension identifier or package appears on very few hosts.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+        - PeFileWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: ide-installs-extension-from-command-line
+        name: IDE installs an extension from command line
+        purpose: >-
+          Surface explicit extension installs where the source is a VSIX, zip or direct
+          install command rather than routine IDE startup.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(code|code-insiders|devenv|idea64|pycharm64|webstorm64|rider64)\.exe$/i
+          | CommandLine=/(--install-extension|--extensions-dir|\.vsix\b|plugins\\|installplugin)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=installs), collect([CommandLine], limit=5)])
+          | sort(installs, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Known engineering hosts and approved internal extension rollout tooling"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: extension-package-written-locally
+        name: Extension package or manifest written locally
+        purpose: >-
+          Catch local staging of extension packages or manifests in writable paths before
+          they are loaded into the IDE.
+        query: |
+          #event_simpleName=/^(NewScriptWritten|PeFileWritten)$/
+          | TargetFileName=/\.(vsix|zip|jar|json)$/i
+          | TargetFileName=/(\\.vscode\\extensions|JetBrains|plugins|AppData\\Local|Temp|Downloads)/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved internal extension cache and managed engineering package paths"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: ide-reaches-rare-extension-source
+        name: IDE reaches a rare extension source
+        purpose: >-
+          Highlight extension retrieval from a first-seen or non-marketplace destination,
+          especially when the IDE normally uses the vendor store or an internal mirror.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | ContextBaseFileName=/^(code\.exe|code-insiders\.exe|devenv\.exe|idea64\.exe|pycharm64\.exe|webstorm64\.exe|rider64\.exe)$/i
+          | groupBy([ComputerName, ContextBaseFileName, RemoteAddressIP4, RemotePort],
+                    function=[count(as=connections)])
+          | sort(connections, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved IDE marketplaces and internal extension mirrors"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - remote_address
+
+evidence:
+  required:
+    - id: extension_installation_event
+      name: IDE extension installation or local staging event
+      description: >-
+        The IDE or a related process installed an extension from command line, or a local
+        extension package or manifest was staged in an extension path.
+      source: process_creation
+      field: CommandLine
+      indicates: ide_persistence_established
+
+  supporting:
+    - id: local_package_or_writable_path
+      name: Extension came from a local package or writable path
+      description: >-
+        The extension source is a VSIX, zip, unpacked directory or another writable local
+        location rather than the vendor marketplace.
+      source: file_creation
+      field: TargetFileName
+      indicates: untrusted_extension_source
+    - id: rare_extension_source
+      name: IDE contacted a rare or unsanctioned source
+      description: >-
+        The IDE reached a destination outside its normal marketplace or internal mirror
+        pattern during extension installation.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: possible_payload_retrieval
+    - id: non_engineering_host
+      name: Extension installed outside the engineering estate
+      description: >-
+        The installation occurred on a host that is not part of the baseline engineering or
+        build fleet, which makes IDE persistence especially unusual.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: fetched_from_external_endpoint
+      name: Extension retrieved from an endpoint that is not the marketplace
+      description: >-
+        The installing process connected to a routable external address outside the
+        published marketplace and internal mirror ranges, so the extension came from a
+        source the organisation does not operate or vet.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: possible_payload_retrieval
+
+  contradicting:
+    - id: approved_engineering_rollout
+      name: Approved engineering extension rollout
+      description: >-
+        The installation matches a sanctioned internal rollout or a stable extension
+        development workflow on engineering hosts.
+      source: baseline
+      field: CommandLine
+      indicates: legitimate_enterprise_activity
+    - id: known_marketplace_or_mirror
+      name: Approved marketplace or internal mirror
+      description: >-
+        The remote source is the vendor marketplace or a documented internal extension
+        mirror with stable historical use.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: expected_user_behavior
+
+  risk_logic:
+    required:
+      - extension_installation_event
+    supporting:
+      any:
+        - local_package_or_writable_path
+        - rare_extension_source
+        - non_engineering_host
+        - fetched_from_external_endpoint
+      all:
+        - local_package_or_writable_path
+        - non_engineering_host
+    contradicting:
+      any:
+        - approved_engineering_rollout
+        - known_marketplace_or_mirror
+      all: []
+
+  verdict:
+    low_risk_when:
+      - approved_engineering_rollout
+      - known_marketplace_or_mirror
+    suspicious_when:
+      - extension_installation_event
+      - local_package_or_writable_path
+    high_risk_when:
+      - extension_installation_event
+      - local_package_or_writable_path
+      - non_engineering_host
+
+  false_positive:
+    - condition: Engineering host testing or developing an internal extension
+      explanation: >-
+        Developers and platform teams may install local VSIX packages or unpacked extensions
+        during extension authoring and test.
+    - condition: Approved extension rollout through an internal mirror
+      explanation: >-
+        Some organizations distribute IDE extensions from an internal package source rather
+        than the public marketplace.
+
