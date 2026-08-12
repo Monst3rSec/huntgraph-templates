@@ -1,0 +1,303 @@
+type: detection
+
+id: hg-win-installer-package-used-for-triggered-execution-t1546-016
+version: 1.0.0
+
+info:
+  name: Installer package used for triggered or elevated execution
+  description: >-
+    An installer package is a container that runs code by design, at elevated privilege,
+    with the installer service as its parent — and Windows will re-run parts of it later
+    during repair, rollback and self-healing without anyone asking. That gives an adversary
+    execution now and a trigger for execution afterwards, wrapped in a mechanism the estate
+    trusts because it is how software legitimately arrives. The observable is the shape of
+    the package, not the installation.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - installer-package
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1546/016
+    - https://attack.mitre.org/detectionstrategies/DET0330
+    - https://attack.mitre.org/techniques/T1546
+
+mitre:
+  tactics:
+    - TA0004
+    - TA0003
+  techniques:
+    - T1546
+  sub_techniques:
+    - T1546.016
+  detection_strategies:
+    - DET0330
+  analytics:
+    - AN0940
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary may use an installer package whose custom actions run their code at
+    elevated privilege, obtaining execution under the installer service and a trigger that
+    fires again during repair or self-healing without further interaction.
+  attacker_behavior:
+    - Installs a package staged in a user-writable directory whose custom action runs a payload.
+    - Relies on the installer service to execute the action at elevated privilege.
+    - Depends on repair and self-healing to re-run the action after cleanup.
+    - Suppresses the interface so the installation is invisible to the user.
+  legitimate_behavior:
+    - Software distribution installs packages across the estate continuously.
+    - Users with local rights install downloaded vendor software.
+    - Application repair and self-healing re-run installer actions by design.
+    - Developers build and test packages on engineering hosts.
+  risk_indicator:
+    - The installer service spawns an interpreter rather than a setup executable.
+    - The package was staged in a user-writable directory outside the managed cache.
+    - The installation is silent and its parent is a delivery application.
+    - The package is unknown across the estate.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: installer-service-spawns-interpreter
+        name: Installer service spawning an interpreter
+        purpose: >-
+          Surface custom actions that run script rather than a setup binary, which is the
+          shape that turns a package into an execution vehicle.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(msiexec|msiserver|setup|installer)\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Documented vendor packages whose custom actions invoke scripting"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - parent_process
+            - command_line
+            - organization
+
+      - id: package-written-outside-managed-cache
+        name: Package written outside the managed installer cache
+        purpose: >-
+          Catch packages arriving in delivery directories rather than being staged by the
+          distribution mechanism.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten|NewScriptWritten)$/
+          | TargetFileName=/\.(msi|msp|mst|appx|msix)$/i
+          | TargetFileName=/\\(Downloads|AppData\\Local\\Temp|Users\\Public|Content\.Outlook|INetCache)\\/i
+          | TargetFileName!=/\\(Windows\\Installer|ccmcache|SoftwareDistribution)\\/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved self-service software distribution paths"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: payload-written-by-installer-service
+        name: Executable written into a writable path by the installer service
+        purpose: >-
+          Identify the package placing content where packaged software does not belong,
+          which is what survives to be re-run by repair.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten|NewScriptWritten)$/
+          | TargetFileName=/\\(AppData|Temp|ProgramData|Users|Public)\\/i
+          | TargetFileName!=/\\(Windows\\Installer|ccmcache|SoftwareDistribution)\\/i
+          | TargetFileName=/\.(exe|dll|ps1|vbs|js|bat|cmd)$/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of approved installers and deployment agents"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+
+evidence:
+  required:
+    - id: package_execution_vehicle
+      name: Installer package running code outside normal setup
+      description: >-
+        The installer service spawned an interpreter, or a package was staged and executed
+        from a delivery directory, meaning the package is carrying code rather than
+        installing software.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: privileged_execution_vehicle
+
+  supporting:
+    - id: package_outside_cache
+      name: Package staged outside the managed cache
+      description: >-
+        The package arrived in a download, mail or temporary directory rather than being
+        staged by the distribution mechanism.
+      source: file_creation
+      field: TargetFileName
+      indicates: untrusted_execution_location
+    - id: payload_written_to_writable_path
+      name: Content written where packaged software does not belong
+      description: >-
+        The installation placed an executable or script in a user-writable directory
+        outside the installer cache, which is what repair and self-healing will re-run.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: delivery_parent
+      name: Delivery-style parent process
+      description: >-
+        The installation was launched by a document handler, archive utility, mail client
+        or browser rather than by a distribution agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: unknown_package
+      name: Package unknown across the estate
+      description: >-
+        This package has not been seen elsewhere during the baseline window, unlike
+        distributed software which appears on many hosts.
+      source: baseline
+      field: TargetFileName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: distribution_agent
+      name: Software distribution installing a package
+      description: >-
+        The installation was initiated by the approved distribution or patching agent from
+        its own cache.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: documented_custom_action
+      name: Documented vendor custom action
+      description: >-
+        The package belongs to a known product whose custom actions invoke scripting during
+        setup, which some vendors do legitimately.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: repair_or_selfheal
+      name: Application repair or self-healing
+      description: >-
+        The activity is the installer service repairing an installed product, which re-runs
+        actions from the managed cache by design.
+      source: file_creation
+      field: ContextProcessId
+      indicates: operating_system_behaviour
+
+  risk_logic:
+    required:
+      - package_execution_vehicle
+
+    supporting:
+      any:
+        - package_outside_cache
+        - payload_written_to_writable_path
+        - delivery_parent
+        - unknown_package
+      all:
+        - package_outside_cache
+        - delivery_parent
+
+    contradicting:
+      any:
+        - distribution_agent
+        - documented_custom_action
+        - repair_or_selfheal
+      all: []
+
+  verdict:
+    low_risk_when:
+      - package_execution_vehicle
+      - distribution_agent
+      - documented_custom_action
+      - repair_or_selfheal
+    suspicious_when:
+      - package_execution_vehicle
+      - unknown_package
+    high_risk_when:
+      - package_execution_vehicle
+      - package_outside_cache
+      - payload_written_to_writable_path
+      - delivery_parent
+
+  false_positive:
+    - condition: Software distribution installs packages across the estate.
+      explanation: >-
+        Managed installation runs constantly and some packages legitimately invoke scripting
+        in custom actions. The distribution agent as parent and the managed cache as the
+        source are the discriminators.
+    - condition: A user with local rights installs downloaded vendor software.
+      explanation: >-
+        Self-service installation stages a package in Downloads and runs it, reproducing
+        both the location and the delivery-parent evidence. The package is a recognisable
+        vendor product and appears across many hosts.
+    - condition: Application repair or self-healing re-runs installer actions.
+      explanation: >-
+        Repair is a designed behaviour that re-executes custom actions without user
+        interaction, which is also what makes this technique durable. Repair operates from
+        the managed cache rather than a user directory.
+    - condition: A developer builds and tests an installer package.
+      explanation: >-
+        Package authoring involves repeated installation from build output directories.
+        This is confined to engineering hosts under developer accounts.

@@ -1,0 +1,297 @@
+type: detection
+
+id: hg-win-office-add-in-registered-for-persistence-t1137-006
+version: 1.0.0
+
+info:
+  name: Office add-in registered to load at application start
+  description: >-
+    An add-in loads every time its host application opens, runs inside a process the user
+    trusts and controls generally permit, and appears nowhere in the autostart locations a
+    persistence review inspects. It is also a supported extension mechanism, so the
+    registration itself is unremarkable — which is why the useful question is where the
+    add-in lives and who registered it, not whether one exists.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - office-add-in
+    - user-triggered
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1137/006
+    - https://attack.mitre.org/detectionstrategies/DET0050
+    - https://attack.mitre.org/techniques/T1137
+
+mitre:
+  tactics:
+    - TA0003
+  techniques:
+    - T1137
+  sub_techniques:
+    - T1137.006
+  detection_strategies:
+    - DET0050
+  analytics:
+    - AN0137
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - File Modification
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An adversary may register an add-in so that their code loads whenever an Office
+    application starts, obtaining persistence inside a trusted process that no autostart
+    review covers and that runs as often as the user works.
+  attacker_behavior:
+    - Registers an add-in under the application's Addins key pointing at a local component.
+    - Drops a WLL, XLL or VBA add-in into an application startup directory.
+    - Sets the load behaviour so the add-in loads automatically rather than on demand.
+    - Chooses a name resembling a vendor productivity add-in.
+  legitimate_behavior:
+    - Productivity and compliance products install Office add-ins by design.
+    - Enterprises deploy internal add-ins to user populations.
+    - Developers build and load their own add-ins while working on them.
+    - Application updates re-register their add-ins.
+  risk_indicator:
+    - The add-in file sits in a user-writable directory rather than an installation path.
+    - The registration was made by a script host rather than an installer.
+    - The add-in appears on very few hosts rather than across a deployment.
+    - The Office application spawns an interpreter after the add-in loads.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+        - PeFileWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: addin-registered-in-registry
+        name: Add-in registered with automatic load behaviour
+        purpose: >-
+          Surface registrations that set the add-in to load on every application start,
+          which is what turns an extension into persistence.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/Office\\\\[^\s]*\\\\(Word|Excel|PowerPoint|Outlook|Access)\\\\Addins|\\\\Addins\\\\/i
+          | CommandLine=/(reg(\.exe)?\s+add|Set-ItemProperty|New-ItemProperty|LoadBehavior)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=registrations), collect([CommandLine], limit=5)])
+          | sort(registrations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of approved productivity and compliance product installers"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: addin-file-in-startup-path
+        name: Add-in written into an application startup directory
+        purpose: >-
+          Catch the filesystem route, where a component dropped into a startup path loads
+          without any registry entry being created.
+        query: |
+          #event_simpleName=/^(NewScriptWritten|PeFileWritten)$/
+          | TargetFileName=/\.(wll|xll|xlam|ppam|dotm|vsto|dll)$/i
+          | TargetFileName=/\\(XLSTART|STARTUP|AddIns|Microsoft\\Word|Microsoft\\Excel|Microsoft\\Addins)\\/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of approved add-in deployment tooling"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: office-spawns-interpreter
+        name: Office application spawning an interpreter after load
+        purpose: >-
+          Observe the add-in doing something, which distinguishes a loaded extension from
+          one that is merely registered.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|msaccess)\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32|certutil)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Documented business macros and add-ins that invoke scripting"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - parent_process
+            - process
+
+evidence:
+  required:
+    - id: addin_registered
+      name: Add-in registered or written into a startup path
+      description: >-
+        An add-in was registered with automatic load behaviour, or a component was written
+        into an application startup directory, so it loads whenever the application opens.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_established
+
+  supporting:
+    - id: writable_addin_location
+      name: Add-in in a user-writable directory
+      description: >-
+        The component sits under AppData, Temp, ProgramData or a user profile rather than
+        in a vendor installation directory.
+      source: file_creation
+      field: TargetFileName
+      indicates: untrusted_execution_location
+    - id: office_spawned_interpreter
+      name: Application spawned an interpreter
+      description: >-
+        The Office application became the parent of a script interpreter or
+        proxy-execution binary, which is the add-in acting rather than merely loading.
+      source: process_creation
+      field: FileName
+      indicates: execution_chain_progression
+    - id: script_host_registrar
+      name: Registered by a script host or delivery application
+      description: >-
+        The registration was performed by an interpreter, document handler or archive
+        utility rather than by a product installer.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: rare_in_estate
+      name: Add-in confined to very few hosts
+      description: >-
+        The component appears on one or a small number of machines during the baseline
+        window, unlike add-ins deployed with a product or by policy.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: product_installer
+      name: Approved product installing its add-in
+      description: >-
+        The add-in belongs to a sanctioned productivity, compliance or communication
+        product that registers itself during installation.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_enterprise_activity
+    - id: managed_addin_deployment
+      name: Managed add-in deployment
+      description: >-
+        The add-in was distributed to a user population by management tooling as part of a
+        governed configuration.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+    - id: developer_addin_work
+      name: Developer building an add-in
+      description: >-
+        The host is an engineering system where building and loading add-ins is routine
+        development work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - addin_registered
+
+    supporting:
+      any:
+        - writable_addin_location
+        - office_spawned_interpreter
+        - script_host_registrar
+        - rare_in_estate
+      all:
+        - writable_addin_location
+        - script_host_registrar
+
+    contradicting:
+      any:
+        - product_installer
+        - managed_addin_deployment
+        - developer_addin_work
+      all: []
+
+  verdict:
+    low_risk_when:
+      - addin_registered
+      - product_installer
+      - managed_addin_deployment
+      - developer_addin_work
+    suspicious_when:
+      - addin_registered
+      - rare_in_estate
+    high_risk_when:
+      - addin_registered
+      - writable_addin_location
+      - office_spawned_interpreter
+      - script_host_registrar
+
+  false_positive:
+    - condition: A productivity or compliance product installs an Office add-in.
+      explanation: >-
+        Add-ins are a supported extension mechanism used by many products, including
+        communication and archiving tools. The installer is the acting process and the
+        add-in appears wherever the product is deployed.
+    - condition: An enterprise deploys an internal add-in to a user population.
+      explanation: >-
+        Managed add-in distribution writes the same registry keys and startup paths,
+        sometimes programmatically. It appears identically across a defined population.
+    - condition: A developer builds and loads their own add-in.
+      explanation: >-
+        Add-in development involves registering components from build output directories,
+        which reproduces the writable-location evidence. Asset role is the discriminator.
+    - condition: An application update re-registers its add-ins.
+      explanation: >-
+        Updates repair add-in registration routinely. The updater is the acting process and
+        the component path stays inside the product's installation tree.
