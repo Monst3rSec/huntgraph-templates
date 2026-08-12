@@ -1,0 +1,293 @@
+type: detection
+
+id: hg-win-unquoted-service-path-intercepted-t1574-009
+version: 1.0.0
+
+info:
+  name: Unquoted service path intercepted by a planted executable
+  description: >-
+    When a service path contains spaces and is not quoted, Windows tries each truncation in
+    turn — so a service registered as C:\Program Files\Some App\svc.exe will first look for
+    C:\Program.exe. Anyone able to write at that truncation point gets their binary started
+    by the service control manager, at whatever privilege the service runs with. The
+    misconfiguration is old and common; what is rare is a file actually appearing at one of
+    those interception points, which is where the hunt sits.
+  severity: high
+  author: huntgraph
+  tags:
+    - privilege-escalation
+    - execution
+    - path-interception
+    - service
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1574/009
+    - https://attack.mitre.org/detectionstrategies/DET0064
+    - https://attack.mitre.org/techniques/T1574
+
+mitre:
+  tactics:
+    - TA0005
+    - TA0002
+  techniques:
+    - T1574
+  sub_techniques:
+    - T1574.009
+  detection_strategies:
+    - DET0064
+  analytics:
+    - AN0176
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - File Metadata
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An adversary may place an executable at the truncation point of an unquoted service
+    path, so the service control manager launches their binary instead of the intended one,
+    inheriting the privilege the service was configured to run with.
+  attacker_behavior:
+    - Writes an executable at a space-truncated prefix of an unquoted service path.
+    - Chooses a service running as SYSTEM so the interception escalates privilege.
+    - Relies on a reboot or a service restart to trigger execution.
+    - Registers a new service with a deliberately unquoted path to create the condition.
+  legitimate_behavior:
+    - Installers create files in the root of a drive or in Program Files legitimately.
+    - Some vendor software registers services with unquoted paths, which is a
+      misconfiguration rather than an attack.
+    - Software deployment writes executables into staging directories at drive roots.
+  risk_indicator:
+    - An executable appears at a path that is a space-truncated prefix of a service path.
+    - The file is written to a drive root or a first path segment.
+    - The writer is a script host rather than an installer.
+    - A service starts from that path shortly afterwards.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: executable-at-interception-point
+        name: Executable written at a path-truncation point
+        purpose: >-
+          Surface files appearing where an unquoted service path would be truncated, which
+          is a location almost nothing legitimately writes to.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+          | TargetFileName=/^[A-Za-z]:\\[^\\]*\.exe$/i
+          | TargetFileName!=/\\(bootmgr|pagefile|hiberfil)/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId, SHA256HashData],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved installers and deployment agents staging at drive roots"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: process-started-from-drive-root
+        name: Service-parented process running from a drive root
+        purpose: >-
+          Catch the interception succeeding, where the service control manager starts a
+          binary from a truncation point rather than the intended path.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/^[A-Za-z]:\\[^\\]*\.exe$/i
+          | ParentBaseFileName=/^(services|svchost)\.exe$/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: unquoted-service-registered
+        name: Service registered with an unquoted path containing spaces
+        purpose: >-
+          Identify the condition being created deliberately rather than inherited from a
+          vendor's misconfiguration.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(sc(\.exe)?\s+.*\bcreate\b|New-Service|sc(\.exe)?\s+.*\bconfig\b.*binpath)/i
+          | CommandLine=/binpath\s*=\s*[A-Za-z]:\\[^"]*\s[^"]*\.exe|(-BinaryPathName\s+[A-Za-z]:\\[^"]*\s)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=registrations), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of approved installers registering their own services"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+evidence:
+  required:
+    - id: interception_point_populated
+      name: Executable present at a path-truncation point
+      description: >-
+        An executable was written to, or started from, a drive root or first path segment
+        that an unquoted service path would truncate to, which is where the service control
+        manager looks before the intended binary.
+      source: file_creation
+      field: TargetFileName
+      indicates: hijacked_execution_flow
+
+  supporting:
+    - id: service_started_it
+      name: Service control manager started the planted binary
+      description: >-
+        The process running from the truncation point was parented by the service control
+        manager, confirming the interception worked rather than merely being possible.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: privilege_escalation_attempt
+    - id: unquoted_service_created
+      name: Unquoted service path registered
+      description: >-
+        A service was registered with an unquoted binary path containing spaces, creating
+        the interception condition rather than inheriting it.
+      source: process_creation
+      field: CommandLine
+      indicates: access_path_creation
+    - id: script_host_writer
+      name: Written by a script host rather than an installer
+      description: >-
+        The executable was placed by an interpreter or a remote-execution channel rather
+        than by an installer or deployment agent.
+      source: file_creation
+      field: ContextProcessId
+      indicates: abnormal_execution_chain
+    - id: rare_in_estate
+      name: File at that path rare across the estate
+      description: >-
+        Nothing comparable appears at that location on peer hosts during the baseline
+        window, which is expected since drive roots hold almost no executables.
+      source: baseline
+      field: SHA256HashData
+      indicates: unusual_binary_in_environment
+
+  contradicting:
+    - id: installer_root_write
+      name: Installer or deployment agent writing at a drive root
+      description: >-
+        The file was placed by an approved installer or deployment agent that stages
+        content at a drive root or in a top-level directory.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_enterprise_activity
+    - id: vendor_misconfiguration
+      name: Vendor service registered unquoted
+      description: >-
+        The unquoted service belongs to installed vendor software, which is a hygiene
+        finding rather than an intrusion and appears identically across the estate.
+      source: baseline
+      field: ComputerName
+      indicates: legitimate_application_component
+    - id: recorded_deployment
+      name: Recorded deployment activity
+      description: >-
+        A change record covers software being staged or a service being registered during a
+        maintenance window.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - interception_point_populated
+
+    supporting:
+      any:
+        - service_started_it
+        - unquoted_service_created
+        - script_host_writer
+        - rare_in_estate
+      all:
+        - service_started_it
+        - script_host_writer
+
+    contradicting:
+      any:
+        - installer_root_write
+        - vendor_misconfiguration
+        - recorded_deployment
+      all: []
+
+  verdict:
+    low_risk_when:
+      - interception_point_populated
+      - installer_root_write
+      - vendor_misconfiguration
+      - recorded_deployment
+    suspicious_when:
+      - interception_point_populated
+      - rare_in_estate
+    high_risk_when:
+      - interception_point_populated
+      - service_started_it
+      - script_host_writer
+      - unquoted_service_created
+
+  false_positive:
+    - condition: An installer stages an executable at a drive root.
+      explanation: >-
+        Some setup routines unpack to the root of a drive before moving content into place.
+        The installer is the writing process and the file is short-lived.
+    - condition: Vendor software registers a service with an unquoted path.
+      explanation: >-
+        Unquoted service paths are a widespread misconfiguration in third-party software.
+        That is worth fixing but is not an attack, and the same service appears identically
+        across every host running the product.
+    - condition: Deployment tooling writes into a top-level staging directory.
+      explanation: >-
+        Distribution products sometimes stage packages in first-level directories. These
+        occur during rollout windows under the deployment agent.

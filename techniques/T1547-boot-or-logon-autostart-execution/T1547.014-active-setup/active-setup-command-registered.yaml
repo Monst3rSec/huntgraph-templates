@@ -1,0 +1,282 @@
+type: detection
+
+id: hg-win-active-setup-command-registered-t1547-014
+version: 1.0.0
+
+info:
+  name: Active Setup command registered to run at logon
+  description: >-
+    Active Setup exists so software can finish per-user configuration the first time each
+    account signs in. A command registered there runs once for every user of the machine,
+    at their privilege, before the desktop is usable — and it lives in a registry location
+    that neither the Run keys nor the startup folder cover, so an autostart review built
+    around those finds nothing. Installers do use it, which is why the discriminator is
+    what the command points at rather than the entry existing.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - active-setup
+    - registry
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1547/014
+    - https://attack.mitre.org/detectionstrategies/DET0312
+    - https://attack.mitre.org/techniques/T1547
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1547
+  sub_techniques:
+    - T1547.014
+  detection_strategies:
+    - DET0312
+  analytics:
+    - AN0871
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Windows Registry Key Creation
+    - Windows Registry Key Modification
+    - Logon Session Metadata
+
+hypothesis:
+  statement: >-
+    An adversary may register a command under Active Setup so that it executes once for
+    every user who signs in to the machine, obtaining persistence that runs in each user's
+    context and sits outside the autostart locations most reviews inspect.
+  attacker_behavior:
+    - Creates an Active Setup installed-components entry with a StubPath command.
+    - Points StubPath at an interpreter or a payload in a user-writable directory.
+    - Uses a component identifier resembling a Microsoft or vendor GUID.
+    - Relies on the entry firing for every existing and future user of the host.
+  legitimate_behavior:
+    - Installers register Active Setup entries to complete per-user configuration.
+    - Windows components use it for their own first-logon setup.
+    - Management tooling deploys per-user configuration through the same mechanism.
+  risk_indicator:
+    - The StubPath command is an interpreter or references a user-writable directory.
+    - The entry is created by a script host rather than an installer.
+    - The component identifier does not correspond to any installed product.
+    - The entry appears on very few hosts rather than across a deployment.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: active-setup-entry-written
+        name: Active Setup entry created
+        purpose: >-
+          Surface writes to the installed-components key, which is a narrow location that
+          an autostart review focused on Run keys does not cover.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/Active\s*Setup\\\\Installed\s*Components/i
+          | CommandLine=/(reg(\.exe)?\s+add|Set-ItemProperty|New-ItemProperty|New-Item)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=registrations), collect([CommandLine], limit=5)])
+          | sort(registrations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of approved installers completing per-user setup"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: stubpath-points-at-interpreter
+        name: StubPath pointing at an interpreter or writable payload
+        purpose: >-
+          Isolate entries whose command is a script interpreter or a program outside the
+          installation trees, which packaged software does not require.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/StubPath/i
+          | CommandLine=/(powershell|pwsh|cmd\.exe|wscript|cscript|mshta|rundll32|regsvr32|\\AppData\\|\\Temp\\|\\ProgramData\\|\\Users\\)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=registrations), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: userinit-spawned-interpreter
+        name: Logon initialisation spawning an interpreter
+        purpose: >-
+          Observe the entry firing, where the per-user setup path becomes the parent of
+          something that is not a configuration step.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(userinit|runonce)\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32|certutil)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Managed per-user configuration deployed through Active Setup"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - process
+
+evidence:
+  required:
+    - id: active_setup_registered
+      name: Active Setup entry created or firing
+      description: >-
+        An installed-components entry with a StubPath command was written, or the logon
+        initialisation path spawned an interpreter, meaning a command runs once for every
+        user who signs in.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_established
+
+  supporting:
+    - id: interpreter_stubpath
+      name: StubPath is an interpreter or writable payload
+      description: >-
+        The registered command launches a script interpreter or a program under a
+        user-writable directory rather than a product's own configuration step.
+      source: process_creation
+      field: CommandLine
+      indicates: dynamic_code_execution
+    - id: logon_spawned_interpreter
+      name: Interpreter spawned during logon initialisation
+      description: >-
+        The per-user setup path became the parent of an interpreter, which is the entry
+        executing rather than merely being present.
+      source: process_creation
+      field: FileName
+      indicates: execution_chain_progression
+    - id: script_host_creator
+      name: Registered by a script host or remote channel
+      description: >-
+        The entry was created by an interpreter or a remote-execution channel rather than
+        by an installer performing per-user setup.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: rare_in_estate
+      name: Entry confined to very few hosts
+      description: >-
+        The component appears on one or a small number of machines during the baseline
+        window, unlike per-user configuration deployed with a product.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: installer_registered
+      name: Registered by an approved installer
+      description: >-
+        The entry was created by an installer completing per-user configuration for the
+        product it deploys, which is the mechanism's intended use.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: windows_component
+      name: Windows component performing first-logon setup
+      description: >-
+        The component belongs to the operating system's own per-user initialisation, which
+        runs on every host.
+      source: baseline
+      field: CommandLine
+      indicates: operating_system_behaviour
+    - id: managed_per_user_config
+      name: Managed per-user configuration
+      description: >-
+        The entry was deployed by management tooling across a host collection as part of a
+        governed desktop configuration.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - active_setup_registered
+
+    supporting:
+      any:
+        - interpreter_stubpath
+        - logon_spawned_interpreter
+        - script_host_creator
+        - rare_in_estate
+      all:
+        - interpreter_stubpath
+        - script_host_creator
+
+    contradicting:
+      any:
+        - installer_registered
+        - windows_component
+        - managed_per_user_config
+      all: []
+
+  verdict:
+    low_risk_when:
+      - active_setup_registered
+      - installer_registered
+      - windows_component
+      - managed_per_user_config
+    suspicious_when:
+      - active_setup_registered
+      - rare_in_estate
+    high_risk_when:
+      - active_setup_registered
+      - interpreter_stubpath
+      - logon_spawned_interpreter
+      - script_host_creator
+
+  false_positive:
+    - condition: An installer registers an Active Setup entry for per-user configuration.
+      explanation: >-
+        This is exactly what the mechanism is for, and many products use it. The installer
+        is the acting process and the entry appears wherever the product is deployed.
+    - condition: A Windows component performs first-logon setup.
+      explanation: >-
+        The operating system uses Active Setup for its own per-user initialisation, so
+        entries exist on every host by default. These are stable and estate-wide.
+    - condition: Management tooling deploys per-user configuration through Active Setup.
+      explanation: >-
+        Desktop management sometimes uses the same mechanism, occasionally with an
+        interpreter as the command. It appears identically across a host collection rather
+        than on isolated machines.
