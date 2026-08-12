@@ -1,0 +1,348 @@
+type: detection
+
+id: hg-win-cookie-store-accessed-by-a-process-that-is-not-the-browser-t1606-001
+
+version: 1.0.0
+
+info:
+  name: Cookie store accessed by a process that is not the browser
+  description: >-
+    A session cookie is the receipt an application issues after it has already decided who
+    you are. Present a valid one and the whole authentication path is skipped: no password
+    prompt, no push notification, no conditional access evaluation, because from the
+    application's point of view none of that is due — it happened, and this is the proof.
+    That is what makes cookie theft and cookie forgery attractive against an estate that has
+    otherwise done the hard work of deploying MFA. Forgery proper needs the signing secret
+    and produces no endpoint artefact at all; theft is the far more common route to the same
+    place and does leave one. On Windows the cookie stores are ordinary files in the browser
+    profile — a SQLite database for the Chromium family, another for Firefox — and the
+    symmetric key that protects the values sits alongside them in the local state file,
+    wrapped with DPAPI so that only the user's own context can unwrap it. So the endpoint
+    observable is narrow but sharp: a process that is not the browser reading, copying or
+    unlocking that profile material. The confirming half of the story is not visible here.
+    A cookie replayed against a cloud service produces a session in the provider's logs with
+    no matching sign-in, and that record lives in the identity provider or SaaS audit trail,
+    not on the endpoint. This template finds the collection; correlating it with an
+    unexplained session is a second, separate step against different data. The discriminator
+    against the benign twin is the accessing process. Backup agents, profile roaming and
+    endpoint DLP all read the same paths as part of sweeping the whole profile; theft
+    reaches for the cookie database and the local state key specifically, and usually
+    nothing else in the directory.
+  severity: high
+  author: huntgraph
+  tags:
+    - credential-access
+    - web-cookies
+    - session-hijacking
+    - browser
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1606/001
+    - https://attack.mitre.org/detectionstrategies/DET0171
+    - https://attack.mitre.org/techniques/T1606
+
+mitre:
+  tactics:
+    - TA0006
+  techniques:
+    - T1606
+  sub_techniques:
+    - T1606.001
+  detection_strategies:
+    - DET0171
+  analytics:
+    - AN0484
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary may take or mint the session cookies held in a browser profile so that
+    authentication is skipped entirely on replay, obtaining access to web and cloud
+    applications without a password and without ever presenting a second factor.
+  attacker_behavior:
+    - Copies the browser's cookie database out of the profile directory to a staging path.
+    - Reads the cookie store in place with a database utility or script rather than copying it.
+    - Takes the local state file so the key protecting the cookie values can be unwrapped.
+    - Starts the browser headless with a debugging interface exposed and harvests cookies through it.
+    - Archives the profile material and moves it off the host for replay elsewhere.
+  legitimate_behavior:
+    - Backup and profile-roaming agents copy the entire user profile, cookie stores included.
+    - Endpoint DLP and antivirus products read profile files during scheduled scans.
+    - Browser updaters and the browsers themselves rewrite these files constantly.
+    - Migration tooling moves browser profiles between machines during a hardware refresh.
+  risk_indicator:
+    - The accessing process is not a browser and belongs to no installed management product.
+    - The cookie database and the local state key are taken together and nothing else is.
+    - The access comes from a shell, script host or a binary running from a user-writable path.
+    - A browser is launched with a debugging port by a parent that is not a user session shell.
+    - The material is compressed or staged into a single archive immediately afterwards.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: cookie-store-copied-out-of-the-profile
+        name: Cookie database copied or archived out of a browser profile
+        purpose: >-
+          Surface the most direct form of collection, where the store is lifted whole. The
+          copy is what makes the session portable, and a copy of a locked database usually
+          needs a specific utility, which narrows the population considerably.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\\+Network\\+Cookies|\\+Cookies|cookies\.sqlite|\\+Login Data|\\+Local State)/i
+          | CommandLine=/(copy|xcopy|robocopy|esentutl|Copy-Item|Compress-Archive|7z|tar\s)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=accesses), collect([CommandLine], limit=5)])
+          | sort(accesses, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Backup, profile-roaming and migration agents that copy the whole user profile"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: cookie-store-read-in-place
+        name: Cookie database opened by a database or scripting utility
+        purpose: >-
+          Cover the quieter variant that never copies anything. Reading the store in place
+          with a SQLite utility or a script leaves no new file, so the accessing process and
+          the column names it reaches for are the only evidence.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(encrypted_value|host_key|moz_cookies|sqlite3|System\.Data\.SQLite|PSSQLite)/i
+          | CommandLine=/(Cookies|cookies\.sqlite|cookie)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=reads), collect([CommandLine], limit=5)])
+          | sort(reads, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Developer workstations where local browser databases are inspected as part of the job"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: profile-key-material-targeted
+        name: Local state key or DPAPI material taken alongside cookies
+        purpose: >-
+          Identify the step that makes stolen cookies usable. The values in the store are
+          encrypted with a key held in the local state file and wrapped with DPAPI, so an
+          adversary who takes only the database has taken ciphertext.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Local State|os_crypt|encrypted_key|dpapi::|masterkey|SharpChrome|SharpDPAPI|Invoke-WCMDump)/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: browser-driven-through-a-debug-interface
+        name: Browser started headless with a debugging port
+        purpose: >-
+          Catch the route that avoids the files entirely. A browser launched with its
+          debugging interface exposed will hand over decrypted cookies for the profile to
+          anything that connects to that port, and the profile never has to be parsed.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/--remote-debugging-(port|pipe)/i
+          | CommandLine=/(--headless|--user-data-dir|--disable-gpu|--profile-directory)/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=launches), collect([CommandLine], limit=5)])
+          | sort(launches, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Automated browser testing frameworks on engineering hosts"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - parent_process
+            - organization
+
+evidence:
+  required:
+    - id: cookie_store_accessed
+      name: Browser cookie store accessed by another process
+      description: >-
+        A process that is not the browser read, copied or archived the cookie database from a
+        browser profile, which is where the session material that substitutes for
+        authentication is held.
+      source: process_creation
+      field: CommandLine
+      indicates: session_material_accessed
+
+  supporting:
+    - id: key_material_taken_too
+      name: Local state key taken alongside the store
+      description: >-
+        The file holding the key that protects the cookie values was accessed in the same
+        activity, which is the difference between taking ciphertext and taking usable
+        sessions.
+      source: process_creation
+      field: CommandLine
+      indicates: cookie_decryption_prepared
+    - id: debug_interface_used
+      name: Browser driven through its debugging interface
+      description: >-
+        A browser was started with a remote debugging port or pipe exposed, which yields
+        decrypted cookies for the profile without the store ever being parsed.
+      source: process_creation
+      field: ImageFileName
+      indicates: session_extraction_via_debug_interface
+    - id: non_browser_parent
+      name: Access issued from a shell or script host
+      description: >-
+        The parent of the accessing process is a command shell, script host or a binary from a
+        user-writable path rather than an installed management or backup product.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: narrow_selection
+      name: Only the credential-bearing files were touched
+      description: >-
+        The activity reaches for the cookie database and the key material and leaves the rest
+        of the profile alone, which is collection rather than a sweep.
+      source: derived
+      field: CommandLine
+      indicates: targeted_collection
+    - id: no_history_on_host
+      name: No history of profile access on this host
+      description: >-
+        Nothing has read these profile paths outside the browser itself during the baseline
+        window, so the access is a deviation as well as a sensitive one.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: backup_or_roaming_agent
+      name: Backup, roaming or migration agent
+      description: >-
+        The accessing process is an installed backup, profile-roaming or migration product,
+        which copies the entire profile on a schedule and touches the cookie store as one
+        file among thousands.
+      source: process_creation
+      field: FileName
+      indicates: legitimate_backup_product
+    - id: browser_or_updater
+      name: The browser or its updater
+      description: >-
+        The process is the browser itself or its update component, which rewrites these files
+        as part of normal operation and holds them open continuously.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_browser_operation
+    - id: sanctioned_security_scan
+      name: Endpoint security product scanning the profile
+      description: >-
+        A deployed antivirus or DLP product reads profile files during scheduled scanning,
+        producing the same access pattern across every host it is installed on.
+      source: asset_inventory
+      field: ComputerName
+      indicates: sanctioned_security_tooling
+
+  risk_logic:
+    required:
+      - cookie_store_accessed
+
+    supporting:
+      any:
+        - key_material_taken_too
+        - debug_interface_used
+        - non_browser_parent
+        - narrow_selection
+        - no_history_on_host
+      all:
+        - key_material_taken_too
+        - non_browser_parent
+
+    contradicting:
+      any:
+        - backup_or_roaming_agent
+        - browser_or_updater
+        - sanctioned_security_scan
+      all: []
+
+  verdict:
+    low_risk_when:
+      - cookie_store_accessed
+      - backup_or_roaming_agent
+      - browser_or_updater
+      - sanctioned_security_scan
+    suspicious_when:
+      - cookie_store_accessed
+      - no_history_on_host
+    high_risk_when:
+      - cookie_store_accessed
+      - key_material_taken_too
+      - debug_interface_used
+      - non_browser_parent
+      - narrow_selection
+
+  false_positive:
+    - condition: A backup or profile-roaming agent copies the user profile.
+      explanation: >-
+        These products copy the cookie store on every run, from every host, and are the main
+        source of volume here. They are separated by being installed products running under a
+        service context, by copying the whole profile rather than selected files, and by the
+        activity appearing estate-wide on a schedule.
+    - condition: Endpoint security software reads profile files during a scan.
+      explanation: >-
+        Antivirus and DLP engines open the cookie database like any other file. The access is
+        read-only, part of a much larger traversal, and attributable to a product present on
+        every managed machine.
+    - condition: A developer inspects a local browser database.
+      explanation: >-
+        Engineers do query these files by hand, and the command looks the same. It is
+        separated by the host role, by the user owning the profile being inspected, and by
+        the absence of any interest in the local state key.
+    - condition: A test framework drives a headless browser with a debugging port.
+      explanation: >-
+        Automated testing legitimately launches browsers this way, but against a throwaway
+        profile directory rather than the user's real one. The theft variant points the
+        debugging session at the profile that holds live sessions.

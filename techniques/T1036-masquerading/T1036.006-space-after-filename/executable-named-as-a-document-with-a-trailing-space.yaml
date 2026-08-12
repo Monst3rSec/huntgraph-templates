@@ -1,0 +1,347 @@
+type: detection
+
+id: hg-mac-executable-named-as-a-document-with-a-trailing-space-t1036-006
+
+version: 1.0.0
+
+info:
+  name: Executable named as a document with a trailing space
+  description: >-
+    macOS decides what to do with a double-clicked file from its extension, and a single
+    trailing space breaks that lookup. A Mach-O binary called report.pdf opens in a document
+    viewer; the same binary called "report.pdf " — one space at the end — no longer matches
+    a known extension, so the system falls back to the file's real type and hands it to
+    Terminal, which runs it. The user sees a PDF icon and a PDF name, clicks it, and
+    executes a binary. Nothing is exploited and no security control is bypassed in the usual
+    sense: the operating system is simply asked a slightly different question than the one
+    the user answered. What makes this worth hunting despite how narrow it is, is that the
+    false positive rate is close to zero. Filenames do not acquire trailing spaces by
+    accident on a Mac — Finder trims them, shells require escaping to produce them, and no
+    installer or build tool emits them. So the observable is blunt: an image path or an
+    execution argument that ends in whitespace, usually with a document extension sitting
+    just in front of it. The two things worth separating out are files that arrived from a
+    Windows or Linux share where trailing spaces survive, and commands that merely read such
+    a file rather than run it.
+  severity: high
+  author: huntgraph
+  tags:
+    - defense-evasion
+    - masquerading
+    - user-execution
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1036/006
+    - https://attack.mitre.org/detectionstrategies/DET0292
+    - https://attack.mitre.org/techniques/T1036
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1036
+  sub_techniques:
+    - T1036.006
+  detection_strategies:
+    - DET0292
+  analytics:
+    - AN0813
+  platforms:
+    - macOS
+  data_sources:
+    - macos:unifiedlog
+    - fs:fsusage
+  data_components:
+    - Process Creation
+    - File Access
+
+hypothesis:
+  statement: >-
+    An adversary may append a space to a filename so that the operating system stops
+    matching the visible extension and falls back to the file's true type, obtaining
+    execution of a binary that the user believed they were opening as a document.
+  attacker_behavior:
+    - Names a Mach-O binary with a document extension followed by a single trailing space.
+    - Delivers it inside an archive or disk image where the name survives extraction intact.
+    - Pairs the name with a document icon so the file looks right in Finder as well as in a listing.
+    - Places the file in Downloads or on a mounted volume where a user will double-click it.
+    - Registers a space-padded program in a launch agent so the same name persists.
+  legitimate_behavior:
+    - Files copied from Windows or Linux shares can retain trailing spaces in their names.
+    - Archive extraction preserves whatever name the archive recorded, including odd whitespace.
+    - Users and scripts sometimes quote paths with stray whitespace when reading a file.
+    - Data exports and scanned document workflows generate machine-made names with loose formatting.
+  risk_indicator:
+    - The executed image path ends in whitespace rather than a normal extension.
+    - A document extension sits immediately before the trailing space.
+    - A Mach-O binary was written to disk under a document-looking name.
+    - The launch came from Finder, open or Terminal rather than from a script.
+    - The file sits in Downloads, a temporary directory or a freshly mounted volume.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewExecutableWritten
+        - PeFileWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: image-path-ends-in-whitespace
+        name: Process image path ending in a space
+        purpose: >-
+          The blunt instrument, and the one that carries the hunt. Executables do not have
+          trailing spaces in their names for any ordinary reason, so an image path that ends
+          in whitespace is the technique itself rather than an indicator of it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/[^\/\s][ \t]+$/
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: document-extension-before-the-space
+        name: Document extension immediately before a trailing space
+        purpose: >-
+          Narrow to the deliberate form. The point of the trailing space is to sit behind an
+          extension the user trusts, so a name ending in a document or media extension plus
+          whitespace is a deception aimed at a person rather than a naming accident.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/\.(pdf|doc|docx|xls|xlsx|ppt|pptx|txt|rtf|jpg|jpeg|png|gif|mp4|mov|csv|zip|pages|numbers|key)[ \t]+$/i
+            or CommandLine=/\.(pdf|doc|docx|xls|xlsx|ppt|pptx|txt|rtf|jpg|jpeg|png|gif|mp4|mov|csv|zip|pages|numbers|key)[ \t]+("|'|$)/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Commands that only read the file, such as cat, cp, qlmanage or a text editor"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: mach-o-written-under-a-document-name
+        name: Executable written with a document-looking name
+        purpose: >-
+          Catch the drop rather than the click. A Mach-O landing on disk under a name that
+          claims to be a document is the moment the deception is created, and it gives the
+          hash and the writing process before any user is fooled by it.
+        query: |
+          #event_simpleName=/^(NewExecutableWritten|PeFileWritten)$/
+          | TargetFileName=/\.(pdf|doc|docx|xls|xlsx|ppt|pptx|txt|rtf|jpg|jpeg|png|gif|mp4|mov|csv|pages|numbers|key)([ \t]+)?$/i
+          | groupBy([ComputerName, TargetFileName],
+                    function=[count(as=writes), collect([SHA256HashData, ContextProcessId], limit=5)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Converters and export tools that write generated media under user-chosen names"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: space-padded-program-launched-by-the-system
+        name: Space-padded program launched by the desktop or by launchd
+        purpose: >-
+          Establish how it ran. Finder, open and Terminal launching such a path is the user
+          being deceived in real time; launchd launching it means the same trick has been
+          written into a launch agent or daemon and now runs without anybody clicking
+          anything.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(launchd|Finder|open|Terminal|bash|zsh|sh)$/i
+          | ImageFileName=/[^\/\s][ \t]+$/
+            or CommandLine=/[^\/\s][ \t]+("|')/
+          | groupBy([ComputerName, UserName, ParentBaseFileName, ImageFileName],
+                    function=[count(as=launches), collect([CommandLine, FileName], limit=5)])
+          | sort(launches, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: trailing_space_in_executed_name
+      name: Executed path ends in whitespace
+      description: >-
+        A process ran from a path whose filename ends in a space or tab, which is the
+        condition that makes the operating system ignore the visible extension and treat the
+        file as whatever it actually is.
+      source: process_creation
+      field: ImageFileName
+      indicates: extension_handler_subverted
+
+  supporting:
+    - id: document_extension_before_the_space
+      name: Document extension sits before the space
+      description: >-
+        The name presents itself as a document, image or media file immediately before the
+        trailing whitespace, showing the padding exists to deceive a person reading the name
+        rather than being incidental.
+      source: process_creation
+      field: CommandLine
+      indicates: user_facing_deception
+    - id: executable_written_as_a_document
+      name: Executable written to disk under a document name
+      description: >-
+        A Mach-O binary was written with a document extension, which is the creation of the
+        disguise and provides the hash and the writing process behind it.
+      source: file_creation
+      field: TargetFileName
+      indicates: masqueraded_payload_staged
+    - id: launched_by_the_desktop_or_launchd
+      name: Launched by the desktop shell or by launchd
+      description: >-
+        Finder, open or Terminal started the process, meaning a user double-clicked it; or
+        launchd did, meaning the padded name has been written into a launch agent and now
+        runs on its own.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: user_execution_or_persistence
+    - id: runs_from_a_delivery_location
+      name: Runs from a download, temporary or mounted path
+      description: >-
+        The file sits where delivered content lands — Downloads, a temporary directory or a
+        freshly mounted disk image — rather than in an installed application directory.
+      source: process_creation
+      field: FileName
+      indicates: recently_delivered_content
+    - id: hash_unseen_in_the_fleet
+      name: Binary not seen elsewhere in the estate
+      description: >-
+        The executable's hash has no history on comparable hosts during the baseline window,
+        so this is not a widely deployed tool that happens to carry an odd name.
+      source: baseline
+      field: SHA256HashData
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: name_arrived_from_a_foreign_filesystem
+      name: Name arrived from a share or archive
+      description: >-
+        The file was created by a sync client, archive extractor or share mount, where
+        trailing spaces from Windows or Linux filesystems survive copying and mean nothing
+        about intent.
+      source: file_creation
+      field: TargetFileName
+      indicates: benign_naming_artifact
+    - id: opened_rather_than_executed
+      name: The file was read, not run
+      description: >-
+        The padded name appears only as an argument to a command that reads or copies it —
+        cat, cp, qlmanage, an editor — so no handler was subverted and nothing was executed.
+      source: process_creation
+      field: CommandLine
+      indicates: file_read_not_executed
+    - id: known_good_across_the_estate
+      name: Same path in use across the estate
+      description: >-
+        The identical path appears on many hosts throughout the baseline window, which is a
+        deployed tool with a sloppy name rather than a file crafted for one target.
+      source: baseline
+      field: ImageFileName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - trailing_space_in_executed_name
+
+    supporting:
+      any:
+        - document_extension_before_the_space
+        - executable_written_as_a_document
+        - launched_by_the_desktop_or_launchd
+        - runs_from_a_delivery_location
+        - hash_unseen_in_the_fleet
+      all:
+        - document_extension_before_the_space
+        - launched_by_the_desktop_or_launchd
+
+    contradicting:
+      any:
+        - name_arrived_from_a_foreign_filesystem
+        - opened_rather_than_executed
+        - known_good_across_the_estate
+      all: []
+
+  verdict:
+    low_risk_when:
+      - trailing_space_in_executed_name
+      - name_arrived_from_a_foreign_filesystem
+      - opened_rather_than_executed
+      - known_good_across_the_estate
+    suspicious_when:
+      - trailing_space_in_executed_name
+      - hash_unseen_in_the_fleet
+    high_risk_when:
+      - trailing_space_in_executed_name
+      - document_extension_before_the_space
+      - executable_written_as_a_document
+      - launched_by_the_desktop_or_launchd
+      - runs_from_a_delivery_location
+
+  false_positive:
+    - condition: A file copied from a Windows or Linux share keeps a trailing space.
+      explanation: >-
+        Other filesystems permit trailing spaces and sync clients preserve them, so such
+        names do reach Macs. The separating fact is execution: these files are opened, read
+        or copied, and a document with a trailing space that is genuinely a document will
+        never appear as a process image.
+    - condition: Archive extraction reproduces an odd name recorded in the archive.
+      explanation: >-
+        Extractors write whatever name the archive stored, including whitespace, so the drop
+        case can fire without any intent behind it. Whether the extracted file is a Mach-O
+        is what matters, and a real document extracted under a padded name does not satisfy
+        the executable-written evidence.
+    - condition: A script quotes a path with stray whitespace when reading a file.
+      explanation: >-
+        Command lines that carry a padded name as an argument look similar to the execution
+        case. The contradicting evidence covers this directly: if the padded name is an
+        argument to a reader rather than the process image, no handler was subverted.
+    - condition: A data export or scanning workflow generates loosely formatted names.
+      explanation: >-
+        Automated pipelines produce names with unusual spacing and land them in shared
+        directories. They appear on many hosts and produce documents rather than
+        executables, so both the fleet-wide contradiction and the absence of a Mach-O write
+        apply.

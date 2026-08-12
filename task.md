@@ -16,24 +16,28 @@ A **target** is a leaf: a sub-technique, or a technique with no sub-techniques o
 
 | Tactic | Covered | In scope | Remaining | Out of scope |
 |---|---:|---:|---:|---:|
-| Execution | 21 (47%) | 45 | 24 | 12 |
-| Persistence | 32 (38%) | 85 | 53 | 14 |
-| Privilege Escalation | 23 (29%) | 78 | 55 | 7 |
-| Stealth | 49 (39%) | 127 | 78 | 5 |
-| Defense Impairment | 10 (33%) | 30 | 20 | 16 |
-| Credential Access | 16 (32%) | 50 | 34 | 8 |
-| Lateral Movement | 10 (62%) | 16 | 6 | 4 |
-| **unique total** | **123** | **315** | **192** | |
+| Execution | 31 (69%) | 45 | 14 | 12 |
+| Persistence | 53 (62%) | 85 | 32 | 14 |
+| Privilege Escalation | 42 (54%) | 78 | 36 | 7 |
+| Stealth | 76 (60%) | 127 | 51 | 5 |
+| Defense Impairment | 23 (77%) | 30 | 7 | 16 |
+| Credential Access | 32 (64%) | 50 | 18 | 8 |
+| Lateral Movement | 13 (81%) | 16 | 3 | 4 |
+| **unique total** | **207** | **315** | **108** | |
+
+Of the 108 remaining, **8 are recorded as deliberately skipped** in `skipped.yaml` — targets whose only observable is telemetry this deployment cannot collect, where any template would look like coverage and detect nothing. They are gaps, but acknowledged ones: T1129, T1218.003, T1218.008, T1218.009, T1480.002, T1497.002, T1497.003, T1622.
 
 ## Priority 2
 
 | Tactic | Covered | In scope | Remaining | Out of scope |
 |---|---:|---:|---:|---:|
 | Discovery | 2 (6%) | 36 | 34 | 7 |
-| Collection | 2 (8%) | 26 | 24 | 8 |
-| Command And Control | 0 (0%) | 36 | 36 | 0 |
+| Collection | 6 (23%) | 26 | 20 | 8 |
+| Command And Control | 2 (6%) | 36 | 34 | 0 |
 | Exfiltration | 0 (0%) | 12 | 12 | 2 |
-| **unique total** | **4** | **110** | **106** | |
+| **unique total** | **10** | **110** | **100** | |
+
+Of the 100 remaining, **3 are recorded as deliberately skipped** in `skipped.yaml` — targets whose only observable is telemetry this deployment cannot collect, where any template would look like coverage and detect nothing. They are gaps, but acknowledged ones: T1497.002, T1497.003, T1622.
 
 ## Blocked on telemetry
 

@@ -1,0 +1,335 @@
+type: detection
+
+id: hg-lin-shell-spawned-by-a-network-facing-service-t1059-004
+version: 1.0.0
+
+info:
+  name: Unix shell spawned by a network-facing service or wired to a socket
+  description: >-
+    Shell execution is the normal state of a Linux host, so counting bash is not a hunt.
+    What is abnormal is a shell appearing where the process tree says there should not be
+    one. A web server, application server or database engine handles requests inside its own
+    worker; it has no reason to fork /bin/sh. A shell whose command line redirects a file
+    descriptor to /dev/tcp, or that is fed by a named pipe, is not running a task at all but
+    holding open an interactive channel. And an interpreter reading its script from the
+    output of curl or wget has executed code that was never written to disk. Each of these
+    is a context, not an interpreter name, which is what keeps the volume survivable on a
+    platform where the interpreter itself is ubiquitous.
+  severity: critical
+  author: huntgraph
+  tags:
+    - execution
+    - unix-shell
+    - reverse-shell
+    - process-lineage
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1059/004
+    - https://attack.mitre.org/detectionstrategies/DET0384
+    - https://attack.mitre.org/techniques/T1059
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1059
+  sub_techniques:
+    - T1059.004
+  detection_strategies:
+    - DET0384
+  analytics:
+    - AN1081
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+    - linux:osquery
+  data_components:
+    - Process Creation
+    - Network Traffic Flow
+
+hypothesis:
+  statement: >-
+    An adversary may obtain a Unix shell in a context that has no reason to hold one — as a
+    child of a network service, wired to a socket, or fed by a download — obtaining
+    interactive command execution on a host where shell activity by itself is invisible.
+  attacker_behavior:
+    - Executes commands through a compromised web, application or database service worker.
+    - Redirects shell input and output to a TCP socket through /dev/tcp or netcat.
+    - Rebuilds an interactive channel from a named pipe when direct redirection is blocked.
+    - Pipes the output of a download straight into an interpreter so no script is written.
+  legitimate_behavior:
+    - Users and administrators run shells constantly on every Linux host.
+    - Configuration management and orchestration agents execute shell tasks at scale.
+    - Some applications legitimately shell out for media conversion or archiving.
+    - Installation documentation for many tools instructs operators to pipe a script to a shell.
+  risk_indicator:
+    - The parent is a service that handles untrusted network input.
+    - The command line contains a socket redirection or a pipe-to-shell construct.
+    - The shell runs as the service account rather than a human or an automation account.
+    - The shell process itself connects outbound to a routable address.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: shell-child-of-network-service
+        name: Shell forked by a web, application or database service
+        purpose: >-
+          Capture the lineage relationship that request-handling code does not produce.
+          This holds whatever the shell is later used for and does not depend on reading
+          the command line at all.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(nginx|httpd|apache2|php-fpm\d*|tomcat\d*|java|node|gunicorn|uwsgi|postgres|mysqld|mariadbd|redis-server|memcached|smbd|vsftpd)$/i
+          | FileName=/^(sh|bash|dash|ash|zsh|ksh|busybox)$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=10)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Application hosts whose software is documented to shell out for media or document processing"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - parent_process
+            - process
+            - organization
+
+      - id: shell-wired-to-a-socket
+        name: Shell with input or output redirected to a socket
+        purpose: >-
+          Isolate the construct that turns a shell into a channel rather than a task: a file
+          descriptor bound to /dev/tcp, a netcat invocation carrying an executable, or a
+          named pipe rebuilt into a two-way session.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\/dev\/(tcp|udp)\/|>&\s*\/dev\/|0<&\d|nc\s+(-\w*e|--exec)|mkfifo|socat\s+.*(exec|system):|telnet\s+.*\|\s*(sh|bash))/i
+          | CommandLine=/(sh|bash|dash|ash|zsh|busybox)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, ImageFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=10)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Health-check and port-probe scripts owned by the monitoring platform"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: download-piped-into-interpreter
+        name: Interpreter reading a script from a download
+        purpose: >-
+          Find code that executed without ever being written to disk, so there is no file
+          to hash, quarantine or retrospectively examine.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(curl|wget|fetch)\s+[^|]*\|\s*(sudo\s+)?(sh|bash|dash|zsh|python\d*|perl)\b/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=10)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Build and container images whose provisioning steps install tooling this way"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: shell-connecting-outbound
+        name: Shell process opening an outbound connection
+        purpose: >-
+          Confirm the channel was actually established, which separates a shell that merely
+          referenced a socket from one that reached a listener.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | FileName=/^(sh|bash|dash|ash|zsh|ksh|busybox|nc|ncat|socat)$/i
+                | shell_pid := TargetProcessId ;
+              #event_simpleName=NetworkConnectIP4
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/ ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([CommandLine, ParentBaseFileName, RemoteAddressIP4, RemotePort]),
+                              count(as=events)])
+          | shell_pid = ContextProcessId
+        filters:
+          include: []
+          exclude:
+            - "RemoteAddressIP4 of approved package mirrors and repository endpoints"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: shell_in_wrong_context
+      name: Shell running in a context that should not hold one
+      description: >-
+        A Unix shell was forked by a network-facing service worker, or its command line
+        binds a file descriptor to a socket or reads its script from a download, rather
+        than running a task from an interactive session or an automation agent.
+      source: process_creation
+      field: CommandLine
+      indicates: unexpected_interactive_shell
+
+  supporting:
+    - id: service_worker_parent
+      name: Network service as the parent process
+      description: >-
+        The shell's parent is a web, application or database worker that handles untrusted
+        network input, which is the lineage a server-side compromise produces.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: service_compromise_lineage
+    - id: service_account_context
+      name: Shell running as a service account
+      description: >-
+        The shell runs under the account the service uses rather than a human or automation
+        account, so no operator session accounts for it.
+      source: process_creation
+      field: UserName
+      indicates: unexpected_account_activity
+    - id: external_channel_established
+      name: Outbound connection from the shell
+      description: >-
+        The shell or its socket helper connected to a routable external address outside the
+        approved mirrors, showing the channel reached a listener.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: command_and_control_channel
+    - id: new_for_service_host
+      name: Lineage new for this server
+      description: >-
+        This parent-child relationship has not been seen on the host across the baseline
+        window, despite the service running the same workload throughout.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: documented_shellout
+      name: Application documented to invoke a shell
+      description: >-
+        The application on this host is recorded as calling out to a shell for media
+        conversion, archiving or report generation as part of request handling.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_application_component
+    - id: provisioning_window
+      name: Provisioning or deployment activity
+      description: >-
+        The execution falls inside an approved build, image or configuration run, where
+        piping an installer to a shell is the documented procedure.
+      source: change_management
+      field: ComputerName
+      indicates: approved_change_activity
+    - id: stable_recurring_command
+      name: Stable command repeating at volume
+      description: >-
+        The same command shape runs continuously at a fixed cadence across a fleet, which
+        is an orchestration task rather than an operator at a keyboard.
+      source: baseline
+      field: CommandLine
+      indicates: scheduled_automation_job
+
+  risk_logic:
+    required:
+      - shell_in_wrong_context
+
+    supporting:
+      any:
+        - service_worker_parent
+        - service_account_context
+        - external_channel_established
+        - new_for_service_host
+      all:
+        - service_worker_parent
+        - external_channel_established
+
+    contradicting:
+      any:
+        - documented_shellout
+        - provisioning_window
+        - stable_recurring_command
+      all: []
+
+  verdict:
+    low_risk_when:
+      - shell_in_wrong_context
+      - documented_shellout
+      - provisioning_window
+      - stable_recurring_command
+    suspicious_when:
+      - shell_in_wrong_context
+      - new_for_service_host
+    high_risk_when:
+      - shell_in_wrong_context
+      - service_worker_parent
+      - service_account_context
+      - external_channel_established
+
+  false_positive:
+    - condition: An application shells out for image or document processing.
+      explanation: >-
+        Some web applications invoke a shell per request to call a conversion utility. The
+        command shape is fixed, the volume is high and constant, and the child is a specific
+        tool rather than an interactive shell reading from a socket.
+    - condition: A provisioning step pipes an installer script into a shell.
+      explanation: >-
+        Vendor documentation for many tools instructs operators to run curl piped to bash.
+        These cluster in build and image windows, resolve to known vendor hosts, and appear
+        under a provisioning agent rather than a service worker.
+    - condition: A monitoring probe opens a socket from a shell script.
+      explanation: >-
+        Health checks written in shell sometimes test connectivity with /dev/tcp or netcat.
+        The destinations are internal, the interval is regular, and the script path belongs
+        to the monitoring platform.
+    - condition: An administrator debugs a service by running a shell as its account.
+      explanation: >-
+        Troubleshooting under the service account happens, and it can produce the same
+        account context. The parent is a login session rather than the service worker, and
+        an authenticated session precedes it.

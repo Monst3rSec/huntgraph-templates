@@ -1,0 +1,335 @@
+type: detection
+
+id: hg-win-database-service-spawning-a-command-shell-t1505-001
+version: 1.0.0
+
+info:
+  name: Database engine service spawning a command shell or utility
+  description: >-
+    A malicious stored procedure is persistence that lives inside the database rather than
+    on the host. It survives a rebuild of the operating system, it is restored along with
+    the data, and it sits somewhere no endpoint tool looks — procedures marked to run at
+    engine startup will re-execute every time the service comes up. Be plain about the
+    limit here: the stored procedure itself is not visible to an endpoint sensor. There is
+    no telemetry in this template that shows a procedure being created, altered, or a CLR
+    assembly being registered; that requires database auditing, and this hunt does not
+    pretend otherwise. What an endpoint sensor does see is the moment the procedure reaches
+    outside the database — xp_cmdshell forking a shell under the engine process, or a CLR
+    assembly launching a child directly. A database engine has no legitimate reason to
+    create a command interpreter, so that lineage is the whole observable.
+  severity: critical
+  author: huntgraph
+  tags:
+    - persistence
+    - sql-server
+    - stored-procedure
+    - process-lineage
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1505/001
+    - https://attack.mitre.org/detectionstrategies/DET0181
+    - https://attack.mitre.org/techniques/T1505
+
+mitre:
+  tactics:
+    - TA0003
+  techniques:
+    - T1505
+  sub_techniques:
+    - T1505.001
+  detection_strategies:
+    - DET0181
+  analytics:
+    - AN0511
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may store a procedure inside a database that executes operating-system
+    commands when invoked or at engine startup, obtaining persistence that survives host
+    rebuilds and is invisible to endpoint tooling except at the moment the database service
+    creates a child process.
+  attacker_behavior:
+    - Enables and calls the command-shell extended procedure to run commands as the engine.
+    - Registers a CLR assembly whose procedure launches processes directly from the engine.
+    - Marks a procedure to execute automatically when the database engine starts.
+    - Uses the database service account, which is often over-privileged on the server.
+  legitimate_behavior:
+    - Database administrators occasionally enable the command shell for maintenance work.
+    - Agent jobs run operating-system and PowerShell steps by design.
+    - Backup, index and integrity tooling shells out to move files.
+    - Monitoring extensions run scripted collectors from the engine or its agent.
+  risk_indicator:
+    - The child is a general-purpose interpreter rather than a named maintenance utility.
+    - The command performs reconnaissance, credential access or file transfer.
+    - The command establishes persistence such as a task, service or run key.
+    - The engine has not produced a child process at all across the baseline window.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: engine-spawns-interpreter
+        name: Database engine process creating a command interpreter
+        purpose: >-
+          Capture the defining lineage. This is what xp_cmdshell looks like from the
+          outside, and it holds regardless of what the stored procedure is named, how it was
+          created, or whether the SQL text was ever logged.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(sqlservr|sqlagent|sqlps|mysqld|postgres)\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh|wscript|cscript|mshta|rundll32)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=10)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Servers where agent jobs are documented to run operating-system or PowerShell steps"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - parent_process
+            - process
+            - organization
+
+      - id: engine-spawns-utility-directly
+        name: Database engine launching a utility with no shell in between
+        purpose: >-
+          Cover the CLR assembly route, where managed code inside the engine creates a
+          process directly and no command interpreter ever appears in the tree.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(sqlservr|sqlagent|mysqld|postgres)\.exe$/i
+          | FileName!=/^(cmd|powershell|pwsh|conhost|csc|cvtres|werfault|dw20|sqlceip|sqldumper)\.exe$/i
+          | FileName=/^(certutil|bitsadmin|curl|msiexec|regsvr32|net|net1|nltest|whoami|ping|nslookup|7z|winrar|rar)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=10)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Backup and archive utilities invoked by the documented maintenance plan"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - parent_process
+            - process
+
+      - id: reconnaissance-from-the-engine
+        name: Reconnaissance commands issued under the database service
+        purpose: >-
+          Isolate the subset where the command enumerates accounts, groups, domain trust or
+          network configuration, which is what an operator does through a new foothold and
+          is never part of a maintenance plan.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(sqlservr|sqlagent|sqlps|cmd|powershell)\.exe$/i
+          | CommandLine=/(whoami\s*\/|net\s+(user|group|localgroup|view)|nltest\s*\/|systeminfo|ipconfig\s*\/all|query\s+user|tasklist|wmic\s+\w+\s+get)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=10)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Inventory collectors that gather host facts on a fixed schedule"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: persistence-established-from-the-engine
+        name: Persistence commands issued under the database service
+        purpose: >-
+          Find the case where the database foothold is used to plant a second one on the
+          host, which is the point at which database persistence becomes host persistence.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(sqlservr|sqlagent|sqlps|cmd|powershell)\.exe$/i
+          | CommandLine=/(schtasks\s+\/create|sc(\.exe)?\s+create|reg\s+add\s+.*\\(Run|RunOnce|Winlogon)|net\s+user\s+\w+\s+.*\/add|net\s+localgroup\s+\w+\s+.*\/add|New-Service|Register-ScheduledTask)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=10)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Approved installation and patching runs for database tooling"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+evidence:
+  required:
+    - id: engine_child_process
+      name: Child process created by the database engine
+      description: >-
+        A database engine or agent process created a command interpreter or a system
+        utility, which is the only point at which code stored inside the database becomes
+        visible to an endpoint sensor.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: database_command_execution
+
+  supporting:
+    - id: general_purpose_interpreter
+      name: Child is a general-purpose interpreter
+      description: >-
+        The spawned process is a command shell or scripting host rather than a named
+        maintenance utility, so the database is being used as a command channel.
+      source: process_creation
+      field: FileName
+      indicates: remote_execution_channel
+    - id: reconnaissance_commands
+      name: Reconnaissance commands executed
+      description: >-
+        The commands enumerate accounts, groups, domain trust or host configuration, which
+        is operator activity rather than any scheduled database task.
+      source: process_creation
+      field: CommandLine
+      indicates: hands_on_keyboard_activity
+    - id: host_persistence_created
+      name: Host persistence established from the engine
+      description: >-
+        A scheduled task, service, run key or local account was created through the database
+        service, extending database-resident persistence onto the host itself.
+      source: process_creation
+      field: CommandLine
+      indicates: secondary_persistence_established
+    - id: privileged_service_account
+      name: Over-privileged database service account
+      description: >-
+        The commands run under an account with local administrator or domain rights, so
+        anything executed through the engine inherits that privilege.
+      source: identity_context
+      field: UserName
+      indicates: excessive_service_privilege
+    - id: first_child_for_engine
+      name: First child process for this engine
+      description: >-
+        The database engine has not created a child process on this host across the baseline
+        window, so this is not part of how the instance normally operates.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: documented_agent_job
+      name: Documented agent job step
+      description: >-
+        The server is recorded as running agent jobs with operating-system or PowerShell
+        steps, which legitimately create child processes under the database service.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: maintenance_window
+      name: Approved maintenance or patching activity
+      description: >-
+        The execution falls inside a recorded maintenance, backup or patching window for
+        this database instance.
+      source: change_management
+      field: ComputerName
+      indicates: approved_change_activity
+    - id: recurring_maintenance_command
+      name: Recurring maintenance command shape
+      description: >-
+        The same command runs on a fixed cadence with stable arguments, matching a backup,
+        integrity or index task rather than interactive use.
+      source: baseline
+      field: CommandLine
+      indicates: scheduled_automation_job
+
+  risk_logic:
+    required:
+      - engine_child_process
+
+    supporting:
+      any:
+        - general_purpose_interpreter
+        - reconnaissance_commands
+        - host_persistence_created
+        - privileged_service_account
+        - first_child_for_engine
+      all:
+        - general_purpose_interpreter
+        - reconnaissance_commands
+
+    contradicting:
+      any:
+        - documented_agent_job
+        - maintenance_window
+        - recurring_maintenance_command
+      all: []
+
+  verdict:
+    low_risk_when:
+      - engine_child_process
+      - documented_agent_job
+      - maintenance_window
+      - recurring_maintenance_command
+    suspicious_when:
+      - engine_child_process
+      - first_child_for_engine
+    high_risk_when:
+      - engine_child_process
+      - general_purpose_interpreter
+      - reconnaissance_commands
+      - host_persistence_created
+      - privileged_service_account
+
+  false_positive:
+    - condition: An agent job runs an operating-system or PowerShell step.
+      explanation: >-
+        Agent jobs create child processes under the database service by design, reproducing
+        the required evidence exactly. They recur on a schedule with a stable command shape
+        and are enumerable from the instance's job definitions.
+    - condition: A backup or maintenance tool shells out to move files.
+      explanation: >-
+        Backup and index tooling calls archive and copy utilities from the engine. The child
+        is a named utility, the arguments reference backup paths, and the timing follows the
+        maintenance plan.
+    - condition: A database administrator enables the command shell for a one-off task.
+      explanation: >-
+        Administrators do occasionally use xp_cmdshell during migrations or troubleshooting.
+        The activity is short, tied to a named individual's session, and normally has a
+        change record; the reconnaissance and persistence evidence stays absent.
+    - condition: A monitoring extension runs a scripted collector.
+      explanation: >-
+        Some monitoring products execute collectors through the database service, including
+        commands that read host configuration. These repeat at a fixed interval on every
+        monitored instance rather than appearing once on one server.

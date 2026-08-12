@@ -1,0 +1,338 @@
+type: detection
+
+id: hg-win-lua-interpreter-running-outside-its-host-application-t1059-011
+version: 1.0.0
+
+info:
+  name: Lua interpreter running outside the application that embeds it
+  description: >-
+    Lua exists on Windows endpoints almost entirely as an embedded engine: games, peripheral
+    software, packet analysers, and the management tooling for network and security
+    appliances all ship a Lua runtime because it is small and easy to link. That is exactly
+    what makes it useful to an adversary. Nobody writes Lua detections, script controls do
+    not understand .lua, and an interpreter dropped alongside a payload looks like part of
+    some product. The observable is not Lua execution but Lua execution detached from a host
+    application — an interpreter running from a user-writable directory, a script or
+    precompiled bytecode file in a delivery path, or a Lua process with a parent and a child
+    that no embedded engine would ever have.
+  severity: high
+  author: huntgraph
+  tags:
+    - execution
+    - lua
+    - embedded-interpreter
+    - bring-your-own-interpreter
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1059/011
+    - https://attack.mitre.org/detectionstrategies/DET0101
+    - https://attack.mitre.org/techniques/T1059
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1059
+  sub_techniques:
+    - T1059.011
+  detection_strategies:
+    - DET0101
+  analytics:
+    - AN0278
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary may bring or repurpose a Lua interpreter to execute payload logic on
+    Windows, obtaining a scripting capability that endpoint script controls do not inspect
+    and that analysts have no baseline for, because Lua normally only appears embedded
+    inside an application.
+  attacker_behavior:
+    - Drops a standalone Lua interpreter into a user-writable directory and runs it there.
+    - Executes a .lua script staged in a download, archive or temporary directory.
+    - Ships precompiled Lua bytecode so the logic cannot be read from the file.
+    - Uses the Lua process to launch a shell, downloader or persistence mechanism.
+  legitimate_behavior:
+    - Games and peripheral software run Lua add-ons continuously.
+    - Packet analysers and network tooling load Lua dissectors and scripts.
+    - Some security and appliance management products script tasks in Lua.
+    - Developers building on Lua run the interpreter from a project directory.
+  risk_indicator:
+    - The interpreter image sits outside any installed product directory.
+    - The script argument resolves to a delivery or temporary path.
+    - The file executed is compiled bytecode rather than readable source.
+    - The Lua process spawns a shell, downloader or persistence tool.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+        - PeFileWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: interpreter-outside-product-tree
+        name: Lua interpreter executing from a user-writable directory
+        purpose: >-
+          Find the interpreter itself in the wrong place. An embedded Lua runtime lives
+          inside the product that ships it, so a copy running from a profile or temporary
+          directory was brought to the host rather than installed on it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(lua|luac|luajit|wlua)[\d._]*\.exe$/i
+          | ImageFileName=/\\(Users|ProgramData|Windows\\Temp|PerfLogs|Intel|Recovery)\\/i
+          | ImageFileName!=/\\Program\s?Files/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Per-user game and peripheral software installations under the profile directory"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - path
+            - organization
+
+      - id: script-or-bytecode-from-delivery-path
+        name: Lua script or bytecode executed from a delivery directory
+        purpose: >-
+          Separate add-on scripts that live beside their application from Lua that arrived
+          on the host, and flag compiled bytecode, which carries no readable logic for
+          anyone reviewing the file.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(lua|luac|luajit|wlua)[\d._]*\.exe$/i
+          | CommandLine=/(?<script_path>[A-Za-z]:\\[^",]+\.(lua|luac|out))(\s|"|$)/i
+          | script_path=/\\(Downloads|AppData\\Local\\Temp|AppData\\Roaming|Users\\Public|Windows\\Temp|ProgramData)\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, script_path],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Add-on directories belonging to installed games and peripheral utilities"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - path
+
+      - id: lua-artefacts-written-to-disk
+        name: Lua interpreter or script written into a delivery directory
+        purpose: >-
+          Catch the staging step, which is where an interpreter that arrived with a payload
+          becomes visible before it is ever run.
+        query: |
+          #event_simpleName=/^(NewScriptWritten|PeFileWritten)$/
+          | TargetFileName=/(\.(lua|luac)$|\\(lua|luac|luajit|wlua)[\d._]*\.(exe|dll)$)/i
+          | TargetFileName=/\\(Downloads|AppData|Users\\Public|Windows\\Temp|ProgramData)\\/i
+          | groupBy([ComputerName, TargetFileName, ContextProcessId],
+                    function=[count(as=writes)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of approved game launchers and software updaters"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+
+      - id: lua-spawning-follow-on
+        name: Lua process spawning a shell, downloader or persistence tool
+        purpose: >-
+          Confirm the interpreter was used to reach the operating system rather than to run
+          application logic, which is what an embedded engine is normally confined to.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(lua|luac|luajit|wlua)[\d._]*\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin|curl|schtasks|reg|net|net1)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: detached_lua_execution
+      name: Lua interpreter running detached from a host application
+      description: >-
+        A Lua interpreter executed from a user-writable directory, or ran a script or
+        bytecode file from a delivery path, rather than running add-on code from inside the
+        product tree of an application that embeds Lua.
+      source: process_creation
+      field: ImageFileName
+      indicates: bring_your_own_interpreter
+
+  supporting:
+    - id: compiled_bytecode
+      name: Precompiled Lua bytecode executed
+      description: >-
+        The file executed is compiled Lua rather than source, so the logic cannot be read
+        from the artefact by anyone reviewing what ran.
+      source: process_creation
+      field: CommandLine
+      indicates: obscured_payload_content
+    - id: interpreter_recently_staged
+      name: Interpreter or script written shortly before use
+      description: >-
+        The Lua binary or script was created in a delivery directory on this host, showing
+        it was brought here rather than installed with a product.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: os_reach_from_lua
+      name: Shell, downloader or persistence tool spawned by Lua
+      description: >-
+        The Lua process created a command interpreter, transfer utility or scheduling tool,
+        which an embedded scripting engine has no reason to do.
+      source: process_creation
+      field: FileName
+      indicates: execution_chain_progression
+    - id: no_lua_product_installed
+      name: No Lua-embedding product on the host
+      description: >-
+        The host is not recorded as running a game, packet analyser or appliance utility
+        that embeds Lua, so there is no application for this interpreter to belong to.
+      source: asset_inventory
+      field: ComputerName
+      indicates: unexpected_software_presence
+    - id: rare_across_estate
+      name: Interpreter path rare across the estate
+      description: >-
+        This interpreter path appears on very few hosts across the baseline window, unlike
+        the fleet-wide footprint an installed product produces.
+      source: baseline
+      field: ImageFileName
+      indicates: rare_binary_path
+
+  contradicting:
+    - id: product_tree_execution
+      name: Interpreter inside an installed product directory
+      description: >-
+        The interpreter and its script both resolve inside the installation tree of a
+        product that embeds Lua, and that product is the parent process.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: game_or_addon_activity
+      name: Game or peripheral add-on activity
+      description: >-
+        The host runs a game client or peripheral utility whose add-ons are Lua, which
+        produces continuous script execution under the user's profile.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_application_behaviour
+    - id: launcher_written_content
+      name: Content written by an approved updater
+      description: >-
+        The Lua files were written by a recognised game launcher or software updater as
+        part of a normal content refresh.
+      source: file_creation
+      field: ContextProcessId
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - detached_lua_execution
+
+    supporting:
+      any:
+        - compiled_bytecode
+        - interpreter_recently_staged
+        - os_reach_from_lua
+        - no_lua_product_installed
+        - rare_across_estate
+      all:
+        - interpreter_recently_staged
+        - os_reach_from_lua
+
+    contradicting:
+      any:
+        - product_tree_execution
+        - game_or_addon_activity
+        - launcher_written_content
+      all: []
+
+  verdict:
+    low_risk_when:
+      - detached_lua_execution
+      - product_tree_execution
+      - game_or_addon_activity
+      - launcher_written_content
+    suspicious_when:
+      - detached_lua_execution
+      - rare_across_estate
+    high_risk_when:
+      - detached_lua_execution
+      - interpreter_recently_staged
+      - compiled_bytecode
+      - os_reach_from_lua
+
+  false_positive:
+    - condition: A game or peripheral utility runs Lua add-ons from the user profile.
+      explanation: >-
+        Add-on directories sit under the profile or ProgramData, which matches the required
+        path evidence. The parent is the game client or its launcher, the volume is high and
+        continuous, and the files are refreshed by the updater.
+    - condition: A packet analyser loads Lua dissectors.
+      explanation: >-
+        Network analysis tools script in Lua and may read scripts from a user directory. The
+        interpreter is inside the product's installation tree and the analysis application
+        is the parent.
+    - condition: A developer runs Lua from a project directory.
+      explanation: >-
+        A project checkout under the profile directory will look user-writable. These are
+        recurring for a named engineer on a development asset and do not spawn shells or
+        transfer utilities.
+    - condition: Appliance management software scripts a task in Lua.
+      explanation: >-
+        Some network and security vendors ship Lua tooling that runs from ProgramData. The
+        parent is the vendor service, the command shape is stable, and the same pattern
+        appears on every host running that product.

@@ -1,0 +1,327 @@
+type: detection
+
+id: hg-lin-payload-embedded-in-an-extended-attribute-t1564-014
+
+version: 1.0.0
+
+info:
+  name: Payload embedded in a file extended attribute
+  description: >-
+    Extended attributes are arbitrary key-value pairs bolted onto any file, and on Linux
+    they are the general-purpose version of that idea — any name under the user namespace,
+    any value, on any file the caller can write. Nothing in the ordinary toolchain shows
+    them. ls does not list them, cat does not print them, du does not count them, and the
+    file's size and content hash are unchanged by writing one. That last property is the
+    real prize: an adversary can put a second stage inside the user namespace of a
+    perfectly normal system file, and every integrity check that hashes file contents will
+    keep reporting the file as clean forever. Retrieval is a one-liner, getfattr
+    --only-values piped through a decoder into a shell, so the loader never needs a payload
+    file on disk at all. The observable is the setfattr and getfattr commands themselves,
+    or the equivalent syscalls made from an interpreter. The benign twin is real and
+    common: SELinux relabelling, ACL tooling, backup agents preserving attributes and
+    capability bits all touch xattrs routinely — but they work in the security, system and
+    trusted namespaces with small structured values, not the user namespace with a
+    kilobyte of base64.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - hide-artifacts
+    - extended-attributes
+    - anti-forensics
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1564/014
+    - https://attack.mitre.org/detectionstrategies/DET0406
+    - https://attack.mitre.org/techniques/T1564
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1564
+  sub_techniques:
+    - T1564.014
+  detection_strategies:
+    - DET0406
+  analytics:
+    - AN1135
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:EXECVE
+  data_components:
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    An adversary may write a second-stage payload into the extended attributes of a
+    legitimate file so that the file's size, contents and hash stay unchanged, then read
+    the attribute back at run time and execute its decoded contents without ever writing a
+    payload file to disk.
+  attacker_behavior:
+    - Writes an encoded payload into a user-namespace attribute with setfattr.
+    - Chooses a host file under a system path so integrity checks keep passing.
+    - Reads the attribute back with getfattr and pipes the value into a decoder and a shell.
+    - Performs the same writes and reads through interpreter syscalls to avoid the utilities.
+  legitimate_behavior:
+    - SELinux relabelling writes security-namespace attributes across whole trees.
+    - Backup and archive tools read and restore attributes so a restore is faithful.
+    - Capability and ACL tooling sets structured attributes on system binaries.
+    - Application frameworks tag files with small user-namespace metadata values.
+  risk_indicator:
+    - The value written is long and encoded rather than a short structured tag.
+    - The attribute is set on a file under a system path that integrity monitoring watches.
+    - The attribute is read back and its value flows into a decoder or interpreter.
+    - The write comes from an interactive shell rather than a packaging or policy tool.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: payload-written-into-a-user-namespace-attribute
+        name: Value written into a user-namespace attribute
+        purpose: >-
+          Catch the store being filled. A write into the user namespace with an explicit
+          value is the technique's first step, and the namespace choice separates it from
+          the security and system namespaces that policy tooling uses.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\bsetfattr\b/
+          | CommandLine=/-n\s+(user|trusted)\./i
+          | CommandLine=/(-v|--value)\b/
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Application frameworks that tag their own data files with small metadata values"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: attribute-read-back-and-decoded
+        name: Attribute value read back and decoded
+        purpose: >-
+          This is the loader. Reading an attribute raw and feeding the value straight into a
+          decoder or an interpreter is retrieval of hidden code, and it is the shape that
+          distinguishes a payload store from a metadata tag.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\bgetfattr\b/
+          | CommandLine=/(--only-values|-e\s+(base64|text)|--encoding)/i
+          | CommandLine=/\b(base64|openssl|xxd|gunzip|zcat|bash|sh|dash|python[0-9.]*|perl|ruby|eval)\b/
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: attribute-set-on-a-system-owned-file
+        name: Attribute set on a file under a system path
+        purpose: >-
+          Isolate the choice of host file, which is what defeats integrity monitoring. A
+          payload parked on a binary under /usr or a config under /etc keeps that file's
+          hash intact while giving the loader a stable, always-present address.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(setfattr|attr)\b/
+          | CommandLine=/\s\/(usr|bin|sbin|lib|lib64|etc|opt|boot)\//
+          | CommandLine!=/-n\s+(security|system)\./i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Package managers and configuration management restoring attributes after an update"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: xattr-syscalls-made-from-an-interpreter
+        name: Attribute syscalls made from an interpreter
+        purpose: >-
+          Cover the route that never runs setfattr at all. The syscalls are available from
+          every scripting runtime, so a loader that calls them directly leaves no attr
+          utility in the process tree and only the interpreter one-liner betrays it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(python[0-9.]*|perl|ruby|node|php)\b/
+          | CommandLine=/\b(setxattr|getxattr|listxattr|removexattr|os\.setxattr|os\.getxattr|File::ExtAttr|xattr\.set)\b/
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+evidence:
+  required:
+    - id: attribute_written_with_a_value
+      name: Extended attribute written with an explicit value
+      description: >-
+        A process wrote a named extended attribute carrying a value onto a file, which stores
+        data outside anything a directory listing, a size check or a content hash will show.
+      source: process_creation
+      field: CommandLine
+      indicates: concealed_payload_storage
+
+  supporting:
+    - id: attribute_value_flows_to_an_interpreter
+      name: Attribute value read back into a decoder or shell
+      description: >-
+        The attribute was read raw and its value handed to a decoder or an interpreter,
+        which is how a hidden second stage is retrieved and run without a payload file.
+      source: process_creation
+      field: CommandLine
+      indicates: payload_extraction
+    - id: interpreter_level_xattr_call
+      name: Attribute manipulated through interpreter syscalls
+      description: >-
+        The attribute work was done from a scripting runtime rather than the attr utilities,
+        which avoids the tooling most monitoring watches for.
+      source: process_creation
+      field: ImageFileName
+      indicates: tooling_evasion
+    - id: interactive_shell_lineage
+      name: Written from an interactive or remote shell
+      description: >-
+        The acting process descends from a shell or remote session rather than from a
+        package manager, policy tool or configuration agent.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: no_xattr_history_on_host
+      name: No history of attribute writes on this host
+      description: >-
+        Extended attributes have not been written on this host outside its policy and backup
+        agents during the baseline window, so this write stands alone.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: policy_or_package_agent
+      name: Policy, packaging or configuration agent
+      description: >-
+        The acting binary is a package manager, configuration management client, backup
+        agent or SELinux tool, all of which set and restore attributes as routine work.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_enterprise_activity
+    - id: security_namespace_relabelling
+      name: Security or system namespace relabelling
+      description: >-
+        The attribute written lives in the security or system namespace and carries a short
+        structured label or capability set, which is policy work rather than data hiding.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_administrative_action
+    - id: identical_write_fleetwide
+      name: Same attribute written across the estate
+      description: >-
+        The identical attribute and value appear on many hosts inside one window, which is a
+        standard being applied rather than a payload being planted.
+      source: baseline
+      field: CommandLine
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - attribute_written_with_a_value
+
+    supporting:
+      any:
+        - attribute_value_flows_to_an_interpreter
+        - interpreter_level_xattr_call
+        - interactive_shell_lineage
+        - no_xattr_history_on_host
+      all:
+        - attribute_value_flows_to_an_interpreter
+        - interactive_shell_lineage
+
+    contradicting:
+      any:
+        - policy_or_package_agent
+        - security_namespace_relabelling
+        - identical_write_fleetwide
+      all: []
+
+  verdict:
+    low_risk_when:
+      - attribute_written_with_a_value
+      - policy_or_package_agent
+      - security_namespace_relabelling
+      - identical_write_fleetwide
+    suspicious_when:
+      - attribute_written_with_a_value
+      - no_xattr_history_on_host
+    high_risk_when:
+      - attribute_written_with_a_value
+      - attribute_value_flows_to_an_interpreter
+      - interpreter_level_xattr_call
+      - interactive_shell_lineage
+
+  false_positive:
+    - condition: SELinux relabelling writes attributes across a filesystem.
+      explanation: >-
+        Relabelling touches every file and writes security-namespace attributes, which
+        matches on the utility name. The namespace is security rather than user, the values
+        are short policy labels, and the operation covers whole trees at once from restorecon
+        or a policy agent.
+    - condition: A backup or archive agent restores attributes during a recovery.
+      explanation: >-
+        Faithful restores rewrite the attributes files originally carried, including
+        user-namespace ones set by applications. The acting process is the backup client, the
+        writes accompany a bulk file restore, and nothing reads the values back into a shell.
+    - condition: Capability or ACL tooling sets attributes on system binaries.
+      explanation: >-
+        Granting capabilities writes structured attributes onto binaries under system paths,
+        which is the same shape as parking a payload there. The values are small and
+        well-formed rather than encoded blobs, and the change is documented.
+    - condition: An application framework tags its own data files with metadata.
+      explanation: >-
+        Some frameworks store small user-namespace tags on files they manage. The writes come
+        from the application's own binary, target files inside its own data directory, and
+        the values are short identifiers rather than kilobytes of base64.

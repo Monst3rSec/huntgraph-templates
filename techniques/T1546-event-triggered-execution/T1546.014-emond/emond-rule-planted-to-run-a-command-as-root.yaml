@@ -1,0 +1,334 @@
+type: detection
+
+id: hg-mac-emond-rule-planted-to-run-a-command-as-root-t1546-014
+
+version: 1.0.0
+
+info:
+  name: Emond rule planted to run a command as root
+  description: >-
+    The Event Monitor Daemon is a launch daemon that reads plist rules from
+    /etc/emond.d/rules, matches them against system events such as startup or
+    authentication, and runs whatever action the rule names — as root, because the daemon
+    itself runs as root. Almost nobody knows it exists, which is exactly its value: a rule
+    dropped there is not a launch agent, not a launch daemon, not a login item and not a
+    cron job, so none of the usual persistence inventories list it, and Apple's own sample
+    rule file gives the directory a plausible reason to be non-empty. It has one further
+    quirk that turns into a detection opportunity — emond refuses to start unless a file
+    exists in its queue directory at /private/var/db/emondClients, so an operator who wants
+    the rule to fire has to create one, and that touch has no benign explanation at all.
+    Apple removed emond in macOS 13, so this hunt applies to the older builds still in most
+    estates and to any host where /sbin/emond is still present; on a Ventura or later host
+    the rule directory is gone and the queries will simply not fire.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - event-triggered-execution
+    - emond
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1546/014
+    - https://attack.mitre.org/detectionstrategies/DET0555
+    - https://attack.mitre.org/techniques/T1546
+
+mitre:
+  tactics:
+    - TA0004
+    - TA0003
+  techniques:
+    - T1546
+  sub_techniques:
+    - T1546.014
+  detection_strategies:
+    - DET0555
+  analytics:
+    - AN1534
+  platforms:
+    - macOS
+  data_sources:
+    - "macos:unifiedlog"
+  data_components:
+    - Command Execution
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may write an emond rule that runs a command on a system event so that the
+    root-privileged event daemon executes their payload at boot or at authentication,
+    obtaining persistence and an administrator-to-root escalation in a subsystem that no
+    standard macOS persistence review covers.
+  attacker_behavior:
+    - Writes a plist rule into /etc/emond.d/rules naming a RunCommand action.
+    - Creates a file under /private/var/db/emondClients so the daemon will actually start.
+    - Chooses a startup or authentication event type so the rule fires without user interaction.
+    - Names a shell, interpreter or downloader as the command the rule runs.
+    - Leaves the Apple sample rule in place so the directory still looks untouched.
+  legitimate_behavior:
+    - Security and audit tooling enumerates the emond directories while inventorying persistence.
+    - Hardening baselines disable or empty emond as part of a benchmark.
+    - Backup and imaging tools read the /etc tree wholesale, including emond.d.
+    - Apple's own sample rule file is present in the rules directory on every older macOS build.
+  risk_indicator:
+    - A plist is written into the rules directory rather than merely read from it.
+    - A file is created in the emondClients queue directory, which activates the daemon.
+    - The rule content contains a command action rather than only a name and event type.
+    - The emond process is the parent of a shell, interpreter or network tool.
+    - The write comes from an interpreter or piped shell rather than from an inventory tool.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: emond-rule-file-written
+        name: Plist written into the emond rules directory
+        purpose: >-
+          Surface the installation step and separate it from the far more common act of
+          reading the directory. Security tooling and hardening checks list
+          /etc/emond.d/rules constantly; a write into it with cp, tee, defaults, PlistBuddy
+          or a redirect is somebody adding a rule, which nothing in a normal macOS build
+          does after installation.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\/etc\/emond\.d(\/rules)?/i
+          | CommandLine=/(>>|>\s*\/|\btee\b|\bcp\b|\bmv\b|\bditto\b|\binstall\b|\bplutil\b|PlistBuddy|\bdefaults\s+write\b|\bsed\s+-i\b|\bprintf\b|\becho\b|\bcurl\b)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=writes), collect([CommandLine], limit=5)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Configuration-management runs that template or remove emond rules as a hardening step"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: emond-client-queue-primed
+        name: File created in the emond client queue directory
+        purpose: >-
+          Catch the activation step, which is the cleanest signal this technique has. emond
+          will not launch at all while /private/var/db/emondClients is empty, so a rule is
+          inert until somebody puts a file there. Nothing in a stock macOS build or in any
+          normal administrative workflow creates one.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\/private)?\/var\/db\/emondClients/i
+          | CommandLine=/(\btouch\b|>>|>\s*\/|\btee\b|\bcp\b|\bmv\b|\bditto\b|\bmkdir\b|\binstall\b)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=primes), collect([CommandLine], limit=5)])
+          | sort(primes, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: emond-rule-carrying-a-command-action
+        name: Rule content defining a RunCommand action
+        purpose: >-
+          Narrow to rules that can execute something. A rule is a name, an event type and an
+          action, and only the command action turns the daemon into an execution vehicle;
+          the notification and logging actions cannot carry a payload. Seeing the action key
+          alongside an emond path in the same command line is the rule being authored.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(RunCommand|allowPartialCriterionMatch|startupItem|eventTypes)/
+          | CommandLine=/(emond|\/etc\/emond\.d)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=rules), collect([CommandLine], limit=5)])
+          | sort(rules, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Audit tooling that prints rule contents while inventorying persistence"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: emond-spawning-a-child-process
+        name: emond executing a command
+        purpose: >-
+          Confirm the rule fired and show what it runs. Apple's shipped rule set contains no
+          command actions, so on an unmodified host emond starts, finds nothing to do and
+          spawns nothing. Any child of emond is a rule someone added, executing as root.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^emond$/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+evidence:
+  required:
+    - id: emond_rule_written
+      name: Rule plist written into the emond rules directory
+      description: >-
+        A plist was placed into /etc/emond.d/rules by a shell, an interpreter or a plist
+        utility, so the root-privileged event daemon now has an additional rule to evaluate
+        that no package delivered.
+      source: process_creation
+      field: CommandLine
+      indicates: event_triggered_persistence
+
+  supporting:
+    - id: client_queue_primed
+      name: emondClients queue directory populated
+      description: >-
+        A file was created under /private/var/db/emondClients, which is the condition emond
+        requires before it will start at all, so the rule was made live deliberately.
+      source: process_creation
+      field: FileName
+      indicates: persistence_made_operational
+    - id: rule_carries_command_action
+      name: Rule defines a command action
+      description: >-
+        The rule content includes a RunCommand action rather than only a name and event
+        type, which is what allows the daemon to execute something rather than log or notify.
+      source: process_creation
+      field: UserName
+      indicates: execution_capability_configured
+    - id: emond_spawned_process
+      name: emond started a child process
+      description: >-
+        The event daemon executed a program, which on a stock host it never does because the
+        shipped rule set contains no command actions. Whatever ran, ran as root.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: execution_chain_progression
+    - id: unusual_for_host
+      name: No history of emond changes on this host
+      description: >-
+        No comparable write to the emond directories has been seen on this host during the
+        baseline window, so the rule is an addition rather than part of the build.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: inventory_or_audit_read
+      name: Directory read by security or audit tooling
+      description: >-
+        The emond paths were touched by a persistence-inventory, benchmark or compliance
+        tool that enumerates them, which reads the rules rather than adding one.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_security_tooling
+    - id: hardening_baseline_change
+      name: Change made by a hardening baseline
+      description: >-
+        A configuration baseline emptied or disabled emond as a benchmark control, which
+        modifies the same paths in the opposite direction.
+      source: change_management
+      field: ComputerName
+      indicates: approved_change
+    - id: fleetwide_change
+      name: Same change across the estate
+      description: >-
+        The identical modification appears on many managed Macs within one window, which is
+        a baseline being applied rather than a targeted rule being planted.
+      source: baseline
+      field: CommandLine
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - emond_rule_written
+
+    supporting:
+      any:
+        - client_queue_primed
+        - rule_carries_command_action
+        - emond_spawned_process
+        - unusual_for_host
+      all:
+        - client_queue_primed
+        - emond_spawned_process
+
+    contradicting:
+      any:
+        - inventory_or_audit_read
+        - hardening_baseline_change
+        - fleetwide_change
+      all: []
+
+  verdict:
+    low_risk_when:
+      - emond_rule_written
+      - inventory_or_audit_read
+      - hardening_baseline_change
+      - fleetwide_change
+    suspicious_when:
+      - emond_rule_written
+      - unusual_for_host
+    high_risk_when:
+      - emond_rule_written
+      - client_queue_primed
+      - rule_carries_command_action
+      - emond_spawned_process
+
+  false_positive:
+    - condition: A persistence-inventory or benchmark tool enumerates the emond directories.
+      explanation: >-
+        Auditing products list and print /etc/emond.d/rules on every scan, and the paths
+        appear in their command lines. Those runs read rather than write, come from the
+        tool's own binary, and recur on a schedule across the estate.
+    - condition: A hardening baseline empties or disables emond.
+      explanation: >-
+        Several macOS benchmarks call for removing emond rules or unloading the daemon,
+        which writes to the same paths. The direction of the change is removal, it arrives
+        through the configuration-management agent, and it lands on every managed host in
+        one window.
+    - condition: The Apple sample rule file is present in the rules directory.
+      explanation: >-
+        Older macOS builds ship a sample rules plist, so a non-empty directory is not by
+        itself a finding. It is delivered by the OS install rather than written later, and it
+        defines no command action.
+    - condition: Backup or imaging tooling walks the /etc tree.
+      explanation: >-
+        Whole-filesystem copies name emond paths in their arguments and can look like a write
+        when the copy is in the restore direction. The activity covers thousands of unrelated
+        paths in the same run, where a planted rule touches only the two emond directories.

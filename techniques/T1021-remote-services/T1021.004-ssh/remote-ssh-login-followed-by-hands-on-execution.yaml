@@ -1,0 +1,337 @@
+type: detection
+
+id: hg-lin-remote-ssh-login-followed-by-hands-on-execution-t1021-004
+
+version: 1.0.0
+
+info:
+  name: Remote SSH login followed by hands-on execution
+  description: >-
+    SSH is the normal way people administer Linux, which is exactly what makes it useful to
+    an adversary holding a stolen password or a private key: the login is authenticated, the
+    session is encrypted, and everything that follows is attributed to a legitimate account.
+    Nothing about the connection itself is anomalous, so the login on its own is not the
+    finding. What separates an adversary from an administrator is the shape of the session
+    that follows the login — an account that has no business holding an interactive shell,
+    reconnaissance and transfer tooling run seconds after landing, and an onward SSH hop to a
+    third host from a machine that has never originated one. This hypothesis is pitched at
+    a new authenticated session established with a credential the adversary holds; riding a
+    session someone else already authenticated is a different technique with different
+    telemetry.
+  severity: high
+  author: huntgraph
+  tags:
+    - lateral-movement
+    - remote-services
+    - ssh
+    - valid-accounts
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1021/004
+    - https://attack.mitre.org/detectionstrategies/DET0596
+    - https://attack.mitre.org/techniques/T1021
+
+mitre:
+  tactics:
+    - TA0008
+  techniques:
+    - T1021
+  sub_techniques:
+    - T1021.004
+  detection_strategies:
+    - DET0596
+  analytics:
+    - AN1638
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:EXECVE
+    - NSM:Flow
+  data_components:
+    - Process Creation
+    - Network Traffic Flow
+
+hypothesis:
+  statement: >-
+    An adversary holding a valid password or private key may log into a host over SSH so that
+    their commands run inside an authenticated session belonging to a legitimate account,
+    obtaining an interactive foothold and an onward path that looks indistinguishable from
+    routine administration.
+  attacker_behavior:
+    - Authenticates over SSH with a stolen password or a key they planted earlier.
+    - Runs host and account reconnaissance within seconds of landing in the shell.
+    - Pulls tooling down or opens a secondary channel from inside the SSH session.
+    - Invokes the SSH client from the compromised host to reach a further internal system.
+  legitimate_behavior:
+    - Administrators log in over SSH to operate and troubleshoot servers.
+    - Configuration management and deployment pipelines run commands over SSH.
+    - Backup and monitoring agents open SSH or SFTP sessions on a schedule.
+    - Engineers hop between hosts in a build or platform estate all day.
+  risk_indicator:
+    - The session belongs to a service or application account that should never log in interactively.
+    - Reconnaissance and transfer utilities run immediately under the login shell.
+    - The client disables host key checking or points at a key in a temporary directory.
+    - The host originates an outbound SSH connection it has never made before.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - RemoteAddressIP4
+        - RemotePort
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: interactive-shell-spawned-by-sshd
+        name: Login shell started by the SSH daemon
+        purpose: >-
+          Establish that an interactive session was actually created, since the daemon
+          forking a login shell is the point at which a remote credential turns into command
+          execution on the host. Rarity by account matters more than volume here.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^sshd$/i
+          | ImageFileName=/\/(bash|sh|zsh|ksh|dash|csh|tcsh|fish)$/
+          | groupBy([ComputerName, UserName, ImageFileName],
+                    function=[count(as=sessions), collect([CommandLine], limit=5)])
+          | sort(sessions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "UserName of the platform and deployment automation accounts that log in by design"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: post-login-tooling-in-ssh-session
+        name: Reconnaissance or transfer tooling run inside the session
+        purpose: >-
+          Separate an operator doing known work from an adversary orienting themselves. The
+          minutes after an unfamiliar login are when host enumeration, account listing and
+          payload retrieval happen, and that burst is the discriminator rather than the login.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(sshd|bash|sh|zsh|ksh|dash)$/i
+          | CommandLine=/(\b(nc|ncat|socat|curl|wget|nmap|chattr|useradd|usermod|crontab|tcpdump)\b|base64\s+-d|bash\s+-i|\/dev\/tcp\/|cat\s+\/etc\/(passwd|shadow))/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Configuration-management and monitoring agents that run these utilities on a schedule"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: ssh-client-invoked-for-onward-hop
+        name: SSH client run with checks disabled or a transient key
+        purpose: >-
+          Catch the pivot being set up. An administrator hopping between known hosts uses the
+          configured key and an existing known_hosts entry; an adversary suppresses host key
+          prompts and supplies a key file dropped somewhere writable, because neither the
+          trust store nor the key belongs to them.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/\/(ssh|scp|sftp)$/
+          | CommandLine=/(StrictHostKeyChecking\s*=?\s*no|UserKnownHostsFile\s*=?\s*\/dev\/null|-i\s+\/(tmp|var\/tmp|dev\/shm)\/|BatchMode\s*=?\s*yes)/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=hops), collect([CommandLine], limit=5)])
+          | sort(hops, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Deployment pipelines that legitimately run non-interactive SSH with batch mode"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: outbound-ssh-connection-to-an-internal-host
+        name: Outbound SSH flow to another internal system
+        purpose: >-
+          Confirm the onward hop actually happened rather than only being attempted, and
+          identify the second host. Most servers are SSH destinations and never SSH sources,
+          so a machine originating port 22 traffic for the first time is a strong signal.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemotePort=/^22$/
+          | RemoteAddressIP4=/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/
+          | groupBy([ComputerName, RemoteAddressIP4, RemotePort, ContextProcessId],
+                    function=[count(as=connections)])
+          | sort(connections, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Jump hosts, bastion servers and backup collectors that originate SSH by design"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - remote_address
+            - organization
+
+evidence:
+  required:
+    - id: ssh_session_command_execution
+      name: Commands executed inside an SSH login session
+      description: >-
+        The SSH daemon forked a login shell and commands ran beneath it, meaning a remote
+        credential was accepted and turned into execution on this host under that account.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: remote_interactive_access
+
+  supporting:
+    - id: hands_on_tooling_in_session
+      name: Reconnaissance or transfer tooling in the session
+      description: >-
+        Host enumeration, account listing, payload retrieval or a secondary channel appeared
+        within the session, which is orientation rather than the specific task an operator
+        logs in to perform.
+      source: process_creation
+      field: CommandLine
+      indicates: hands_on_keyboard_activity
+    - id: non_interactive_account_used
+      name: Session opened by a service or application account
+      description: >-
+        The account holding the interactive shell is a service, database or application
+        identity that exists to run a daemon and has no reason to hold a login shell.
+      source: process_creation
+      field: UserName
+      indicates: credential_misuse
+    - id: onward_ssh_hop
+      name: Outbound SSH connection to another internal host
+      description: >-
+        The host originated an SSH flow to a further internal system, which turns a single
+        compromised machine into a step in a chain.
+      source: network_connection
+      field: RemotePort
+      indicates: lateral_movement_progression
+    - id: unusual_login_for_host
+      name: No comparable session in the baseline
+      description: >-
+        This account has not held an interactive SSH session on this host during the baseline
+        window, so the login is a deviation as well as an authentication.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: known_administrator
+      name: Account is a recognised administrator of this host
+      description: >-
+        Identity context places the account in the operations group responsible for this
+        system, where interactive SSH is the expected way of working.
+      source: identity_context
+      field: UserName
+      indicates: legitimate_administrative_action
+    - id: automation_over_ssh
+      name: Session belongs to configuration management or deployment
+      description: >-
+        The session was opened by an approved automation client running a governed playbook
+        or deployment step rather than by a person.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_enterprise_activity
+    - id: scheduled_maintenance
+      name: Covered by a maintenance or change record
+      description: >-
+        A change record covers work on this host in this window, accounting for both the
+        login and the commands that followed.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - ssh_session_command_execution
+
+    supporting:
+      any:
+        - hands_on_tooling_in_session
+        - non_interactive_account_used
+        - onward_ssh_hop
+        - unusual_login_for_host
+      all:
+        - non_interactive_account_used
+        - hands_on_tooling_in_session
+
+    contradicting:
+      any:
+        - known_administrator
+        - automation_over_ssh
+        - scheduled_maintenance
+      all: []
+
+  verdict:
+    low_risk_when:
+      - ssh_session_command_execution
+      - known_administrator
+      - automation_over_ssh
+      - scheduled_maintenance
+    suspicious_when:
+      - ssh_session_command_execution
+      - unusual_login_for_host
+    high_risk_when:
+      - ssh_session_command_execution
+      - non_interactive_account_used
+      - hands_on_tooling_in_session
+      - onward_ssh_hop
+
+  false_positive:
+    - condition: An administrator logs in over SSH to operate a server.
+      explanation: >-
+        This is the technique performed legitimately and it produces the required evidence
+        every time. The discriminators are whose account it is, whether the account normally
+        holds a shell on this host, and whether the session does one known task or sweeps the
+        machine first.
+    - condition: Configuration management or a deployment pipeline runs commands over SSH.
+      explanation: >-
+        Automation authenticates with a key and executes non-interactively, often with batch
+        mode and host key checking relaxed on freshly built hosts, which reproduces the
+        client-side evidence. It runs under a known automation identity on a fixed cadence and
+        the command set is identical across the fleet.
+    - condition: A backup or monitoring agent opens SSH or SFTP sessions on a schedule.
+      explanation: >-
+        Agents that pull files or run checks over SSH generate steady sessions and outbound
+        port 22 flows. Their client binary, destination set and interval are stable, which is
+        what distinguishes them from a first-ever hop to a new internal address.
+    - condition: An engineer hops between hosts in a build or platform estate.
+      explanation: >-
+        Chained SSH is normal in engineering estates and produces onward hops from machines
+        that are not bastions. The accounts are human, the destinations recur in the baseline,
+        and no enumeration burst precedes the hop.

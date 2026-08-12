@@ -124,6 +124,30 @@ def corpus_coverage() -> dict[str, list[str]]:
     return covered
 
 
+def skip_register() -> dict[str, str]:
+    """Map ATT&CK id -> why this project deliberately does not cover it.
+
+    A skip is a decision, not a backlog item. Keeping it separate from
+    'not-covered' is what stops an acknowledged blind spot decaying into an
+    unnoticed one.
+    """
+    path = os.path.join(ROOT, "skipped.yaml")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path) as fh:
+            doc = yaml.safe_load(fh)
+    except yaml.YAMLError:
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    return {
+        e["id"]: " ".join((e.get("reason") or "").split())
+        for e in doc.get("skipped") or []
+        if isinstance(e, dict) and e.get("id")
+    }
+
+
 def targets(atk: Attack, tactic: str) -> tuple[list, list]:
     """(in-scope targets, out-of-scope targets) for a tactic."""
     techs = atk.live_techniques(tactic)
@@ -263,6 +287,15 @@ def render_markdown(atk: Attack, covered: dict) -> str:
         w("| **unique total** | **%d** | **%d** | **%d** | |"
           % (len(udone), len(unique), len(unique) - len(udone)))
         w("")
+        skipped = skip_register()
+        uskipped = sorted(tid for tid in unique if tid not in covered and tid in skipped)
+        if uskipped:
+            w("Of the %d remaining, **%d are recorded as deliberately skipped** in "
+              "`skipped.yaml` — targets whose only observable is telemetry this "
+              "deployment cannot collect, where any template would look like coverage "
+              "and detect nothing. They are gaps, but acknowledged ones: %s."
+              % (len(unique) - len(udone), len(uskipped), ", ".join(uskipped)))
+            w("")
 
     # blocked analysis, Priority 1 only
     seen, rows = set(), []

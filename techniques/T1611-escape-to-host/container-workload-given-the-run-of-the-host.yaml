@@ -1,0 +1,371 @@
+type: detection
+
+id: hg-lin-container-workload-given-the-run-of-the-host-t1611
+
+version: 1.0.0
+
+info:
+  name: Container workload given the run of the host
+  description: >-
+    A container is a boundary the operator is relying on, and it is a boundary made of
+    kernel namespaces, capability sets and a mount table rather than of anything the
+    application can see. Every one of those can be handed back at creation time by a flag,
+    and once it is, escape stops being an exploit and becomes ordinary use: a privileged
+    container can load a kernel module or write to the host block device, a container with
+    the host root bind-mounted can drop a cron entry or an SSH key onto the node, and a
+    container holding the runtime socket can simply ask the daemon for a new, more
+    privileged container. Breaking out converts one compromised workload into the whole
+    node and everything else scheduled on it. The hard part is that none of this looks like
+    an exploit in telemetry — the launch is a well-formed runtime invocation and the escape
+    primitives are stock utilities. The discriminator is therefore not the syntax but the
+    requester and the history: node agents, storage drivers and debug tooling need these
+    properties and use them constantly, while an application workload that has run for
+    months without them and suddenly asks for the host filesystem is the finding. That is
+    why every case here carries a baseline rather than a static allowlist.
+  severity: critical
+  author: huntgraph
+  tags:
+    - privilege-escalation
+    - container-escape
+    - containers
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1611
+    - https://attack.mitre.org/detectionstrategies/DET0219
+    - https://attack.mitre.org/techniques/T1609
+
+mitre:
+  tactics:
+    - TA0004
+  techniques:
+    - T1611
+  sub_techniques: []
+  detection_strategies:
+    - DET0219
+  analytics:
+    - AN0613
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+    - linux:Sysmon
+  data_components:
+    - OS API Execution
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may launch or inhabit a container whose isolation has been given away —
+    privileged mode, host namespaces, a bind mount of the host filesystem or the runtime
+    control socket — so that ordinary commands reach the node, obtaining root on the
+    underlying host and on every other workload scheduled there.
+  attacker_behavior:
+    - Starts a container with the privileged flag or with SYS_ADMIN added to its capability set.
+    - Bind-mounts the host root, /proc or /var/lib/kubelet into a container it controls.
+    - Mounts the container runtime socket in and asks the daemon for a second, freer container.
+    - Enters the host namespaces of PID 1 with nsenter or setns from inside a workload.
+    - Writes a cgroup release_agent so the kernel executes a payload in the host namespace.
+  legitimate_behavior:
+    - Node agents, log shippers and CNI plugins run privileged and mount host paths by design.
+    - Storage and device drivers need host mounts and device access to do their job.
+    - Build and CI tooling mounts the runtime socket so it can build images.
+    - Engineers use debug containers with host namespaces to troubleshoot a node.
+    - Backup and security agents read host filesystems from a container.
+  risk_indicator:
+    - The workload has never requested privilege or a host mount during the baseline window.
+    - The host root, rather than a specific directory, is what gets mounted.
+    - A namespace-entry utility runs with a target of PID 1 from inside an application container.
+    - The runtime socket is driven by a generic client such as curl or socat rather than by build tooling.
+    - The request comes from an interactive shell or a service account with no operational role on the node.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: privileged-container-requested
+        name: Container runtime invoked with isolation-removing flags
+        purpose: >-
+          Catch the boundary being given away at creation. Privileged mode, an added
+          SYS_ADMIN capability, an unconfined seccomp or AppArmor profile and host PID or
+          IPC namespaces each remove a different part of the wall, and any of them alone is
+          enough to make escape a matter of running the right stock utility.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(docker|podman|nerdctl|ctr|crictl|kubectl|oc|runc)$/i
+          | CommandLine=/(--privileged|--cap-add[= ]?(SYS_ADMIN|SYS_MODULE|SYS_PTRACE|ALL)|--pid[= ]host|--ipc[= ]host|--uts[= ]host|--security-opt[= ]?(seccomp|apparmor)[=:]unconfined)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=launches), collect([CommandLine], limit=5)])
+          | sort(launches, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Node agents, CNI and CSI plugins whose manifests have always carried these flags"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+            - organization
+
+      - id: host-paths-mounted-into-a-workload
+        name: Host filesystem or runtime socket bind-mounted into a container
+        purpose: >-
+          A bind mount is the quietest escape there is, because nothing is exploited: the
+          container writes to the node's own filesystem through a normal file handle. The
+          shape that matters is the breadth of the mount — a single application directory is
+          routine, whereas the host root, /proc, the kubelet directory or the runtime socket
+          hand over the node itself.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(-v|--volume|--mount|hostPath|hostPID)/i
+          | CommandLine=/((-v|--volume)[= ]?\/(:|proc|sys|etc|root|boot|var\/run|var\/lib\/kubelet|var\/lib\/docker)|source=\/(,|:|\s|$)|path:\s*\/(\s|$)|docker\.sock|containerd\.sock|crio\.sock)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=mounts), collect([CommandLine], limit=5)])
+          | sort(mounts, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Storage and backup workloads whose function is to read host paths"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+            - organization
+
+      - id: namespace-escape-primitive-executed
+        name: Namespace or kernel primitive used to reach the host
+        purpose: >-
+          Once a container holds enough privilege, the escape itself is a stock utility.
+          Entering the namespaces of PID 1, unsharing into a new user namespace with root
+          mapped, mounting a host block device or writing a cgroup release_agent are the
+          four routes that actually cross the boundary, and none of them is ordinary inside
+          an application container.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(nsenter|setns|unshare|capsh|chroot|keyctl|mount)$/i
+            or CommandLine=/(release_agent|notify_on_release|\/proc\/1\/(ns|root|cwd))/i
+          | CommandLine=/(--target[= ]?1|-t\s+1|\/proc\/1\/|--map-root-user|--mount-proc|release_agent|notify_on_release|--bind|\/dev\/(sd|vd|nvme|mapper)[a-z0-9]*)/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName],
+                    function=[count(as=uses), collect([CommandLine], limit=5)])
+          | sort(uses, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Node debug sessions and kubectl debug workflows covered by an operational record"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - command_line
+            - organization
+
+      - id: runtime-socket-driven-by-a-generic-client
+        name: Container runtime socket spoken to directly
+        purpose: >-
+          A mounted runtime socket is a root shell waiting to be asked for. Build tooling
+          uses it through its own client, so the discriminator is the caller: a generic HTTP
+          or socket client talking to the daemon endpoint is somebody hand-crafting a
+          container-create request rather than software doing its job.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(docker\.sock|containerd\.sock|crio\.sock|dockershim\.sock|\/run\/(docker|containerd|crio))/i
+          | CommandLine=/(--unix-socket|UNIX-CONNECT|nc\s+-U|-H\s+unix:|\/containers\/create|\/images\/create|http\.client|requests_unixsocket)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=calls), collect([CommandLine], limit=5)])
+          | sort(calls, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Image build and CI agents that talk to the daemon socket as their normal function"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - process
+            - organization
+
+evidence:
+  required:
+    - id: container_isolation_given_away
+      name: Workload created or run with the host boundary removed
+      description: >-
+        A container was launched with privilege, host namespaces, a broad host bind mount or
+        the runtime socket exposed, which is the condition that makes reaching the node a
+        matter of running an ordinary command rather than finding a vulnerability.
+      source: process_creation
+      field: CommandLine
+      indicates: container_boundary_removed
+
+  supporting:
+    - id: namespace_primitive_used
+      name: Namespace or kernel primitive executed
+      description: >-
+        A utility that crosses the container boundary — entering PID 1's namespaces,
+        unsharing with root mapped, mounting a host device or writing a cgroup release
+        agent — was run, which is the escape itself rather than the setup for one.
+      source: process_creation
+      field: FileName
+      indicates: namespace_boundary_crossed
+    - id: runtime_control_plane_reached
+      name: Runtime socket driven by a generic client
+      description: >-
+        The container daemon's socket was addressed by a general-purpose HTTP or socket
+        client, meaning a container-create request was composed by hand rather than issued
+        by build or orchestration software.
+      source: process_creation
+      field: ImageFileName
+      indicates: runtime_control_plane_reached
+    - id: requested_from_a_shell
+      name: Request issued from an interactive shell
+      description: >-
+        The runtime invocation descended from a shell or remote session rather than from the
+        kubelet, an orchestration agent or a package-managed service, which is how a person
+        with access asks for privilege rather than how a manifest declares it.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: workload_never_needed_host_access
+      name: No history of this workload requesting the host
+      description: >-
+        Neither this image nor this account has launched a privileged or host-mounted
+        container on this node during the baseline window, so the request is new rather than
+        an established operational pattern.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+    - id: actor_has_no_node_role
+      name: Requester has no operational role on the node
+      description: >-
+        The identity behind the request is an application service account or a user outside
+        the platform team, rather than one of the identities that maintain nodes.
+      source: identity_context
+      field: UserName
+      indicates: unexpected_actor
+
+  contradicting:
+    - id: platform_component_by_design
+      name: Platform component that requires host access
+      description: >-
+        The asset record identifies the workload as a node agent, CNI or CSI plugin, log
+        shipper or security sensor, all of which are deployed privileged and with host
+        mounts because that is what they exist to do.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: recorded_node_maintenance
+      name: Covered by a maintenance record
+      description: >-
+        A change or incident record covers the node and the window, tying a debug container
+        with host namespaces to planned troubleshooting rather than to an escape.
+      source: change_management
+      field: CommandLine
+      indicates: legitimate_administrative_action
+    - id: same_request_across_the_fleet
+      name: Identical request on comparable nodes
+      description: >-
+        The same image and the same flags appear on peer nodes throughout the baseline
+        window, which is a manifest rolled out by the platform rather than a targeted
+        request on one node.
+      source: baseline
+      field: ImageFileName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - container_isolation_given_away
+
+    supporting:
+      any:
+        - namespace_primitive_used
+        - runtime_control_plane_reached
+        - requested_from_a_shell
+        - workload_never_needed_host_access
+        - actor_has_no_node_role
+      all:
+        - namespace_primitive_used
+        - workload_never_needed_host_access
+
+    contradicting:
+      any:
+        - platform_component_by_design
+        - recorded_node_maintenance
+        - same_request_across_the_fleet
+      all: []
+
+  verdict:
+    low_risk_when:
+      - container_isolation_given_away
+      - platform_component_by_design
+      - recorded_node_maintenance
+      - same_request_across_the_fleet
+    suspicious_when:
+      - container_isolation_given_away
+      - workload_never_needed_host_access
+    high_risk_when:
+      - container_isolation_given_away
+      - namespace_primitive_used
+      - runtime_control_plane_reached
+      - requested_from_a_shell
+      - actor_has_no_node_role
+
+  false_positive:
+    - condition: A node agent or driver runs privileged with host mounts.
+      explanation: >-
+        Log shippers, CNI and CSI plugins, monitoring sensors and backup agents are deployed
+        exactly this way and will match the required evidence on every node, every restart.
+        They are identifiable by being identical everywhere, by descending from the kubelet
+        or the container runtime rather than from a shell, and by having done so for the
+        whole baseline window.
+    - condition: An engineer opens a debug container with host namespaces.
+      explanation: >-
+        Node troubleshooting genuinely needs nsenter or a host-PID container, which produces
+        both the required evidence and the strongest supporting item. The separating facts
+        are the identity — a platform engineer rather than an application service account —
+        and a matching incident or change record covering the window.
+    - condition: CI or build tooling mounts the container runtime socket.
+      explanation: >-
+        Image builds inside containers commonly mount the daemon socket, which satisfies the
+        host-mount case. Those builds drive the socket through the runtime's own client on
+        build hosts that do it constantly, whereas an escape addresses the socket with curl,
+        socat or netcat and appears on a host with no build role.
+    - condition: A storage driver mounts host block devices.
+      explanation: >-
+        Volume plugins mount devices under /dev and bind host directories as part of
+        attaching storage, which matches the namespace and mount case. The mounts are
+        specific device and directory paths tied to a volume request, they recur on a
+        schedule the baseline has learned, and they are not accompanied by entry into PID
+        1's namespaces.
+    - condition: A container image is built or run with broad mounts during a migration.
+      explanation: >-
+        Lift-and-shift work often runs a workload with the host root mounted while
+        dependencies are sorted out. It shows up as a burst on a small set of hosts with a
+        change record behind it, and it stops, unlike an escape which is followed by
+        namespace entry or writes into host persistence paths.

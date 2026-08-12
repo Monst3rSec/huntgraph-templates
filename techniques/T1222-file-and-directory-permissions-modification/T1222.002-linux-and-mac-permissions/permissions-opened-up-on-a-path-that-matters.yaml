@@ -1,0 +1,373 @@
+type: detection
+
+id: hg-lin-permissions-opened-up-on-a-path-that-matters-t1222-002
+
+version: 1.0.0
+
+info:
+  name: Permissions opened up on a path that matters
+  description: >-
+    chmod and chown are among the most-run commands on any Unix host, so "a permission
+    changed" is not a finding and a hunt built on it will drown. What makes a permission
+    change interesting is that it is the enabling step for something else: a downloaded
+    payload cannot run until the execute bit is set, a configuration file an adversary wants
+    to edit has to become writable first, and a directory made world-writable turns every
+    file under it into a hijack opportunity for anything that reads from there. Three shapes
+    separate the operationally significant change from the constant background. The first is
+    breadth — a recursive change across a system tree relaxes hundreds of files at once and
+    is almost never what an administrator actually intended. The second is target — setuid,
+    setgid or world-writable modes applied to /etc, the system binary directories, the unit
+    and cron directories or the sudoers path, where the permission itself grants privilege.
+    The third is adjacency — a mode change on a file in a temporary or home directory
+    followed immediately by that file executing, which is a payload being armed and fired in
+    one motion. The immutability attribute belongs here too, in the opposite direction:
+    chattr is used to lock a modified file so cleanup and configuration management cannot
+    put it back.
+  severity: medium
+  author: huntgraph
+  tags:
+    - defense-evasion
+    - file-permissions
+    - privilege-escalation
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1222/002
+    - https://attack.mitre.org/detectionstrategies/DET0351
+    - https://attack.mitre.org/techniques/T1222
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1222
+  sub_techniques:
+    - T1222.002
+  detection_strategies:
+    - DET0351
+  analytics:
+    - AN0998
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+    - auditd:PROCTITLE
+    - linux:osquery
+  data_components:
+    - File Metadata
+    - Command Execution
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may relax the permissions or ownership of a file or directory so that a
+    payload becomes executable, a protected configuration becomes writable, or a shared path
+    becomes hijackable, obtaining the access control change that every following step in the
+    intrusion depends on.
+  attacker_behavior:
+    - Sets the execute bit on a payload dropped into a temporary or home directory.
+    - Applies a recursive permissive mode across a system tree to reach whatever is inside it.
+    - Grants setuid or setgid on a binary so it can be re-entered with elevated privilege.
+    - Makes a configuration, unit or cron directory world-writable so anything can drop into it.
+    - Sets the immutable attribute so cleanup and configuration management cannot revert the change.
+  legitimate_behavior:
+    - Package installers and post-install scripts set modes on the files they ship.
+    - Configuration management enforces ownership and modes on every agent run.
+    - Build pipelines make scripts and freshly compiled binaries executable.
+    - Administrators fix a broken permission on a service directory during an incident.
+    - Application setup scripts open up a data or cache directory the service must write to.
+  risk_indicator:
+    - The change is recursive and its target is a system tree rather than an application directory.
+    - The resulting mode is world-writable, setuid or setgid on a path that grants privilege.
+    - The file made executable sits in /tmp, /dev/shm, /var/tmp or a hidden directory.
+    - The same path executes within moments of the mode change.
+    - The command comes from an interactive shell rather than from packaging or an agent.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: recursive-change-across-a-system-tree
+        name: Recursive permission or ownership change on a system tree
+        purpose: >-
+          Breadth is the first discriminator. A recursive change rooted at /, /etc, /usr,
+          /opt, /var or /root relaxes far more than whatever the operator was trying to fix,
+          and it is the single most damaging form of this technique because it silently
+          creates hijack opportunities the adversary never has to visit again.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(chmod|chown|chgrp|setfacl)$/i
+          | CommandLine=/(\s-R\b|\s-{1,2}recursive\b)/i
+          | CommandLine=/\s\/(etc|usr|bin|sbin|lib|lib64|opt|var|root|boot|srv)(\/|\s|$)|\s\/\s*$/
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Configuration-management agents enforcing ownership across a managed tree"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+            - organization
+
+      - id: privileged-mode-on-a-protected-path
+        name: World-writable, setuid or setgid mode on a privileged path
+        purpose: >-
+          Target is the second discriminator. On the configuration, binary, unit, cron and
+          sudoers paths a permission is not merely access, it is privilege: a world-writable
+          unit file or cron directory is a root execution primitive, and a new setuid binary
+          is a re-entry point that survives losing the original session.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(chmod|chown|setfacl)$/i
+          | CommandLine=/(\s[0-7]?(777|776|766|707|706|666|4755|4777|2755|6755)\b|o\+w|a\+w|[ug]\+s|--reference)/i
+          | CommandLine=/\/(etc|usr\/bin|usr\/sbin|usr\/local\/bin|usr\/local\/sbin|bin|sbin|boot|lib\/systemd|etc\/systemd|etc\/cron|etc\/sudoers|var\/spool\/cron)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Package post-install scripts that set modes on the files they ship"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: payload-armed-then-run
+        name: Execute bit set in a writable directory and that path then runs
+        purpose: >-
+          Adjacency is the third and sharpest discriminator. Correlating the mode change and
+          the execution in one window turns an ordinary chmod into the arming step of a
+          payload, which is the shape almost every commodity Linux intrusion produces within
+          seconds of dropping its tooling.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              FileName=/^chmod$/i
+                | CommandLine=/(\+x|\b[0-7]?7[0-7][0-7]\b)/i
+                | CommandLine=/\/(tmp|var\/tmp|dev\/shm|home\/[^\/ ]+|root|run\/user)\//
+                | armed := CommandLine ;
+              ImageFileName=/^\/(tmp|var\/tmp|dev\/shm|home\/[^\/ ]+|root|run\/user)\//
+                | ran := ImageFileName ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[count(as=events), collect([armed, ran, ParentBaseFileName], limit=8)])
+          | armed=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Build agents that compile into a workspace and immediately run what they built"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - path
+
+      - id: immutability-attribute-toggled
+        name: Immutable or append-only attribute changed
+        purpose: >-
+          The inverse move. Setting the immutable flag stops configuration management,
+          package updates and responders from restoring a tampered file, and clearing it is
+          how an adversary edits something the estate has deliberately locked. Either
+          direction is rare enough on a managed host to be worth reading every time.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(chattr|lsattr)$/i
+            or CommandLine=/\bchattr\b/i
+          | CommandLine=/([+-][aiu]\b|-R\b)/
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Hardening baselines that set the immutable flag on audit and log files"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+evidence:
+  required:
+    - id: permission_relaxed_on_a_path_that_matters
+      name: Permission or ownership relaxed where it grants access
+      description: >-
+        A mode, ownership or ACL change was applied to a system path, a privileged directory
+        or a file in a writable staging location, which is the access control step the rest
+        of the intrusion depends on rather than routine housekeeping.
+      source: process_creation
+      field: CommandLine
+      indicates: access_control_weakened
+
+  supporting:
+    - id: change_applied_recursively
+      name: Change applied recursively
+      description: >-
+        The command carried a recursive flag, so the relaxation reached every file beneath
+        the target rather than the one file the operator named.
+      source: process_creation
+      field: FileName
+      indicates: broad_permission_change
+    - id: armed_file_then_executed
+      name: File made executable then run
+      description: >-
+        A path in a temporary, shared-memory or home directory was given the execute bit and
+        a process from that same location started in the same window, which is a payload
+        being armed and fired.
+      source: process_creation
+      field: ImageFileName
+      indicates: execution_chain_progression
+    - id: immutability_manipulated
+      name: Immutable or append-only attribute toggled
+      description: >-
+        The immutable or append-only attribute was set or cleared, either to stop a modified
+        file being restored or to allow editing of something the estate had locked.
+      source: process_creation
+      field: aid
+      indicates: tamper_resistance_manipulated
+    - id: issued_from_an_interactive_shell
+      name: Issued from an interactive shell
+      description: >-
+        The command descended from a login shell or remote session rather than from a
+        package script, a build agent or the configuration-management daemon that normally
+        owns permissions on this host.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: unusual_for_this_host
+      name: No history of this change on the host
+      description: >-
+        Neither this command shape nor this target has been seen on the host during the
+        baseline window, which separates a one-off relaxation from the permission
+        enforcement that runs on every agent cycle.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: configuration_management_enforcement
+      name: Enforced by configuration management
+      description: >-
+        The change was issued by a management agent or a package script applying the state
+        the estate has declared, which is the overwhelming majority of permission changes on
+        a managed host.
+      source: process_creation
+      field: UserName
+      indicates: legitimate_enterprise_activity
+    - id: covered_by_a_change_record
+      name: Covered by a change or incident record
+      description: >-
+        A record covers the host, the path and the window, tying the relaxation to work
+        somebody asked for — a broken service directory, a migration, a permissions repair.
+      source: change_management
+      field: CommandLine
+      indicates: legitimate_administrative_action
+    - id: build_or_development_host
+      name: Build or development workspace
+      description: >-
+        The host compiles and runs its own artefacts, so making a freshly produced file
+        executable and immediately running it is the machine's whole purpose and recurs
+        throughout the baseline window.
+      source: baseline
+      field: ComputerName
+      indicates: expected_user_behavior
+
+  risk_logic:
+    required:
+      - permission_relaxed_on_a_path_that_matters
+
+    supporting:
+      any:
+        - change_applied_recursively
+        - armed_file_then_executed
+        - immutability_manipulated
+        - issued_from_an_interactive_shell
+        - unusual_for_this_host
+      all:
+        - armed_file_then_executed
+        - issued_from_an_interactive_shell
+
+    contradicting:
+      any:
+        - configuration_management_enforcement
+        - covered_by_a_change_record
+        - build_or_development_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - permission_relaxed_on_a_path_that_matters
+      - configuration_management_enforcement
+      - covered_by_a_change_record
+      - build_or_development_host
+    suspicious_when:
+      - permission_relaxed_on_a_path_that_matters
+      - unusual_for_this_host
+    high_risk_when:
+      - permission_relaxed_on_a_path_that_matters
+      - change_applied_recursively
+      - armed_file_then_executed
+      - issued_from_an_interactive_shell
+
+  false_positive:
+    - condition: Configuration management enforces modes and ownership on every run.
+      explanation: >-
+        Agents reassert permissions across managed trees continuously, including recursively,
+        and will dominate raw volume. They run under the agent's own process lineage, produce
+        the identical command shape on every comparable host, and repeat on the agent
+        interval, all of which the baseline captures.
+    - condition: A build pipeline makes a compiled artefact executable and runs it.
+      explanation: >-
+        This reproduces the arming-then-execution correlation exactly, which is why the
+        build-host contradiction exists. The workspace path, the build agent parentage and
+        the fact that it happens on every job separate it from a payload dropped into
+        /dev/shm by a shell.
+    - condition: A package post-install script sets setuid on a shipped binary.
+      explanation: >-
+        A handful of system binaries legitimately carry setuid and packaging sets it at
+        install time. The writer is the package manager, the path is inside the package's
+        own file list, and the same change lands wherever that package version is deployed.
+    - condition: An administrator fixes a broken permission during an incident.
+      explanation: >-
+        Repairing a service directory often means a quick recursive chown, issued from an
+        interactive shell, which is the strongest supporting combination here. What
+        distinguishes it is a matching incident record and a target scoped to the failing
+        application rather than a system tree.
+    - condition: A hardening baseline sets the immutable flag on audit or log files.
+      explanation: >-
+        Some standards lock audit configuration with chattr, which matches the attribute
+        case. Those changes arrive with the hardening run, apply to a fixed list of files,
+        and appear across the estate rather than on one host in isolation.

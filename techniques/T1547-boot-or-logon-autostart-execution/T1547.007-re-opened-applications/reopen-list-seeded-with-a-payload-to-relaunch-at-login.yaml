@@ -1,0 +1,364 @@
+type: detection
+
+id: hg-mac-reopen-list-seeded-with-a-payload-to-relaunch-at-login-t1547-007
+
+version: 1.0.0
+
+info:
+  name: Re-open list seeded with a payload to relaunch at login
+  description: >-
+    When a Mac user logs out or restarts through the GUI, macOS offers to reopen the windows
+    that were open at the time, and the answer is stored as a list of application paths in a
+    per-host preference file, com.apple.loginwindow.<UUID>.plist under
+    ~/Library/Preferences/ByHost. At the next login the login window walks that list and
+    relaunches everything in it. Adding an entry to the list therefore buys persistence with
+    none of the usual tells: no launch agent, no login item, no cron entry, nothing in the
+    user's Login Items pane, and a file the user's own account can write without a prompt or
+    an administrator password. When it fires, the payload is a child of loginwindow in a
+    perfectly ordinary session-restore burst alongside the browser and the mail client, so
+    the execution reads as the user's session coming back rather than as anything starting.
+    The discriminator is what the list points at and how it got there. The system writes this
+    file itself, from the logout path, with entries naming signed applications inside
+    /Applications or a user's Applications folder. Persistence is written by defaults,
+    PlistBuddy, plutil or a redirect, often followed by a cfprefsd flush so the hand-edited
+    file is not overwritten from cache, and names a bare executable or an interpreter in a
+    scratch directory that has no bundle around it.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - autostart
+    - login-items
+    - plist
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1547/007
+    - https://attack.mitre.org/detectionstrategies/DET0125
+    - https://attack.mitre.org/techniques/T1547
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1547
+  sub_techniques:
+    - T1547.007
+  detection_strategies:
+    - DET0125
+  analytics:
+    - AN0349
+  platforms:
+    - macOS
+  data_sources:
+    - "macos:unifiedlog"
+    - "fs:filesystem"
+  data_components:
+    - Process Creation
+    - File Modification
+
+hypothesis:
+  statement: >-
+    An adversary may add an application path to the login window's saved re-open list so that
+    macOS relaunches their payload at the user's next login, obtaining persistence that needs
+    no administrative rights, creates no launch agent or login item, and hides its execution
+    inside the ordinary session-restore burst.
+  attacker_behavior:
+    - Appends a path entry to TALAppsToRelaunchAtLogin in the ByHost login window plist.
+    - Edits the plist with defaults, plutil or PlistBuddy rather than through a logout.
+    - Flushes cfprefsd so the running preference cache does not overwrite the hand edit.
+    - Turns the reopen behaviour on so the list is honoured even if the user unticked it.
+    - Points the entry at a bare executable or script in a temporary or hidden directory.
+  legitimate_behavior:
+    - macOS itself writes the list at every GUI logout or restart the user confirms.
+    - Users leave the reopen-windows checkbox ticked and get their applications back.
+    - Applications register their own bundle path so their windows return with the session.
+    - Management platforms set session and logout preferences across managed Macs.
+    - Developers and administrators read or dump the same plist while troubleshooting logins.
+  risk_indicator:
+    - The plist is edited by a shell, defaults, plutil or PlistBuddy rather than at logout.
+    - The referenced path is not an application bundle under an Applications directory.
+    - The preference cache is flushed immediately after the file is touched.
+    - The login window relaunches a process from a temporary, hidden or home directory.
+    - The entry exists on one Mac and on no comparable host in the estate.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: byhost-loginwindow-plist-edited-from-a-command-line
+        name: Login window re-open list edited by a command-line tool
+        purpose: >-
+          Surface the write that is the technique. This file is authored by the operating
+          system during a GUI logout, so no ordinary workflow produces a defaults, plutil,
+          PlistBuddy, copy or redirect aimed at com.apple.loginwindow in the ByHost
+          directory. Matching the domain and the relaunch key together keeps read-only
+          troubleshooting of the same file out of the result.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Preferences\/ByHost\/com\.apple\.loginwindow|com\.apple\.loginwindow)/i
+          | CommandLine=/(TALAppsToRelaunchAtLogin|LoginwindowLaunchesRelaunchApps|TALLogoutSavesState)/i
+          | CommandLine=/(write|-array-add|Add\s+:|Insert|-insert|-replace|>>|>\s*\/|tee\b|cp\b|mv\b|ditto\b)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=edits), collect([CommandLine], limit=5)])
+          | sort(edits, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Management platform scripts that template session preferences onto managed Macs"
+            - "Read-only inspection of the same domain with defaults read or plutil -p"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: reopen-behaviour-forced-and-cache-flushed
+        name: Reopen behaviour turned on and the preference cache flushed
+        purpose: >-
+          Catch the two steps that turn a hand-edited list into working persistence. An entry
+          is only honoured if the session-restore behaviour is enabled, and a direct file edit
+          is silently discarded unless cfprefsd is restarted, so an operator does both. Neither
+          step is something a user performs, because the checkbox at logout does the first and
+          the system owns the second.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(TALLogoutSavesState|LoginwindowLaunchesRelaunchApps|NSQuitAlwaysKeepsWindows)/i
+                and CommandLine=/(write|-bool\s+(true|YES)|-int\s+1)/i
+                | reopen_forced := CommandLine ;
+              FileName=/^(killall|pkill|launchctl)$/i and CommandLine=/cfprefsd/i
+                | cache_flushed := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[collect([reopen_forced, cache_flushed], limit=5), count(as=steps)])
+          | reopen_forced=/.+/ or cache_flushed=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Imaging and first-boot provisioning scripts that set session defaults once per build"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: payload-staged-outside-an-application-bundle
+        name: Executable staged where a reopened application would not live
+        purpose: >-
+          Reach the file the list points at rather than the pointer. Session restore relaunches
+          application bundles, so every genuine entry resolves inside an Applications directory.
+          A new executable arriving in a home, temporary or mounted-volume path is the kind of
+          target only a planted entry names, and it dates the persistence.
+        query: |
+          #event_simpleName=/^(NewExecutableWritten)$/
+          | TargetFileName=/^\/(Users|tmp|var\/tmp|private\/tmp|private\/var\/tmp|Volumes)\//i
+          | TargetFileName!=/\/(Applications|Library\/Application Support|DerivedData|Xcode)\//i
+          | groupBy([ComputerName, TargetFileName],
+                    function=[count(as=writes), collect([SHA256HashData], limit=3)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Build output directories on developer and continuous integration Macs"
+            - "Installer disk images mounted under /Volumes during ordinary software installation"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: loginwindow-relaunching-a-process-from-a-scratch-path
+        name: Login window relaunching a process from a writable path
+        purpose: >-
+          Confirm the persistence fired and identify what it started. Session restore is the
+          only routine reason for loginwindow to be a parent, and the applications it restores
+          live in bundles. A loginwindow child whose image sits in a home, temporary or hidden
+          directory is the planted entry executing at login.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(loginwindow|launchservicesd)$/i
+          | ImageFileName=/^\/(Users|tmp|var\/tmp|private\/tmp|private\/var\/tmp|Volumes)\//i
+          | ImageFileName!=/\.app\/Contents\/MacOS\//i
+          | groupBy([ComputerName, UserName, ImageFileName],
+                    function=[count(as=relaunches), collect([CommandLine], limit=3)])
+          | sort(relaunches, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Sanctioned tooling that users install under their own home directory"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - path
+
+evidence:
+  required:
+    - id: reopen_list_edited_by_hand
+      name: Re-open list edited by a command-line tool
+      description: >-
+        The login window's ByHost preference domain and its relaunch key were written by
+        defaults, plutil, PlistBuddy, a copy or a redirect, rather than by the logout path
+        that is the only thing that normally authors this file.
+      source: process_creation
+      field: CommandLine
+      indicates: logon_persistence_installed
+
+  supporting:
+    - id: reopen_behaviour_forced
+      name: Session restore enabled or the preference cache flushed
+      description: >-
+        The reopen-windows behaviour was switched on, or cfprefsd was restarted immediately
+        after the file was touched, which are the steps that make a hand-written entry
+        survive and actually run.
+      source: process_creation
+      field: FileName
+      indicates: persistence_made_operational
+    - id: payload_staged_outside_a_bundle
+      name: Executable staged outside an application bundle
+      description: >-
+        A new executable was written into a home, temporary or removable path with no
+        surrounding application bundle, which is what a planted re-open entry points at and
+        what a restored application never is.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staged_in_writable_path
+    - id: relaunched_from_a_scratch_path
+      name: Login window started the payload at login
+      description: >-
+        A child of the login window executed from a writable path outside any bundle,
+        confirming that the re-open list ran and showing which program it carried.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: execution_chain_progression
+    - id: unusual_for_host
+      name: No history of re-open list edits on this Mac
+      description: >-
+        This preference domain has not been written from a command line on this host during
+        the baseline window, so the edit is a deviation as well as a persistence event.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: restored_application_bundle
+      name: Restored target is a signed application bundle
+      description: >-
+        The program the login window relaunched lives inside an application bundle under an
+        Applications directory, which is exactly what session restore is meant to bring back.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: managed_session_preference
+      name: Session preference set by management tooling
+      description: >-
+        The reopen and logout preferences on this Mac are governed by the management platform
+        as part of the standard build, so a scripted write to the domain is expected here.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: fleetwide_preference_write
+      name: Same preference write across the estate
+      description: >-
+        The identical command appears on many Macs inside one window, which is a configuration
+        wave rather than a targeted edit to one user's re-open list.
+      source: baseline
+      field: CommandLine
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - reopen_list_edited_by_hand
+
+    supporting:
+      any:
+        - reopen_behaviour_forced
+        - payload_staged_outside_a_bundle
+        - relaunched_from_a_scratch_path
+        - unusual_for_host
+      all:
+        - payload_staged_outside_a_bundle
+        - relaunched_from_a_scratch_path
+
+    contradicting:
+      any:
+        - restored_application_bundle
+        - managed_session_preference
+        - fleetwide_preference_write
+      all: []
+
+  verdict:
+    low_risk_when:
+      - reopen_list_edited_by_hand
+      - restored_application_bundle
+      - managed_session_preference
+      - fleetwide_preference_write
+    suspicious_when:
+      - reopen_list_edited_by_hand
+      - unusual_for_host
+    high_risk_when:
+      - reopen_list_edited_by_hand
+      - reopen_behaviour_forced
+      - payload_staged_outside_a_bundle
+      - relaunched_from_a_scratch_path
+
+  false_positive:
+    - condition: A management platform scripts session and logout preferences onto managed Macs.
+      explanation: >-
+        Configuration tooling does write the login window domain from a script, which
+        reproduces the required evidence exactly. It writes the behaviour keys rather than the
+        relaunch list itself, runs under the management agent rather than an interactive
+        shell, and lands identically on many Macs inside one window.
+    - condition: An administrator dumps the ByHost login window plist while debugging a login problem.
+      explanation: >-
+        Slow or failed logins are commonly diagnosed by reading this exact file. Inspection
+        uses defaults read or plutil -p and changes nothing, so it does not carry the write
+        verbs the required evidence depends on, and no relaunch entry changes as a result.
+    - condition: A user keeps the reopen-windows checkbox ticked and gets a large session back.
+      explanation: >-
+        Ordinary session restore produces a burst of loginwindow children at every login,
+        which resembles the confirmation case. Those children are application bundles under
+        an Applications directory, and the list they come from was authored by the logout
+        path rather than by a command line.
+    - condition: A developer scripts their own session so a personal tool comes back at login.
+      explanation: >-
+        Personal automation genuinely writes this domain and points it at a script in a home
+        directory. It belongs to the logged-in account, has a history on the host across the
+        baseline window, and is not accompanied by a freshly staged executable or a cfprefsd
+        flush timed to hide the edit.

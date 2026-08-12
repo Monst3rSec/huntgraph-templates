@@ -1,0 +1,326 @@
+type: detection
+
+id: hg-mac-osascript-executing-inline-script-text-t1059-002
+version: 1.0.0
+
+info:
+  name: osascript executing inline script text rather than a script file
+  description: >-
+    osascript is signed by Apple, present on every macOS install, and expected to run. What
+    makes it useful to an adversary is not that it executes code but that AppleScript speaks
+    to other applications through AppleEvents, so a script can ask a browser, Finder or
+    System Events to do the work and the resulting activity belongs to that application
+    rather than to anything the adversary shipped. The observable that separates this from
+    normal automation is where the script text lives. Deployed AppleScript is compiled into
+    a .scpt or lives inside an application bundle and is passed to osascript as a path;
+    delivered AppleScript is handed over on the command line with -e, because there is
+    nothing to install and nothing left behind to examine. Inline script text is the
+    discriminator this hunt is built on.
+  severity: high
+  author: huntgraph
+  tags:
+    - execution
+    - applescript
+    - osascript
+    - inter-application-messaging
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1059/002
+    - https://attack.mitre.org/detectionstrategies/DET0414
+    - https://attack.mitre.org/techniques/T1059
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1059
+  sub_techniques:
+    - T1059.002
+  detection_strategies:
+    - DET0414
+  analytics:
+    - AN1164
+  platforms:
+    - macOS
+  data_sources:
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may pass AppleScript to osascript as inline text so that the code executes
+    under a signed Apple binary and drives other applications through AppleEvents, obtaining
+    execution and user-facing interaction without installing a script file on the host.
+  attacker_behavior:
+    - Passes script text with -e instead of supplying a compiled .scpt path.
+    - Uses "tell application" to make a browser, Finder or System Events perform the action.
+    - Presents a dialog asking the user to re-enter their password.
+    - Chains out of AppleScript into a shell, curl or launchctl for the next stage.
+  legitimate_behavior:
+    - Management agents run AppleScript to query or configure endpoint state.
+    - Applications invoke their own bundled .scpt files for automation features.
+    - Users run Automator or Shortcuts workflows that call AppleScript.
+    - Developers and support engineers write inline AppleScript while testing.
+  risk_indicator:
+    - The script text is inline rather than a path to a compiled script.
+    - The script drives a browser, Terminal or Keychain Access.
+    - The script asks the user for a password through a dialog.
+    - The parent is a browser, archive tool or mail client rather than a management agent.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: inline-script-text
+        name: osascript given script text on the command line
+        purpose: >-
+          Separate delivered AppleScript, which arrives as text because there is nothing to
+          install, from deployed AppleScript, which is a compiled file passed by path.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^osascript$/i
+          | CommandLine=/\s-e\s/i
+          | CommandLine!=/\.(scpt|scptd|applescript)(\s|"|'|$)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the approved endpoint management agent"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: driving-another-application
+        name: AppleScript directing a browser, Terminal or keychain tool
+        purpose: >-
+          Catch the case where the script does not act itself but tells an already-trusted
+          application to act, which is what makes AppleEvent abuse hard to attribute from
+          the resulting activity alone.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^osascript$/i
+          | CommandLine=/tell\s+(current\s+)?application\s+("|')?(Safari|Google Chrome|Microsoft Edge|Firefox|Terminal|iTerm2?|Finder|Mail|System Events|Keychain Access)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Accessibility and automation tooling documented to script the Finder"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: password-dialog
+        name: AppleScript presenting a password prompt
+        purpose: >-
+          Identify a script asking the user for credentials through a native dialog, which
+          looks identical to a system prompt and has no legitimate counterpart in ordinary
+          endpoint automation.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^osascript$/i
+          | CommandLine=/display\s+dialog/i
+          | CommandLine=/(with\s+hidden\s+answer|default\s+answer|password|administrator\s+privileges|keychain)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=prompts), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: osascript-spawning-follow-on
+        name: osascript spawning a shell, downloader or persistence tool
+        purpose: >-
+          Confirm the script progressed beyond AppleScript into something that retrieves,
+          installs or persists, which turns an execution into observed intent.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^osascript$/i
+          | FileName=/^(bash|sh|zsh|curl|python\d*(\.\d+)?|launchctl|chmod|xattr|security|osacompile|open)$/i
+          | groupBy([ComputerName, UserName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Management agent workflows whose AppleScript wrappers call launchctl on a schedule"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - process
+
+evidence:
+  required:
+    - id: inline_applescript_text
+      name: AppleScript supplied as inline text
+      description: >-
+        osascript was invoked with script text on the command line rather than a path to a
+        compiled script, so the code never existed as a file that could be inspected.
+      source: process_creation
+      field: CommandLine
+      indicates: dynamic_code_execution
+
+  supporting:
+    - id: interapplication_control
+      name: Script directing another application
+      description: >-
+        The script uses AppleEvents to make a browser, Finder, Terminal or keychain tool
+        perform the action, so the resulting activity is attributed to that application.
+      source: process_creation
+      field: CommandLine
+      indicates: trusted_application_abuse
+    - id: credential_dialog
+      name: Password prompt presented to the user
+      description: >-
+        The script displays a dialog requesting a password or administrator privileges,
+        which is indistinguishable from a system prompt to the person reading it.
+      source: process_creation
+      field: CommandLine
+      indicates: credential_prompt_spoofing
+    - id: delivery_parent
+      name: Delivery application as parent
+      description: >-
+        osascript was launched by a browser, mail client, archive tool or disk-image mount
+        rather than by a management agent or an installed application.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: follow_on_process
+      name: Shell, downloader or persistence tool spawned
+      description: >-
+        The script created a shell, curl or launchctl process, showing it progressed into
+        retrieval, installation or persistence rather than ending at the AppleScript.
+      source: process_creation
+      field: FileName
+      indicates: execution_chain_progression
+    - id: rare_for_host
+      name: Inline AppleScript rare on this host
+      description: >-
+        No comparable inline osascript invocation appears for this host and user across the
+        baseline window, unlike the recurring automation a management agent produces.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: compiled_script_path
+      name: Compiled script invoked by path
+      description: >-
+        osascript was handed a .scpt or .applescript file inside an application bundle or a
+        managed directory, which is how deployed automation is packaged and shipped.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_application_component
+    - id: management_agent_parent
+      name: Endpoint management agent as parent
+      description: >-
+        The invocation came from an approved management agent running a policy or inventory
+        task, which routinely uses inline AppleScript for state queries.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: developer_workstation
+      name: Developer or support workstation
+      description: >-
+        The host belongs to an asset group where scripting and automation authoring is part
+        of the normal working day.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - inline_applescript_text
+
+    supporting:
+      any:
+        - interapplication_control
+        - credential_dialog
+        - delivery_parent
+        - follow_on_process
+        - rare_for_host
+      all:
+        - credential_dialog
+        - delivery_parent
+
+    contradicting:
+      any:
+        - compiled_script_path
+        - management_agent_parent
+        - developer_workstation
+      all: []
+
+  verdict:
+    low_risk_when:
+      - inline_applescript_text
+      - compiled_script_path
+      - management_agent_parent
+      - developer_workstation
+    suspicious_when:
+      - inline_applescript_text
+      - rare_for_host
+    high_risk_when:
+      - inline_applescript_text
+      - credential_dialog
+      - interapplication_control
+      - delivery_parent
+      - follow_on_process
+
+  false_positive:
+    - condition: An endpoint management agent runs inline AppleScript for policy checks.
+      explanation: >-
+        Jamf, Munki and similar agents call osascript with -e to read state or show a
+        notification, which reproduces the required evidence exactly. The parent is the
+        agent, the script text is identical across the fleet, and it repeats on a schedule.
+    - condition: An application invokes its own bundled AppleScript.
+      explanation: >-
+        Backup, media and productivity applications ship .scpt files and call osascript with
+        a path. The path form is what the contradicting evidence captures, so these do not
+        raise the required observation at all.
+    - condition: A user runs an Automator or Shortcuts workflow.
+      explanation: >-
+        These workflows can pass inline AppleScript, including "tell application" clauses
+        aimed at Finder or Safari. They run under an interactive session with the workflow
+        runner as parent and recur for the same user.
+    - condition: A support engineer scripts a fix during troubleshooting.
+      explanation: >-
+        Inline AppleScript is a normal way to apply a one-off change on a Mac. The activity
+        is interactive, the parent is Terminal, and it is usually attached to a ticket.

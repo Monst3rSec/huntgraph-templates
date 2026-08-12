@@ -1,0 +1,386 @@
+type: detection
+
+id: hg-lin-passive-backdoor-listening-through-a-packet-filter-t1205-002
+
+version: 1.0.0
+
+info:
+  name: Passive backdoor listening through a packet filter
+  description: >-
+    A socket filter backdoor never holds a port. The implant opens a raw or packet socket,
+    attaches a BPF program that matches a magic byte pattern, and then sleeps; the kernel
+    hands it the trigger packet regardless of which port it was addressed to and regardless
+    of whether anything is listening there. Nothing appears in a netstat, nothing answers a
+    scan, no firewall rule has to change, and between activations there is no traffic to
+    profile. This is what makes the family — Penquin, BPFDoor, the ICMP-triggered implants
+    on network appliances — so durable. An endpoint sensor cannot see the trigger: the
+    inbound packet is consumed by the kernel and delivered to a filter, and there is no
+    process event for it. What it can see is the capability being obtained and the callback
+    being made. Obtaining the capability means one of three things — running packet-capture
+    tooling, granting CAP_NET_RAW to a binary that has no networking role, or loading a BPF
+    program by hand — and each of those is rare and deliberate on a server. The callback is
+    the other half: a resident process that has never talked to the network suddenly making
+    one outbound connection to an address the estate has not seen. Neither half is
+    conclusive alone; together they are the technique.
+  severity: high
+  author: huntgraph
+  tags:
+    - command-and-control
+    - persistence
+    - defense-evasion
+    - traffic-signaling
+    - socket-filters
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1205/002
+    - https://attack.mitre.org/detectionstrategies/DET0162
+    - https://attack.mitre.org/techniques/T1205
+
+mitre:
+  tactics:
+    - TA0005
+    - TA0003
+    - TA0011
+  techniques:
+    - T1205
+  sub_techniques:
+    - T1205.002
+  detection_strategies:
+    - DET0162
+  analytics:
+    - AN0463
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+    - linux:osquery
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may attach a BPF filter to a raw socket so that a crafted packet wakes a
+    dormant implant without any port being held open, obtaining a command and control
+    channel that is invisible to port enumeration, survives firewall review, and generates
+    no traffic at all between uses.
+  attacker_behavior:
+    - Opens an AF_PACKET or raw socket and attaches a BPF program matching a magic byte sequence.
+    - Grants CAP_NET_RAW to a planted binary so it can capture without running as root.
+    - Loads and pins a BPF program by hand with bpftool rather than through a package.
+    - Runs the implant from a temporary or hidden path and names it after a kernel thread.
+    - Makes a single outbound connection back to the address that sent the trigger packet.
+  legitimate_behavior:
+    - Engineers run tcpdump, tshark or ngrep while troubleshooting a service.
+    - Monitoring, IDS and service-mesh agents open packet sockets as their normal function.
+    - DHCP clients, keepalived, LLDP and bonding daemons need raw sockets to work at all.
+    - Observability tooling loads eBPF programs for tracing and network policy.
+    - Container and CNI runtimes attach BPF programs during pod setup.
+  risk_indicator:
+    - Capture tooling runs on a host with no diagnostic or monitoring role.
+    - CAP_NET_RAW is granted to a binary outside package management.
+    - The process holding the capability lives in /tmp, /dev/shm or a dotted directory.
+    - A long-lived process makes one outbound connection to an address nothing else contacts.
+    - The activity has no counterpart on peer hosts running the same build.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - ContextBaseFileName
+        - RemoteAddressIP4
+        - RemotePort
+        - Protocol
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: capture-tooling-on-a-non-diagnostic-host
+        name: Packet capture tooling run where it has no role
+        purpose: >-
+          The filter has to be attached by something, and the commodity way to do it is a
+          libpcap-backed tool. On an application or database server these binaries have no
+          reason to run, so an execution is either an engineer in an incident or the
+          capability the technique needs. Rarity is what carries this, hence the baseline.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(tcpdump|tshark|dumpcap|ngrep|netsniff-ng|tcpflow|sngrep|pcapdump)$/i
+            or CommandLine=/(libpcap|pcap_setfilter|SO_ATTACH_FILTER|SO_ATTACH_BPF|AF_PACKET|SOCK_RAW)/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=runs), collect([CommandLine], limit=5)])
+          | sort(runs, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Network engineering, monitoring and IDS hosts where capture is routine work"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: raw-socket-capability-granted-to-a-binary
+        name: CAP_NET_RAW granted outside package management
+        purpose: >-
+          An implant that wants to survive without running as root asks for the one
+          capability it actually needs. Granting CAP_NET_RAW or CAP_NET_ADMIN to a specific
+          file is a deliberate, durable act that packaging performs at install time and that
+          almost nothing else does, so a hand-issued grant names the implant binary outright.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(setcap|getcap)$/i
+            or CommandLine=/\bsetcap\b/i
+          | CommandLine=/cap_net_(raw|admin|bind_service)/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=grants), collect([CommandLine], limit=5)])
+          | sort(grants, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Package post-install scripts that set capabilities on shipped binaries"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: bpf-program-loaded-by-hand
+        name: BPF program loaded or pinned outside the runtime
+        purpose: >-
+          The modern form of the technique installs the filter as an eBPF program rather
+          than a classic BPF blob. Observability and CNI tooling loads programs constantly,
+          but it does so from its own binaries; bpftool driven from a shell, or a filesystem
+          pin created by hand, is somebody installing a filter of their own.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(bpftool|bpftrace|xdp-loader|tc)$/i
+            or CommandLine=/(\/sys\/fs\/bpf|bpf\(BPF_PROG_LOAD|mount\s+-t\s+bpf)/i
+          | CommandLine=/(prog\s+(load|loadall|pin|attach)|filter\s+add.*bpf|attach\s+(xdp|socket)|--bpf)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=loads), collect([CommandLine], limit=5)])
+          | sort(loads, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Service mesh, CNI and eBPF observability agents that load programs by design"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: sparse-callback-from-a-resident-process
+        name: Single outbound connection from a quiet resident process
+        purpose: >-
+          The half of the technique that is visible after the trigger. A socket-filter
+          implant is silent until woken, then connects once to whoever woke it. The shape is
+          the discriminator: one or two connections to a single remote address by a process
+          that is otherwise not a network client, as opposed to the steady, many-destination
+          traffic of a real service or agent.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | ContextBaseFileName!=/^(curl|wget|apt|apt-get|yum|dnf|dpkg|rpm|git|ssh|sshd|chronyd|ntpd|systemd-resolved|containerd|dockerd|kubelet)$/i
+          | groupBy([ComputerName, ContextBaseFileName, RemoteAddressIP4],
+                    function=[count(as=connections),
+                              count(field=RemotePort, distinct=true, as=ports),
+                              collect([RemotePort, Protocol, ContextProcessId], limit=5)])
+          | connections <= 3
+          | ports <= 2
+          | sort(connections, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Health-check and licence-check clients that contact one endpoint occasionally"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - remote_address
+
+evidence:
+  required:
+    - id: raw_capture_capability_exercised
+      name: Raw packet capability used on the host
+      description: >-
+        A process capable of receiving raw or filtered packets ran — capture tooling, a BPF
+        loader, or a binary just granted CAP_NET_RAW — which is the prerequisite for a
+        socket-filter backdoor and is not ordinary on a workload host.
+      source: process_creation
+      field: FileName
+      indicates: raw_socket_capability_used
+
+  supporting:
+    - id: net_raw_granted_by_hand
+      name: CAP_NET_RAW granted outside packaging
+      description: >-
+        The raw-socket capability was attached to a specific binary from a shell rather than
+        by a package installer, which is how an implant obtains the one privilege it needs
+        without running as root.
+      source: process_creation
+      field: CommandLine
+      indicates: covert_capability_prepared
+    - id: filter_installed_manually
+      name: BPF program loaded or pinned by hand
+      description: >-
+        A packet filter was loaded, attached or pinned by a general-purpose tool rather than
+        by the observability or networking agent that normally owns programs on this host.
+      source: process_creation
+      field: ImageFileName
+      indicates: packet_filter_installed
+    - id: sparse_outbound_callback
+      name: One-off connection to a single remote address
+      description: >-
+        A resident process made a very small number of connections to one remote address
+        with no repeating pattern, the shape of an implant answering a trigger rather than
+        of a service doing its job.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: activation_after_trigger
+    - id: started_outside_service_management
+      name: Started from a shell rather than by the service manager
+      description: >-
+        The capable process descended from a shell, a remote session or another payload
+        instead of from systemd or a package-managed supervisor, which is how a planted
+        implant starts and not how a daemon does.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: no_capture_history_on_host
+      name: No history of packet capture on this host
+      description: >-
+        Neither this binary nor this capability has been seen on the host during the
+        baseline window, so the capture capability is new rather than an established part of
+        how the system is operated.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: host_has_a_network_diagnostic_role
+      name: Host exists to inspect traffic
+      description: >-
+        The asset record places the host in a network, monitoring or security function where
+        capture tooling and raw sockets are the point of the machine rather than an anomaly
+        on it.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_operational_role
+    - id: agent_owns_the_packet_socket
+      name: Packet socket belongs to an installed agent
+      description: >-
+        The capable process is a packaged monitoring, IDS, service-mesh or DHCP component
+        running from its product path, all of which hold raw sockets permanently and by
+        design.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: capture_covered_by_a_record
+      name: Capture covered by an incident or change record
+      description: >-
+        A change or incident record covers the host and the window, tying the capture
+        session to troubleshooting that somebody asked for rather than to a filter left
+        behind.
+      source: change_management
+      field: CommandLine
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - raw_capture_capability_exercised
+
+    supporting:
+      any:
+        - net_raw_granted_by_hand
+        - filter_installed_manually
+        - sparse_outbound_callback
+        - started_outside_service_management
+        - no_capture_history_on_host
+      all:
+        - sparse_outbound_callback
+        - started_outside_service_management
+
+    contradicting:
+      any:
+        - host_has_a_network_diagnostic_role
+        - agent_owns_the_packet_socket
+        - capture_covered_by_a_record
+      all: []
+
+  verdict:
+    low_risk_when:
+      - raw_capture_capability_exercised
+      - host_has_a_network_diagnostic_role
+      - agent_owns_the_packet_socket
+      - capture_covered_by_a_record
+    suspicious_when:
+      - raw_capture_capability_exercised
+      - no_capture_history_on_host
+    high_risk_when:
+      - raw_capture_capability_exercised
+      - net_raw_granted_by_hand
+      - filter_installed_manually
+      - sparse_outbound_callback
+      - started_outside_service_management
+
+  false_positive:
+    - condition: An engineer runs tcpdump during an incident.
+      explanation: >-
+        This satisfies the required evidence exactly and is the most common match by a wide
+        margin. It is separable by the surrounding session — an interactive login, a change
+        or incident record, a short-lived process — and by the absence of any callback or
+        capability grant afterwards.
+    - condition: A monitoring, IDS or service-mesh agent holds a packet socket permanently.
+      explanation: >-
+        These agents are the legitimate twin of the whole technique: they capture, filter
+        and then talk to a collector. They run from packaged product paths, they are present
+        on every comparable host for the whole baseline window, and their outbound traffic
+        goes to one known collector continuously rather than once.
+    - condition: DHCP, keepalived, LLDP or bonding daemons open raw sockets at boot.
+      explanation: >-
+        System networking components genuinely require CAP_NET_RAW and will match capability
+        queries. They are started by the service manager at boot, they come from
+        distribution paths, and the capability was set by the package rather than granted
+        from a shell.
+    - condition: eBPF observability or CNI tooling loads programs during pod setup.
+      explanation: >-
+        Container networking loads and attaches BPF programs constantly on a node, which
+        matches the BPF case in volume. The loader is the runtime's own binary, the loads
+        track pod churn, and no capability grant or callback accompanies them.
+    - condition: A licence or health-check client contacts one endpoint occasionally.
+      explanation: >-
+        Low-volume single-destination traffic reproduces the callback shape. Those clients
+        contact a stable vendor address the baseline has learned across the estate, on a
+        regular interval, whereas an implant's callback goes to an address nothing else has
+        ever contacted.

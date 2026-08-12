@@ -1,0 +1,346 @@
+type: detection
+
+id: hg-win-package-install-producing-unexpected-execution-t1204-005
+
+version: 1.0.0
+
+info:
+  name: Library install producing execution the install should not need
+  description: >-
+    Package managers execute code as part of installing, and that is the whole of the
+    problem. An npm package runs its install hooks, a Python package runs its setup script,
+    and both do so with the user's rights on a developer or build host that usually has
+    credentials, source and network reach worth taking. An adversary who gets a typosquatted
+    or backdoored package installed therefore gets execution without any of the delivery
+    machinery a phishing chain needs, and the user believes they installed a dependency
+    because they did. The install itself is unremarkable and must not be alerted on. What
+    is observable is what the install spawns and writes: a package that needs a shell, a
+    downloader, or an executable dropped under the user profile is doing something a
+    dependency install does not need to do. The benign twin is the native build step —
+    packages with C extensions really do invoke compilers and really do write binaries — so
+    the discriminator is the identity of the child and where the artefact lands, not the
+    fact that the install produced a child at all.
+  severity: high
+  author: huntgraph
+  tags:
+    - execution
+    - user-execution
+    - supply-chain
+    - package-manager
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1204/005
+    - https://attack.mitre.org/detectionstrategies/DET0252
+    - https://attack.mitre.org/techniques/T1204
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1204
+  sub_techniques:
+    - T1204.005
+  detection_strategies:
+    - DET0252
+  analytics:
+    - AN0699
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    A user may be induced to install a library from a public registry that is malicious or
+    backdoored, so that the package manager's own install hooks execute adversary code with
+    the user's rights on a host that holds source, credentials and internal network access.
+  attacker_behavior:
+    - Publishes a typosquatted or dependency-confusing package to a public registry.
+    - Uses install hooks so that merely installing the package runs code.
+    - Has the install hook fetch a second stage or drop an executable under the user profile.
+    - Persists the payload in the package cache or a startup path so it survives the session.
+  legitimate_behavior:
+    - Packages with native extensions invoke compilers and build tools during installation.
+    - Package managers fetch archives and write files under the user profile by design.
+    - Developers install packages from git URLs and internal mirrors as part of normal work.
+    - Build agents install dependencies continuously and unattended.
+  risk_indicator:
+    - The install spawns a general-purpose shell, downloader or proxy-execution binary.
+    - The package comes from a direct URL or an index that is not the sanctioned mirror.
+    - An executable is written outside the package directory during the install.
+    - The package name has never been installed anywhere in the estate before.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: package-manager-spawning-a-shell-or-downloader
+        name: Package manager spawning a shell or downloader
+        purpose: >-
+          Surface the install hook doing something an install does not need. A package that
+          builds a native extension calls a compiler; a package that calls PowerShell,
+          certutil or curl is running a payload, not compiling one.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(npm(\.cmd)?|npx(\.cmd)?|yarn(\.cmd)?|pnpm(\.cmd)?|node|pip|pip3|pipx|python|python3|py|gem|conda)(\.exe)?$/i
+          | FileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin|curl|msiexec|schtasks|reg)\.exe$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, FileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Build agents whose packaging steps legitimately shell out during dependency installation"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - parent_process
+            - process
+
+      - id: library-installed-from-a-non-registry-source
+        name: Library installed from a direct URL or an unexpected index
+        purpose: >-
+          Catch delivery rather than aftermath. Installing straight from a URL, a git
+          reference or an index other than the sanctioned mirror is how a package that the
+          registry would never have served gets onto the host.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(npm(\.cmd)?|npx(\.cmd)?|yarn(\.cmd)?|pnpm(\.cmd)?|pip|pip3|pipx|gem|conda)(\.exe)?$/i
+          | CommandLine=/\b(install|add|i)\b/i
+          | CommandLine=/(https?:\/\/|git\+|--index-url|--extra-index-url|--registry|--trusted-host|\.(tgz|tar\.gz|whl|zip)\b)/i
+          | groupBy([ComputerName, UserName, FileName],
+                    function=[count(as=installs), collect([CommandLine], limit=5)])
+          | sort(installs, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "The organisation's own package mirror, artifact repository and internal git hosts"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: executable-written-under-the-user-profile-during-an-install
+        name: Executable or script written outside the package tree during an install
+        purpose: >-
+          Confirm the install produced an artefact where a dependency has no reason to put
+          one. Packages write into their own package directory; a binary appearing under
+          AppData, Temp or ProgramData while the install runs is a payload being staged.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|PeFileWritten|NewExecutableWritten|NewScriptWritten)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | FileName=/^(npm(\.cmd)?|npx(\.cmd)?|yarn(\.cmd)?|pnpm(\.cmd)?|node|pip|pip3|pipx|python|python3|gem)(\.exe)?$/i
+                | CommandLine=/\b(install|add|setup\.py|-m\s+pip)\b/i
+                | installer_pid := TargetProcessId ;
+              #event_simpleName=/^(PeFileWritten|NewExecutableWritten|NewScriptWritten)$/
+                | TargetFileName=/\\(AppData\\(Roaming|Local)|Temp|ProgramData|Users\\Public|Startup)\\/i ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([CommandLine, FileName, TargetFileName]),
+                              count(as=events)])
+          | installer_pid = ContextProcessId
+        filters:
+          include: []
+          exclude:
+            - "Package caches and virtual-environment paths the toolchain owns by design"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+
+      - id: payload-running-out-of-a-package-path
+        name: Executable running from a package or module directory
+        purpose: >-
+          Cover the stage after installation, where the installed library is the thing that
+          runs. Code inside node_modules or site-packages is normally executed by the
+          interpreter, not started as its own process from a shell or a logon.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/\\(node_modules|site-packages|npm-cache|_npx|\.yarn|Roaming\\npm|Python\d*\\Scripts)\\/i
+          | FileName=/\.(exe|scr|com|pif|js|jse|vbs|vbe|wsf|hta|bat|cmd|ps1|dll)$/i
+          | ParentBaseFileName!=/^(node|python|python3|npm|npx|yarn|pnpm|pip|pip3)(\.exe|\.cmd)?$/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=3)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Developer tooling installed globally through npm or pip and launched from a shell"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: install_produced_unexpected_execution
+      name: Package install spawning a shell, downloader or proxy binary
+      description: >-
+        A package manager or its interpreter became the parent of a general-purpose shell,
+        downloader or proxy-execution binary, which installing a dependency does not
+        require even when the dependency has to build itself.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: user_execution_foothold
+
+  supporting:
+    - id: install_from_untrusted_source
+      name: Install pointed at a direct URL or an unexpected index
+      description: >-
+        The package was fetched from a URL, a git reference or an index other than the
+        sanctioned mirror, which bypasses whatever curation the mirror provides.
+      source: process_creation
+      field: CommandLine
+      indicates: untrusted_source_retrieval
+    - id: executable_written_to_user_path
+      name: Executable written outside the package tree during the install
+      description: >-
+        A binary or script appeared under the user profile, ProgramData or a startup path
+        while the install was running, which is a payload being staged rather than a
+        dependency being unpacked.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+    - id: payload_running_from_package_path
+      name: Executable started from inside a package directory
+      description: >-
+        Content inside node_modules, site-packages or a package cache was launched as its
+        own process by something other than the interpreter that owns that tree.
+      source: process_creation
+      field: ImageFileName
+      indicates: execution_chain_progression
+    - id: package_never_seen_before
+      name: Package not previously installed in the estate
+      description: >-
+        This package name has not been installed on this host or elsewhere in the baseline
+        window, which is what a typosquat or a confused dependency looks like.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: native_build_step
+      name: Native extension build step
+      description: >-
+        The child process is a compiler, linker or build driver that packages with C or C++
+        extensions legitimately invoke while installing.
+      source: process_creation
+      field: FileName
+      indicates: legitimate_application_component
+    - id: internal_mirror_install
+      name: Install served by the organisation's own mirror
+      description: >-
+        The package came from the internal artifact repository or package mirror, which is
+        the sanctioned path and applies its own controls.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: routine_for_this_developer
+      name: Recurring pattern on a development host
+      description: >-
+        The same user installs packages continuously across the baseline window with the
+        same shape of child processes, which reads as ordinary development or build work.
+      source: baseline
+      field: UserName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - install_produced_unexpected_execution
+
+    supporting:
+      any:
+        - install_from_untrusted_source
+        - executable_written_to_user_path
+        - payload_running_from_package_path
+        - package_never_seen_before
+      all:
+        - install_from_untrusted_source
+        - executable_written_to_user_path
+
+    contradicting:
+      any:
+        - native_build_step
+        - internal_mirror_install
+        - routine_for_this_developer
+      all: []
+
+  verdict:
+    low_risk_when:
+      - install_produced_unexpected_execution
+      - native_build_step
+      - internal_mirror_install
+      - routine_for_this_developer
+    suspicious_when:
+      - install_produced_unexpected_execution
+      - package_never_seen_before
+    high_risk_when:
+      - install_produced_unexpected_execution
+      - install_from_untrusted_source
+      - executable_written_to_user_path
+      - payload_running_from_package_path
+
+  false_positive:
+    - condition: A package with a native extension compiles itself during installation.
+      explanation: >-
+        node-gyp, setuptools and similar drivers shell out to compilers and write binaries,
+        so the shape is identical. The children are named build tools rather than shells or
+        downloaders, and the output lands inside the package's own directory.
+    - condition: A developer installs a package straight from a git URL or a local archive.
+      explanation: >-
+        This is normal during development and when consuming an unpublished internal
+        library. It recurs for the same user against the same hosts, and the reference
+        usually points at the organisation's own git or artifact service.
+    - condition: A build agent installs dependencies continuously and unattended.
+      explanation: >-
+        CI hosts run installs constantly, which makes any per-install signal noisy there.
+        The lineage starts from the build service rather than an interactive session, and
+        the same package set repeats on every run.
+    - condition: A globally installed CLI tool is launched from a shell.
+      explanation: >-
+        Tools installed through npm or pip live in package paths and are meant to be run
+        directly, so a shell starting them is expected. These are a small, stable set per
+        host that the baseline exposes, unlike a binary that appears once and runs once.

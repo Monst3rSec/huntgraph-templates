@@ -43,6 +43,7 @@ from coverage import (  # noqa: E402
     PRIORITY_2,
     blocking_components,
     corpus_coverage,
+    skip_register,
 )
 
 COLUMNS = [
@@ -60,6 +61,7 @@ COLUMNS = [
     "data_components_required",
     "data_components_missing",
     "status",
+    "skip_reason",
     "hypotheses",
     "files",
 ]
@@ -75,6 +77,7 @@ def priority_of(shortname: str) -> str:
 
 def build_rows(atk: Attack, covered: dict, only_priority: str | None) -> list[dict]:
     tactic_objs = {t["x_mitre_shortname"]: t for t in atk.tactics.values()}
+    skipped = skip_register()
 
     # which parents decompose
     live = atk.live_techniques()
@@ -106,12 +109,17 @@ def build_rows(atk: Attack, covered: dict, only_priority: str | None) -> list[di
         missing = sorted(set(components) - COLLECTABLE_COMPONENTS) if components else []
 
         files = covered.get(tid, [])
+        skip_reason = skipped.get(tid, "")
         if not leaf:
             status = "parent"
         elif files:
             status = "covered"
         elif not in_scope:
             status = "out-of-scope"
+        elif skip_reason:
+            # A recorded decision outranks the telemetry verdict: several skips
+            # are blocked anyway, but the reason is the useful part.
+            status = "skipped"
         elif blocking_components(atk, tech):
             status = "blocked-telemetry"
         else:
@@ -140,6 +148,7 @@ def build_rows(atk: Attack, covered: dict, only_priority: str | None) -> list[di
                 "data_components_required": "; ".join(components),
                 "data_components_missing": "; ".join(missing),
                 "status": status,
+                "skip_reason": skip_reason,
                 "hypotheses": len(files),
                 "files": "; ".join(files),
             })

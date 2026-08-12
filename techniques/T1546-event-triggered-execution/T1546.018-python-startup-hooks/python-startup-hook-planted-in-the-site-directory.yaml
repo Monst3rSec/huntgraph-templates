@@ -1,0 +1,366 @@
+type: detection
+
+id: hg-lin-python-startup-hook-planted-in-the-site-directory-t1546-018
+
+version: 1.0.0
+
+info:
+  name: Python startup hook planted in the site directory
+  description: >-
+    Python runs code before it runs your code. During interpreter start the site module
+    scans site-packages and dist-packages for path configuration files, and any line in a
+    .pth file that begins with the word import is executed rather than merely added to the
+    search path; the same initialisation imports sitecustomize and usercustomize if they
+    exist anywhere on the path. A single line in a text file therefore executes on every
+    interpreter launch, for every user who shares that environment, with no service, timer,
+    shell profile or autostart entry to find. On a build agent, a data platform or any
+    server where scripts and cron jobs call python constantly, that is a trigger that fires
+    dozens of times an hour and reasserts itself faster than most cleanups. The difficulty
+    is that a .pth file containing an import line is also how editable installs work, so the
+    mechanism itself is not the finding. The discriminator is who wrote it and what the line
+    does: pip and the distribution packager write these files routinely and their import
+    lines reference an installed package, while an adversary writes them from a shell and
+    the line reaches for exec, a subprocess, a socket or an encoded blob.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - event-triggered-execution
+    - python
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1546/018
+    - https://attack.mitre.org/detectionstrategies/DET0258
+    - https://attack.mitre.org/techniques/T1546
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1546
+  sub_techniques:
+    - T1546.018
+  detection_strategies:
+    - DET0258
+  analytics:
+    - AN0713
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+    - auditd:PATH
+    - auditd:CONFIG_CHANGE
+  data_components:
+    - Process Creation
+    - File Modification
+    - File Metadata
+
+hypothesis:
+  statement: >-
+    An adversary may write a path configuration file or a customisation module into a Python
+    site directory so that the interpreter executes their code during startup, obtaining
+    persistence that fires whenever anyone on the host runs python and that appears in no
+    service, timer or autostart inventory.
+  attacker_behavior:
+    - Appends an import line carrying executable code to a .pth file in site-packages.
+    - Creates sitecustomize.py or usercustomize.py so every interpreter start imports it.
+    - Hides the payload behind an encoded blob so the line reads like an ordinary import.
+    - Targets a shared virtual environment so the hook fires for every user of that tooling.
+    - Makes the hook file readable and executable so it survives environment recreation.
+  legitimate_behavior:
+    - Editable installs write .pth files whose import line bootstraps a package finder.
+    - Distribution packaging ships .pth files for namespace packages and compatibility shims.
+    - Administrators add sitecustomize.py to set encodings, proxies or certificate paths.
+    - Virtual environment creation and pip installs rewrite site directories constantly.
+    - Configuration management templates a site customisation file across a fleet.
+  risk_indicator:
+    - The file is written from a shell or an interpreter rather than by pip or the packager.
+    - The import line calls exec, eval, subprocess, socket or decodes a blob.
+    - The hook lives in a system site directory rather than in a project virtual environment.
+    - Permissions on the hook are changed immediately after it is written.
+    - A python interpreter becomes the parent of a shell or a network client shortly afterwards.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: pth-file-written-into-a-site-directory
+        name: Path configuration file written outside packaging
+        purpose: >-
+          Surface the installation step. Site directories are owned by the package manager,
+          so a shell redirect, a tee, a copy or an in-place edit landing a .pth file there is
+          somebody adding a startup hook by hand rather than software being installed.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(site-packages|dist-packages|\/lib\/python3?[0-9.]*\/site)/i
+          | CommandLine=/\.pth\b/i
+          | CommandLine=/(>>|>\s*\/|tee\b|cp\b|mv\b|install\b|sed\s+-i|cat\s*<<|printf\b|echo\b|python.*open\()/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=writes), collect([CommandLine], limit=5)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "pip, dpkg, rpm and the configuration-management agent writing into site directories"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+            - organization
+
+      - id: customisation-module-created
+        name: sitecustomize or usercustomize module created
+        purpose: >-
+          The other automatic entry point. These two module names are imported by the site
+          module on every interpreter start wherever they sit on the path, so creating one
+          is functionally identical to a .pth import line but leaves a plain .py file that
+          nobody thinks to inventory.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(sitecustomize|usercustomize)\.py/i
+          | CommandLine=/(>>|>\s*\/|tee\b|cp\b|mv\b|install\b|sed\s+-i|cat\s*<<|printf\b|echo\b|touch\b|chmod\b)/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=writes), collect([CommandLine], limit=5)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Managed builds that template a site customisation file at provisioning time"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: hook-line-carries-executable-code
+        name: Hook content reaching beyond an import
+        purpose: >-
+          Separate the hook that persists from the hook that configures. An editable install
+          imports a finder module and stops; a payload has to reach a shell, a socket or an
+          interpreter call, and because a .pth line must be a single statement that intent
+          is compressed onto one visible line.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\.pth|sitecustomize|usercustomize)/i
+          | CommandLine=/(exec\(|eval\(|compile\(|__import__|os\.system|subprocess|socket\.|urllib|base64|b64decode|codecs\.decode|marshal\.loads|pty\.spawn)/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=hooks), collect([CommandLine], limit=5)])
+          | sort(hooks, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Editable install shims whose import line only bootstraps a package finder"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: interpreter-spawning-a-shell-or-client
+        name: Python interpreter parenting a shell or network client
+        purpose: >-
+          Confirm the hook fired. Startup code runs inside the interpreter, so the visible
+          consequence is the interpreter itself becoming the parent of something it has no
+          reason to launch — a shell, a downloader, an encoder — at the moment any script on
+          the host happens to run.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^python[0-9.]*$/i
+          | FileName=/^(sh|bash|dash|zsh|ksh|nc|ncat|socat|curl|wget|base64|openssl|chmod|crontab|systemctl)$/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName],
+                    function=[count(as=children), collect([CommandLine], limit=5)])
+          | sort(children, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Build, orchestration and deployment scripts whose whole purpose is to shell out"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - parent_process
+            - organization
+
+evidence:
+  required:
+    - id: startup_hook_written
+      name: Python startup hook written into a site directory
+      description: >-
+        A .pth file, sitecustomize.py or usercustomize.py was created or appended to in a
+        site directory by a shell or interpreter, so the next interpreter launch on that
+        host will execute whatever it contains.
+      source: process_creation
+      field: CommandLine
+      indicates: event_triggered_persistence
+
+  supporting:
+    - id: hook_executes_code
+      name: Hook content calls out to code execution
+      description: >-
+        The written content reaches for exec, a subprocess, a socket, a decoder or an
+        interpreter call rather than importing an installed package, which is the difference
+        between a payload and a path fix-up.
+      source: process_creation
+      field: ImageFileName
+      indicates: code_execution_configured
+    - id: written_outside_package_management
+      name: Written from a shell rather than by pip or the packager
+      description: >-
+        The writing process descended from a shell or a remote session instead of pip, the
+        distribution packager or the configuration-management agent that normally owns site
+        directories.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: hook_permissions_adjusted
+      name: Permissions changed on the hook right after it was written
+      description: >-
+        The hook file's mode or ownership was altered in the same activity, which makes it
+        readable by the interpreter under other accounts and is not part of how packaging
+        installs these files.
+      source: process_creation
+      field: FileName
+      indicates: persistence_made_operational
+    - id: interpreter_spawned_unexpected_child
+      name: Python became the parent of a shell or network client
+      description: >-
+        An interpreter launched a shell, downloader or encoder shortly afterwards,
+        confirming that startup code is executing rather than merely sitting in a file.
+      source: process_creation
+      field: UserName
+      indicates: execution_chain_progression
+    - id: hook_absent_from_peer_hosts
+      name: Hook missing from comparable hosts
+      description: >-
+        The same file does not appear on peers running the same image or environment during
+        the baseline window, unlike packaged and templated hooks which land wherever the
+        build does.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: written_by_pip_or_packaging
+      name: Written by pip or the distribution packager
+      description: >-
+        The site directory was modified by pip, dpkg, rpm or a wheel installer, which is the
+        ordinary and by far the most frequent reason a .pth file appears at all.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: editable_install_shim
+      name: Editable install path shim
+      description: >-
+        The file is an editable-install shim whose import line loads a package finder
+        pointing at a checkout on the same host, which is the closest benign twin this
+        technique has and is expected on any development or build machine.
+      source: derived
+      field: CommandLine
+      indicates: legitimate_application_component
+    - id: templated_across_the_fleet
+      name: Same hook across the estate
+      description: >-
+        The identical customisation file appears on many hosts in one window, the signature
+        of a build image or a configuration-management template rather than of a targeted
+        write.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - startup_hook_written
+
+    supporting:
+      any:
+        - hook_executes_code
+        - written_outside_package_management
+        - hook_permissions_adjusted
+        - interpreter_spawned_unexpected_child
+        - hook_absent_from_peer_hosts
+      all:
+        - hook_executes_code
+        - written_outside_package_management
+
+    contradicting:
+      any:
+        - written_by_pip_or_packaging
+        - editable_install_shim
+        - templated_across_the_fleet
+      all: []
+
+  verdict:
+    low_risk_when:
+      - startup_hook_written
+      - written_by_pip_or_packaging
+      - editable_install_shim
+      - templated_across_the_fleet
+    suspicious_when:
+      - startup_hook_written
+      - hook_absent_from_peer_hosts
+    high_risk_when:
+      - startup_hook_written
+      - hook_executes_code
+      - written_outside_package_management
+      - interpreter_spawned_unexpected_child
+
+  false_positive:
+    - condition: An editable install creates a .pth file with an import line.
+      explanation: >-
+        This is the same mechanism the technique abuses and it happens on every development
+        and build host. The import line names a finder module inside the installed
+        distribution, the writer is pip, and the file appears alongside a matching package
+        metadata directory.
+    - condition: Distribution packaging ships .pth files for namespace packages.
+      explanation: >-
+        Several system packages install path configuration files as compatibility shims.
+        They arrive through dpkg or rpm, they are identical on every host of that build, and
+        their content is a bare path or a namespace declaration with no call into code.
+    - condition: An administrator adds sitecustomize.py to set proxies or certificates.
+      explanation: >-
+        Setting a default encoding, a proxy or a CA bundle in sitecustomize is a legitimate
+        estate-wide practice. It is distinguishable by arriving through configuration
+        management, by appearing across the fleet at once, and by containing only
+        assignments into os.environ or ssl rather than execution.
+    - condition: A build pipeline rewrites a virtual environment on every run.
+      explanation: >-
+        Environment recreation rewrites site directories continuously and will match the
+        write cases in volume on CI hosts. Those writes descend from the build agent, they
+        target a per-job virtual environment rather than a system site directory, and the
+        content is regenerated identically each time.
+    - condition: A deployment script has python shell out to system tools.
+      explanation: >-
+        Automation written in Python legitimately launches shells, curl and systemctl, which
+        matches the confirmation case on its own. Those interpreters run a named script from
+        a known path under an automation account, whereas a fired hook produces the same
+        children from interpreters started for unrelated reasons.

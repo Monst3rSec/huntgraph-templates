@@ -1,0 +1,340 @@
+type: detection
+
+id: hg-lin-kernel-module-loaded-from-outside-the-packaged-module-set-t1547-006
+
+version: 1.0.0
+
+info:
+  name: Kernel module loaded from outside the packaged module set
+  description: >-
+    A loadable kernel module runs in ring 0, in the same address space as the kernel that
+    every user-space security product depends on for its facts. Once the module is in, the
+    adversary is underneath the sensor rather than beside it: syscall results can be
+    filtered so files, processes, sockets and the module itself disappear from anything that
+    asks the kernel, and the module reloads on every boot if its name is registered in
+    modules-load.d or /etc/modules. There is no user-space countermeasure to that, so the
+    only reliable place to catch it is the load itself. The load is loud in one specific
+    way: on a stable host the set of modules that will ever be inserted is fixed by the
+    distribution kernel package and its firmware and driver packages, and insertion happens
+    automatically through modprobe at boot or on device hotplug. An insmod of a .ko sitting
+    outside /lib/modules, a module compiled on the host against the running kernel headers,
+    or a module name registered for boot that no package owns are all outside that set, and
+    each is a deliberate act rather than a side effect of running the machine.
+  severity: critical
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - kernel-module
+    - rootkit
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1547/006
+    - https://attack.mitre.org/detectionstrategies/DET0450
+    - https://attack.mitre.org/techniques/T1547
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1547
+  sub_techniques:
+    - T1547.006
+  detection_strategies:
+    - DET0450
+  analytics:
+    - AN1243
+  platforms:
+    - Linux
+  data_sources:
+    - "auditd:SYSCALL"
+  data_components:
+    - Command Execution
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary may insert a kernel module that no package delivered so that their code
+    runs in ring 0, obtaining the ability to hide files, processes and network activity from
+    every user-space sensor and to regain that position on each boot.
+  attacker_behavior:
+    - Inserts a .ko file with insmod from a temporary, home or shared directory.
+    - Compiles a module on the host against the running kernel's headers or build tree.
+    - Copies a .ko into /lib/modules and runs depmod so modprobe will find it by name.
+    - Registers the module name in /etc/modules-load.d or /etc/modules so it loads at boot.
+    - Removes a competing or logging module with rmmod before inserting its own.
+  legitimate_behavior:
+    - Distribution kernel and driver packages install modules and run depmod on upgrade.
+    - DKMS rebuilds third-party modules such as storage, GPU or hypervisor drivers after a kernel update.
+    - Hardware and virtualisation agents load their own modules during installation.
+    - Administrators load a module by hand while enabling filesystem or network functionality.
+  risk_indicator:
+    - insmod is used with a path outside /lib/modules rather than modprobe with a module name.
+    - The module was compiled on the host in the same window it was loaded.
+    - The loading command's parent is an interactive shell, an interpreter or a remote session.
+    - A module name is added to the boot-load configuration without an accompanying package operation.
+    - The module name does not appear on any comparable host in the estate.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: insmod-from-a-path-outside-lib-modules
+        name: Module inserted from a directory the packaged set does not use
+        purpose: >-
+          The core observable. Packaged modules are inserted by modprobe from
+          /lib/modules/$(uname -r), by name, usually automatically. Handing insmod an
+          explicit path under /tmp, /dev/shm, /var/tmp, a home directory or a mounted share
+          means the object being loaded is not part of that set and did not come from the
+          package manager.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^insmod$/i
+          | CommandLine!=/\/(usr\/)?lib\/modules\//i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=loads), collect([CommandLine], limit=5)])
+          | sort(loads, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Driver installers and DKMS post-build steps that insert freshly built modules by path"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: module-compiled-on-the-host
+        name: Kernel module built against the running kernel on a production host
+        purpose: >-
+          Catch the module being made rather than loaded. Building against
+          /lib/modules/$(uname -r)/build is how a module is matched to a specific running
+          kernel, which is what an operator has to do to get their code accepted. On a
+          server that is not a build host, a compiler invoked against the kernel build tree
+          has no routine cause outside DKMS.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(make|gcc|cc|clang|ld)$/i
+          | CommandLine=/(\/(usr\/)?lib\/modules\/[^\/\s]+\/build|\bM=|\bmodules\b|\.ko\b|kernel\/headers)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=builds), collect([CommandLine], limit=5)])
+          | sort(builds, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "DKMS rebuilds triggered by a kernel package upgrade"
+            - "Dedicated build and CI hosts that compile kernel modules as their function"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: ko-staged-into-lib-modules-then-indexed
+        name: Module object placed into /lib/modules and the index rebuilt
+        purpose: >-
+          Cover the tidier route, where the operator makes their module look packaged. A .ko
+          copied or fetched into the module tree followed by depmod gives modprobe a name to
+          resolve, after which the load itself is indistinguishable from a normal one — so
+          the staging is where the discrimination has to happen.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\/(usr\/)?lib\/modules\//i
+          | CommandLine=/(\.ko(\.[a-z]+)?\b|\bdepmod\b)/i
+          | CommandLine=/(\bcp\b|\bmv\b|\binstall\b|\bcurl\b|\bwget\b|\bscp\b|\btar\b|\bdepmod\b|>\s*\/)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=stages), collect([CommandLine], limit=5)])
+          | sort(stages, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Kernel and driver package installs, which write modules and run depmod as their final step"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: module-registered-to-load-at-boot
+        name: Module name added to the boot-load configuration
+        purpose: >-
+          Confirm the load is meant to survive a reboot rather than being a one-off. A name
+          written into /etc/modules-load.d, /etc/modules or a modprobe.d options file is the
+          persistence half of the technique, and it is a plain configuration edit that
+          packaging performs only when it is installing the matching driver.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\/etc\/(modules-load\.d|modprobe\.d|modules\b)/i
+          | CommandLine=/(>>|>\s*\/|\btee\b|\bcp\b|\bmv\b|\bsed\s+-i\b|\bprintf\b|\becho\b|\binstall\b)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=registrations), collect([CommandLine], limit=5)])
+          | sort(registrations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Package post-install scripts and configuration management that manage modprobe configuration"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+evidence:
+  required:
+    - id: module_loaded_from_unpackaged_source
+      name: Module inserted from outside the packaged module set
+      description: >-
+        insmod was given an explicit path outside /lib/modules, or a .ko was staged into the
+        module tree by hand, so the object entering the kernel is not one the distribution or
+        a driver package delivered.
+      source: process_creation
+      field: CommandLine
+      indicates: unsigned_kernel_code_loaded
+
+  supporting:
+    - id: module_compiled_on_host
+      name: Module built against the running kernel here
+      description: >-
+        A compiler or make run referenced the running kernel's build tree on this host, which
+        is how a module is matched to a specific kernel version before it can be loaded.
+      source: process_creation
+      field: FileName
+      indicates: tooling_built_on_host
+    - id: boot_load_registered
+      name: Module name registered to load at boot
+      description: >-
+        The module name was written into the boot-load or modprobe configuration, so the
+        kernel-level position is regained automatically after every restart.
+      source: process_creation
+      field: ImageFileName
+      indicates: persistence_made_operational
+    - id: loaded_by_interactive_parent
+      name: Load driven by a shell or interpreter
+      description: >-
+        The module tooling was invoked by a login shell, a script or an interpreter rather
+        than by the package manager, DKMS or the udev-driven automatic load path.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: unusual_for_host
+      name: Module unseen on comparable hosts
+      description: >-
+        This module name and path have not appeared on this host or its peers during the
+        baseline window, unlike driver modules which land wherever the hardware or product is.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: package_or_dkms_managed
+      name: Delivered by packaging or DKMS
+      description: >-
+        The insertion, build or depmod run was driven by dpkg, rpm, dnf, apt or dkms, which
+        is how third-party drivers are rebuilt and reinstalled after a kernel upgrade.
+      source: process_creation
+      field: UserName
+      indicates: legitimate_enterprise_activity
+    - id: known_driver_deployed
+      name: Module belongs to deployed hardware or virtualisation support
+      description: >-
+        The module name matches a driver recorded as deployed on this host, such as storage,
+        GPU, hypervisor guest or network acceleration support.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_application_component
+    - id: fleetwide_module
+      name: Same module across comparable hosts
+      description: >-
+        The identical module appears across the estate within one window, which is a driver
+        rollout rather than a targeted kernel implant.
+      source: baseline
+      field: CommandLine
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - module_loaded_from_unpackaged_source
+
+    supporting:
+      any:
+        - module_compiled_on_host
+        - boot_load_registered
+        - loaded_by_interactive_parent
+        - unusual_for_host
+      all:
+        - module_compiled_on_host
+        - loaded_by_interactive_parent
+
+    contradicting:
+      any:
+        - package_or_dkms_managed
+        - known_driver_deployed
+        - fleetwide_module
+      all: []
+
+  verdict:
+    low_risk_when:
+      - module_loaded_from_unpackaged_source
+      - package_or_dkms_managed
+      - known_driver_deployed
+      - fleetwide_module
+    suspicious_when:
+      - module_loaded_from_unpackaged_source
+      - unusual_for_host
+    high_risk_when:
+      - module_loaded_from_unpackaged_source
+      - module_compiled_on_host
+      - boot_load_registered
+      - loaded_by_interactive_parent
+
+  false_positive:
+    - condition: DKMS rebuilds a third-party driver after a kernel upgrade.
+      explanation: >-
+        DKMS compiles against the new kernel's build tree and installs the result into
+        /lib/modules, which reproduces both the build and the staging cases. The parent chain
+        runs back to the package manager or the dkms service, it follows a kernel package
+        install, and the module name is one already present on the host before the upgrade.
+    - condition: A hypervisor, GPU or storage vendor agent installs its own modules.
+      explanation: >-
+        Guest additions and driver bundles compile and insert modules during installation,
+        often by explicit path. The activity is bounded by the installer's own process tree
+        and the same module names appear on every host running that hardware or platform.
+    - condition: An administrator loads a module by hand to enable a filesystem or network feature.
+      explanation: >-
+        Enabling something like an overlay filesystem, a netfilter target or a bonding driver
+        is done with modprobe by name, resolving to an object already inside /lib/modules that
+        the kernel package shipped. The required evidence looks for a source outside that set.
+    - condition: A build or CI host compiles kernel modules as its normal function.
+      explanation: >-
+        Kernel and driver development produces continuous builds against the kernel headers.
+        It is confined to identified build hosts and developer accounts, repeats constantly
+        rather than once, and is usually not followed by an insertion on the same machine.

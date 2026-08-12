@@ -1,0 +1,343 @@
+type: detection
+
+id: hg-mac-quarantine-attribute-stripped-from-a-downloaded-payload-t1553-001
+
+version: 1.0.0
+
+info:
+  name: Quarantine attribute stripped from a downloaded payload
+  description: >-
+    Gatekeeper is opt-in and hangs almost entirely off one extended attribute. When a
+    browser, mail client or messaging app writes a file to disk it tags it with
+    com.apple.quarantine, and Launch Services uses that tag as the trigger for everything
+    that follows: the are-you-sure prompt, the system policy check, the Developer ID
+    signature check and the notarisation lookup. Remove the attribute and the file stops
+    being a download. It becomes indistinguishable from something the user compiled or
+    created locally, and macOS runs it with no prompt and no notarisation call to Apple.
+    That is what makes this a near-perfect signal rather than a noisy one: there is no
+    ordinary reason for a person to reach for xattr and delete that attribute by hand.
+    Users who want to run an unsigned tool right-click and choose Open, or approve it in
+    Privacy settings; neither of those runs xattr. The related routes have the same shape —
+    disabling assessment outright with spctl, or fetching the payload with curl in the
+    first place, which never sets the attribute at all — and the confirmation is the
+    now-untagged file executing out of a download or scratch directory.
+  severity: high
+  author: huntgraph
+  tags:
+    - defense-impairment
+    - gatekeeper
+    - quarantine
+    - trust-controls
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1553/001
+    - https://attack.mitre.org/detectionstrategies/DET0288
+    - https://attack.mitre.org/techniques/T1553
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1553
+  sub_techniques:
+    - T1553.001
+  detection_strategies:
+    - DET0288
+  analytics:
+    - AN0800
+  platforms:
+    - macOS
+  data_sources:
+    - "macos:unifiedlog"
+  data_components:
+    - File Metadata
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may delete the com.apple.quarantine extended attribute from a downloaded
+    file so that Gatekeeper never evaluates it, obtaining execution of unsigned and
+    un-notarised code with no user prompt and no trust check, on a file that afterwards
+    looks locally produced.
+  attacker_behavior:
+    - Runs xattr -d com.apple.quarantine against a dropped binary, app bundle or disk image.
+    - Clears every extended attribute at once with xattr -c, or recursively with -r across a bundle.
+    - Disables assessment entirely with spctl so no file needs stripping.
+    - Fetches the payload with curl, which never sets the attribute, instead of through a browser.
+    - Executes the untagged file from the download or temporary directory it landed in.
+  legitimate_behavior:
+    - Developers strip quarantine from their own build output and test artefacts.
+    - Package and cask managers remove the attribute from tools they install for the user.
+    - Deployment tooling clears quarantine on software it places on managed Macs.
+    - Users unblock a legitimately downloaded but un-notarised utility they intend to run.
+  risk_indicator:
+    - The attribute is removed from a file under Downloads, Desktop, a temporary path or a mounted volume.
+    - The removal is recursive or clears all attributes across an application bundle.
+    - Assessment is disabled globally rather than an exception being added for one file.
+    - The command runs under an interpreter or a piped shell rather than an interactive terminal.
+    - The stripped file executes shortly afterwards from the same directory.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: quarantine-attribute-deleted
+        name: com.apple.quarantine removed with xattr
+        purpose: >-
+          The core observable. Deleting this one attribute is what turns off every
+          Gatekeeper check that would otherwise apply to the file, and no part of the normal
+          macOS user experience does it — the supported way to run an unsigned tool is the
+          right-click Open prompt or the approval button in Privacy settings, neither of
+          which touches xattr.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^xattr$/i
+          | CommandLine=/\s-[a-z]*[dc][a-z]*\b/i
+          | CommandLine=/(com\.apple\.quarantine|\s-c\b)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=strips), collect([CommandLine], limit=5)])
+          | sort(strips, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Developer accounts stripping quarantine from their own build output"
+            - "Cask and package managers that unquarantine the tools they install"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: strip-targeting-a-download-or-scratch-path
+        name: Attribute removed from a file in a download or temporary directory
+        purpose: >-
+          Narrow to where a delivered payload actually lands. Build output and locally
+          created files never carried the attribute, so a strip that names Downloads, the
+          Desktop, a temporary path or a mounted volume is being applied to something that
+          arrived from outside — which is the only kind of file the attribute is set on.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^xattr$/i
+          | CommandLine=/(\/Users\/[^\/\s]+\/(Downloads|Desktop|Public)|(\/private)?\/(tmp|var\/tmp)|\/Users\/Shared|\/Volumes)\//i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=strips), collect([CommandLine], limit=5)])
+          | sort(strips, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Software installed from a mounted disk image by a sanctioned deployment workflow"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: assessment-disabled-with-spctl
+        name: Gatekeeper assessment turned off or bypassed with spctl
+        purpose: >-
+          Cover the blunt alternative to stripping individual files. Disabling assessment
+          globally removes the check for everything that follows rather than for one file,
+          and adding a label or rule for a specific path whitelists the payload permanently.
+          Both are administrative actions with no routine cause on a managed Mac.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^spctl$/i
+          | CommandLine=/--(master-disable|global-disable|disable|add|remove|reset-default)\b/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Imaging and provisioning workflows that relax assessment during a build"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: untagged-payload-executed-from-a-download-path
+        name: Binary run out of a download or scratch directory
+        purpose: >-
+          Confirm the bypass had a point. A Mach-O or script executing directly from
+          Downloads, a temporary path or a mounted volume is what the strip was for, and its
+          parent shows whether a person double-clicked it or a script chained straight from
+          the fetch into the run.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/^(\/private)?\/(tmp|var\/tmp)\/|^\/Users\/[^\/]+\/(Downloads|Desktop|Public)\/|^\/Users\/Shared\/|^\/Volumes\//i
+          | ParentBaseFileName=/^(bash|sh|zsh|python3?|perl|ruby|osascript|curl|open|Terminal|installer)$/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Application installers running from a mounted disk image during ordinary software installation"
+            - "Build and test binaries executing from developer workspaces"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+evidence:
+  required:
+    - id: quarantine_attribute_removed
+      name: com.apple.quarantine deleted from a file
+      description: >-
+        The extended attribute that Gatekeeper keys on was removed with xattr, so the
+        prompt, the policy check, the signature check and the notarisation lookup are all
+        skipped for that file from then on.
+      source: process_creation
+      field: CommandLine
+      indicates: trust_control_subverted
+
+  supporting:
+    - id: target_is_a_delivered_file
+      name: Strip aimed at a download, temporary or mounted path
+      description: >-
+        The file being unquarantined sits where delivered content lands rather than where a
+        local build lands, so the attribute being removed was set by whatever fetched it.
+      source: process_creation
+      field: ImageFileName
+      indicates: payload_staged_in_writable_path
+    - id: assessment_disabled
+      name: Gatekeeper assessment disabled or whitelisted
+      description: >-
+        spctl was used to turn assessment off or to add a standing exception, which removes
+        the check for everything rather than for one file.
+      source: process_creation
+      field: FileName
+      indicates: security_control_disabled
+    - id: scripted_rather_than_interactive
+      name: Removal driven by a script or interpreter
+      description: >-
+        The command was issued by a shell script, interpreter or piped installer rather than
+        typed at a terminal, which is how a dropper unblocks its own payload.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: unusual_for_host
+      name: No history of quarantine removal on this host
+      description: >-
+        No comparable xattr or spctl activity has been seen on this host during the baseline
+        window, so the trust control was not routinely relaxed here before now.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: developer_build_workflow
+      name: Part of a developer build or test cycle
+      description: >-
+        The account and parent process belong to a build, signing or test workflow that
+        strips attributes from its own artefacts, which is ordinary on a development Mac.
+      source: process_creation
+      field: UserName
+      indicates: legitimate_development_activity
+    - id: package_manager_unquarantine
+      name: Performed by a package or cask manager
+      description: >-
+        A package or cask manager removed the attribute from software it installed for the
+        user, which is a documented step in several of those tools.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_application_component
+    - id: fleetwide_strip
+      name: Same removal across the estate
+      description: >-
+        The identical command appears on many managed Macs within one window, which is a
+        deployment workflow unblocking a distributed tool rather than a targeted bypass.
+      source: baseline
+      field: CommandLine
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - quarantine_attribute_removed
+
+    supporting:
+      any:
+        - target_is_a_delivered_file
+        - assessment_disabled
+        - scripted_rather_than_interactive
+        - unusual_for_host
+      all:
+        - target_is_a_delivered_file
+        - scripted_rather_than_interactive
+
+    contradicting:
+      any:
+        - developer_build_workflow
+        - package_manager_unquarantine
+        - fleetwide_strip
+      all: []
+
+  verdict:
+    low_risk_when:
+      - quarantine_attribute_removed
+      - developer_build_workflow
+      - package_manager_unquarantine
+      - fleetwide_strip
+    suspicious_when:
+      - quarantine_attribute_removed
+      - unusual_for_host
+    high_risk_when:
+      - quarantine_attribute_removed
+      - target_is_a_delivered_file
+      - assessment_disabled
+      - scripted_rather_than_interactive
+
+  false_positive:
+    - condition: A developer strips quarantine from their own build output.
+      explanation: >-
+        Artefacts pulled from CI or extracted from an archive do carry the attribute, and
+        clearing it is a normal part of testing an unsigned build. The paths sit inside a
+        project or derived-data tree rather than in Downloads or a temporary directory, and
+        the behaviour repeats on every build instead of happening once.
+    - condition: A package or cask manager unquarantines a tool it installed.
+      explanation: >-
+        Several package managers run xattr on casks that ship un-notarised binaries, which
+        reproduces the required evidence precisely. The parent is the package manager, the
+        target is inside its own prefix or Applications, and the same command appears on
+        every host where that formula is installed.
+    - condition: A user unblocks an un-notarised utility they downloaded deliberately.
+      explanation: >-
+        A power user who knows the trick will type xattr -d rather than use the right-click
+        Open dialog. It is one file, typed at an interactive terminal, and the file is a
+        recognisable tool rather than something a script fetched and immediately ran.
+    - condition: Provisioning relaxes assessment while building an image.
+      explanation: >-
+        Imaging workflows sometimes disable spctl so unattended installs do not stall on
+        prompts. It happens on build and provisioning hosts as part of a scripted sequence
+        that re-enables assessment afterwards, and does not co-occur with a payload running
+        out of a download directory.

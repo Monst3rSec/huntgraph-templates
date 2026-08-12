@@ -1,0 +1,347 @@
+type: detection
+
+id: hg-win-keystroke-path-extended-by-a-registered-component-t1056-001
+
+version: 1.0.0
+
+info:
+  name: Keystroke path extended by a newly registered component
+  description: >-
+    Keylogging is mostly an in-memory behaviour. A user-mode hook installed with
+    SetWindowsHookEx, or a loop polling key state, leaves no file, no command line and no
+    configuration change, and this template does not claim to see it. What it does cover is
+    the other half of the technique, the half that has to be written down: to read
+    keystrokes reliably, from a service, or from processes an adversary does not otherwise
+    control, something has to be inserted into the path a keystroke takes from the device
+    to the application. Windows only offers a few such insertion points, and every one of
+    them is a registry entry — a filter driver added to the keyboard or HID device class, a
+    kernel driver service registered to back it, a DLL forced into every process that loads
+    the window manager, or a text-input processor registered to receive input before the
+    application does. These values are near-static on a built host. The benign twin is real:
+    touchpad, smartcard, remote-desktop and accessibility products install exactly these
+    components. The discriminator is where the referenced image lives and how well known it
+    is, not the fact that the value changed.
+  severity: high
+  author: huntgraph
+  tags:
+    - collection
+    - credential-access
+    - input-capture
+    - registry
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1056/001
+    - https://attack.mitre.org/detectionstrategies/DET0089
+    - https://attack.mitre.org/techniques/T1056
+
+mitre:
+  tactics:
+    - TA0009
+    - TA0006
+  techniques:
+    - T1056
+  sub_techniques:
+    - T1056.001
+  detection_strategies:
+    - DET0089
+  analytics:
+    - AN0243
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An adversary may register a driver, injected library or input processor into the
+    keyboard input path so that keystrokes are captured system-wide and survive reboot,
+    obtaining credentials as the user types them without having to attach to each target
+    process.
+  attacker_behavior:
+    - Adds a filter driver to the keyboard or HID device class so it sees raw input.
+    - Registers a kernel driver service whose image sits outside the system driver directory.
+    - Configures the driver to start at boot so capture resumes without user action.
+    - Registers a DLL or text-input processor that loads into processes receiving keystrokes.
+  legitimate_behavior:
+    - Touchpad, keyboard and docking-station vendors install class filter drivers.
+    - Remote-desktop, virtualisation and KVM products insert their own input drivers.
+    - Accessibility software and input method editors register text-input processors.
+    - Endpoint security products load libraries broadly across user-mode processes.
+  risk_indicator:
+    - The referenced driver or library sits in a user-writable directory.
+    - The component is registered on one host rather than across a hardware model.
+    - The service is configured as a boot-start kernel driver immediately after registration.
+    - The input path is extended on a host whose hardware and software have not changed.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: registry
+      event_types:
+        - AsepValueUpdate
+        - RegGenericValueUpdate
+        - RegSystemConfigValueUpdate
+        - RegKeyCreate
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - RegObjectName
+        - RegValueName
+        - RegStringValue
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: keyboard-class-filter-registered
+        name: Filter driver added to the keyboard or HID device class
+        purpose: >-
+          Surface the most direct insertion point. A driver listed in the class filter
+          values sees every keystroke before any application does, and the set of drivers
+          that legitimately appear there is small and stable per hardware model.
+        query: |
+          #event_simpleName=/^(AsepValueUpdate|RegGenericValueUpdate|RegSystemConfigValueUpdate|RegKeyCreate)$/
+          | RegObjectName=/\\Control\\Class\\\{(4D36E96B-E325-11CE-BFC1-08002BE10318|745A17A0-74D3-11D0-B6FE-00A0C90F57DA)\}/i
+          | RegValueName=/^(Upper|Lower)Filters$/i
+          | RegStringValue!=/^(kbdclass|mouclass|kbdhid|mouhid|hidusb|i8042prt|terminpt|vmkbd|kbfiltr|synhid)$/i
+          | groupBy([ComputerName, RegObjectName, RegStringValue],
+                    function=[count(as=changes)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Filter drivers shipped with the standard build for a given hardware model"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - module
+            - organization
+
+      - id: kernel-driver-service-registered-outside-system-path
+        name: Kernel driver service registered for an image in a writable path
+        purpose: >-
+          Catch the service entry that backs a filter driver. Legitimate drivers are staged
+          into the system driver directory by the installer; one registered from a profile,
+          temporary or ProgramData path was placed there by hand.
+        query: |
+          #event_simpleName=/^(AsepValueUpdate|RegGenericValueUpdate|RegSystemConfigValueUpdate|RegKeyCreate)$/
+          | RegObjectName=/\\CurrentControlSet\\Services\\[^\\]+$/i
+          | case {
+              RegValueName=/^ImagePath$/i and RegStringValue=/\.sys\b/i
+                | driver_image := RegStringValue ;
+              RegValueName=/^Type$/i and RegStringValue=/^(0x)?0*1$/
+                | kernel_driver := RegValueName ;
+              RegValueName=/^Start$/i and RegStringValue=/^(0x)?0*[0-2]$/
+                | boot_start := RegStringValue ;
+            }
+          | groupBy([ComputerName, RegObjectName],
+                    function=[collect([driver_image, kernel_driver, boot_start]),
+                              count(as=changes)])
+          | driver_image=/\\(Users|AppData|Temp|ProgramData|Public|Downloads)\\/i
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Driver staging paths used by the organisation's own deployment tooling"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: library-forced-into-processes-handling-input
+        name: Library registered to load into every interactive process
+        purpose: >-
+          Cover the user-mode route into other processes. A hook has to live inside the
+          process that owns the window receiving keystrokes, and these values are how a
+          library gets there without the adversary touching each process.
+        query: |
+          #event_simpleName=/^(AsepValueUpdate|RegGenericValueUpdate|RegSystemConfigValueUpdate)$/
+          | RegObjectName=/\\(Windows NT\\CurrentVersion\\Windows|Session Manager\\AppCertDlls)/i
+          | case {
+              RegValueName=/^AppInit_DLLs$/i and RegStringValue=/\.dll/i
+                | injected_dll := RegStringValue ;
+              RegValueName=/^LoadAppInit_DLLs$/i and RegStringValue=/^(0x)?0*1$/
+                | injection_enabled := RegValueName ;
+              RegObjectName=/AppCertDlls/i and RegStringValue=/\.dll/i
+                | injected_dll := RegStringValue ;
+            }
+          | groupBy([ComputerName, RegObjectName, RegValueName],
+                    function=[collect([injected_dll, injection_enabled]),
+                              count(as=changes)])
+          | injected_dll=/.+/ or injection_enabled=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Endpoint security and accessibility products that register a broad-load library by design"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - module
+            - organization
+
+      - id: text-input-processor-registered
+        name: Input processor or keyboard layout pointed at a non-system image
+        purpose: >-
+          Cover the input-method route, where a registered text service or layout receives
+          keystrokes ahead of the application. Stock layouts reference a bare filename that
+          resolves out of the system directory, so a full path is the anomaly.
+        query: |
+          #event_simpleName=/^(AsepValueUpdate|RegGenericValueUpdate|RegSystemConfigValueUpdate|RegKeyCreate)$/
+          | RegObjectName=/\\(Microsoft\\CTF\\TIP|Control\\Keyboard Layouts?)\\/i
+          | RegValueName=/^(Layout File|Layout Dll|Ime File|Layout Text)$/i
+          | RegStringValue=/(\\|\/)/
+          | groupBy([ComputerName, UserName, RegObjectName, RegStringValue],
+                    function=[count(as=changes)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Language packs and input method editors deployed as part of the standard build"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: input_path_component_registered
+      name: Component registered into the keystroke path
+      description: >-
+        A device class filter, driver service, broad-load library or input processor was
+        registered at one of the few points where code can observe keystrokes before the
+        application that owns them.
+      source: registry
+      field: RegObjectName
+      indicates: input_capture_component_installed
+
+  supporting:
+    - id: image_outside_system_path
+      name: Referenced image sits in a writable directory
+      description: >-
+        The driver or library the registration points at lives under a profile, temporary
+        or ProgramData path rather than the system directory an installer would use.
+      source: registry
+      field: RegStringValue
+      indicates: untrusted_execution_location
+    - id: configured_to_load_at_boot
+      name: Configured as a boot-start kernel driver
+      description: >-
+        The service was set to kernel driver type with an early start value, so capture
+        resumes on every boot without anyone signing in.
+      source: registry
+      field: RegValueName
+      indicates: persistence_made_operational
+    - id: broad_injection_enabled
+      name: Broad library loading switched on alongside the registration
+      description: >-
+        The switch that makes the registered library load into every process handling a
+        window was enabled in the same window as the value that names it.
+      source: registry
+      field: RegValueName
+      indicates: process_injection_configured
+    - id: unusual_for_host
+      name: Input path unchanged on this host until now
+      description: >-
+        These values have not been written on this host during the baseline window, so the
+        registration is a deviation rather than part of a build or driver update.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: vendor_input_driver
+      name: Vendor input or docking driver
+      description: >-
+        The referenced image is a signed vendor driver for the machine's keyboard, touchpad,
+        smartcard reader or docking station, installed into the system driver directory.
+      source: registry
+      field: RegStringValue
+      indicates: legitimate_application_component
+    - id: security_or_accessibility_product
+      name: Endpoint security or accessibility product
+      description: >-
+        The host runs a product that legitimately inserts itself into input handling, such
+        as an endpoint agent, a screen reader or a remote-support tool.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: fleetwide_registration
+      name: Same registration across a hardware model
+      description: >-
+        The identical component appears on every host of a hardware model or build within
+        one window, which is a driver rollout rather than a targeted change.
+      source: baseline
+      field: RegObjectName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - input_path_component_registered
+
+    supporting:
+      any:
+        - image_outside_system_path
+        - configured_to_load_at_boot
+        - broad_injection_enabled
+        - unusual_for_host
+      all:
+        - image_outside_system_path
+        - configured_to_load_at_boot
+
+    contradicting:
+      any:
+        - vendor_input_driver
+        - security_or_accessibility_product
+        - fleetwide_registration
+      all: []
+
+  verdict:
+    low_risk_when:
+      - input_path_component_registered
+      - vendor_input_driver
+      - security_or_accessibility_product
+      - fleetwide_registration
+    suspicious_when:
+      - input_path_component_registered
+      - unusual_for_host
+    high_risk_when:
+      - input_path_component_registered
+      - image_outside_system_path
+      - configured_to_load_at_boot
+      - broad_injection_enabled
+
+  false_positive:
+    - condition: A vendor driver update rewrites the keyboard or HID class filter values.
+      explanation: >-
+        Touchpad, docking and KVM drivers legitimately own these values and rewrite them on
+        every update. The referenced driver is signed, lives in the system driver directory,
+        and the same change appears on every host of that hardware model at once.
+    - condition: An endpoint security or accessibility product registers a broad-load library.
+      explanation: >-
+        Agents, screen readers and remote-support tools do load themselves into user-mode
+        processes deliberately. They are present in the software inventory and appear
+        estate-wide rather than on one host, which is what separates them.
+    - condition: A language pack or input method editor is installed.
+      explanation: >-
+        Installing an IME registers a text-input processor that genuinely receives keystrokes
+        first. It is installed through the operating system's own language support and its
+        files land in the system directory rather than a profile path.
+    - condition: A virtualisation or remote-desktop platform installs its input driver.
+      explanation: >-
+        Virtual keyboards and remote input channels require a driver in the same place a
+        keylogger would sit. These arrive with the platform's guest tools, are signed by the
+        platform vendor, and are present on every guest of that platform.

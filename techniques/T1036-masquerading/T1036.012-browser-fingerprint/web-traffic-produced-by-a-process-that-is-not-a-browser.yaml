@@ -1,0 +1,357 @@
+type: detection
+
+id: hg-win-web-traffic-produced-by-a-process-that-is-not-a-browser-t1036-012
+
+version: 1.0.0
+
+info:
+  name: Web traffic produced by a process that is not a browser
+  description: >-
+    Spoofing a browser fingerprint is cheap and effective: the adversary sets a User-Agent
+    and whatever other attributes the server checks, and their traffic stops standing out in
+    a proxy log full of real browsing. The header itself is not visible in endpoint
+    telemetry, so this template does not pretend to read it. It keys instead on the thing
+    the spoof exists to conceal, which the endpoint does see plainly: the traffic is being
+    produced by a process that has no browser in it. A scripting host, a signed
+    proxy-execution binary or a command-line fetcher opening a session on a web port is
+    already outside the shape of the population it is imitating, and no header can change
+    which process the connection belongs to. The benign twin is substantial — updaters,
+    telemetry agents and administrative scripts all speak HTTPS — so the discriminator is
+    the destination rather than the protocol: a process copying browser traffic is talking
+    to somewhere the browsers on that host never go, often without the name resolution a
+    browser would have performed first.
+  severity: medium
+  author: huntgraph
+  tags:
+    - stealth
+    - masquerading
+    - command-and-control
+    - network
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1036/012
+    - https://attack.mitre.org/detectionstrategies/DET0898
+    - https://attack.mitre.org/techniques/T1036
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1036
+  sub_techniques:
+    - T1036.012
+  detection_strategies:
+    - DET0898
+  analytics:
+    - AN2029
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may shape outbound requests to look like an ordinary browser session, so
+    that traffic from a scripting host or a proxy-execution binary blends into normal web
+    browsing and passes a proxy inspecting user agents and request shape.
+  attacker_behavior:
+    - Sets a browser User-Agent on requests issued from a scripting host or fetcher.
+    - Sends command-and-control traffic over the same ports and protocol as browsing.
+    - Reuses the fingerprint of the browser actually installed on the host.
+    - Contacts a destination that no browser on the host has any reason to visit.
+  legitimate_behavior:
+    - Updaters and telemetry agents make HTTPS requests without any browser involved.
+    - Administrative scripts call internal and vendor web services routinely.
+    - Development tooling fetches packages and metadata over the same ports.
+    - Management agents poll cloud endpoints on a fixed schedule.
+  risk_indicator:
+    - The destination is contacted by a scripting host but never by a browser on that host.
+    - The connection is made to an address with no preceding name resolution.
+    - Contact repeats at a steady cadence rather than in bursts around user activity.
+    - The process is one that has no legitimate reason to originate web traffic on this host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+        - NetworkConnectIP6
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+    - source: dns_request
+      event_types:
+        - DnsRequest
+      fields:
+        - aid
+        - ComputerName
+        - DomainName
+        - ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: non-browser-process-opening-web-sessions
+        name: Scripting host or proxy binary opening web sessions
+        purpose: >-
+          Establish the base population. Traffic shaped to look like browsing but issued by
+          a process with no user interface is the part of the masquerade the endpoint can
+          see regardless of what headers are sent.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | ContextBaseFileName=/^(powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin|curl|wget|python|pythonw|node|msbuild|installutil)\.exe$/i
+          | RemotePort in (80, 443, 8080, 8443)
+          | groupBy([ComputerName, ContextBaseFileName, RemoteAddressIP4, RemotePort],
+                    function=[count(as=connections)])
+          | sort(connections, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Management, update and monitoring agents that reach their own service endpoints"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: web-connection-without-a-preceding-resolution
+        name: Web session opened with no name resolution behind it
+        purpose: >-
+          Separate traffic that imitates browsing from traffic that follows it. A browser
+          reaches a site by name; a payload with a hardcoded address connects without ever
+          asking the resolver, and the missing lookup is visible even when the request
+          itself is not.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6|DnsRequest)$/
+          | case {
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | ContextBaseFileName=/^(powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin|curl|wget|python|pythonw|node)\.exe$/i
+                | RemotePort in (80, 443, 8080, 8443)
+                | web_peer := RemoteAddressIP4 ;
+              #event_simpleName=DnsRequest
+                | resolved := DomainName ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([ContextBaseFileName, web_peer, resolved]),
+                              count(as=events)])
+          | web_peer=/.+/
+          | resolved!=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Agents configured with literal endpoint addresses by the organisation's own build"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - process
+            - remote_address
+
+      - id: destination-no-browser-on-the-host-visits
+        name: Destination reached by a script host but never by a browser
+        purpose: >-
+          Carry the discriminator. If the point of the fingerprint is to look like the
+          user's browsing, then a destination the user's browsers have never contacted is
+          exactly where the imitation fails.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+          | RemotePort in (80, 443, 8080, 8443)
+          | case {
+              ContextBaseFileName=/^(msedge|chrome|firefox|iexplore|brave|opera|vivaldi)\.exe$/i
+                | browser_peer := RemoteAddressIP4 ;
+              ContextBaseFileName=/^(powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin|curl|wget|python|pythonw|node)\.exe$/i
+                | script_peer := RemoteAddressIP4 ;
+            }
+          | groupBy([ComputerName, RemoteAddressIP4],
+                    function=[collect([ContextBaseFileName, browser_peer, script_peer]),
+                              count(as=connections)])
+          | script_peer=/.+/
+          | browser_peer!=/.+/
+          | sort(connections, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Package registries, vendor APIs and update services on the approved egress list"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - remote_address
+            - organization
+
+      - id: steady-repeat-contact-from-one-process
+        name: Steady repeat contact from a single non-browser process
+        purpose: >-
+          Pick out the cadence. Browsing is bursty and follows the working day, whereas a
+          channel dressed as browsing keeps a rhythm of its own, which shows in the volume
+          of lookups and connections from one process.
+        query: |
+          #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6|DnsRequest)$/
+          | case {
+              #event_simpleName=DnsRequest
+                | lookup_domain := DomainName ;
+              #event_simpleName=/^(NetworkConnectIP4|NetworkConnectIP6)$/
+                | ContextBaseFileName=/^(powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin|curl|wget|python|pythonw|node)\.exe$/i
+                | RemotePort in (80, 443, 8080, 8443)
+                | peer := RemoteAddressIP4 ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([ContextBaseFileName, lookup_domain, peer]),
+                              count(as=events)])
+          | peer=/.+/
+          | events > 20
+        filters:
+          include: []
+          exclude:
+            - "Polling agents whose interval and endpoint are documented in the build"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: web_traffic_from_a_non_browser_process
+      name: Web session originated by a process that is not a browser
+      description: >-
+        A scripting host, fetcher or proxy-execution binary opened a session on a web port,
+        which is the traffic the spoofed fingerprint is meant to make indistinguishable from
+        browsing.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: browser_traffic_masquerade
+
+  supporting:
+    - id: no_preceding_name_resolution
+      name: No name resolution preceded the connection
+      description: >-
+        The process connected to an address without asking the resolver first, which a
+        browser following a link or a bookmark would not do.
+      source: dns_request
+      field: DomainName
+      indicates: hardcoded_destination
+    - id: destination_unseen_for_browsers
+      name: Destination never contacted by a browser on this host
+      description: >-
+        The address is reached only by the non-browser process, so the traffic is not part
+        of the browsing it is imitating.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: unusual_destination
+    - id: steady_repeat_contact
+      name: Contact repeats at a steady rate
+      description: >-
+        The same process keeps contacting the destination at a volume and rhythm unlike
+        user-driven browsing, which is the shape of a maintained channel.
+      source: network_connection
+      field: ContextProcessId
+      indicates: active_command_and_control_attempt
+    - id: first_time_for_host
+      name: Process has no history of web traffic on this host
+      description: >-
+        This process has not originated outbound web sessions on this host during the
+        baseline window, so the traffic is new rather than part of a standing agent.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: management_or_update_agent
+      name: Management, update or monitoring agent
+      description: >-
+        The process is a deployed agent whose job is to call a service endpoint over HTTPS
+        without a browser being involved.
+      source: network_connection
+      field: ContextBaseFileName
+      indicates: legitimate_application_component
+    - id: approved_automation
+      name: Sanctioned automation on this host
+      description: >-
+        The host is a build, automation or administration system where scripted web calls
+        are the normal workload rather than an exception.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: routine_destination
+      name: Destination reached by the whole estate
+      description: >-
+        The same address is contacted by many hosts across the baseline window, which is a
+        shared service rather than a destination chosen for one victim.
+      source: baseline
+      field: RemoteAddressIP4
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - web_traffic_from_a_non_browser_process
+
+    supporting:
+      any:
+        - no_preceding_name_resolution
+        - destination_unseen_for_browsers
+        - steady_repeat_contact
+        - first_time_for_host
+      all:
+        - destination_unseen_for_browsers
+        - steady_repeat_contact
+
+    contradicting:
+      any:
+        - management_or_update_agent
+        - approved_automation
+        - routine_destination
+      all: []
+
+  verdict:
+    low_risk_when:
+      - web_traffic_from_a_non_browser_process
+      - management_or_update_agent
+      - approved_automation
+      - routine_destination
+    suspicious_when:
+      - web_traffic_from_a_non_browser_process
+      - first_time_for_host
+    high_risk_when:
+      - web_traffic_from_a_non_browser_process
+      - no_preceding_name_resolution
+      - destination_unseen_for_browsers
+      - steady_repeat_contact
+
+  false_positive:
+    - condition: An update or telemetry agent calls its vendor endpoint over HTTPS.
+      explanation: >-
+        These processes originate web traffic constantly and often connect to literal
+        addresses from a configuration file, which reproduces both the process shape and the
+        missing lookup. They are the same on every host running the product, which is what
+        the estate-wide comparison exposes.
+    - condition: An administrative or deployment script calls an internal web service.
+      explanation: >-
+        Scripted HTTPS calls are ordinary on servers and administrative workstations. The
+        destination is an internal service that other hosts also reach, and the activity
+        follows a schedule the change record explains.
+    - condition: Developer tooling fetches packages and metadata over web ports.
+      explanation: >-
+        Package managers, language runtimes and build tools generate exactly this pattern on
+        engineering hosts. The destinations are public registries reached by many users, not
+        a single address contacted from one machine.
+    - condition: A browser is invoked headlessly by automation.
+      explanation: >-
+        Headless browsing produces traffic that genuinely comes from a browser binary, so it
+        falls outside the process set here. It is worth noting because it is the legitimate
+        way to script a browser, and its absence is part of why scripted fetchers stand out.

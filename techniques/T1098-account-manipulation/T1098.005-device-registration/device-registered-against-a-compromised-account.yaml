@@ -1,0 +1,343 @@
+type: detection
+
+id: hg-win-device-registered-against-a-compromised-account-t1098-005
+
+version: 1.0.0
+
+info:
+  name: Device registered against a compromised account
+  description: >-
+    Registering a device is how an adversary turns a stolen password into a tenancy. The
+    password by itself is fragile — it can be reset, and a second factor stands in front of
+    it — but a device registered to the account becomes a thing the identity system trusts
+    on its own terms. It satisfies MFA as an enrolled factor, it satisfies conditional
+    access as a compliant or joined device, and it is not removed when the password is
+    changed, so the usual containment step leaves the access intact. The self-enrolment
+    paths are the weak point: enrolling the first device for an account, or any device for a
+    dormant one, often requires nothing more than the username and password that were just
+    stolen, and the tenant treats the result as a legitimate user provisioning their own
+    hardware. What this template sees is the endpoint side of that: the join, the enrolment
+    or the bulk registration token being driven from a managed Windows host, along with the
+    mailbox access changes that commonly follow a registration. The limitation is worth
+    stating plainly, because it is large. The authoritative record of a device being added
+    to a tenant is the identity provider's own audit log, and an adversary who registers a
+    device from a machine of their own — which is the common case — produces no endpoint
+    telemetry at all. What is caught here is the variant driven from inside the estate, on a
+    host that already carries a sensor. The discriminator against ordinary onboarding is
+    the driver: provisioning runs the join from the enrolment stack during setup, whereas
+    the adversary form is issued interactively from a shell, often through tooling that
+    requests the join token directly.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - account-manipulation
+    - device-registration
+    - identity
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1098/005
+    - https://attack.mitre.org/detectionstrategies/DET0036
+    - https://attack.mitre.org/techniques/T1098
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1098
+  sub_techniques:
+    - T1098.005
+  detection_strategies:
+    - DET0036
+  analytics:
+    - AN0104
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+  data_components:
+    - Active Directory Object Creation
+
+hypothesis:
+  statement: >-
+    An adversary holding valid credentials may register a device of their own to the
+    compromised account so that the tenant treats it as trusted hardware, obtaining a
+    standing second factor and a compliant-device claim that survives a password reset.
+  attacker_behavior:
+    - Joins a machine under their control to the tenant using the compromised account's credentials.
+    - Enrols the device into management so it satisfies conditional access as compliant.
+    - Requests a bulk registration token so many devices can be added without further interaction.
+    - Enables mailbox synchronisation for the account once the device is trusted.
+    - Targets dormant accounts where no device is registered yet and self-enrolment is unchallenged.
+  legitimate_behavior:
+    - New hardware is joined and enrolled during provisioning as part of onboarding.
+    - Users enrol a personal device under a bring-your-own-device policy.
+    - Support staff re-join a machine after a repair, rebuild or domain change.
+    - Deployment teams use bulk registration tokens to provision batches of new machines.
+  risk_indicator:
+    - The join or enrolment is issued interactively from a shell rather than by the provisioning stack.
+    - Registration tooling associated with adversary use of the identity platform is present.
+    - A bulk registration token is requested outside a deployment window.
+    - The account has no prior device registration and no onboarding record.
+    - Mailbox synchronisation is enabled for the account immediately after the registration.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: device-join-driven-from-a-shell
+        name: Directory join issued interactively
+        purpose: >-
+          Surface the join itself and, more importantly, who drove it. Provisioning performs
+          this once during setup from the enrolment stack, so the same command arriving from
+          an interactive shell on a machine that is already in service is the anomaly.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(dsregcmd|Join-AADIntDeviceToAzureAD|Get-AADIntAccessTokenForAADJoin|Register-DeviceWithManagement|AADInternals)/i
+          | CommandLine=/(\/join|\/debug|-DeviceName|-JoinType|-SSTFile|AzureAD)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=joins), collect([CommandLine], limit=5)])
+          | sort(joins, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Provisioning and imaging hosts where joins occur as part of the build"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: management-enrolment-forced
+        name: Management enrolment triggered by hand
+        purpose: >-
+          Catch the enrolment half separately from the join, because it is enrolment that
+          produces the compliant-device claim conditional access reads. Triggering it
+          manually on an in-service machine is what an adversary does to make a registered
+          device acceptable to policy.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(deviceenroller|MDMDiagnosticsTool|AutoEnrollMDM|Enroll-Device|omadmclient)/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=enrolments), collect([CommandLine], limit=5)])
+          | sort(enrolments, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Scheduled enrolment repair tasks distributed by the management platform"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: bulk-registration-token-requested
+        name: Bulk registration token created or consumed
+        purpose: >-
+          Identify the form that scales. A bulk registration token lets devices be added to a
+          tenant without a user present for each one, which is a provisioning convenience and,
+          in the wrong hands, a way to register many trusted devices at once.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(BulkPRTToken|BPRT|New-AADIntBulkPRTToken|Install-ProvisioningPackage|Add-ProvisioningPackage|\.ppkg)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+        filters:
+          include: []
+          exclude:
+            - "Deployment windows where provisioning packages are applied to batches of new machines"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: mailbox-access-enabled-after-registration
+        name: Mailbox synchronisation enabled for the account
+        purpose: >-
+          Confirm the registration was put to use rather than merely performed. Enabling
+          synchronisation for the account is what makes a newly trusted device able to pull
+          the mailbox down, and it is a documented follow-on step.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Set-CASMailbox|ActiveSyncEnabled|EwsEnabled|MAPIEnabled|Add-MailboxPermission)/i
+          | CommandLine=/(-Identity|-User|@)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Mail administration hosts where mailbox settings are managed routinely"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - user
+            - organization
+
+evidence:
+  required:
+    - id: device_registration_performed
+      name: Device joined or enrolled against an account
+      description: >-
+        A command was executed that registers this machine with the directory or the
+        management platform under a user's credentials, creating a device the tenant will
+        subsequently trust.
+      source: process_creation
+      field: CommandLine
+      indicates: trusted_device_added
+
+  supporting:
+    - id: offensive_identity_tooling
+      name: Adversary identity tooling performed the registration
+      description: >-
+        The registration was driven by tooling associated with adversary use of the identity
+        platform rather than by the operating system's own join and enrolment components.
+      source: process_creation
+      field: FileName
+      indicates: offensive_tooling_present
+    - id: bulk_registration_token
+      name: Bulk registration token created or applied
+      description: >-
+        A token or provisioning package permitting device registration without a user present
+        was created or consumed, which turns one compromised account into an ability to add
+        many trusted devices.
+      source: process_creation
+      field: CommandLine
+      indicates: mass_enrolment_capability
+    - id: mailbox_sync_enabled
+      name: Mailbox synchronisation enabled for the account
+      description: >-
+        Synchronisation or client access was enabled for the account around the registration,
+        which is how a newly trusted device is turned into access to the mailbox contents.
+      source: process_creation
+      field: CommandLine
+      indicates: registered_device_put_to_use
+    - id: shell_issued_registration
+      name: Registration issued from a shell or script host
+      description: >-
+        The parent of the registering process is a command shell or script host rather than
+        the provisioning and enrolment stack that performs joins during setup.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: no_registration_history
+      name: Account has no device registration history
+      description: >-
+        The account has not registered or enrolled a device during the baseline window, which
+        is the condition self-enrolment abuse depends on and often marks a dormant identity.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_user
+
+  contradicting:
+    - id: provisioning_workflow
+      name: Part of provisioning or setup
+      description: >-
+        The join and enrolment were performed by the provisioning stack during first-run
+        setup, which is the ordinary way a machine enters a tenant.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: recorded_onboarding
+      name: Recorded onboarding or rebuild
+      description: >-
+        A change or asset record covers this machine being issued, rebuilt or repaired, which
+        accounts for a fresh registration under the assigned user.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: deployment_wave
+      name: Part of a deployment batch
+      description: >-
+        The same registration activity appears across many machines within one window, which
+        is a provisioning batch rather than a single account gaining a device.
+      source: baseline
+      field: CommandLine
+      indicates: deployment_wave
+
+  risk_logic:
+    required:
+      - device_registration_performed
+
+    supporting:
+      any:
+        - offensive_identity_tooling
+        - bulk_registration_token
+        - mailbox_sync_enabled
+        - shell_issued_registration
+        - no_registration_history
+      all:
+        - shell_issued_registration
+        - no_registration_history
+
+    contradicting:
+      any:
+        - provisioning_workflow
+        - recorded_onboarding
+        - deployment_wave
+      all: []
+
+  verdict:
+    low_risk_when:
+      - device_registration_performed
+      - provisioning_workflow
+      - recorded_onboarding
+      - deployment_wave
+    suspicious_when:
+      - device_registration_performed
+      - no_registration_history
+    high_risk_when:
+      - device_registration_performed
+      - offensive_identity_tooling
+      - bulk_registration_token
+      - mailbox_sync_enabled
+      - shell_issued_registration
+
+  false_positive:
+    - condition: A new machine is joined and enrolled during onboarding.
+      explanation: >-
+        This is the intended use of every command in this hunt and it happens for every device
+        the organisation issues. It is separated by running from the provisioning stack during
+        first-run setup rather than interactively on a machine already in service.
+    - condition: A user enrols a personal device under a bring-your-own-device policy.
+      explanation: >-
+        Personal enrolment is genuine self-registration by the account holder. It is
+        distinguished by the user driving it from their own session through the company
+        portal, and by the account already having other registered devices.
+    - condition: Support re-joins a machine after a rebuild or repair.
+      explanation: >-
+        A rebuilt machine legitimately registers again, sometimes from a shell, which makes it
+        the closest benign twin. The separator is an asset or ticket record covering the
+        rebuild and the machine's assigned user matching the account used.
+    - condition: A deployment batch is provisioned with a bulk registration token.
+      explanation: >-
+        Bulk tokens exist for exactly this and are used during refresh programmes. Their
+        legitimate use is concentrated in a deployment window, appears across many new
+        machines, and is performed by build staff on staging infrastructure.

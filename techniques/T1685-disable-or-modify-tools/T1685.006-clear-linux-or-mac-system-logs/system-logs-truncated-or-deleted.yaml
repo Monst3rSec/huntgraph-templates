@@ -1,0 +1,346 @@
+type: detection
+
+id: hg-lin-system-logs-truncated-or-deleted-t1685-006
+
+version: 1.0.0
+
+info:
+  name: System logs truncated or deleted on a Unix host
+  description: >-
+    Everything an investigator would read next lives under /var/log — who authenticated,
+    from where, what sudo was used for, which sessions existed. Clearing it is cheap, needs
+    only root, and is usually the last thing done before an operator leaves a host. The
+    distinction that matters for triage is truncation against deletion, and it runs the
+    opposite way to intuition. A deleted log is a recoverable mistake in appearance: syslog
+    or journald simply recreates the file on the next write, and file rotation, disk-full
+    cleanups and reimaging all delete logs routinely. A log that still exists but contains
+    zero bytes is different — no maintenance process leaves a file in that state, because
+    rotation moves the old content aside before starting a new file. Someone redirected
+    nothing into it, or ran truncate against it, and that is a deliberate act with no
+    housekeeping explanation. Stealthier still is selective editing, where only the lines
+    naming one address or one account are stripped and the file keeps a plausible size and
+    a continuous appearance. The discriminator throughout is the actor and the target set:
+    logrotate and journald manage their own files on a schedule, while an adversary reaches
+    for auth.log, wtmp and btmp specifically, from a shell, in one window.
+  severity: high
+  author: huntgraph
+  tags:
+    - defense-impairment
+    - anti-forensics
+    - log-clearing
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1685/006
+    - https://attack.mitre.org/detectionstrategies/DET0520
+    - https://attack.mitre.org/techniques/T1685
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1685
+  sub_techniques:
+    - T1685.006
+  detection_strategies:
+    - DET0520
+  analytics:
+    - AN1438
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary who has obtained root on a Unix host may empty, delete or selectively edit
+    the system logs under /var/log, so that the authentication records, session history and
+    command traces describing how the host was taken are gone before anyone reads them.
+  attacker_behavior:
+    - Redirects nothing into a log file so it exists but holds no content.
+    - Deletes or shreds log files outright, sometimes across the whole directory.
+    - Zeroes the login record databases so sessions leave no trace in last or lastb output.
+    - Edits a log in place to strip only the lines naming their address or account.
+  legitimate_behavior:
+    - Log rotation moves, compresses and removes aged log files on a schedule.
+    - Operators truncate a runaway application log when a filesystem fills up.
+    - Image build and rebuild scripts clear logs so a golden image ships without host history.
+    - Journald vacuums its own store to stay inside a size or time limit.
+  risk_indicator:
+    - A log file is left present but empty rather than rotated aside.
+    - Several unrelated log files are cleared inside one short window.
+    - The clearing runs from an interactive shell rather than from a log manager.
+    - The login record databases are targeted alongside the text logs.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: log-file-truncated-in-place
+        name: Log file emptied but left in place
+        purpose: >-
+          The highest-signal case. Rotation never leaves a zero-length file with its history
+          gone, so a redirect of nothing or an explicit truncate against a system log is a
+          deliberate erasure with no maintenance explanation.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\/var\/log\//
+          | CommandLine=/(truncate\s+-s\s*0|:\s*>\s*\/var\/log|(^|;|&&|\|\|)\s*>\s*\/var\/log|echo\s+(-n\s+)?(""|''|)\s*>\s*\/var\/log|cat\s+\/dev\/null\s*>|cp\s+\/dev\/null\s|dd\s+if=\/dev\/(null|zero)[^|]*of=\/var\/log)/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Operators truncating a single oversized application log during a disk-full incident"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: log-files-deleted-or-shredded
+        name: Log files deleted or shredded
+        purpose: >-
+          Cover the blunt version. Deletion is noisier and more ambiguous than truncation
+          because rotation deletes logs too, so the escalation here comes from the actor and
+          from how much of the directory went at once.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\b(rm|shred|srm|wipe|unlink|find)\b/
+          | CommandLine=/\/var\/log(\/|\b)/
+          | ImageFileName!=/\/(logrotate|systemd-journald|journalctl|rsyslogd|syslog-ng)$/
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Log rotation and retention jobs removing aged files on their schedule"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - path
+
+      - id: login-records-and-journal-cleared
+        name: Login records and the journal cleared
+        purpose: >-
+          Isolate the targets that only matter to an investigator. wtmp, btmp and lastlog
+          carry the session history, and they have no operational reason to be cleared —
+          unlike an application log, nothing depends on them being small.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\/var\/log\/(wtmp|btmp|utmp|lastlog|faillog|tallylog)|\/var\/run\/utmp|\/var\/log\/journal|journalctl\s+--(vacuum-(time|size|files)|rotate|flush))/i
+          | CommandLine=/\b(rm|shred|truncate|dd|cat|echo|cp|utmpdump|journalctl|>)\b|>/
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Journald vacuum jobs enforcing a documented size or retention limit"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: log-lines-selectively-removed
+        name: Individual log lines stripped in place
+        purpose: >-
+          Catch the careful version, which is the one that survives a size check. Rewriting
+          a log to drop the lines naming one address or account leaves a file that still
+          looks alive, and only the editing command reveals what happened.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/\/var\/log\//
+          | CommandLine=/(sed\s+(-[a-z]*i|--in-place)|grep\s+-v|awk\s+.*!\s*\/|perl\s+-[a-z]*i)/i
+          | groupBy([ComputerName, UserName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=events), collect([CommandLine], limit=5)])
+          | sort(events, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Log sanitisation jobs that redact secrets before shipping logs off host"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - command_line
+
+evidence:
+  required:
+    - id: system_log_cleared
+      name: System log emptied, removed or rewritten
+      description: >-
+        A process truncated, deleted, zeroed or edited a file under the system log directory,
+        destroying or altering the record an investigator would read to reconstruct the host.
+      source: process_creation
+      field: CommandLine
+      indicates: log_destruction
+
+  supporting:
+    - id: truncated_rather_than_deleted
+      name: Log left present but empty
+      description: >-
+        The file was emptied in place rather than rotated aside or removed, a state no
+        housekeeping process produces because rotation preserves the old content first.
+      source: process_creation
+      field: CommandLine
+      indicates: deliberate_erasure
+    - id: actor_is_not_a_log_manager
+      name: Acting binary is not a log manager
+      description: >-
+        The clearing was done by a general-purpose utility or interpreter rather than by
+        logrotate, journald or the syslog daemon, none of which were involved.
+      source: process_creation
+      field: ImageFileName
+      indicates: abnormal_writer
+    - id: interactive_shell_lineage
+      name: Run from an interactive or remote session
+      description: >-
+        The process descends from a shell or remote session rather than from cron or a
+        maintenance timer, so a person drove it at a moment of their choosing.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: hands_on_keyboard
+    - id: several_logs_in_one_window
+      name: Several unrelated logs cleared together
+      description: >-
+        More than one log file, spanning functions that have no operational relationship,
+        was cleared inside a short window, which is coverage of an intrusion rather than
+        maintenance of a file.
+      source: derived
+      field: ComputerName
+      indicates: coordinated_log_destruction
+    - id: no_log_clearing_history
+      name: No history of manual log clearing on this host
+      description: >-
+        Outside its rotation and journald jobs, this host has not had logs cleared manually
+        during the baseline window.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: rotation_or_journald_maintenance
+      name: Rotation or journald maintenance
+      description: >-
+        The acting process is logrotate, journald, the syslog daemon or a retention job
+        removing aged files, which is what those components exist to do.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: recorded_rebuild_or_incident
+      name: Recorded rebuild or disk-full response
+      description: >-
+        A change or incident record covers clearing logs on this host, such as preparing a
+        golden image or recovering a filesystem that filled.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: single_oversized_application_log
+      name: One runaway application log emptied
+      description: >-
+        The target was a single application log that had grown large, rather than the
+        authentication, session and system logs an investigator would read.
+      source: process_creation
+      field: CommandLine
+      indicates: capacity_remediation
+
+  risk_logic:
+    required:
+      - system_log_cleared
+
+    supporting:
+      any:
+        - truncated_rather_than_deleted
+        - actor_is_not_a_log_manager
+        - interactive_shell_lineage
+        - several_logs_in_one_window
+        - no_log_clearing_history
+      all:
+        - truncated_rather_than_deleted
+        - several_logs_in_one_window
+
+    contradicting:
+      any:
+        - rotation_or_journald_maintenance
+        - recorded_rebuild_or_incident
+        - single_oversized_application_log
+      all: []
+
+  verdict:
+    low_risk_when:
+      - system_log_cleared
+      - rotation_or_journald_maintenance
+      - recorded_rebuild_or_incident
+      - single_oversized_application_log
+    suspicious_when:
+      - system_log_cleared
+      - no_log_clearing_history
+    high_risk_when:
+      - system_log_cleared
+      - truncated_rather_than_deleted
+      - several_logs_in_one_window
+      - interactive_shell_lineage
+      - actor_is_not_a_log_manager
+
+  false_positive:
+    - condition: Log rotation removes or compresses aged log files.
+      explanation: >-
+        Rotation deletes logs on every host every day, which reproduces the deletion
+        evidence. It runs from logrotate under a timer, it moves content aside before
+        starting a new file, and it never leaves a live log at zero bytes.
+    - condition: An operator empties a runaway log when a filesystem fills.
+      explanation: >-
+        This genuinely truncates a file in place and is the strongest false positive for the
+        truncation case. It targets one large application log rather than auth.log or wtmp,
+        it coincides with a disk-space alert, and it is usually followed by a rotation-policy
+        change rather than by more clearing.
+    - condition: An image build or rebuild script clears logs.
+      explanation: >-
+        Golden images ship without host history, so build scripts clear /var/log wholesale.
+        This happens on build hosts or at instance birth, under a provisioning process, and
+        correlates with a pipeline run rather than with an interactive session.
+    - condition: Journald vacuums its own store.
+      explanation: >-
+        Vacuuming deletes journal files to stay inside a size or time limit and can remove
+        large parts of the history. It runs as journald or as a scheduled journalctl
+        invocation with a vacuum argument, and it leaves the journal functioning rather than
+        emptied.
+    - condition: A sanitisation job redacts secrets from logs before shipping them.
+      explanation: >-
+        Some estates strip credentials or tokens out of logs in place, which looks identical
+        to selective line removal. The job runs on a schedule from a named script, the
+        pattern it removes is a secret format rather than an address or account, and it is
+        applied uniformly across hosts.

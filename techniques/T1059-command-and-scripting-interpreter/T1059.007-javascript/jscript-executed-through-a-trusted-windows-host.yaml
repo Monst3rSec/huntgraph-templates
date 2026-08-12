@@ -1,0 +1,314 @@
+type: detection
+
+id: hg-win-jscript-executed-through-a-trusted-windows-host-t1059-007
+version: 1.0.0
+
+info:
+  name: JScript executed through a trusted Windows scripting host
+  description: >-
+    JScript is the Microsoft implementation of JavaScript, interpreted by the Windows script
+    engine and wired into COM and the HTML application host. That gives an adversary two
+    routes. The plain one is a .js or .jse file run by wscript or cscript, which behaves
+    like any other delivered script. The more useful one is executing JScript through a
+    trusted host so it never lands as a script file at all: mshta given script text after a
+    javascript: token, or rundll32 calling into the HTML application host, both of which run
+    the code from the command line of a signed Microsoft binary. The second route defeats
+    any control that inspects script files, so the discriminator has to be the shape of the
+    invocation rather than the presence of a script on disk.
+  severity: high
+  author: huntgraph
+  tags:
+    - execution
+    - javascript
+    - jscript
+    - script-host
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1059/007
+    - https://attack.mitre.org/detectionstrategies/DET0264
+    - https://attack.mitre.org/techniques/T1059
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1059
+  sub_techniques:
+    - T1059.007
+  detection_strategies:
+    - DET0264
+  analytics:
+    - AN0733
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may execute JScript through a built-in Windows scripting or HTML
+    application host so that the code runs under a signed Microsoft binary, obtaining
+    execution without deploying a binary and, on the inline routes, without writing a
+    script file that any file-based control could examine.
+  attacker_behavior:
+    - Runs a .js or .jse file delivered into a download, archive or temporary directory.
+    - Forces the JScript engine onto a file with a harmless extension using the engine switch.
+    - "Passes script text to mshta after a javascript: token so nothing reaches disk."
+    - Calls the HTML application host through rundll32 to run script from the command line.
+  legitimate_behavior:
+    - Some enterprise applications ship .js components and invoke them through the script host.
+    - Legacy deployment and packaging tooling runs JScript during installs.
+    - HTA-based internal tools are still in use in some estates.
+    - Administrators occasionally run scripted one-liners during troubleshooting.
+  risk_indicator:
+    - The script runs from a delivery directory rather than an installation path.
+    - The engine is forced onto a file whose extension does not indicate script content.
+    - Script text is supplied inline to mshta with no .hta file involved.
+    - rundll32 is used to reach the HTML application host rather than a normal export.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: jscript-file-from-delivery-path
+        name: Script host running a JScript file from a delivery directory
+        purpose: >-
+          Cover the ordinary route where the payload is a .js or .jse that arrived on the
+          host, and separate it from the JScript components that ship inside installed
+          products and run from their own directories.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(wscript|cscript)\.exe$/i
+          | CommandLine=/(?<script_path>[A-Za-z]:\\[^",]+\.jse?)(\s|"|$)/i
+          | script_path=/\\(Downloads|AppData\\Local\\Temp|AppData\\Roaming|Users\\Public|INetCache|Windows\\Temp)\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, script_path],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Installer working directories used by approved packaging tooling"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - path
+
+      - id: engine-forced-onto-disguised-file
+        name: JScript engine forced onto a file with a harmless extension
+        purpose: >-
+          Catch the case where the payload is named .txt, .log or .dat and the engine is
+          selected explicitly, which defeats every control keyed on script file extensions.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(wscript|cscript)\.exe$/i
+          | CommandLine=/\/\/\s*e\s*:\s*(jscript|javascript)/i
+          | CommandLine!=/\.jse?(\s|"|$)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: mshta-inline-script-text
+        name: HTML application host given script text instead of a file
+        purpose: >-
+          Isolate the fileless route: mshta running code supplied on its command line, where
+          there is no .hta and no .js for any file-based control to inspect.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^mshta\.exe$/i
+          | CommandLine=/(javascript|vbscript|about)\s*:/i
+          | CommandLine!=/\.hta(\s|"|$)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: rundll32-reaching-html-host
+        name: rundll32 invoking the HTML application host
+        purpose: >-
+          Cover the variant that avoids mshta entirely by calling into the HTML application
+          entry point from rundll32, which is never a normal way for software to run.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^rundll32\.exe$/i
+          | CommandLine=/(mshtml|RunHTMLApplication|javascript\s*:|\bGetObject\s*\()/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: jscript_host_invocation
+      name: JScript executed through a built-in scripting host
+      description: >-
+        A Windows scripting or HTML application host ran JScript from a delivery directory,
+        from a file whose extension was overridden, or from script text supplied on the
+        command line.
+      source: process_creation
+      field: CommandLine
+      indicates: trusted_host_script_execution
+
+  supporting:
+    - id: no_script_on_disk
+      name: Script text supplied inline
+      description: >-
+        The code was passed on the command line to mshta or rundll32 rather than read from a
+        file, so nothing was written that a file-based control could see or retain.
+      source: process_creation
+      field: CommandLine
+      indicates: fileless_execution
+    - id: signed_proxy_binary
+      name: Execution proxied through a signed Microsoft binary
+      description: >-
+        The executing image is a Microsoft-signed host rather than anything the adversary
+        supplied, so application controls keyed on publisher do not fire.
+      source: process_creation
+      field: ImageFileName
+      indicates: signed_binary_proxy_execution
+    - id: delivery_parent
+      name: Browser, mail client or archive tool as parent
+      description: >-
+        The scripting host was launched by an application a user opened content in, which
+        establishes how the code reached the host.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: rare_for_user
+      name: Scripting host use rare for this user
+      description: >-
+        This user and host show no comparable scripting host activity across the baseline
+        window, unlike the populations covered by legacy packaging or HTA tooling.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: installed_product_script
+      name: Script belonging to an installed product
+      description: >-
+        The script path resolves inside a product's installation directory and the product
+        itself is the parent, which is how bundled JScript components run.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_application_component
+    - id: packaging_tool_parent
+      name: Packaging or deployment tool as parent
+      description: >-
+        The invocation belongs to an approved software deployment run, where legacy JScript
+        is still used for install-time logic.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: internal_hta_tool
+      name: Sanctioned internal HTA tool
+      description: >-
+        The host belongs to a group that uses a recorded internal HTA application, which
+        produces the same host process with a stable command shape.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - jscript_host_invocation
+
+    supporting:
+      any:
+        - no_script_on_disk
+        - signed_proxy_binary
+        - delivery_parent
+        - rare_for_user
+      all:
+        - no_script_on_disk
+        - delivery_parent
+
+    contradicting:
+      any:
+        - installed_product_script
+        - packaging_tool_parent
+        - internal_hta_tool
+      all: []
+
+  verdict:
+    low_risk_when:
+      - jscript_host_invocation
+      - installed_product_script
+      - packaging_tool_parent
+      - internal_hta_tool
+    suspicious_when:
+      - jscript_host_invocation
+      - rare_for_user
+    high_risk_when:
+      - jscript_host_invocation
+      - no_script_on_disk
+      - signed_proxy_binary
+      - delivery_parent
+
+  false_positive:
+    - condition: An installed application invokes its own JScript component.
+      explanation: >-
+        Older line-of-business software ships .js files and calls them through the script
+        host. The script path sits inside the installation tree and the application is the
+        parent, which the contradicting evidence captures directly.
+    - condition: A software deployment tool runs JScript during an install.
+      explanation: >-
+        Packaging frameworks execute JScript from temporary working directories, which looks
+        like a delivery path. These cluster in deployment windows under the deployment
+        agent and repeat identically across many hosts.
+    - condition: An internal tool is still delivered as an HTA.
+      explanation: >-
+        Some estates run HTA front-ends for operational tasks. These invoke mshta with a
+        file path or a fixed internal URL rather than inline script text, so they do not
+        raise the fileless evidence.
+    - condition: An administrator runs a scripted one-liner while troubleshooting.
+      explanation: >-
+        Inline mshta or rundll32 invocations occasionally appear during interactive support
+        work. The session is interactive under a named engineer with a console parent, and
+        it does not repeat.

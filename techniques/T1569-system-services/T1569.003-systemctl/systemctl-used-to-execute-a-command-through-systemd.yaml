@@ -1,0 +1,342 @@
+type: detection
+
+id: hg-lin-systemctl-used-to-execute-a-command-through-systemd-t1569-003
+
+version: 1.0.0
+
+info:
+  name: Systemctl used to execute a command through systemd
+  description: >-
+    systemctl is the front end to systemd, and an operator can use it to get a command run
+    rather than to arrange for one to run later. That distinction is the whole of this
+    behaviour. Handing work to systemd buys three things at once: the process is reparented
+    to PID 1 so nothing above it in the tree names the shell, the SSH session or the
+    interpreter that asked for it; it survives the caller logging out, because it lives in
+    its own cgroup rather than the session scope; and if the system manager rather than the
+    user manager is addressed, it runs as root without the payload itself ever appearing on
+    a sudo command line. The activation sequence is short and distinctive — a unit is
+    dropped somewhere systemd will read, daemon-reload makes the manager notice it, and
+    start runs it — and a transient unit skips even the file. systemctl runs constantly on
+    a healthy Linux host, so the invocation is not the finding. The finding is a
+    daemon-reload followed immediately by a start of a unit nobody packaged, a unit path
+    under a world-writable directory, or systemd parenting a shell or interpreter, which
+    for a real service never happens.
+  severity: high
+  author: huntgraph
+  tags:
+    - execution
+    - systemd
+    - service-manager
+    - proxy-execution
+    - linux
+  references:
+    - https://attack.mitre.org/techniques/T1569/003
+    - https://attack.mitre.org/detectionstrategies/DET0073
+    - https://attack.mitre.org/techniques/T1569
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1569
+  sub_techniques:
+    - T1569.003
+  detection_strategies:
+    - DET0073
+  analytics:
+    - AN0200
+  platforms:
+    - Linux
+  data_sources:
+    - "auditd:EXECVE"
+  data_components:
+    - Command Execution
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may hand a command to systemd through systemctl so that the service
+    manager executes it instead of their own shell, obtaining a root or session-independent
+    process whose parent is PID 1 and whose origin no longer appears anywhere in the
+    process tree.
+  attacker_behavior:
+    - Writes a unit file, reloads the manager and starts it in one short sequence.
+    - Starts a transient unit so the command runs with no unit file on disk at all.
+    - Uses the user manager with --user so no root privilege is needed to get a detached process.
+    - Points ExecStart at a binary or script under a temporary or shared directory.
+    - Restarts an existing unit after replacing the executable it references.
+  legitimate_behavior:
+    - Package installs reload the manager and start the services they deliver.
+    - Administrators restart services by hand during maintenance and troubleshooting.
+    - Configuration management templates unit files and reloads systemd on every run.
+    - Container and orchestration tooling starts and stops units as part of normal operation.
+  risk_indicator:
+    - A daemon-reload is followed within seconds by a start of a unit that no package owns.
+    - The unit or command references a path under /tmp, /dev/shm or /var/tmp.
+    - systemctl was invoked by an interpreter, a downloader or a remote shell rather than by packaging.
+    - systemd is the parent of a shell, interpreter or network tool.
+    - A transient unit is run rather than a unit file that would leave an artefact behind.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: reload-then-start-sequence
+        name: Manager reloaded and a unit started in the same activity
+        purpose: >-
+          Isolate the activation sequence rather than either half of it. A daemon-reload
+          alone is routine after a package install, and a start alone is routine
+          maintenance, but the pair appearing together from the same account within a short
+          window is what registering and running a new unit looks like.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^systemctl$/i
+          | case {
+              CommandLine=/\bdaemon-reload\b/i
+                | reloaded := CommandLine ;
+              CommandLine=/\b(start|restart|enable\s+--now)\b/i
+                | started := CommandLine ;
+            }
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[collect([reloaded, started], limit=5), count(as=calls)])
+          | reloaded=/.+/
+          | started=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Package manager and configuration-management parents that reload and start on every deployment"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: transient-unit-execution
+        name: Command run as a transient unit with no file on disk
+        purpose: >-
+          Catch the form that leaves nothing behind. systemd-run creates a scope or service
+          on the fly, so the command executes under PID 1 with no unit file to find later,
+          and --uid or a system-manager target makes it a privilege change as well.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^systemd-run$/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=runs), collect([CommandLine], limit=5)])
+          | sort(runs, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Orchestration and provisioning tooling that wraps maintenance jobs in transient units"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: unit-referencing-a-writable-path
+        name: Unit or command naming a temporary or shared directory
+        purpose: >-
+          Look at what is being run. Packaged units reference binaries under the system
+          directories and unit files under /usr/lib/systemd or /etc/systemd. A systemctl or
+          systemd-run argument that names /tmp, /dev/shm, /var/tmp or a home directory is a
+          payload being executed through the manager rather than a service.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(systemctl|systemd-run)$/i
+          | CommandLine=/\/(tmp|dev\/shm|var\/tmp|home\/[^\/\s]+|root)\//i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=runs), collect([CommandLine], limit=5)])
+          | sort(runs, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Build and CI hosts whose jobs legitimately execute out of scratch directories"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: systemd-parenting-a-shell-or-interpreter
+        name: systemd spawning a shell, interpreter or network tool
+        purpose: >-
+          Confirm the proxy worked and show the result. PID 1 parents daemons and their
+          helpers; a bare bash, python, curl, nc or socat directly under systemd is the
+          command an operator handed to the manager, now detached from whatever session
+          asked for it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^systemd$/i
+          | FileName=/^(bash|sh|dash|zsh|ksh|python3?|perl|ruby|curl|wget|nc|ncat|socat|screen|tmux)$/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Packaged units whose ExecStart is a vendor shell or python entry point"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - process
+            - organization
+
+evidence:
+  required:
+    - id: service_manager_asked_to_run
+      name: Systemd asked to execute something now
+      description: >-
+        systemctl reloaded the manager and started a unit, or systemd-run created a
+        transient one, which makes the manager spawn a process immediately rather than
+        record a configuration for the next boot.
+      source: process_creation
+      field: CommandLine
+      indicates: service_manager_proxy_execution
+
+  supporting:
+    - id: transient_unit_used
+      name: Transient unit leaving no file behind
+      description: >-
+        The command was run through systemd-run, so it executed under PID 1 without a unit
+        file that a later inventory of /etc/systemd or /usr/lib/systemd would show.
+      source: process_creation
+      field: FileName
+      indicates: artefact_free_execution
+    - id: target_in_writable_path
+      name: Argument naming a temporary or shared directory
+      description: >-
+        The unit or command references a path that any user can write to, which is where a
+        staged payload lives and where a packaged service's executable does not.
+      source: process_creation
+      field: ImageFileName
+      indicates: payload_staged_in_writable_path
+    - id: systemd_parented_interpreter
+      name: systemd started a shell, interpreter or network tool
+      description: >-
+        PID 1 is the parent of a process of a kind that packaged units do not launch,
+        confirming a command was executed through the manager and detached from the caller.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: execution_chain_progression
+    - id: unusual_for_host
+      name: No history of this activity on the host
+      description: >-
+        Comparable reload-and-start or transient-unit activity has not been seen on this
+        host during the baseline window, so it is a deviation rather than routine churn.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: package_or_config_management_parent
+      name: Driven by packaging or configuration management
+      description: >-
+        systemctl was invoked by dpkg, rpm, apt, dnf or the configuration-management agent,
+        which reload and start units as the last step of every deployment.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: known_unit_restarted
+      name: Unit belongs to installed software
+      description: >-
+        The unit named is one a package owns on this host, so the call is that service being
+        restarted rather than a new one being introduced.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_application_component
+    - id: fleetwide_invocation
+      name: Same invocation across the estate
+      description: >-
+        The identical command line appears on many comparable hosts within one window, which
+        is a maintenance or deployment wave rather than hands-on execution.
+      source: baseline
+      field: CommandLine
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - service_manager_asked_to_run
+
+    supporting:
+      any:
+        - transient_unit_used
+        - target_in_writable_path
+        - systemd_parented_interpreter
+        - unusual_for_host
+      all:
+        - target_in_writable_path
+        - systemd_parented_interpreter
+
+    contradicting:
+      any:
+        - package_or_config_management_parent
+        - known_unit_restarted
+        - fleetwide_invocation
+      all: []
+
+  verdict:
+    low_risk_when:
+      - service_manager_asked_to_run
+      - package_or_config_management_parent
+      - known_unit_restarted
+      - fleetwide_invocation
+    suspicious_when:
+      - service_manager_asked_to_run
+      - unusual_for_host
+    high_risk_when:
+      - service_manager_asked_to_run
+      - transient_unit_used
+      - target_in_writable_path
+      - systemd_parented_interpreter
+
+  false_positive:
+    - condition: A package install reloads systemd and starts the service it delivered.
+      explanation: >-
+        This is the single largest source of the reload-and-start pair and reproduces the
+        required evidence exactly. The parent is the package manager or its post-install
+        script, and the unit file it registered is owned by that package rather than sitting
+        in a scratch directory.
+    - condition: An administrator restarts a service by hand during maintenance.
+      explanation: >-
+        Interactive restarts come from a login shell, which is the same parent shape an
+        operator produces. The unit named is an existing packaged one, no daemon-reload is
+        usually needed, and no shell or interpreter turns up as a systemd child afterwards.
+    - condition: Configuration management templates a unit and reloads on every agent run.
+      explanation: >-
+        Automation writes unit files and reloads systemd repeatedly, matching both halves of
+        the sequence. It runs on a schedule across the whole estate with an identical command
+        line, and the parent is the management agent.
+    - condition: Provisioning or CI tooling wraps a job in a transient unit.
+      explanation: >-
+        systemd-run is a reasonable way to run a long maintenance task detached from an SSH
+        session, so it appears legitimately on build and provisioning hosts. Those runs
+        reference paths inside the job workspace and recur with the same shape, where an
+        operator's transient unit is a one-off pointing at a staged file.

@@ -1,0 +1,341 @@
+type: detection
+
+id: hg-mac-launchctl-used-to-run-a-command-through-launchd-t1569-001
+
+version: 1.0.0
+
+info:
+  name: Launchctl used to run a command through launchd
+  description: >-
+    launchctl is the client for launchd, and it can be used to start something now rather
+    than to arrange for it to start later. That is the point of this behaviour and what
+    separates it from planting a launch agent or daemon: the operator is not after a file
+    that survives a reboot, they are after a process that is not a child of their shell.
+    Submitting a job, bootstrapping into the system domain or kickstarting an existing
+    service hands the work to launchd, which then spawns it. The result is a process whose
+    parent is launchd, whose session is detached from the SSH connection or terminal the
+    operator is using, and whose privilege is whatever the target domain carries — the
+    system domain runs as root, so an administrator who can talk to it gets root without a
+    sudo of their own payload. Every process-tree heuristic that looks upward for a shell,
+    an interpreter or a download tool sees nothing above launchd. The discriminator is not
+    that launchctl ran, because it runs constantly on a healthy Mac; it is which subcommand
+    ran, what the argument pointed at, and whether launchd ended up parenting a shell or an
+    interpreter, which for a real service it never does.
+  severity: high
+  author: huntgraph
+  tags:
+    - execution
+    - launchd
+    - service-manager
+    - proxy-execution
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1569/001
+    - https://attack.mitre.org/detectionstrategies/DET0265
+    - https://attack.mitre.org/techniques/T1569
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1569
+  sub_techniques:
+    - T1569.001
+  detection_strategies:
+    - DET0265
+  analytics:
+    - AN0736
+  platforms:
+    - macOS
+  data_sources:
+    - "macos:unifiedlog"
+  data_components:
+    - Command Execution
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may hand a command to launchd through launchctl so that the service
+    manager rather than their own shell executes it, obtaining a detached process at the
+    privilege of the target domain and a parent chain that hides the tool, session or
+    interpreter the command actually came from.
+  attacker_behavior:
+    - Submits a one-off job with launchctl submit so launchd runs the command immediately.
+    - Bootstraps or kickstarts a job in the system domain to execute it as root.
+    - Uses launchctl asuser to run a command inside another logged-in user's session.
+    - Loads a plist path from a temporary or shared directory purely to trigger a run.
+    - Restarts an existing service after replacing the binary it points at.
+  legitimate_behavior:
+    - Installers and updaters load, start and kickstart their own services during setup.
+    - Administrators restart a stuck service with launchctl kickstart while troubleshooting.
+    - Management platforms bootstrap and enable agent jobs on managed Macs.
+    - Developers submit and reload their own jobs while building background tooling.
+  risk_indicator:
+    - The subcommand is one that runs a job now rather than one that queries or lists state.
+    - The command or plist argument points into a temporary, shared or home directory.
+    - launchctl itself was started by an interpreter, a downloader or a remote shell.
+    - launchd is the parent of a shell, interpreter or network tool rather than a service binary.
+    - The invocation crosses a privilege or session boundary through the system domain or asuser.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: launchctl-run-now-subcommand
+        name: Launchctl invoked with a subcommand that executes immediately
+        purpose: >-
+          Separate the launchctl calls that run something from the far larger number that
+          only inspect or configure. submit, start, kickstart and bootstrap are the verbs
+          that make launchd spawn a process on the spot, which is what this technique is,
+          while list, print, getenv and setenv leave nothing running.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^launchctl$/i
+          | CommandLine=/\s(submit|kickstart|bootstrap|start|asuser)\b/i
+          | CommandLine!=/\s(list|print|print-disabled|getenv|dumpstate)\b/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=invocations), collect([CommandLine], limit=5)])
+          | sort(invocations, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Management agent and installer parents that start their own services during deployment"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: launchctl-crossing-a-privilege-or-session-boundary
+        name: Job pushed into the system domain or another user's session
+        purpose: >-
+          Catch the reason an operator reaches for launchctl in the first place. Targeting
+          system/ runs the job as root, and asuser plants it inside a specific logged-in
+          user's session, which is how a root shell reaches the desktop or a desktop
+          process reaches root. Both name the boundary being crossed in the command line.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^launchctl$/i
+          | CommandLine=/\s(asuser\s+\d+|(bootstrap|enable|kickstart|print)\s+system\/|gui\/\d+)/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=crossings), collect([CommandLine], limit=5)])
+          | sort(crossings, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Endpoint management tooling that routinely bootstraps jobs into the system domain"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: launchctl-target-in-a-scratch-path
+        name: Launchctl pointed at a program or plist outside the install directories
+        purpose: >-
+          Look at what is being run rather than how. A service that belongs to installed
+          software names a binary inside an application bundle, a framework or a system
+          directory. An argument under /tmp, /var/tmp, /Users/Shared or /Volumes is a
+          payload being executed through the service manager, not a service.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^launchctl$/i
+          | CommandLine=/(\/private)?\/(tmp|var\/tmp|Users\/Shared|Volumes)\//i
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(as=runs), collect([CommandLine], limit=5)])
+          | sort(runs, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Software installed from a mounted disk image that starts its helper before the copy completes"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: launchd-parenting-a-shell-or-interpreter
+        name: launchd spawning a shell, interpreter or network tool
+        purpose: >-
+          Confirm the proxy worked and show what came out of it. launchd parents daemons,
+          agents and helper binaries; it does not normally parent bash, python, osascript,
+          curl or netcat as a one-off. A launchd child of that shape is the command the
+          operator handed to the service manager, now detached from their session.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^launchd$/i
+          | FileName=/^(bash|sh|zsh|ksh|python3?|perl|ruby|osascript|curl|nc|ncat|socat|screen|tmux)$/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Vendor agents whose job definitions legitimately wrap a shell or python entry point"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - process
+            - organization
+
+evidence:
+  required:
+    - id: launchctl_run_now_invocation
+      name: Launchctl called with a subcommand that executes a job
+      description: >-
+        launchctl was invoked with submit, start, kickstart, bootstrap or asuser, which are
+        the subcommands that make launchd spawn a process immediately rather than record a
+        configuration for later.
+      source: process_creation
+      field: CommandLine
+      indicates: service_manager_proxy_execution
+
+  supporting:
+    - id: boundary_crossed
+      name: Job targeted at the system domain or another session
+      description: >-
+        The invocation named system/ or asuser with a specific uid, so the command runs at
+        root privilege or inside a user session the caller is not currently in.
+      source: process_creation
+      field: UserName
+      indicates: privilege_or_session_boundary_crossed
+    - id: target_in_scratch_path
+      name: Program or plist argument in a temporary or shared directory
+      description: >-
+        The thing being run lives under a scratch, shared or removable path rather than in
+        an application bundle or system directory, which is where a real service lives.
+      source: process_creation
+      field: ImageFileName
+      indicates: payload_staged_in_writable_path
+    - id: launchd_parented_interpreter
+      name: launchd started a shell, interpreter or network tool
+      description: >-
+        A launchd child of a kind that no packaged service uses confirms a command was run
+        through the service manager and is now detached from the caller's session.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: execution_chain_progression
+    - id: unusual_for_host
+      name: No history of this invocation on the host
+      description: >-
+        Comparable launchctl execution has not been seen on this host during the baseline
+        window, so the call is a deviation rather than part of the normal service churn.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: installer_or_management_parent
+      name: Called by installer or management tooling
+      description: >-
+        launchctl was started by installd, a package script or the management agent, which
+        is how deployed software brings its own services up and is the most common source
+        of these subcommands.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_software_installation
+    - id: known_service_restarted
+      name: Target is a service recorded as deployed
+      description: >-
+        The label or path being started belongs to a product recorded as installed on this
+        host, so the invocation is that product being restarted rather than a payload run.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_application_component
+    - id: fleetwide_invocation
+      name: Same invocation across the estate
+      description: >-
+        The identical command line appears on many hosts within one window, which is a
+        deployment or maintenance wave rather than a hands-on execution.
+      source: baseline
+      field: CommandLine
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - launchctl_run_now_invocation
+
+    supporting:
+      any:
+        - boundary_crossed
+        - target_in_scratch_path
+        - launchd_parented_interpreter
+        - unusual_for_host
+      all:
+        - target_in_scratch_path
+        - launchd_parented_interpreter
+
+    contradicting:
+      any:
+        - installer_or_management_parent
+        - known_service_restarted
+        - fleetwide_invocation
+      all: []
+
+  verdict:
+    low_risk_when:
+      - launchctl_run_now_invocation
+      - installer_or_management_parent
+      - known_service_restarted
+      - fleetwide_invocation
+    suspicious_when:
+      - launchctl_run_now_invocation
+      - unusual_for_host
+    high_risk_when:
+      - launchctl_run_now_invocation
+      - boundary_crossed
+      - target_in_scratch_path
+      - launchd_parented_interpreter
+
+  false_positive:
+    - condition: An installer or updater starts the service it just delivered.
+      explanation: >-
+        Package installs end with a bootstrap or kickstart of the new job, which matches the
+        required evidence exactly. The parent is installd or a package post-install script,
+        and the target is a label and path the same package created inside an application
+        bundle or system directory.
+    - condition: An administrator restarts a stuck service while troubleshooting.
+      explanation: >-
+        kickstart -k on a named service is standard repair work and comes from an interactive
+        shell, which is the same parent shape an operator produces. The target is an existing
+        packaged service rather than a scratch path, and no shell or interpreter appears as a
+        launchd child afterwards.
+    - condition: Management tooling bootstraps agent jobs into the system domain.
+      explanation: >-
+        Fleet management pushes jobs into system/ on every enrolled Mac, which reproduces the
+        boundary-crossing case. It appears on the whole estate inside one window with an
+        identical command line, and the parent is the management agent.
+    - condition: A developer submits and reloads a job while building a background tool.
+      explanation: >-
+        Development produces repeated submit and bootstrap calls for the same label, often
+        pointing into a build directory. The activity is iterative, confined to one account,
+        and the referenced path sits under the developer's project tree rather than in a
+        shared or temporary directory.
