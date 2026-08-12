@@ -1,0 +1,369 @@
+type: detection
+
+id: hg-win-payload-written-by-a-content-fetching-client-and-run-immediately-t1659
+
+version: 1.0.0
+
+info:
+  name: Payload written by a content-fetching client and run immediately
+  description: >-
+    Content injection puts the adversary inside a transfer the victim already trusts. Rather
+    than luring anyone to a hostile site, they sit on a compromised link — an operator, an
+    internet provider, a lawful-interception appliance — and substitute their own response
+    into ordinary traffic, or race a legitimate server to answer first. The documented use of
+    it delivered a fake Windows Update page to a handful of specifically chosen targets while
+    everyone else on the same network got the real thing. None of the substitution is visible
+    to an endpoint sensor: the manipulation happens on the wire, and this file makes no claim
+    to see it. What the endpoint does see is where the injected content lands. The client
+    that fetched it — a browser, a helper process, an update path — writes an executable or a
+    script into a cache, temp or download directory and something runs it, and it runs from
+    that directory rather than from an installed location. The reason this is worth a
+    template of its own rather than folding into drive-by delivery is the estate comparison.
+    Legitimate content arriving over a shared channel is identical everywhere: the same
+    installer, the same hash, on every machine that fetched it. Injected content is aimed,
+    so its hash exists on one or two hosts and nowhere else in the organisation, while the
+    rest of the fleet pulling the same resource got something different. That contrast is
+    the discriminator, and it is available directly from write records and their hashes.
+  severity: medium
+  author: huntgraph
+  tags:
+    - initial-access
+    - command-and-control
+    - content-injection
+    - fake-update
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1659
+    - https://attack.mitre.org/detectionstrategies/DET0349
+    - https://attack.mitre.org/techniques/T1189
+
+mitre:
+  tactics:
+    - TA0001
+    - TA0011
+  techniques:
+    - T1659
+  sub_techniques: []
+  detection_strategies:
+    - DET0349
+  analytics:
+    - AN0992
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary positioned on a network path may substitute their own content into traffic
+    the victim already trusts, so that a routine fetch or an update prompt delivers their
+    payload and execution follows without the user having chosen to run anything unusual.
+  attacker_behavior:
+    - Replaces or races the response to a request the victim's software made itself.
+    - Delivers a payload dressed as an update, patch or driver package.
+    - Has the fetching client write the payload into a cache, temp or download path.
+    - Executes it from where it landed rather than from an installed location.
+    - Targets a small number of hosts while the rest of the network receives real content.
+  legitimate_behavior:
+    - Browsers write downloaded installers into per-user download directories.
+    - Update clients stage packages in temporary directories before installing them.
+    - Software distribution tools drop and run installers as part of a deployment.
+    - Users deliberately download and run tools from the internet.
+  risk_indicator:
+    - The written file executes within moments of being created, from where it was written.
+    - The executing image sits in a user cache or temp path rather than an install location.
+    - The file is named like an update or patch but runs outside any update mechanism.
+    - The payload's hash appears on almost no other host in the estate.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+        - NewScriptWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - SHA256HashData
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: executable-written-into-a-cache-or-temp-path
+        name: Executable or script written into a cache, temp or download path
+        purpose: >-
+          Establish the landing site. Injected content has to be written somewhere the
+          fetching client can write, which on Windows means the per-user cache and temp
+          trees or the download folder, and never the installation directories a genuine
+          package would target.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten|NewScriptWritten)$/
+          | TargetFileName=/\\(AppData\\Local\\Temp|AppData\\Local\\Microsoft\\Windows\\INetCache|AppData\\Local\\Packages|AppData\\Roaming|Windows\\Temp|Downloads)\\/i
+          | TargetFileName=/\.(exe|dll|msi|scr|js|jse|vbs|vbe|hta|ps1|bat|cmd)$/i
+          | groupBy([ComputerName, ContextProcessId, TargetFileName],
+                    function=[count(as=writes), collect([SHA256HashData], limit=5)])
+          | sort(writes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Software distribution and patching tools that stage packages in temporary directories"
+            - "Development and build hosts where compilers write executables continuously"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: written-payload-executed-where-it-landed
+        name: Written payload executed from the directory it landed in
+        purpose: >-
+          Join the drop to the run, which is the sequence that turns a downloaded file into
+          delivered code. Requiring the executing image to sit in the same user-writable
+          tree separates a payload that ran from where the client put it from an installer
+          that was properly unpacked into a program directory first.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten|NewScriptWritten|ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              #event_simpleName=/^(PeFileWritten|NewExecutableWritten|NewScriptWritten)$/
+                | TargetFileName=/\\(AppData|Windows\\Temp|Downloads)\\/i
+                | TargetFileName=/\.(exe|dll|msi|scr|js|jse|vbs|vbe|hta|ps1)$/i
+                | dropped := TargetFileName ;
+              #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+                | ImageFileName=/\\(AppData|Windows\\Temp|Downloads)\\/i
+                | ParentBaseFileName=/^(msedge|chrome|firefox|iexplore|brave|opera|vivaldi|msedgewebview2|explorer|outlook|teams)\.exe$/i
+                | executed := ImageFileName ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[collect([dropped, executed, ParentBaseFileName, CommandLine], limit=20),
+                              count(as=events)])
+          | dropped=/.+/ and executed=/.+/
+        filters:
+          include: []
+          exclude:
+            - "Users deliberately downloading and running approved tools"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - path
+
+      - id: update-shaped-payload-run-outside-any-update-path
+        name: Update-shaped payload run from a user-writable directory
+        purpose: >-
+          Cover the named form of this technique, where injected content presents itself as
+          a system or vendor update. A genuine update runs from a servicing path under a
+          system-owned directory; one that runs out of a browser cache or download folder is
+          borrowing the appearance of an update without any of its mechanics.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/\\(AppData|Windows\\Temp|Downloads|Documents)\\/i
+          | FileName=/(update|upgrade|patch|hotfix|servicing|setup|install|driver|flash|java|codec)/i
+          | ParentBaseFileName=/^(msedge|chrome|firefox|iexplore|brave|opera|vivaldi|msedgewebview2|explorer)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions),
+                              collect([ImageFileName, CommandLine, SHA256HashData], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Vendor installers a user downloaded and ran deliberately, where the download is expected"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - process
+
+      - id: payload-hash-almost-no-other-host-received
+        name: Payload hash that almost no other host in the estate received
+        purpose: >-
+          Carry the discriminator that distinguishes injected content from delivered content.
+          Anything arriving through a shared channel is byte-identical across the fleet, so
+          ranking written payloads by how many hosts ever saw that hash puts targeted
+          substitution at the top and routine distribution at the bottom.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten|NewScriptWritten)$/
+          | TargetFileName=/\\(AppData|Windows\\Temp|Downloads)\\/i
+          | TargetFileName=/\.(exe|dll|msi|scr|js|jse|vbs|vbe|hta|ps1)$/i
+          | groupBy([SHA256HashData],
+                    function=[count(ComputerName, distinct=true, as=hosts),
+                              count(as=writes),
+                              collect([TargetFileName], limit=10)])
+          | hosts <= 2
+          | sort(hosts, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Files whose content is generated per host, such as configured or signed-per-user installers"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - organization
+            - path
+
+evidence:
+  required:
+    - id: payload_written_into_a_fetch_path
+      name: Executable or script written into a cache, temp or download path
+      description: >-
+        A process wrote runnable content into one of the user-writable directories that
+        network clients use for fetched data, which is where injected content lands when the
+        substitution happens upstream.
+      source: file_creation
+      field: TargetFileName
+      indicates: injected_payload_landing
+
+  supporting:
+    - id: executed_where_it_landed
+      name: The payload executed from the directory it was written to
+      description: >-
+        The written file ran as a process from the same user-writable tree rather than being
+        unpacked into an installed location first, which is delivery completing rather than
+        a package being installed.
+      source: process_creation
+      field: ImageFileName
+      indicates: write_then_execute_sequence
+    - id: fetching_client_lineage
+      name: The run descends from the client that fetched the content
+      description: >-
+        The executing process was started by a browser, embedded web view or shell handler
+        rather than by an installer or a management agent, which places it at the end of a
+        network fetch.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: update_shaped_naming
+      name: The payload is named as an update or patch
+      description: >-
+        The image name borrows the vocabulary of servicing while running outside any
+        servicing mechanism, which is the documented presentation of this technique.
+      source: process_creation
+      field: FileName
+      indicates: fake_update_masquerade
+    - id: hash_absent_from_the_estate
+      name: Payload hash seen on almost no other host
+      description: >-
+        The written content is unique to one or two machines across the baseline window,
+        which is what targeted substitution produces and what content delivered over a shared
+        channel does not.
+      source: baseline
+      field: SHA256HashData
+      indicates: rare_across_estate
+
+  contradicting:
+    - id: fleet_wide_identical_payload
+      name: The same payload arrived across the fleet
+      description: >-
+        Many hosts wrote the identical hash during the baseline window, which is a genuine
+        distribution of the same content rather than something injected for one target.
+      source: baseline
+      field: SHA256HashData
+      indicates: legitimate_enterprise_activity
+    - id: vendor_updater_staging
+      name: Vendor update client staging a package
+      description: >-
+        The writing and executing processes belong to a product's own update mechanism, which
+        legitimately stages packages in temporary directories before installing them.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_application_component
+    - id: recorded_software_deployment
+      name: Recorded software deployment or engineering host
+      description: >-
+        A change record covers a package being pushed at this time, or the host is a build or
+        engineering system where executables are written and run from working directories as
+        the normal workload.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - payload_written_into_a_fetch_path
+
+    supporting:
+      any:
+        - executed_where_it_landed
+        - fetching_client_lineage
+        - update_shaped_naming
+        - hash_absent_from_the_estate
+      all:
+        - executed_where_it_landed
+        - hash_absent_from_the_estate
+
+    contradicting:
+      any:
+        - fleet_wide_identical_payload
+        - vendor_updater_staging
+        - recorded_software_deployment
+      all: []
+
+  verdict:
+    low_risk_when:
+      - payload_written_into_a_fetch_path
+      - fleet_wide_identical_payload
+      - vendor_updater_staging
+      - recorded_software_deployment
+    suspicious_when:
+      - payload_written_into_a_fetch_path
+      - executed_where_it_landed
+    high_risk_when:
+      - payload_written_into_a_fetch_path
+      - executed_where_it_landed
+      - update_shaped_naming
+      - hash_absent_from_the_estate
+
+  false_positive:
+    - condition: A user downloads an installer and runs it from the download folder.
+      explanation: >-
+        This is the single most common benign form and it reproduces the write, the browser
+        lineage and the execution from a user-writable path. What it does not reproduce is
+        rarity — a real vendor installer has the same hash on every machine that fetched it,
+        which is why the estate comparison rather than the sequence decides the verdict.
+    - condition: An update client stages a package in a temporary directory.
+      explanation: >-
+        Product updaters write to temp and execute from there as their normal design. They
+        run under their own service or agent lineage rather than under a browser, and the
+        package is identical across every host running that product version.
+    - condition: A software deployment tool pushes and runs an installer.
+      explanation: >-
+        Managed distribution drops executables into staging directories and runs them, which
+        looks the same at file level. It is initiated by the management agent, it is covered
+        by a change record, and it lands on many machines at once.
+    - condition: An engineering host writes and runs executables from working directories.
+      explanation: >-
+        Build and development machines produce fresh, unique executables constantly, so the
+        rare-hash leg fires on them routinely. The writing process is a compiler or build
+        tool rather than a network client, and the host's role explains the volume.
