@@ -31,13 +31,13 @@ Of the 102 remaining, **9 are recorded as deliberately skipped** in `skipped.yam
 
 | Tactic | Covered | In scope | Remaining | Out of scope |
 |---|---:|---:|---:|---:|
-| Discovery | 2 (6%) | 36 | 34 | 7 |
-| Collection | 6 (23%) | 26 | 20 | 8 |
-| Command And Control | 2 (6%) | 36 | 34 | 0 |
-| Exfiltration | 0 (0%) | 12 | 12 | 2 |
-| **unique total** | **10** | **110** | **100** | |
+| Discovery | 29 (81%) | 36 | 7 | 7 |
+| Collection | 19 (73%) | 26 | 7 | 8 |
+| Command And Control | 27 (75%) | 36 | 9 | 0 |
+| Exfiltration | 9 (75%) | 12 | 3 | 2 |
+| **unique total** | **84** | **110** | **26** | |
 
-Of the 100 remaining, **3 are recorded as deliberately skipped** in `skipped.yaml` — targets whose only observable is telemetry this deployment cannot collect, where any template would look like coverage and detect nothing. They are gaps, but acknowledged ones: T1497.002, T1497.003, T1622.
+Of the 26 remaining, **11 are recorded as deliberately skipped** in `skipped.yaml` — targets whose only observable is telemetry this deployment cannot collect, where any template would look like coverage and detect nothing. They are gaps, but acknowledged ones: T1001.001, T1001.003, T1010, T1048.002, T1090.004, T1132.002, T1497.002, T1497.003, T1573.001, T1573.002, T1622.
 
 ## Blocked on telemetry
 
