@@ -1,0 +1,359 @@
+type: detection
+
+id: hg-any-system-language-checked-as-a-geographic-guardrail-t1614-001
+
+version: 1.0.0
+
+info:
+  name: System language checked as a geographic guardrail before execution
+  description: >-
+    This is a narrow technique with an unusually specific meaning, which is what makes it
+    worth a template despite the small surface. A large family of ransomware and stealers
+    refuses to run where the operator does not want the attention of local law enforcement:
+    DEATHRANSOM exits on Russian, Kazakh, Belarusian, Ukrainian or Tatar; Cuba and Clop read
+    the keyboard layout list for the same reason; Cuckoo Stealer checks LANG for the CIS
+    locales; CanisterWorm inverts the logic and reads /etc/timezone and LANG looking for an
+    Iranian locale before deploying its wiper. The check is therefore not reconnaissance in
+    the ordinary sense at all — the answer is used to decide whether to proceed, and it runs
+    before anything else the sample does. Two things make it detectable. First, the observable
+    is genuinely rare: software that needs the user's language reads it through an API inside
+    its own process, and asking for it from a command line is something almost nothing
+    legitimate does. Second, it is loud relative to the rest of the guardrail, because the
+    decision itself is arithmetic and produces no telemetry while the question produces a
+    command. What this deployment cannot see is stated plainly: the registry read of the NLS
+    language key and the GetKeyboardLayoutList API call, which is how most compiled malware
+    actually asks, leave no process, file or network event, so this file catches the shelled-
+    out and scripted variants only. It is deliberately distinct from the T1480.001 template,
+    which requires host-unique identifiers such as the volume serial and machine GUID and
+    treats locale as one keying value among several; here locale, layout and timezone are the
+    whole question, the answer is used to refuse rather than to derive a key, and the hunt
+    runs on Linux and macOS as well as Windows.
+  severity: medium
+  author: huntgraph
+  tags:
+    - discovery
+    - system-language
+    - locale
+    - execution-guardrails
+    - anti-analysis
+    - windows
+    - linux
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1614/001
+    - https://attack.mitre.org/detectionstrategies/DET0565
+    - https://attack.mitre.org/techniques/T1614
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1614
+  sub_techniques:
+    - T1614.001
+  detection_strategies:
+    - DET0565
+  analytics:
+    - AN1561
+    - AN1562
+    - AN1563
+  platforms:
+    - Windows
+    - Linux
+    - macOS
+  data_sources:
+    - WinEventLog:Sysmon
+    - auditd:SYSCALL
+    - linux:Sysmon
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    An adversary may read the system language, installed keyboard layouts or locale of a
+    host in order to infer which country it sits in, and use that answer as a guardrail that
+    decides whether the payload proceeds, so the operation avoids jurisdictions the operator
+    does not wish to attract attention from.
+  attacker_behavior:
+    - Reads the NLS language registry values from the command line rather than through an API.
+    - Enumerates the installed keyboard layouts or input languages of the current user.
+    - Queries the operating system language, locale or country code through WMI or a PowerShell cmdlet.
+    - Reads the LANG environment variable or runs locale on a Linux host.
+    - Reads AppleLocale or the preferred languages list on macOS.
+    - Checks the configured timezone alongside the language to corroborate the geography.
+    - Launches an interpreter or payload immediately after the check, or exits without doing anything.
+  legitimate_behavior:
+    - Installers and localisation routines determine the display language before presenting a user interface.
+    - Asset inventory tooling reports locale and keyboard settings as part of configuration data.
+    - Imaging and provisioning scripts set and then verify the language and regional settings of a new build.
+    - Support scripts collect regional settings while diagnosing a formatting or input fault.
+    - Application health checks read locale to select the right resource bundle.
+  risk_indicator:
+    - The check runs from a delivery-chain parent such as a document handler, archive tool or mail client.
+    - Language and timezone are read together, which corroborates geography rather than selecting a language.
+    - The check is immediately followed by an interpreter or proxy-execution launch.
+    - The host has never performed a comparable check during the baseline window.
+    - The reading process is a script host running from a user-writable path.
+
+requires:
+  platforms:
+    - windows
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: language-or-keyboard-layout-queried
+        name: System language or keyboard layout read from a command line
+        purpose: >-
+          Surface the question itself across the three platforms. The keyboard layout list
+          is the strongest member of this set because it answers where the user types rather
+          than what the interface displays, which is exactly the distinction a geographic
+          guardrail cares about and one no localisation routine needs.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Control\\Nls\\Language|Control\\Keyboard\s?Layout|Get-WinUserLanguageList|Get-WinSystemLocale|Get-WinUILanguageOverride|Get-Culture\b|CurrentUICulture|InstalledUICulture|GetKeyboardLayout|GetUserDefaultUILanguage|GetSystemDefaultUILanguage|GetUserDefaultLangID|\bos\s+get\s+(oslanguage|locale|countrycode|muilanguages)|\bchcp\b|\blocale\b\s*(-a)?\s*$|\becho\s+\$LANG\b|\blocalectl\b|\bdefaults\b\s+read\s+.{0,30}(AppleLocale|AppleLanguages)|NSGlobalDomain.{0,20}AppleLanguages)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=checks), collect([CommandLine], limit=5)])
+          | sort(checks, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the asset inventory and endpoint management agents"
+            - "ComputerName of imaging and provisioning hosts where regional settings are configured and verified"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - parent_process
+            - command_line
+
+      - id: language-check-from-a-delivery-parent
+        name: Language check made by a delivery-chain process
+        purpose: >-
+          Apply the actor discriminator, which on this technique is unusually decisive.
+          Localisation happens inside an installer or an application; a language query
+          arriving from a document handler, an archive utility, a mail client, a browser or
+          a script host running out of a user-writable directory is a sample deciding
+          whether the machine is in a country it is willing to run in.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(Control\\Nls\\Language|Get-WinUserLanguageList|Get-WinSystemLocale|Get-Culture\b|GetKeyboardLayout|GetUserDefaultUILanguage|GetSystemDefaultUILanguage|\bos\s+get\s+(oslanguage|locale|countrycode)|\bchcp\b|\blocale\b|\$LANG\b|AppleLocale|AppleLanguages)/i
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|onenote|msaccess|acrord32|acrobat|7z(fm|g)?|winrar|rar|zip|explorer|chrome|msedge|firefox|thunderbird|mshta|wscript|cscript|hh|wmiprvse)\.exe$|^(bash|sh|zsh|python[0-9.]*|perl|osascript|curl|wget)$/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=checks), collect([CommandLine], limit=5)])
+          | sort(checks, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Software distribution packages that localise themselves during a supervised installation"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - parent_process
+            - command_line
+
+      - id: language-and-timezone-then-execution
+        name: Language and timezone read together, then an interpreter launched
+        purpose: >-
+          Catch the guardrail as a whole rather than one of its questions. A localisation
+          routine wants one fact, the display language. A geofence wants corroboration, so
+          it reads the language and the timezone and then either proceeds to the payload or
+          stops — and the combination followed by a proxy-execution or interpreter launch is
+          the shape reported for the CIS-avoiding ransomware families and for the wipers
+          that invert the same logic.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(Control\\Nls\\Language|Get-WinUserLanguageList|Get-WinSystemLocale|Get-Culture\b|GetKeyboardLayout|GetUserDefaultUILanguage|\bos\s+get\s+(oslanguage|locale|countrycode)|\bchcp\b|\blocale\b|\$LANG\b|AppleLocale|AppleLanguages)/i
+                | language_probe := CommandLine ;
+              CommandLine=/(\btzutil\b|Get-TimeZone\b|TimeZoneInformation|Control\\TimeZoneInformation|\/etc\/timezone|\btimedatectl\b|systemsetup\b.{0,20}-gettimezone|\bdate\b\s+\+%Z)/i
+                | timezone_probe := CommandLine ;
+              FileName=/^(powershell|pwsh|cmd|rundll32|regsvr32|mshta|wscript|cscript|installutil)\.exe$|^(bash|sh|python[0-9.]*|perl|osascript)$/i
+                | interpreter_launch := FileName ;
+            }
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[collect([language_probe, timezone_probe, interpreter_launch], limit=12),
+                              count(as=events)])
+          | language_probe=/.+/
+          | timezone_probe=/.+/ or interpreter_launch=/.+/
+          | sort(events, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Imaging and provisioning runs that set language, keyboard and timezone together on a new build"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - process
+
+evidence:
+  required:
+    - id: language_probe
+      name: System language or locale read
+      description: >-
+        A command read the system or user interface language, the installed keyboard layout
+        list, the locale or the country code, from a command line rather than through an
+        in-process API call.
+      source: process_creation
+      field: CommandLine
+      indicates: system_language_discovery
+
+  supporting:
+    - id: delivery_parent
+      name: Delivery-chain parent process
+      description: >-
+        The querying process was launched by a document handler, archive utility, mail
+        client, browser or script host rather than by an installer, inventory agent or
+        provisioning task.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: timezone_corroboration
+      name: Timezone read alongside the language
+      description: >-
+        The configured timezone was read together with the language, which corroborates the
+        host's geography rather than selecting a display language and is characteristic of a
+        guardrail rather than of localisation.
+      source: process_creation
+      field: ImageFileName
+      indicates: geographic_guardrail
+    - id: interpreter_followup
+      name: Interpreter launched after the check
+      description: >-
+        A command interpreter or proxy-execution binary was launched by the same lineage
+        immediately after the check, which is the payload proceeding once the environment
+        passed its test.
+      source: process_creation
+      field: FileName
+      indicates: execution_chain_progression
+    - id: rare_for_host
+      name: Check unprecedented on this host
+      description: >-
+        No comparable language or locale query has been seen on this host during the
+        baseline window, which for a command-line locale read is the normal state of an
+        endpoint.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: provisioning_or_imaging
+      name: Provisioning, imaging or localisation task
+      description: >-
+        The read accompanied a build, imaging or language-pack installation where the
+        regional settings are being configured and then verified.
+      source: process_creation
+      field: UserName
+      indicates: legitimate_enterprise_activity
+    - id: inventory_agent
+      name: Asset inventory or endpoint management agent
+      description: >-
+        The approved inventory or endpoint management agent collected locale and keyboard
+        settings as part of its scheduled configuration reporting.
+      source: process_creation
+      field: TargetProcessId
+      indicates: legitimate_enterprise_activity
+    - id: recurring_collection
+      name: Check recurs on a stable schedule
+      description: >-
+        The same query recurs at a regular interval across many hosts, which is configuration
+        reporting rather than a one-off decision procedure run once by a single process.
+      source: baseline
+      field: ComputerName
+      indicates: scheduled_automation_job
+
+  risk_logic:
+    required:
+      - language_probe
+
+    supporting:
+      any:
+        - delivery_parent
+        - timezone_corroboration
+        - interpreter_followup
+        - rare_for_host
+      all:
+        - delivery_parent
+        - interpreter_followup
+
+    contradicting:
+      any:
+        - provisioning_or_imaging
+        - inventory_agent
+        - recurring_collection
+      all: []
+
+  verdict:
+    low_risk_when:
+      - language_probe
+      - provisioning_or_imaging
+      - inventory_agent
+      - recurring_collection
+    suspicious_when:
+      - language_probe
+      - rare_for_host
+      - delivery_parent
+    high_risk_when:
+      - language_probe
+      - rare_for_host
+      - delivery_parent
+      - timezone_corroboration
+      - interpreter_followup
+
+  false_positive:
+    - condition: An installer determines the display language before presenting its interface.
+      explanation: >-
+        Localisation is the legitimate twin of this behaviour and it is the reason the file
+        rests on the parent rather than the command. An installer reads the language from
+        within its own process or from a supervised setup package, and does not pair the read
+        with a timezone query.
+    - condition: Imaging or provisioning sets and then verifies regional settings on a new build.
+      explanation: >-
+        Provisioning reads language, keyboard layout and timezone together, which reproduces
+        the strongest supporting evidence in the third case. It is confined to build hosts and
+        to the first hours of a machine's life, and it writes those settings as well as
+        reading them.
+    - condition: Asset inventory reports locale and keyboard configuration on every host.
+      explanation: >-
+        Configuration reporting collects exactly these values estate-wide and on a schedule,
+        which is why the agent must be excluded by parent process rather than by rarity.
+    - condition: A support script collects regional settings while diagnosing a formatting fault.
+      explanation: >-
+        Date, currency and input problems are diagnosed by reading locale, and the script may
+        run from an interactive shell that resembles a delivery parent. These are tied to a
+        named engineer and a ticket, and nothing executes afterwards.
+    - condition: A developer or application health check reads the culture to select a resource bundle.
+      explanation: >-
+        Culture reads appear in development and in application self-checks on engineering
+        hosts, from interpreter parents, which weakens the actor discriminator on exactly the
+        machines where scripting is normal. Host role and the absence of a timezone read
+        separate them.

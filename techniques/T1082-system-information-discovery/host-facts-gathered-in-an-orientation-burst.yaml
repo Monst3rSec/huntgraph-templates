@@ -1,0 +1,393 @@
+type: detection
+
+id: hg-win-host-facts-gathered-in-an-orientation-burst-t1082
+
+version: 1.0.0
+
+info:
+  name: Host facts gathered in an orientation burst
+  description: >-
+    This template is for enriching a lead you already have, not for generating one. Set the
+    expectation before deploying it: systeminfo, ver and wmic os get are among the most
+    executed commands in any Windows estate, they are run by logon scripts, monitoring
+    agents, installers, support engineers and the operating system itself, and there is no
+    standalone form of this technique that can be separated from that traffic. A template
+    claiming otherwise would produce an alert stream nobody could read. Severity is low
+    deliberately and the intended use is an analyst pivoting on a host, account or lineage
+    that is already interesting and asking what the operator looked at first.
+    What survives that honesty is shape rather than content. An operator who has just landed
+    does not know the build, the patch level, the hardware or what runtime is available, and
+    finds out in one pass — several unrelated categories of host fact under one lineage
+    inside a couple of minutes. Software does not behave that way; it asks the one question
+    it needs. The second shape is ancestry: the same ordinary command parented by a document
+    handler, mail client, browser, archive tool or script host is the only real
+    discriminator available when the command itself is universal. The third is capture — an
+    administrator reads the answer on screen, while an operator redirects it to a file
+    because the answer is going somewhere else.
+    One nuance worth stating: a lone systeminfo returns most of these facts at once and will
+    therefore score a single category, not several. That is intended. The clustering case is
+    built for the operator working through separate commands; the single all-in-one dump is
+    left to the ancestry and capture cases.
+    The narrow set of machine-unique identifiers — volume and BIOS serials, machine GUID,
+    system UUID, adapter address — is deliberately excluded here. Those are key material
+    rather than orientation and belong to the environmental keying hypothesis.
+  severity: low
+  author: huntgraph
+  tags:
+    - discovery
+    - system-information-discovery
+    - host-orientation
+    - enrichment
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1082
+    - https://attack.mitre.org/detectionstrategies/DET0525
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1082
+  sub_techniques: []
+  detection_strategies:
+    - DET0525
+  analytics:
+    - AN1452
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+    - WinEventLog:PowerShell
+  data_components:
+    - Process Creation
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    An adversary newly arrived on a host may establish what that host is — build, patch
+    level, architecture, hardware and available runtimes — by running several unrelated
+    enumeration commands under one lineage in a short window, or by running an ordinary
+    enumeration command from a process that has no reason to ask.
+  attacker_behavior:
+    - Asks for the operating system version and build shortly after arriving on the host.
+    - Lists applied hotfixes to judge which privilege escalation routes remain open.
+    - Reads the hardware model and memory to tell a workstation from a server or a sandbox.
+    - Works through several unrelated host questions in one short burst.
+    - Redirects the collected answers into a file rather than reading them on screen.
+  legitimate_behavior:
+    - Monitoring and inventory agents collect host facts on a fixed schedule.
+    - Installers check build, architecture and patch level before deciding what to install.
+    - Logon and imaging scripts branch on version and hardware to apply the right configuration.
+    - Support engineers gather host details while working a ticket.
+    - Application diagnostics and crash handlers record environment details on failure.
+  risk_indicator:
+    - Several unrelated categories of host fact were gathered under one lineage in one window.
+    - The enumerating process was launched by a document handler, archive tool or script host.
+    - The output was redirected to a file rather than displayed.
+    - The lineage is one already implicated by another finding on the same host.
+    - The pattern is unprecedented for this host and does not recur on a schedule.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: unrelated-host-facts-in-one-burst
+        name: Several unrelated categories of host fact under one lineage
+        purpose: >-
+          The only case in this file that carries any weight on its own, and it is still a
+          ranking device rather than an alert. Tag each command by which question about the
+          host it answers, collapse per host, account and parent, and report lineages that
+          asked several unrelated questions. Software asks the one thing it needs; an
+          operator orienting themselves asks everything. Sort ascending on rarity and work
+          the top of the list, and raise the threshold until the result set is small enough
+          for a person to read.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              CommandLine=/(\bsysteminfo\b|os\s+get\s+(caption|version|buildnumber)|Win32_OperatingSystem|Get-ComputerInfo|\[Environment\]::OSVersion|CurrentBuild(Number)?|ProductName)/i
+                | fact := "os_version" ;
+              CommandLine=/(\bwmic\b.{0,20}\bqfe\b|Get-HotFix|\bhotfix\b|ServicePackMajorVersion|\bqfe\s+list\b)/i
+                | fact := "patch_level" ;
+              CommandLine=/(osarchitecture|PROCESSOR_ARCHITECTURE|Is64BitOperatingSystem|Is64BitProcess|AddressWidth)/i
+                | fact := "architecture" ;
+              CommandLine=/(computersystem\s+get\s+(model|manufacturer)|csproduct\s+get\s+(name|vendor)|baseboard\s+get|Win32_ComputerSystem\b|SystemFamily)/i
+                | fact := "hardware_model" ;
+              CommandLine=/(\bcpu\s+get\b|Win32_Processor|NumberOfCores|memorychip|TotalPhysicalMemory|Win32_PhysicalMemory|Get-CimInstance.{0,30}Processor)/i
+                | fact := "cpu_and_memory" ;
+              CommandLine=/(\bset\b\s*$|Get-ChildItem\s+Env:|\bdir\s+env:|tzutil(\.exe)?\s+\/g|Get-TimeZone|Get-WinSystemLocale|Get-Culture)/i
+                | fact := "environment_settings" ;
+            }
+          | fact=/.+/
+          | groupBy([ComputerName, UserName, ParentBaseFileName],
+                    function=[count(fact, distinct=true, as=fact_categories),
+                              count(as=commands),
+                              collect([fact, CommandLine], limit=15)])
+          | fact_categories >= 3
+          | sort(fact_categories, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Monitoring, inventory and patch agents that collect host facts on a fixed schedule"
+            - "Imaging and provisioning pipelines during a build window"
+            - "Installer and software distribution parents performing pre-install checks"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - parent_process
+
+      - id: host-enumeration-from-a-delivery-parent
+        name: Host enumeration run from a document handler, archive tool or script host
+        purpose: >-
+          Where the command set is universal the parent is the discriminator, and this case
+          says so rather than pretending the command is suspicious. A spreadsheet, a mail
+          client, a browser, an archive utility or a script host has no reason to ask what
+          build the machine is running. This case needs no breadth, so it catches the single
+          all-in-one dump the clustering case is designed to miss.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\bsysteminfo\b|\bver\b\s*$|os\s+get\b|computersystem\s+get\b|csproduct\s+get\b|\bqfe\b|Get-HotFix|Get-ComputerInfo|Win32_OperatingSystem|Win32_ComputerSystem)/i
+          | ParentBaseFileName=/^(winword|excel|powerpnt|outlook|onenote|msaccess|visio|acrord32|acrobat|7zfm|7z|winrar|winzip|mshta|wscript|cscript|hh|chrome|msedge|firefox|teams|equation)\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=commands), collect([CommandLine], limit=10)])
+          | sort(commands, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Application diagnostics and crash handlers that record environment details on failure"
+            - "Add-in and plugin installers launched from within an office application"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - parent_process
+            - command_line
+
+      - id: enumeration-output-captured-to-a-file
+        name: Enumeration output redirected to a file rather than displayed
+        purpose: >-
+          Separate looking from taking. An engineer diagnosing a fault reads the answer on
+          screen; an operator writes it to a temporary file because the answer is going
+          somewhere else, and that redirection is the closest thing to intent this technique
+          offers. Capture into a user-writable or temporary path narrows it further.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(\bsysteminfo\b|os\s+get\b|computersystem\s+get\b|\bqfe\b|Get-HotFix|Get-ComputerInfo|\bver\b)/i
+          | CommandLine=/(>|>>|Out-File|Set-Content|Add-Content|Tee-Object|\/fo\s+csv)/i
+          | CommandLine=/(\\+Temp\\+|\\+AppData\\+|\\+ProgramData\\+|\\+Public\\+|\\+Users\\+|%temp%|\$env:temp)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=captures), collect([CommandLine], limit=10)])
+          | sort(captures, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Support and diagnostic collection scripts that bundle host details for a ticket"
+            - "Vendor log collection utilities run during a support case"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: host-inventory-through-management-objects
+        name: Host facts collected through management objects rather than built-in utilities
+        purpose: >-
+          Cover the route that avoids the well known utility names entirely. Querying the
+          operating system, computer system and processor classes through the management
+          interface returns the same answers as systeminfo without ever running it, which is
+          what tooling written to evade command line matching does. The object names are the
+          anchor, and they are specific enough to be worth looking at in their own right.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(powershell|pwsh|wscript|cscript|mshta|wmic)\.exe$/i
+          | CommandLine=/(Win32_OperatingSystem|Win32_ComputerSystem(Product)?|Win32_Processor|Win32_PhysicalMemory|Win32_BaseBoard|Win32_QuickFixEngineering|Get-CimInstance|Get-WmiObject|New-CimSession)/i
+          | CommandLine!=/(SerialNumber|MachineGuid|\bUUID\b|IdentifyingNumber|MACAddress)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=queries), collect([CommandLine], limit=10)])
+          | sort(queries, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Configuration management and reporting scripts that query management objects by design"
+            - "Endpoint agents whose collection is implemented through the management interface"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+evidence:
+  required:
+    - id: system_information_collected
+      name: Host facts enumerated
+      description: >-
+        A process asked the host about its operating system version, patch level,
+        architecture, hardware or available runtime, through a built-in utility or through
+        the management interface.
+      source: process_creation
+      field: CommandLine
+      indicates: host_capability_enumeration
+
+  supporting:
+    - id: multiple_fact_categories
+      name: Several unrelated host questions in one window
+      description: >-
+        One lineage asked three or more unrelated categories of host fact inside the window,
+        which is orientation on an unfamiliar machine rather than software checking a
+        prerequisite it needs.
+      source: process_creation
+      field: CommandLine
+      indicates: orientation_burst
+    - id: delivery_parent
+      name: Launched from a delivery or script parent
+      description: >-
+        The enumerating process was started by a document handler, mail client, browser,
+        archive utility or script host, none of which have any reason to ask what the
+        machine is.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: output_captured_to_file
+      name: Answers written to a file
+      description: >-
+        The enumeration output was redirected into a file under a temporary or user-writable
+        path rather than displayed, which is collection rather than a person looking.
+      source: process_creation
+      field: CommandLine
+      indicates: collection_for_transfer
+    - id: management_object_route
+      name: Collected through management objects
+      description: >-
+        The facts were gathered by querying management classes rather than by running the
+        named utilities, which returns the same answers without the recognisable command.
+      source: process_creation
+      field: FileName
+      indicates: evasive_enumeration_route
+    - id: rare_for_host
+      name: Pattern unprecedented on this host
+      description: >-
+        No comparable enumeration burst has run on this host and account during the baseline
+        window, unlike agent and script activity which recurs at a predictable interval.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: inventory_or_monitoring_agent
+      name: Inventory, monitoring or patch agent
+      description: >-
+        The enumerating process belongs to an approved monitoring, inventory or patch
+        management agent whose deployed function is collecting exactly these facts.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_enterprise_activity
+    - id: support_or_change_activity
+      name: Recorded support or change activity
+      description: >-
+        The enumeration falls inside a recorded support ticket, change window or build
+        pipeline run for this host, performed by a named engineer or service account.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_administrative_activity
+    - id: fleetwide_recurring_pattern
+      name: Same pattern across the estate on a cycle
+      description: >-
+        The identical command sequence appears on many hosts at a stable interval, which is
+        a management platform reporting rather than one operator orienting on one machine.
+      source: baseline
+      field: CommandLine
+      indicates: scheduled_automation_job
+
+  risk_logic:
+    required:
+      - system_information_collected
+
+    supporting:
+      any:
+        - multiple_fact_categories
+        - delivery_parent
+        - output_captured_to_file
+        - management_object_route
+        - rare_for_host
+      all:
+        - multiple_fact_categories
+        - delivery_parent
+
+    contradicting:
+      any:
+        - inventory_or_monitoring_agent
+        - support_or_change_activity
+        - fleetwide_recurring_pattern
+      all: []
+
+  verdict:
+    low_risk_when:
+      - system_information_collected
+      - inventory_or_monitoring_agent
+      - support_or_change_activity
+      - fleetwide_recurring_pattern
+    suspicious_when:
+      - system_information_collected
+      - multiple_fact_categories
+    high_risk_when:
+      - system_information_collected
+      - multiple_fact_categories
+      - delivery_parent
+      - output_captured_to_file
+
+  false_positive:
+    - condition: A monitoring or inventory agent collects host facts on every endpoint.
+      explanation: >-
+        Inventory tooling asks for exactly the same facts an operator does, usually several in
+        one pass, so it reproduces both the required and the clustering evidence. It runs from
+        a known agent on a fixed cycle, the command lines are identical across the estate, and
+        the answers are reported to a platform rather than written to a temporary file.
+    - condition: An installer checks build, architecture and patch level before installing.
+      explanation: >-
+        Pre-install checks legitimately touch several unrelated fact categories in one burst,
+        which is the clustering signal exactly. The parent is an installer or distribution
+        agent, the burst is immediately followed by an installation, and it recurs whenever
+        that product is deployed anywhere in the estate.
+    - condition: A logon or imaging script branches on version and hardware.
+      explanation: >-
+        Build and logon scripts read version, architecture and model constantly to decide what
+        to apply. They run under the provisioning or logon context at a predictable moment in
+        the machine's life and appear on every host that passes through the same pipeline.
+    - condition: A support engineer gathers host details while working a ticket.
+      explanation: >-
+        Diagnostic work produces genuine orientation bursts, sometimes captured to a file for
+        attaching to a case. It is tied to a named engineer and a ticket, and the parent is an
+        interactive shell opened by that engineer rather than a document or archive handler.
+    - condition: An application diagnostic or crash handler records environment details.
+      explanation: >-
+        Crash reporting collects operating system, memory and processor details and writes them
+        to a file under a temporary path, which reproduces the capture evidence. The parent is
+        the failing application itself and the collection follows a crash rather than an arrival.
