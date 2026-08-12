@@ -114,11 +114,21 @@ Two other honest limits, stated in the files themselves:
 
 ## Status
 
-See [task.md](task.md), which is generated:
+Both status artefacts are generated. Neither is safe to edit by hand.
 
 ```bash
-python3 tools/coverage.py --markdown > task.md
+python3 tools/coverage.py --markdown > task.md    # summary tracker
+python3 tools/export_csv.py -o coverage.csv       # full matrix, one row per tactic-technique
 ```
+
+[task.md](task.md) is the per-tactic summary. [coverage.csv](coverage.csv) is the whole
+Enterprise matrix — every tactic, technique and sub-technique, the data components its
+analytics need, which of those this repo cannot collect, and whether a hypothesis exists.
+A technique mapped to three tactics produces three rows, because coverage is a question
+you ask per tactic.
+
+`status` in the CSV is one of `covered`, `not-covered`, `blocked-telemetry`,
+`out-of-scope`, or `parent` (decomposes into sub-techniques, covered through them).
 
 ## Licence
 
