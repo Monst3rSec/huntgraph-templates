@@ -1,0 +1,302 @@
+type: detection
+
+id: hg-win-remote-access-service-exposed-for-reentry-t1133
+version: 1.0.0
+
+info:
+  name: Remote access service enabled or exposed for re-entry
+  description: >-
+    An adversary who expects to lose their foothold wants a way back that does not depend
+    on the payload surviving. Enabling remote desktop, standing up a tunnelling client, or
+    installing a remote access product gives them a route that authenticates normally,
+    survives reboot and cleanup, and looks like administration if anyone glances at it.
+    The endpoint sees the setup: a service being enabled on a host where it was off, or a
+    tunnelling tool arriving that the estate does not deploy.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - initial-access
+    - remote-services
+    - tunnelling
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1133
+    - https://attack.mitre.org/detectionstrategies/DET0354
+    - https://attack.mitre.org/techniques/T1021
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0001
+  techniques:
+    - T1133
+  sub_techniques: []
+  detection_strategies:
+    - DET0354
+  analytics:
+    - AN1004
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Application
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Connection Creation
+    - Application Log Content
+    - User Account Authentication
+
+hypothesis:
+  statement: >-
+    An adversary may enable a remote access service or install a tunnelling client on a
+    compromised host, establishing a route back that authenticates normally and survives
+    reboot, cleanup and the loss of the original payload.
+  attacker_behavior:
+    - Enables remote desktop or remote management on a host where it was disabled.
+    - Installs a remote access or tunnelling client that reaches an external relay.
+    - Creates a firewall exception so the service is reachable from outside.
+    - Chooses a product that resembles legitimate support tooling.
+  legitimate_behavior:
+    - Support teams deploy remote assistance products across the estate.
+    - Administrators enable remote management on servers by policy.
+    - Engineers use tunnelling tools to reach lab and cloud environments.
+    - Vendors provide remote support software during an incident.
+  risk_indicator:
+    - The service is enabled on a host where it has been off throughout the baseline.
+    - A tunnelling client appears that the estate does not deploy.
+    - The client runs from a user-writable directory rather than an installation path.
+    - The enabling is done by a script host rather than by policy or an installer.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: remote-service-enabled
+        name: Remote access service enabled on a host
+        purpose: >-
+          Surface the protocol being turned on where it was off, which is the cheapest
+          route back and leaves a configuration change rather than a file.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(fDenyTSConnections|Enable-PSRemoting|winrm\s+quickconfig|Set-Service\s+.*TermService.*Automatic|sc(\.exe)?\s+config\s+termservice)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Managed policy enabling remote management across server collections"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: tunnelling-client-present
+        name: Tunnelling or remote access client running
+        purpose: >-
+          Catch a client the estate does not deploy, which provides reachability without
+          any inbound firewall change being needed.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(ngrok|frpc|frps|chisel|cloudflared|localtonet|playit|ssh|plink|socat|dwagent|meshagent|rustdesk|anydesk|teamviewer|screenconnect|atera|splashtop)\w*\.exe$/i
+          | groupBy([ComputerName, UserName, FileName, ImageFileName, ParentBaseFileName],
+                    function=[count(as=starts), collect([CommandLine], limit=5)])
+          | sort(starts, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "The estate's sanctioned remote assistance and tunnelling products"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: tunnel-client-external-egress
+        name: Tunnelling client connecting to an external relay
+        purpose: >-
+          Confirm the client established a route rather than merely being present, which is
+          what turns capability into access.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | FileName=/^(ngrok|frpc|chisel|cloudflared|localtonet|playit|socat|plink)\w*\.exe$/i
+                | tunnel_pid := TargetProcessId ;
+              #event_simpleName=NetworkConnectIP4
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/ ;
+            }
+          | groupBy([ComputerName, ContextProcessId],
+                    function=[collect([CommandLine, UserName, RemoteAddressIP4, RemotePort]),
+                              count(as=events)])
+          | tunnel_pid = ContextProcessId
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: remote_route_established
+      name: Remote access enabled or a tunnelling client running
+      description: >-
+        A remote access protocol was enabled, or a tunnelling or remote control client was
+        started, creating a route back to the host that does not depend on the original
+        payload.
+      source: process_creation
+      field: CommandLine
+      indicates: reentry_path_created
+
+  supporting:
+    - id: external_relay_reached
+      name: Client connected to an external relay
+      description: >-
+        The tunnelling client opened a connection to a routable external address,
+        confirming a route was established rather than merely made possible.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: active_command_and_control_attempt
+    - id: writable_client_path
+      name: Client running from a user-writable directory
+      description: >-
+        The executable sits under AppData, Temp, ProgramData or a user profile rather than
+        in an installation directory, which is a portable client rather than deployed
+        software.
+      source: process_creation
+      field: ImageFileName
+      indicates: untrusted_execution_location
+    - id: no_prior_remote_access
+      name: Host has no history of this service or client
+      description: >-
+        The protocol has been off, or the client absent, throughout the baseline window,
+        so its appearance now is a change to how the host can be reached.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: script_host_actor
+      name: Enabled by a script host or remote channel
+      description: >-
+        The change was made by an interpreter or a remote-execution channel rather than by
+        managed policy, an installer or an interactive administrator.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+
+  contradicting:
+    - id: sanctioned_remote_product
+      name: The estate's approved remote assistance product
+      description: >-
+        The client is the organisation's chosen remote support or tunnelling tool, deployed
+        and used by the support function.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_enterprise_activity
+    - id: managed_policy_enablement
+      name: Remote management enabled by policy
+      description: >-
+        The protocol was enabled through Group Policy or the management platform across a
+        server collection rather than locally.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: engineering_or_recorded_use
+      name: Engineering use or a recorded support engagement
+      description: >-
+        The host is an engineering system where tunnelling is routine, or a change record
+        covers a vendor support session using remote access software.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+
+  risk_logic:
+    required:
+      - remote_route_established
+
+    supporting:
+      any:
+        - external_relay_reached
+        - writable_client_path
+        - no_prior_remote_access
+        - script_host_actor
+      all:
+        - external_relay_reached
+        - writable_client_path
+
+    contradicting:
+      any:
+        - sanctioned_remote_product
+        - managed_policy_enablement
+        - engineering_or_recorded_use
+      all: []
+
+  verdict:
+    low_risk_when:
+      - remote_route_established
+      - sanctioned_remote_product
+      - managed_policy_enablement
+      - engineering_or_recorded_use
+    suspicious_when:
+      - remote_route_established
+      - no_prior_remote_access
+    high_risk_when:
+      - remote_route_established
+      - external_relay_reached
+      - writable_client_path
+      - script_host_actor
+
+  false_positive:
+    - condition: A support team deploys a remote assistance product across the estate.
+      explanation: >-
+        Remote support software is legitimate and present on many hosts. The estate's chosen
+        product is recognisable and appears in installation directories fleet-wide, which is
+        why the sanctioned product is contradicting evidence.
+    - condition: An administrator enables remote management on a server by policy.
+      explanation: >-
+        Servers are commonly managed remotely and the protocol is enabled deliberately. It
+        arrives through policy rather than a local scripted change.
+    - condition: An engineer uses a tunnelling tool to reach a lab or cloud environment.
+      explanation: >-
+        Tunnelling clients are ordinary engineering tools, often run from a user directory,
+        which reproduces the strongest supporting evidence. Asset role is the discriminator.
+    - condition: A vendor provides remote support software during an incident.
+      explanation: >-
+        Vendor support sessions install remote control clients temporarily. These are
+        covered by an incident record and removed afterwards.

@@ -1,0 +1,287 @@
+type: detection
+
+id: hg-win-file-association-redirected-to-an-interpreter-t1546-001
+version: 1.0.0
+
+info:
+  name: File association redirected to an interpreter
+  description: >-
+    A file association decides what runs when a user double-clicks. Repointing one means
+    the adversary's command executes every time anybody on the machine opens that file
+    type, triggered by ordinary work rather than by anything they have to do themselves.
+    It is quieter than an autostart entry because nothing runs until the user acts, and the
+    file they open behaves normally if the handler passes it on. Applications register
+    associations constantly, so the signal is the handler being an interpreter rather than
+    an application.
+  severity: high
+  author: huntgraph
+  tags:
+    - persistence
+    - privilege-escalation
+    - file-association
+    - registry
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1546/001
+    - https://attack.mitre.org/detectionstrategies/DET0061
+    - https://attack.mitre.org/techniques/T1546
+
+mitre:
+  tactics:
+    - TA0004
+    - TA0003
+  techniques:
+    - T1546
+  sub_techniques:
+    - T1546.001
+  detection_strategies:
+    - DET0061
+  analytics:
+    - AN0170
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Windows Registry Key Modification
+    - Logon Session Metadata
+
+hypothesis:
+  statement: >-
+    An adversary may repoint the handler for a common file type at an interpreter or a
+    payload, so their command runs whenever any user opens a file of that type, with the
+    user's ordinary work providing the trigger.
+  attacker_behavior:
+    - Rewrites the shell open command for a common document, archive or media extension.
+    - Points the handler at an interpreter or a program in a user-writable directory.
+    - Chains to the original handler so the file still opens and nothing looks wrong.
+    - Targets an extension the user opens routinely rather than a rare one.
+  legitimate_behavior:
+    - Installers register associations for the file types their product owns.
+    - Users change default applications through Settings.
+    - Management tooling deploys association defaults across the estate.
+    - Application updates re-register their own handlers.
+  risk_indicator:
+    - The handler command is an interpreter rather than an application executable.
+    - The handler references a user-writable directory.
+    - The change is made by a script host rather than an installer or the shell.
+    - The affected extension is a common document or archive type.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: association-repointed-to-interpreter
+        name: Shell open command repointed at an interpreter
+        purpose: >-
+          Surface handler rewrites whose command is a script interpreter, which no
+          application registering its own file type requires.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/shell\\\\open\\\\command|HKCR\\\\[^\s]+\\\\shell|Classes\\\\[^\s]+\\\\shell/i
+          | CommandLine=/(powershell|pwsh|cmd\.exe|wscript|cscript|mshta|rundll32|regsvr32)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=changes), collect([CommandLine], limit=5)])
+          | sort(changes, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "ContextProcessId of approved installers registering their own file types"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: association-points-at-writable-path
+        name: Handler pointing at a user-writable directory
+        purpose: >-
+          Catch handlers whose target sits where any unprivileged process could have placed
+          it, as opposed to an installed application path.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/shell\\\\open\\\\command/i
+          | CommandLine=/(?<handler_path>[A-Za-z]:\\[^",]+\.(exe|dll|ps1|vbs|js|bat|cmd))/i
+          | handler_path=/\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\/i
+          | handler_path!=/\\Program Files( \(x86\))?\\/i
+          | groupBy([ComputerName, UserName, ParentBaseFileName, handler_path],
+                    function=[count(as=changes), collect([CommandLine], limit=3)])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: document-open-spawns-interpreter
+        name: Document opened through explorer spawning an interpreter
+        purpose: >-
+          Observe the association firing, where opening a file produces an interpreter
+          rather than the application that should own it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^explorer\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32)\.exe$/i
+          | CommandLine=/\.(txt|pdf|doc|docx|xls|xlsx|jpg|png|zip|rtf|csv|log)\b/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+evidence:
+  required:
+    - id: association_repointed
+      name: File handler repointed at an interpreter or writable payload
+      description: >-
+        A shell open command was rewritten so the handler for a file type is a script
+        interpreter or a program in a user-writable directory rather than an application.
+      source: process_creation
+      field: CommandLine
+      indicates: persistence_established
+
+  supporting:
+    - id: writable_handler_path
+      name: Handler in a user-writable directory
+      description: >-
+        The registered handler sits under AppData, Temp, ProgramData or a user profile
+        rather than in an installation path.
+      source: process_creation
+      field: CommandLine
+      indicates: untrusted_execution_location
+    - id: association_fired
+      name: Opening a file produced an interpreter
+      description: >-
+        Explorer became the parent of an interpreter carrying a document path, which is the
+        redirected association executing rather than merely being registered.
+      source: process_creation
+      field: FileName
+      indicates: execution_chain_progression
+    - id: script_host_editor
+      name: Change made by a script host
+      description: >-
+        The handler was rewritten by an interpreter or a remote-execution channel rather
+        than by an installer or the shell's own default-apps mechanism.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: rare_in_estate
+      name: Change confined to very few hosts
+      description: >-
+        The handler rewrite appears on one or a small number of machines during the
+        baseline window, unlike associations deployed with an application.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: installer_association
+      name: Installer registering its own file type
+      description: >-
+        An approved installer registered the handler for a file type its product owns,
+        which is the mechanism's intended use.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_enterprise_activity
+    - id: user_default_change
+      name: User changing a default application
+      description: >-
+        The association was changed through the shell's default-apps interface by the user
+        rather than written programmatically.
+      source: process_creation
+      field: FileName
+      indicates: legitimate_enterprise_activity
+    - id: managed_association
+      name: Managed association deployment
+      description: >-
+        The handler was deployed by management tooling across a host collection as part of
+        a governed desktop configuration.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - association_repointed
+
+    supporting:
+      any:
+        - writable_handler_path
+        - association_fired
+        - script_host_editor
+        - rare_in_estate
+      all:
+        - writable_handler_path
+        - script_host_editor
+
+    contradicting:
+      any:
+        - installer_association
+        - user_default_change
+        - managed_association
+      all: []
+
+  verdict:
+    low_risk_when:
+      - association_repointed
+      - installer_association
+      - user_default_change
+      - managed_association
+    suspicious_when:
+      - association_repointed
+      - rare_in_estate
+    high_risk_when:
+      - association_repointed
+      - writable_handler_path
+      - association_fired
+      - script_host_editor
+
+  false_positive:
+    - condition: An installer registers the handler for a file type its product owns.
+      explanation: >-
+        Association registration is part of nearly every installation. The handler points at
+        the product's own executable and appears wherever it is deployed.
+    - condition: A user changes their default application for a file type.
+      explanation: >-
+        Choosing a different default is ordinary and writes the same keys. It goes through
+        the shell's default-apps mechanism rather than a scripted registry write.
+    - condition: Management tooling deploys association defaults.
+      explanation: >-
+        Managed desktops receive file-type defaults from policy, written programmatically.
+        These appear identically across a host collection.
+    - condition: An application update re-registers its own handlers.
+      explanation: >-
+        Updates commonly rewrite associations to repair them. The updater is the acting
+        process and the target is the product's own installation path.
