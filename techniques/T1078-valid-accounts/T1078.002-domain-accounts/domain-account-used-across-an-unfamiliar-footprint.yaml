@@ -1,0 +1,376 @@
+type: detection
+
+id: hg-win-domain-account-used-across-an-unfamiliar-footprint-t1078-002
+
+version: 1.0.0
+
+info:
+  name: Domain account used across an unfamiliar footprint
+  description: >-
+    A compromised domain account is the hardest thing in this corpus to detect, because
+    every individual event it produces is correct. The credential is valid, the tickets are
+    properly issued, the permissions genuinely belong to the user, and no tool is dropped.
+    What changes is not the legitimacy of any one action but the shape of the account's
+    activity: a user who touches four machines starts touching forty, an identity that has
+    only ever authenticated interactively starts appearing as network logons, or a session
+    opens in a place and at an hour the account has never worked. This template is therefore
+    built entirely on deviation from the account's own history, and it is worth nothing
+    until that history exists.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - persistence
+    - privilege-escalation
+    - initial-access
+    - valid-accounts
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1078/002
+    - https://attack.mitre.org/detectionstrategies/DET0210
+    - https://attack.mitre.org/techniques/T1078
+
+mitre:
+  tactics:
+    - TA0005
+    - TA0003
+    - TA0004
+    - TA0001
+  techniques:
+    - T1078
+  sub_techniques:
+    - T1078.002
+  detection_strategies:
+    - DET0210
+  analytics:
+    - AN0590
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Logon Session Metadata
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary may operate with a valid domain credential, producing authentication that
+    is correct in every particular but whose breadth, timing or direction departs from what
+    that account has ever done, so the deviation rather than the event is the finding.
+  attacker_behavior:
+    - Authenticates to hosts the account has no working relationship with.
+    - Widens the account's machine footprint sharply within a short window.
+    - Works outside the hours the account has historically been active.
+    - Holds sessions from two distant sources at once, which one person cannot.
+  legitimate_behavior:
+    - Support and engineering staff legitimately touch many machines.
+    - Service accounts authenticate broadly and constantly by design.
+    - Role changes, projects and on-call rotations alter a person's footprint.
+    - Vulnerability scanners and management platforms authenticate estate-wide.
+  risk_indicator:
+    - The account's host footprint expands well beyond its own baseline.
+    - Logon types shift from interactive to network or remote interactive.
+    - Activity falls outside the account's established working hours.
+    - Concurrent sessions originate from sources that cannot be the same person.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: logon_session
+      event_types:
+        - UserLogon
+        - UserLogonFailed2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - UserPrincipal
+        - LogonType
+        - LogonTime
+        - RemoteAddressIP4
+        - UserIsAdmin
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: footprint-expansion
+        name: Account footprint wider than its own history
+        purpose: >-
+          Measure the account against itself rather than against a fixed threshold, because
+          a support engineer's normal is an ordinary user's compromise.
+        query: |
+          #event_simpleName=UserLogon
+          | UserPrincipal=/@/
+          | groupBy([UserName],
+                    function=[count(ComputerName, distinct=true, as=host_count),
+                              collect([ComputerName], limit=25),
+                              collect([LogonType], limit=5)])
+          | sort(host_count, order=desc)
+        filters:
+          include: []
+          exclude:
+            - "Service accounts and management platform identities that authenticate estate-wide"
+            - "Vulnerability scanning and inventory credentials"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - user
+            - host
+            - organization
+
+      - id: logon-type-shift
+        name: Account changing how it authenticates
+        purpose: >-
+          Catch an identity that has only ever signed in at a keyboard beginning to appear
+          as network or remote-interactive logons, which is a change in how it is being used.
+        query: |
+          #event_simpleName=UserLogon
+          | UserPrincipal=/@/
+          | LogonType=/^(3|10)$/
+          | groupBy([UserName, LogonType],
+                    function=[count(as=logons),
+                              count(ComputerName, distinct=true, as=host_count),
+                              collect([RemoteAddressIP4], limit=10)])
+          | sort(logons, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Accounts documented to be used for remote administration"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - user
+            - organization
+
+      - id: concurrent-distant-sessions
+        name: Simultaneous sessions from unrelated sources
+        purpose: >-
+          Identify the one condition that admits no innocent reading of a single human
+          operator, where the same identity is active from two places at once.
+        query: |
+          #event_simpleName=UserLogon
+          | UserPrincipal=/@/
+          | LogonType=/^(2|3|10)$/
+          | groupBy([UserName],
+                    function=[count(RemoteAddressIP4, distinct=true, as=source_count),
+                              collect([RemoteAddressIP4, ComputerName], limit=20),
+                              min(LogonTime, as=first_seen), max(LogonTime, as=last_seen)])
+          | source_count >= 3
+        filters:
+          include: []
+          exclude:
+            - "Accounts used by pooled infrastructure with many egress addresses"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - user
+            - organization
+
+      - id: privileged-account-on-workstations
+        name: Privileged domain account signing in to workstations
+        purpose: >-
+          Surface the tiering violation that turns one compromised workstation into a
+          domain-wide problem, since a privileged credential used there is exposed there.
+        query: |
+          #event_simpleName=UserLogon
+          | UserPrincipal=/@/
+          | UserIsAdmin=1
+          | LogonType=/^(2|10)$/
+          | groupBy([UserName, ComputerName],
+                    function=[count(as=logons), collect([RemoteAddressIP4], limit=5)])
+          | sort(logons, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Designated privileged access workstations and administrative jump hosts"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - user
+            - host
+            - organization
+
+      - id: account-running-remote-execution-tooling
+        name: Account running remote-execution tooling after logon
+        purpose: >-
+          Look past the authentication to what the identity then did, since an account being
+          used to reach further is a different signal from one merely signing in.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | UserName=/.+/
+          | FileName=/^(psexec|psexesvc|wmic|winrs|sc|schtasks|net|net1|reg|rundll32|mstsc)\.exe$/i
+          | CommandLine=/(\\\\[a-z0-9._-]+\\|\/node\s*:|-ComputerName|\/s\s+\\\\)/i
+          | groupBy([ComputerName, UserName, FileName, ParentBaseFileName],
+                    function=[count(as=executions), collect([CommandLine], limit=5)])
+          | sort(executions, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Administrative jump hosts where remote-execution tooling is the normal workload"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - user
+            - host
+            - organization
+
+evidence:
+  required:
+    - id: domain_account_authenticated
+      name: Domain account established a session
+      description: >-
+        A directory-managed account authenticated and established a logon session on a host,
+        identified by its principal name carrying a domain suffix.
+      source: logon_session
+      field: UserPrincipal
+      indicates: valid_account_use
+
+  supporting:
+    - id: footprint_beyond_baseline
+      name: Machine footprint beyond the account's own history
+      description: >-
+        The account authenticated to substantially more hosts than it has during the
+        baseline window, measured against its own pattern rather than a fixed number.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_user
+    - id: authentication_shape_changed
+      name: Account authenticating in a way it has not before
+      description: >-
+        The logon types recorded for this account differ from its established pattern,
+        typically interactive use giving way to network or remote-interactive sessions.
+      source: logon_session
+      field: LogonType
+      indicates: abnormal_access_pattern
+    - id: concurrent_sources
+      name: Sessions from sources that cannot be one person
+      description: >-
+        The account was active from multiple unrelated origins within a window too short for
+        one operator to have moved between them.
+      source: logon_session
+      field: RemoteAddressIP4
+      indicates: shared_or_stolen_credential
+    - id: privileged_on_workstation
+      name: Privileged credential exposed on a workstation
+      description: >-
+        An administrative domain account signed in interactively on a general-purpose
+        machine, exposing that credential wherever the machine is already compromised.
+      source: logon_session
+      field: UserIsAdmin
+      indicates: credential_exposure
+    - id: remote_execution_tooling
+      name: Account driving remote-execution tooling
+      description: >-
+        Under this identity, utilities that act against other machines were run with
+        arguments naming a remote target, so the account is being used to reach onward
+        rather than only to sign in.
+      source: process_creation
+      field: CommandLine
+      indicates: lateral_movement_attempt
+
+  contradicting:
+    - id: broad_by_role
+      name: Role legitimately spans the estate
+      description: >-
+        The account belongs to support, engineering or operations staff whose recorded role
+        requires access to many machines.
+      source: identity_context
+      field: UserName
+      indicates: expected_administrative_scope
+    - id: service_or_scanner_identity
+      name: Service, scanner or management identity
+      description: >-
+        The account is a non-human identity documented to authenticate broadly and
+        continuously as part of its function.
+      source: asset_inventory
+      field: UserName
+      indicates: legitimate_application_component
+    - id: recorded_role_change
+      name: Recorded role change or project work
+      description: >-
+        A change record, on-call rotation or project assignment accounts for the shift in
+        the account's footprint.
+      source: change_management
+      field: UserName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - domain_account_authenticated
+
+    supporting:
+      any:
+        - footprint_beyond_baseline
+        - authentication_shape_changed
+        - concurrent_sources
+        - privileged_on_workstation
+        - remote_execution_tooling
+      all:
+        - footprint_beyond_baseline
+        - remote_execution_tooling
+
+    contradicting:
+      any:
+        - broad_by_role
+        - service_or_scanner_identity
+        - recorded_role_change
+      all: []
+
+  verdict:
+    low_risk_when:
+      - domain_account_authenticated
+      - broad_by_role
+      - service_or_scanner_identity
+      - recorded_role_change
+    suspicious_when:
+      - domain_account_authenticated
+      - footprint_beyond_baseline
+    high_risk_when:
+      - domain_account_authenticated
+      - concurrent_sources
+      - remote_execution_tooling
+      - privileged_on_workstation
+
+  false_positive:
+    - condition: Support or engineering staff legitimately touch many machines.
+      explanation: >-
+        Their normal footprint reproduces every breadth signal here, which is why the
+        comparison is against the account's own history and why role context is
+        contradicting evidence rather than only a filter.
+    - condition: A service account authenticates across the estate by design.
+      explanation: >-
+        Non-human identities are the widest-footprint accounts in most environments. They
+        are also the most stable, so their baseline is deep and their deviation is small.
+    - condition: A role change or on-call rotation alters someone's access pattern.
+      explanation: >-
+        People change jobs, join projects and take on-call. This produces a genuine step
+        change in footprint that persists, whereas a compromise produces a spike that does
+        not match any recorded change.
+    - condition: A pooled remote-access service presents many egress addresses.
+      explanation: >-
+        VPN and virtual desktop infrastructure can make one user appear from several
+        addresses, reproducing the concurrent-source evidence. Knowing the organisation's
+        egress ranges resolves it.

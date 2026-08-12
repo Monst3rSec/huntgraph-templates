@@ -1,0 +1,326 @@
+type: detection
+
+id: hg-win-local-account-authenticating-outside-its-normal-scope-t1078-003
+
+version: 1.0.0
+
+info:
+  name: Local account authenticating outside its normal scope
+  description: >-
+    A local account exists on one machine and is answerable to nobody but that machine.
+    There is no directory to disable it in, no central group to audit, and when the same
+    build or the same support procedure is used across an estate the same local password
+    frequently exists on hundreds of hosts at once. An adversary who recovers one therefore
+    gets an identity that already works, that survives a domain password reset, and whose
+    use is indistinguishable from support work. Nothing about the authentication is
+    malformed, so the question is never whether the logon succeeded — it is whether this
+    account has ever signed in here, at this hour, from this direction.
+  severity: high
+  author: huntgraph
+  tags:
+    - stealth
+    - persistence
+    - privilege-escalation
+    - initial-access
+    - valid-accounts
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1078/003
+    - https://attack.mitre.org/detectionstrategies/DET0407
+    - https://attack.mitre.org/techniques/T1078
+
+mitre:
+  tactics:
+    - TA0005
+    - TA0003
+    - TA0004
+    - TA0001
+  techniques:
+    - T1078
+  sub_techniques:
+    - T1078.003
+  detection_strategies:
+    - DET0407
+  analytics:
+    - AN1137
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+  data_components:
+    - Logon Session Creation
+    - Logon Session Metadata
+
+hypothesis:
+  statement: >-
+    An adversary may authenticate with a local account whose password is reused across the
+    estate, obtaining access that survives directory-level remediation and that looks like
+    ordinary support activity because the account and the machine are both legitimate.
+  attacker_behavior:
+    - Signs in with a local account on a host where that account has never been used interactively.
+    - Reuses one recovered local password across many machines built from the same image.
+    - Prefers local accounts precisely because a domain password reset does not touch them.
+    - Uses the account remotely rather than at the console.
+  legitimate_behavior:
+    - Support staff use local accounts when domain authentication is unavailable.
+    - Break-glass procedures depend on a local administrator existing.
+    - Some services and scheduled work run under local identities by design.
+    - Imaging and provisioning authenticate locally before a host joins a domain.
+  risk_indicator:
+    - The account has no interactive logon history on this host.
+    - The same local account authenticates across many unrelated hosts in one window.
+    - The logon is a network or remote-interactive type rather than at the console.
+    - Elevated privileges are assigned to the session.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: logon_session
+      event_types:
+        - UserLogon
+        - UserLogonFailed2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - UserIsAdmin
+        - LogonType
+        - RemoteAddressIP4
+        - LogonTime
+        - UserSid
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: local-account-first-seen-on-host
+        name: Local account signing in where it has no history
+        purpose: >-
+          Surface the account-to-host pairing rather than the account alone, since a local
+          identity signing in somewhere it never has is the core deviation.
+        query: |
+          #event_simpleName=UserLogon
+          | UserSid=/^S-1-5-21-/
+          | UserName!=/\$$/
+          | groupBy([ComputerName, UserName],
+                    function=[count(as=logons), min(LogonTime, as=first_seen),
+                              collect([LogonType, RemoteAddressIP4], limit=5)])
+          | logons <= 3
+        filters:
+          include: []
+          exclude:
+            - "UserName of service identities documented to run locally"
+            - "ComputerName of hosts undergoing imaging or provisioning"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: same-local-account-across-many-hosts
+        name: One local account authenticating across many machines
+        purpose: >-
+          Catch reused local credentials being exercised at breadth, which is the shape that
+          separates a recovered password from ordinary single-machine support.
+        query: |
+          #event_simpleName=UserLogon
+          | UserSid=/^S-1-5-21-/
+          | UserName!=/\$$/
+          | groupBy([UserName],
+                    function=[count(ComputerName, distinct=true, as=host_count),
+                              collect([ComputerName], limit=25)])
+          | host_count >= 5
+        filters:
+          include: []
+          exclude:
+            - "Local service accounts intentionally standardised across the build"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - user
+            - organization
+
+      - id: local-account-remote-and-privileged
+        name: Local account used remotely with elevated rights
+        purpose: >-
+          Isolate the combination that makes a local identity operationally useful to an
+          adversary, since a console session with no privilege is a far weaker signal.
+        query: |
+          #event_simpleName=UserLogon
+          | UserSid=/^S-1-5-21-/
+          | UserName!=/\$$/
+          | LogonType=/^(3|10)$/
+          | UserIsAdmin=1
+          | groupBy([ComputerName, UserName, RemoteAddressIP4],
+                    function=[count(as=logons), collect([LogonType], limit=3)])
+          | sort(logons, order=asc)
+        filters:
+          include: []
+          exclude:
+            - "Jump hosts and management ranges used for approved remote support"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: local-account-failures-then-success
+        name: Local account failing repeatedly then succeeding
+        purpose: >-
+          Separate a recovered credential from a guessed one by pairing the failures with
+          the eventual success on the same account and host.
+        query: |
+          #event_simpleName=/^(UserLogon|UserLogonFailed2)$/
+          | UserSid=/^S-1-5-21-/
+          | case {
+              #event_simpleName=UserLogonFailed2 | failures := UserName ;
+              #event_simpleName=UserLogon       | success  := UserName ;
+            }
+          | groupBy([ComputerName, UserName],
+                    function=[count(failures, as=failed), count(success, as=succeeded),
+                              collect([RemoteAddressIP4], limit=5)])
+          | failed >= 5 and succeeded >= 1
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: local_account_authenticated
+      name: Local account authenticated
+      description: >-
+        An account local to the machine rather than to the directory established a logon
+        session, identified by a machine-scoped security identifier.
+      source: logon_session
+      field: UserName
+      indicates: valid_account_use
+
+  supporting:
+    - id: no_history_on_host
+      name: No logon history for this account on this host
+      description: >-
+        The account has not authenticated on this machine during the baseline window, so the
+        pairing is new even though both the account and the machine are legitimate.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+    - id: breadth_across_estate
+      name: Same local account used across many hosts
+      description: >-
+        One local identity authenticated on an unusual number of machines in a single
+        window, which is the signature of a reused password rather than local support.
+      source: baseline
+      field: UserName
+      indicates: credential_reuse_at_scale
+    - id: remote_privileged_session
+      name: Remote session with elevated rights
+      description: >-
+        The logon arrived over the network or as remote interactive and the session was
+        granted administrative privilege, which is what makes the identity useful.
+      source: logon_session
+      field: LogonType
+      indicates: privileged_remote_access
+    - id: failures_preceded_success
+      name: Repeated failures before the successful logon
+      description: >-
+        The account failed several times before succeeding, which points at a credential
+        being tried rather than one already known to the operator.
+      source: logon_session
+      field: UserName
+      indicates: credential_guessing
+
+  contradicting:
+    - id: documented_local_service
+      name: Documented local service identity
+      description: >-
+        The account is a service or scheduled-task identity recorded as running locally on
+        this host, which it does continuously.
+      source: asset_inventory
+      field: UserName
+      indicates: legitimate_application_component
+    - id: recorded_break_glass
+      name: Recorded break-glass or support use
+      description: >-
+        An incident or change record covers deliberate use of a local account, typically
+        because directory authentication was unavailable.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: provisioning_state
+      name: Host being imaged or provisioned
+      description: >-
+        The machine is in a build state where local authentication precedes the domain join
+        and is expected.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - local_account_authenticated
+
+    supporting:
+      any:
+        - no_history_on_host
+        - breadth_across_estate
+        - remote_privileged_session
+        - failures_preceded_success
+      all:
+        - no_history_on_host
+        - remote_privileged_session
+
+    contradicting:
+      any:
+        - documented_local_service
+        - recorded_break_glass
+        - provisioning_state
+      all: []
+
+  verdict:
+    low_risk_when:
+      - local_account_authenticated
+      - documented_local_service
+      - recorded_break_glass
+      - provisioning_state
+    suspicious_when:
+      - local_account_authenticated
+      - no_history_on_host
+    high_risk_when:
+      - local_account_authenticated
+      - breadth_across_estate
+      - remote_privileged_session
+      - failures_preceded_success
+
+  false_positive:
+    - condition: Support staff use a local account when domain authentication is unavailable.
+      explanation: >-
+        This is exactly why local administrator accounts are kept, and it produces a
+        first-ever logon on the affected host. It is tied to an outage or a ticket, and it
+        happens on the machine with the problem rather than across many.
+    - condition: A service or scheduled task runs under a local identity.
+      explanation: >-
+        Many products install local service accounts deliberately. These authenticate
+        continuously and consistently on the same host, so they have deep baseline history
+        rather than none.
+    - condition: Imaging or provisioning authenticates locally before a domain join.
+      explanation: >-
+        Build processes routinely use local accounts, including on many machines at once,
+        which can reproduce the breadth evidence. Build state is the discriminator.
+    - condition: A standardised local account exists across the estate by design.
+      explanation: >-
+        Some organisations deploy a managed local administrator to every host. Where the
+        password is unique per machine this is sound practice; the breadth signal then
+        reflects the design rather than reuse, and asset inventory should record it.
