@@ -72,18 +72,32 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -158,6 +172,48 @@ query:
             - host
             - command_line
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100448
+      group: huntgraph,windows,stealth,obfuscation
+      lists: []
+
+    cases:
+      - id: registry-value-piped-to-interpreter
+        covers: registry-value-piped-to-interpreter
+        name: Registry value read and executed
+        purpose: >-
+          Isolate the read side of the chain, where stored content is fetched and
+          handed straight to an interpreter, which is execution rather than
+          configuration.
+        rule: |
+          <rule id="100448" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.image" type="pcre2">(?i)^(powershell|pwsh)\.exe$</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(Get-ItemProperty|Get-ItemPropertyValue|\[Microsoft\.Win32\.Registry\]|reg(\.exe)?\s+query)</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(iex|Invoke-Expression|FromBase64String|\[Reflection\.Assembly\]::Load|\.Invoke\s*\()</field>
+            <description>Registry value read and executed</description>
+            <mitre><id>T1027.011</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: large-blob-written-to-registry
+        reason: >-
+          Depends on a 60d baseline comparison (host, parent_process, command_line,
+          organization); a stateless rule holds no history.
+      - case: payload-in-wmi-class
+        reason: >-
+          Depends on a 60d baseline comparison (host, command_line); a stateless rule
+          holds no history.
+
 evidence:
   required:
     - id: oversized_encoded_value
@@ -167,7 +223,7 @@ evidence:
         than a configuration setting requires, indicating content is being stored rather
         than configured.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: fileless_payload_storage
 
   supporting:
@@ -177,7 +233,7 @@ evidence:
         The stored content is retrieved and handed to Invoke-Expression, a base64 decode
         or an assembly load, completing a storage-to-execution chain.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: dynamic_code_execution
     - id: script_host_writer
       name: Script host performing the write
@@ -185,7 +241,7 @@ evidence:
         The write is performed by PowerShell, cmd or a script host rather than by an
         installer, management agent or licensing component.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: non_standard_automation
     - id: delivery_parent
       name: Delivery-style parent process
@@ -193,7 +249,7 @@ evidence:
         The writing process was launched by a document handler, archive utility, mail
         client or browser rather than by a management agent or setup routine.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: unique_to_host
       name: Value unique to one host
@@ -211,7 +267,7 @@ evidence:
         The approved configuration-management, policy or licensing component wrote the
         value, which is its documented way of caching state.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: estate_wide_value
       name: Same value present across the estate

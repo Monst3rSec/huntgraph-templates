@@ -74,27 +74,51 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - NewExecutableWritten
         - PeFileWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -162,6 +186,64 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100064
+      group: huntgraph,windows,credential-access,domain-controller
+      lists: []
+
+    cases:
+      - id: ntdsutil-ifm-export
+        covers: ntdsutil-ifm-export
+        name: Ntdsutil install-from-media export
+        purpose: >-
+          Catch the directory service's own supported export path, which produces a
+          usable copy without any shadow-copy command appearing.
+        rule: |
+          <rule id="100064" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)ntdsutil</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(ifm|create\s+full|activate\s+instance)</field>
+            <description>Ntdsutil install-from-media export</description>
+            <mitre><id>T1003.003</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+      - id: ntds-and-system-hive-together
+        covers: ntds-and-system-hive-together
+        name: NTDS database and SYSTEM hive handled together
+        purpose: >-
+          Isolate the pairing that makes the database usable, since NTDS.dit without
+          the boot key from the SYSTEM hive cannot be decrypted.
+        rule: |
+          <rule id="100065" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)ntds\.dit</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(\bSYSTEM\b.*\bhive\b|reg(\.exe)?\s+save\s+hklm\\\\system|\\\\config\\\\SYSTEM)</field>
+            <description>NTDS database and SYSTEM hive handled together</description>
+            <mitre><id>T1003.003</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: shadow-copy-then-ntds-copy
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: ntds_extraction
@@ -171,7 +253,7 @@ evidence:
         raw volume read, producing a copy of every domain credential outside the running
         directory service.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: domain_credential_capture
 
   supporting:
@@ -181,7 +263,7 @@ evidence:
         The SYSTEM registry hive was saved or copied in the same activity, which is
         required to decrypt the database and has no purpose without it.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: credential_material_capture
     - id: writable_output_path
       name: Output written to a user-writable directory
@@ -189,7 +271,7 @@ evidence:
         The extracted files were placed under a temporary or user-writable path rather
         than a backup target or a staging location for domain controller promotion.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: payload_staging
     - id: interactive_actor
       name: Interactive rather than scheduled execution
@@ -197,7 +279,7 @@ evidence:
         The extraction was issued by an interactive shell or remote-execution channel
         rather than by the backup product's own scheduled process.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: hands_on_keyboard_activity
     - id: unprecedented_on_host
       name: No comparable activity in the baseline
@@ -215,7 +297,7 @@ evidence:
         The shadow copy was created by the approved backup product as part of its
         scheduled protection of the domain controller.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: dc_promotion_change
       name: Recorded domain controller promotion

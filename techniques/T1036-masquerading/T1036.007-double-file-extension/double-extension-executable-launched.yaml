@@ -70,30 +70,56 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
-        - SHA256HashData
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        image_hash: SHA256HashData
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
+        image_hash: win.eventdata.hashes
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - PeFileWritten
         - NewExecutableWritten
         - NewScriptWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -155,6 +181,81 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100000
+      group: huntgraph,windows,stealth,masquerading
+      lists: []
+
+    cases:
+      - id: double-extension-execution
+        covers: double-extension-execution
+        name: Process started from a double-extension file
+        purpose: >-
+          Surface executions whose image name pairs a document extension with an
+          executable one, which is the disguise itself rather than a consequence of
+          it.
+        rule: |
+          <rule id="100000" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.image" type="pcre2">(?i)\.(pdf|doc|docx|xls|xlsx|ppt|pptx|txt|rtf|jpg|jpeg|png|gif|csv|zip|rar|htm|html)\.(exe|scr|com|pif|bat|cmd|js|jse|vbs|vbe|wsf|hta|lnk|ps1)$</field>
+            <description>Process started from a double-extension file</description>
+            <mitre><id>T1036.007</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+      - id: double-extension-written
+        covers: double-extension-written
+        name: Double-extension file written to the host
+        purpose: >-
+          Catch the payload at delivery rather than at execution, so the file is
+          visible even if the user never opens it or opens it after the hunt window.
+        rule: |
+          <rule id="100001" level="12">
+            <if_group>sysmon_event_11</if_group>
+            <field name="win.eventdata.targetFilename" type="pcre2">(?i)\.(pdf|doc|docx|xls|xlsx|ppt|pptx|txt|rtf|jpg|jpeg|png|gif|csv|zip|rar|htm|html)\.(exe|scr|com|pif|bat|cmd|js|jse|vbs|vbe|wsf|hta|lnk|ps1)$</field>
+            <description>Double-extension file written to the host</description>
+            <mitre><id>T1036.007</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+      - id: double-extension-from-archive-or-browser
+        covers: double-extension-from-archive-or-browser
+        name: Double-extension file launched by an archive tool or browser
+        purpose: >-
+          Establish the delivery route, which is what turns a suspicious file name
+          into a confirmed user-opened payload.
+        rule: |
+          <rule id="100002" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.image" type="pcre2">(?i)\.[a-z]{2,4}\.(exe|scr|com|pif|js|vbs|hta|bat|cmd|ps1)$</field>
+            <field name="win.eventdata.parentImage" type="pcre2">(?i)^(7zfm|winrar|winzip|explorer|chrome|msedge|firefox|outlook|thunderbird)\.exe$</field>
+            <description>Double-extension file launched by an archive tool or browser</description>
+            <mitre><id>T1036.007</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable: []
+
 evidence:
   required:
     - id: document_style_double_extension
@@ -164,7 +265,7 @@ evidence:
         script extension, so Windows extension hiding presents it to the user as the
         harmless type.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: user_facing_deception
 
   supporting:
@@ -174,7 +275,7 @@ evidence:
         The file was launched by an archive utility, browser, mail client or explorer,
         establishing that it arrived through a delivery channel and was opened by a user.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: user_writable_location
       name: File in a download or temporary directory
@@ -182,7 +283,7 @@ evidence:
         The image runs from a download, extraction or temporary directory rather than from
         an installed location.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: untrusted_execution_location
     - id: recently_written
       name: File written shortly before execution
@@ -190,7 +291,7 @@ evidence:
         The file was created on the host shortly before it ran, consistent with delivery
         followed immediately by the user opening it.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: payload_staging
     - id: unique_hash
       name: Hash unique in the estate
@@ -208,7 +309,7 @@ evidence:
         The segment preceding the real extension is a version or build string rather than
         a document type, so the name only superficially resembles a double extension.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: legitimate_application_component
     - id: vendor_installation_path
       name: File inside a vendor installation directory
@@ -216,7 +317,7 @@ evidence:
         The image resides in an installation directory belonging to approved software,
         rather than in a delivery or temporary location.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_application_component
     - id: fleetwide_presence
       name: Same file across the estate

@@ -71,18 +71,32 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -151,6 +165,62 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100080
+      group: huntgraph,windows,credential-access,dcsync
+      lists: []
+
+    cases:
+      - id: replication-tooling-invoked
+        covers: replication-tooling-invoked
+        name: Directory replication tooling invoked on an endpoint
+        purpose: >-
+          Surface the endpoint-side artefact, since the replication request itself is
+          answered by the controller and looks legitimate to it.
+        rule: |
+          <rule id="100080" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(lsadump::dcsync|dcsync\s+\/|Get-ADReplAccount|DSInternals|\/domain\s*:.*\/user\s*:|drsuapi)</field>
+            <description>Directory replication tooling invoked on an endpoint</description>
+            <mitre><id>T1003.006</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+      - id: krbtgt-targeted
+        covers: krbtgt-targeted
+        name: Replication request naming the krbtgt account
+        purpose: >-
+          Isolate requests for the account whose hash enables ticket forging, which
+          has no administrative purpose outside a deliberate key rotation.
+        rule: |
+          <rule id="100081" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)krbtgt</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(dcsync|Get-ADReplAccount|DSInternals|replicat)</field>
+            <description>Replication request naming the krbtgt account</description>
+            <mitre><id>T1003.006</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: replication-then-ticket-forging
+        reason: >-
+          None of the case's filter fields have a Wazuh equivalent on windows.
+
 evidence:
   required:
     - id: replication_requested
@@ -159,7 +229,7 @@ evidence:
         Replication tooling was invoked on a host, requesting secret directory attributes
         through the interface that domain controllers use to synchronise with each other.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: domain_credential_capture
 
   supporting:
@@ -169,7 +239,7 @@ evidence:
         The request names krbtgt, whose hash allows Kerberos tickets to be forged for any
         principal, which is the highest-value outcome of this technique.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: high_impact_credential_theft
     - id: ticket_forging_followed
       name: Ticket forging followed the request
@@ -177,7 +247,7 @@ evidence:
         Golden or silver ticket tooling was invoked after the replication request, turning
         the recovered hash into durable domain-wide authentication.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: durable_privileged_access
     - id: non_controller_origin
       name: Request from a host that is not a domain controller
@@ -194,7 +264,7 @@ evidence:
         The invocation matches published credential-manipulation utilities rather than a
         directory synchronisation or migration product.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: credential_material_capture
 
   contradicting:
@@ -212,7 +282,7 @@ evidence:
         The request belongs to a sanctioned identity synchronisation, federation or
         migration product that replicates directory data by design.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: legitimate_enterprise_activity
     - id: recorded_krbtgt_rotation
       name: Recorded krbtgt rotation or recovery exercise

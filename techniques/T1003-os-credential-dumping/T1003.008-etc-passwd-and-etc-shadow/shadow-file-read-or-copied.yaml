@@ -69,17 +69,29 @@ requires:
     - linux
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - audit_command
+      fields:
+        agent_id: agent.id
+        host: agent.name
+        image_path: audit.exe
+        command_line: audit.execve.a1
+        parent_process: audit.ppid
 
 query:
   - platform: crowdstrike
@@ -148,6 +160,63 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100096
+      group: huntgraph,linux,credential-access,credential-dumping
+      lists: []
+
+    cases:
+      - id: shadow-and-passwd-together
+        covers: shadow-and-passwd-together
+        name: Shadow and passwd handled in the same activity
+        purpose: >-
+          Isolate the pairing that makes the hashes usable, since shadow without the
+          account names is far less valuable.
+        rule: |
+          <rule id="100096" level="14">
+            <if_group>audit_command</if_group>
+            <field name="audit.execve.a1" type="pcre2">\/etc\/shadow\b</field>
+            <field name="audit.execve.a1" type="pcre2">\/etc\/passwd\b</field>
+            <description>Shadow and passwd handled in the same activity</description>
+            <mitre><id>T1003.008</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+      - id: cracking-utility-present
+        covers: cracking-utility-present
+        name: Password cracking or combining utility invoked
+        purpose: >-
+          Catch the processing step, where the collected files are prepared for or
+          submitted to cracking.
+        rule: |
+          <rule id="100097" level="14">
+            <if_group>audit_command</if_group>
+            <field name="audit.execve.a1" type="pcre2">(?i)\b(unshadow|john|hashcat|hydra)\b</field>
+            <description>Password cracking or combining utility invoked</description>
+            <mitre><id>T1003.008</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: shadow-read-directly
+        reason: >-
+          Depends on a 90d baseline comparison (host, command_line, organization); a
+          stateless rule holds no history.
+
 evidence:
   required:
     - id: shadow_accessed
@@ -156,7 +225,7 @@ evidence:
         The shadow password file was read or copied by a shell utility, which
         authentication itself never does because it operates through PAM.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: credential_material_capture
 
   supporting:
@@ -166,7 +235,7 @@ evidence:
         /etc/passwd was handled in the same activity, which is what allows the hashes to be
         matched to accounts and cracked usefully.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: credential_decryption_attempt
     - id: cracking_tooling
       name: Cracking or combining utility invoked
@@ -174,7 +243,7 @@ evidence:
         A utility for combining or cracking password files was run on the host, which turns
         collection into an attempt to recover plaintext credentials.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: offline_cracking_attempt
     - id: interactive_or_service_actor
       name: Read by an interactive shell or service account
@@ -182,7 +251,7 @@ evidence:
         The reading process is a shell or a web service account rather than a backup,
         configuration-management or compliance agent.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: hands_on_keyboard_activity
     - id: unprecedented_read
       name: No comparable access in the baseline
@@ -200,7 +269,7 @@ evidence:
         The reader is an approved backup, configuration-management or compliance agent
         whose sweep necessarily covers account files.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_enterprise_activity
     - id: compliance_scanning
       name: Approved compliance or password-policy audit
@@ -208,7 +277,7 @@ evidence:
         The access belongs to a sanctioned audit that inspects account configuration and
         password policy on a schedule.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: recorded_investigation
       name: Recorded administrative investigation

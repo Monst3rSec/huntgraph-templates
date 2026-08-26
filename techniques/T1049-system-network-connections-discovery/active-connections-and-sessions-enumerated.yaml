@@ -84,20 +84,36 @@ requires:
     - linux
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
-        - TargetProcessId
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
+        process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -226,6 +242,53 @@ query:
             - user
             - command_line
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100848
+      group: huntgraph,windows,discovery,system-network-connections-discovery
+      lists: []
+
+    cases:
+      - id: enumeration-under-an-unrelated-parent
+        covers: enumeration-under-an-unrelated-parent
+        name: Connection listing parented by software with no such role
+        purpose: >-
+          Where the command itself carries no signal, the thing running it is the only
+          real discriminator. A document application, mail client, web server or
+          script host has no reason to ask what this machine is connected to, so a
+          single command from one of those lineages is worth more than a burst from a
+          console.
+        rule: |
+          <rule id="100848" level="5">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.parentImage" type="pcre2">(?i)^(winword|excel|powerpnt|outlook|onenote|acrord32|7zg|winrar|w3wp|httpd|nginx|tomcat\d*|mshta|wscript|cscript|regsvr32|rundll32|msbuild)\.exe$</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(netstat(\.exe)?\s+-|Get-NetTCPConnection|\bss\s+-[a-z]*t|lsof\s+-i|net(\.exe)?\s+session|net(\.exe)?\s+use\b|quser|qwinsta|\bwho\s+-a\b)</field>
+            <description>Connection listing parented by software with no such role</description>
+            <mitre><id>T1049</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: connection-enumeration-inside-an-orientation-burst
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, parent_process,
+          organization); a stateless rule holds no history.
+      - case: enumeration-output-captured-to-a-file
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+      - case: same-enumeration-repeated-many-times
+        reason: >-
+          Depends on a 30d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: connection_or_session_listing
@@ -234,7 +297,7 @@ evidence:
         A command was executed whose purpose is to enumerate this host's open network
         connections, its mapped shares, or the sessions currently logged on to it.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: host_relationship_enumeration
 
   supporting:
@@ -253,7 +316,7 @@ evidence:
         The listing was redirected into a temporary, public or user-writable directory
         rather than displayed, which is collection for later retrieval.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: collection_staging
     - id: unrelated_parent_process
       name: Parent has no connection-enumeration role
@@ -261,7 +324,7 @@ evidence:
         The command was launched by a document application, mail client, web server or
         script host rather than by a console, shell session or management agent.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: enumeration_repeated
       name: The same listing repeated many times
@@ -295,7 +358,7 @@ evidence:
         The parent is a monitoring, clustering or backup agent that collects connection
         and session state as part of its documented function.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: legitimate_application_component
     - id: recorded_incident
       name: Recorded fault investigation

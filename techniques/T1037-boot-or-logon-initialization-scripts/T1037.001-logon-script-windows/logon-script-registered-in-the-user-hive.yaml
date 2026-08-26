@@ -72,27 +72,51 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - NewScriptWritten
         - PeFileWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -166,6 +190,63 @@ query:
             - host
             - path
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100704
+      group: huntgraph,windows,persistence,privilege-escalation
+      lists: []
+
+    cases:
+      - id: logon-script-value-written
+        covers: logon-script-value-written
+        name: Logon script value registered
+        purpose: >-
+          Surface writes to the specific value Windows runs at logon, which almost
+          nothing legitimate sets.
+        rule: |
+          <rule id="100704" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)UserInitMprLogonScript|Environment\\\\UserInitMprLogonScript</field>
+            <description>Logon script value registered</description>
+            <mitre><id>T1037.001</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+      - id: logon-value-pointing-to-writable-path
+        covers: logon-value-pointing-to-writable-path
+        name: Logon script value pointing at a user-writable path
+        purpose: >-
+          Isolate registrations whose target sits where any unprivileged process could
+          have placed it, as opposed to a managed script share.
+        rule: |
+          <rule id="100705" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)UserInitMprLogonScript</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(?&lt;script_target&gt;[A-Za-z]:\\[^",]+\.(exe|dll|ps1|vbs|js|bat|cmd|scr))</field>
+            <description>Logon script value pointing at a user-writable path</description>
+            <mitre><id>T1037.001</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: payload-written-then-registered
+        reason: >-
+          Depends on a 60d baseline comparison (host, path); a stateless rule holds no
+          history.
+
 evidence:
   required:
     - id: logon_script_registered
@@ -174,7 +255,7 @@ evidence:
         The user environment logon-script value was set, causing the named program to run
         at every logon for that account.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: persistence_established
 
   supporting:
@@ -184,7 +265,7 @@ evidence:
         The registered program sits under AppData, Temp, ProgramData or a user profile
         rather than on a managed script share or in an installation directory.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: untrusted_execution_location
     - id: payload_recently_written
       name: Target written shortly before registration
@@ -192,7 +273,7 @@ evidence:
         The program the value names was created on the host shortly before the value was
         set, which is self-installation rather than configuration.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: payload_staging
     - id: script_host_creator
       name: Registered by a script host or delivery application
@@ -200,7 +281,7 @@ evidence:
         The write was performed by an interpreter, document handler or archive utility
         rather than by profile-management tooling.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: key_unused_in_estate
       name: Key otherwise unused across the estate
@@ -226,7 +307,7 @@ evidence:
         The value was written by an approved profile or desktop management product that
         configures logon-time actions by design.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_application_component
     - id: recorded_configuration
       name: Recorded administrative configuration

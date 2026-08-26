@@ -78,19 +78,34 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -198,6 +213,53 @@ query:
             - user
             - path
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100480
+      group: huntgraph,windows,stealth,obfuscation
+      lists: []
+
+    cases:
+      - id: encoded-file-converted-back-to-a-binary
+        covers: encoded-file-converted-back-to-a-binary
+        name: Encoded file read and written back out as bytes
+        purpose: >-
+          Catch the encoding rather than encryption variant, where a text file that
+          passed inspection is read and written back out as a binary. Both a file
+          being read and a file being written distinguish this from a one-off base64
+          string on a console.
+        rule: |
+          <rule id="100480" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(certutil(\.exe)?\s[^\n]*-decode(hex)?|FromBase64String|\[Convert\]::FromBase64|base64\s+-d)</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(Get-Content|ReadAllText|ReadAllBytes|WriteAllBytes|Set-Content\s[^\n]*-Encoding\s+Byte|\.(b64|txt|dat|log|cfg|tmp)\b)</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)\\(Downloads|Temp|AppData|Public|ProgramData)\\</field>
+            <description>Encoded file read and written back out as bytes</description>
+            <mitre><id>T1027.013</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: archive-extracted-with-a-supplied-password
+        reason: >-
+          Depends on a 45d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+      - case: file-decrypted-with-an-inline-key
+        reason: >-
+          Depends on a 45d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+      - case: unwrapped-payload-executed
+        reason: >-
+          Depends on a 45d baseline comparison (host, user, path); a stateless rule
+          holds no history.
+
 evidence:
   required:
     - id: payload_unwrapped_with_supplied_key
@@ -207,7 +269,7 @@ evidence:
         decryption tool, which is how a payload that was opaque in transit becomes readable
         on the endpoint.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: encrypted_payload_unwrapped
 
   supporting:
@@ -218,7 +280,7 @@ evidence:
         than a document library or a backup target, which places the operation immediately
         after delivery.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: payload_staging
     - id: encoded_file_converted_to_binary
       name: Encoded file converted back into bytes
@@ -226,7 +288,7 @@ evidence:
         A file was read as text and written back out as bytes, which turns content that
         passed inspection into something executable.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: encoded_payload_restored
     - id: unwrapped_payload_executed
       name: Unwrapped content executed from the same path
@@ -235,7 +297,7 @@ evidence:
         running from the directory it wrote to, showing the payload was used rather than
         merely opened.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: execution_chain_progression
     - id: first_time_for_host
       name: No history of inline-key unwrapping on this host
@@ -269,7 +331,7 @@ evidence:
         The unwrapping is a signed vendor installer unpacking its own contents into a
         temporary directory, which is structurally identical and appears on many hosts.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: software_deployment_wave
 
   risk_logic:

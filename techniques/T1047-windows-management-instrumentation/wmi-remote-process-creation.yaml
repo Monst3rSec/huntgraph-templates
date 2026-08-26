@@ -71,27 +71,52 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
     - source: network_connection
+      connector: crowdstrike-ngsiem
       event_types:
         - NetworkConnectIP4
       fields:
-        - aid
-        - ComputerName
-        - ContextProcessId
-        - RemoteAddressIP4
-        - RemotePort
+        agent_id: aid
+        host: ComputerName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+    - source: network_connection
+      connector: wazuh
+      event_types:
+        - sysmon_event3
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        process_id: win.eventdata.processId
+        remote_address: win.eventdata.destinationIp
+        remote_port: win.eventdata.destinationPort
 
 query:
   - platform: crowdstrike
@@ -166,6 +191,47 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100800
+      group: huntgraph,windows,execution,lateral-movement
+      lists: []
+
+    cases:
+      - id: explicit-credentials-supplied
+        covers: explicit-credentials-supplied
+        name: Remote WMI call using explicit credentials
+        purpose: >-
+          Isolate calls that authenticate as a different account, which is how stolen
+          credentials are used and is uncommon in tooling that runs under its own
+          service identity.
+        rule: |
+          <rule id="100800" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(wmic(\.exe)?\s+.*\/node\s*:|Invoke-WmiMethod|Invoke-CimMethod|New-CimSession)</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(\/user\s*:|\/password\s*:|-Credential\b)</field>
+            <description>Remote WMI call using explicit credentials</description>
+            <mitre><id>T1047</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: wmiprvse-spawns-interpreter
+        reason: >-
+          Depends on a 45d baseline comparison (host, user, process, organization); a
+          stateless rule holds no history.
+      - case: remote-process-create-issued
+        reason: >-
+          Depends on a 45d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: wmi_remote_execution
@@ -174,7 +240,7 @@ evidence:
         A process was created by the WMI provider host, or a remote Win32_Process create
         was issued, meaning code executed through WMI rather than through a local launch.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: remote_execution_channel
 
   supporting:
@@ -184,7 +250,7 @@ evidence:
         The process WMI created is a script interpreter or proxy-execution binary rather
         than a maintenance utility, which is the shape of hands-on-keyboard operation.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: dynamic_code_execution
     - id: explicit_credentials
       name: Explicit credentials supplied to the call
@@ -192,7 +258,7 @@ evidence:
         The invocation carried a user and password or a credential object rather than
         relying on the caller's own context, which is how harvested credentials are used.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: credential_reuse
     - id: workstation_origin
       name: Call originating from a workstation
@@ -208,7 +274,7 @@ evidence:
         The calling process opened a connection to a remote host on an administrative
         port, confirming the call left the machine.
       source: network_connection
-      field: RemotePort
+      field: remote_port
       indicates: lateral_movement_attempt
 
   contradicting:
@@ -218,7 +284,7 @@ evidence:
         The activity runs under the service account of an approved management platform
         that uses WMI as a documented remote-execution transport.
       source: process_creation
-      field: UserName
+      field: user
       indicates: legitimate_enterprise_activity
     - id: approved_jump_host
       name: Approved management server or jump host

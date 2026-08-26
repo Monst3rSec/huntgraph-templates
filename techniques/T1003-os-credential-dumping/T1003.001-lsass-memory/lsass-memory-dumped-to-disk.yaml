@@ -72,29 +72,55 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
-        - SHA256HashData
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        image_hash: SHA256HashData
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
+        image_hash: win.eventdata.hashes
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - NewExecutableWritten
         - PeFileWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -168,6 +194,45 @@ query:
             - path
             - process
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100032
+      group: huntgraph,windows,credential-access,credential-dumping
+      lists: []
+
+    cases:
+      - id: comsvcs-minidump
+        covers: comsvcs-minidump
+        name: LSASS dumped through the comsvcs.dll MiniDump export
+        purpose: >-
+          Catch the living-off-the-land form, which needs no tooling on the host at
+          all and is therefore the variant most likely to survive application control.
+        rule: |
+          <rule id="100032" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)comsvcs\.dll\s*,?\s*#?\s*24|comsvcs\.dll\s*,\s*MiniDump</field>
+            <description>LSASS dumped through the comsvcs.dll MiniDump export</description>
+            <mitre><id>T1003.001</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: dump-utility-against-lsass
+        reason: >-
+          Depends on a 60d baseline comparison (host, user, process, organization); a
+          stateless rule holds no history.
+      - case: dumper-from-writable-path
+        reason: >-
+          Depends on a 60d baseline comparison (host, path, process); a stateless rule
+          holds no history.
+
 evidence:
   required:
     - id: lsass_dump_attempt
@@ -176,7 +241,7 @@ evidence:
         A command line invokes a memory-dump mechanism — the comsvcs MiniDump export, a
         dump utility flag set, or a MiniDumpWriteDump wrapper — against the LSASS process.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: credential_material_capture
 
   supporting:
@@ -187,7 +252,7 @@ evidence:
         profile rather than in an installation directory, indicating it was staged for this
         purpose.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: untrusted_execution_location
     - id: tool_recently_staged
       name: Dumping tool written to the host recently
@@ -195,7 +260,7 @@ evidence:
         The executable was written to the host shortly before it ran, which is
         inconsistent with an installed diagnostic utility.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: payload_staging
     - id: scripted_parent
       name: Script host or remote-execution parent
@@ -203,7 +268,7 @@ evidence:
         The dump was initiated by a script interpreter or through a remote-execution
         channel rather than from an interactive administrative session.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: unique_tool_hash
       name: Tool hash unique in the estate
@@ -221,7 +286,7 @@ evidence:
         The capture is performed by the error-reporting components in response to an
         actual LSASS fault, which produces process memory legitimately.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: operating_system_behaviour
     - id: approved_diagnostic_agent
       name: Approved diagnostic or EDR agent
@@ -229,7 +294,7 @@ evidence:
         The capture is performed by a sanctioned security or diagnostic agent from its
         installation directory as part of documented investigation tooling.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_enterprise_activity
     - id: support_engagement
       name: Recorded support engagement

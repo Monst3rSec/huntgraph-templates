@@ -71,30 +71,56 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
-        - SHA256HashData
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        image_hash: SHA256HashData
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
+        image_hash: win.eventdata.hashes
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - PeFileWritten
         - NewExecutableWritten
         - NewScriptWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -156,6 +182,80 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100592
+      group: huntgraph,windows,stealth,masquerading
+      lists: []
+
+    cases:
+      - id: override-in-executed-path
+        covers: override-in-executed-path
+        name: Directional override character in an executed path
+        purpose: >-
+          Surface execution of a file whose name carries the override, which is the
+          disguise being acted on.
+        rule: |
+          <rule id="100592" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.image" type="pcre2">[\x{202E}\x{202B}\x{202D}\x{2066}\x{2067}]</field>
+            <description>Directional override character in an executed path</description>
+            <mitre><id>T1036.002</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+      - id: override-in-written-file
+        covers: override-in-written-file
+        name: Directional override character in a written filename
+        purpose: >-
+          Catch the payload at delivery, before the user opens it, which is the
+          earliest point of intervention.
+        rule: |
+          <rule id="100593" level="12">
+            <if_group>sysmon_event_11</if_group>
+            <field name="win.eventdata.targetFilename" type="pcre2">[\x{202E}\x{202B}\x{202D}\x{2066}\x{2067}]</field>
+            <description>Directional override character in a written filename</description>
+            <mitre><id>T1036.002</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+      - id: override-file-from-delivery-parent
+        covers: override-file-from-delivery-parent
+        name: Override-named file launched by an archive tool or browser
+        purpose: >-
+          Establish the delivery route, which confirms the disguised file reached a
+          user through a channel they acted on.
+        rule: |
+          <rule id="100594" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.image" type="pcre2">[\x{202E}\x{202B}\x{202D}]</field>
+            <field name="win.eventdata.parentImage" type="pcre2">(?i)^(7zfm|7zg|winrar|winzip|explorer|chrome|msedge|firefox|outlook|thunderbird)\.exe$</field>
+            <description>Override-named file launched by an archive tool or browser</description>
+            <mitre><id>T1036.002</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable: []
+
 evidence:
   required:
     - id: directional_override_present
@@ -164,7 +264,7 @@ evidence:
         A file that was written or executed carries a Unicode directional override in its
         name, which reverses how the extension is displayed to the user.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: user_facing_deception
 
   supporting:
@@ -174,7 +274,7 @@ evidence:
         The file was launched by a delivery application, establishing that it arrived
         through a channel the user acted on rather than being local content.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: recently_written
       name: File written shortly before execution
@@ -182,7 +282,7 @@ evidence:
         The file was created on the host shortly before it ran, consistent with delivery
         followed immediately by the user opening it.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: payload_staging
     - id: writable_location
       name: File in a download or temporary directory
@@ -190,7 +290,7 @@ evidence:
         The image runs from a download, extraction or temporary directory rather than from
         an installed application path.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: untrusted_execution_location
     - id: unique_hash
       name: Hash unique in the estate
@@ -208,7 +308,7 @@ evidence:
         The file belongs to localisation, translation or language-pack content where
         directional characters occur naturally.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_application_component
     - id: vendor_installation_path
       name: File inside a vendor installation directory
@@ -216,7 +316,7 @@ evidence:
         The file resides in an installed application directory rather than a delivery
         location.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_application_component
     - id: fleetwide_presence
       name: Same file across the estate

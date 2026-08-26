@@ -72,27 +72,51 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - NewExecutableWritten
         - PeFileWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -162,6 +186,64 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100048
+      group: huntgraph,windows,credential-access,credential-dumping
+      lists: []
+
+    cases:
+      - id: hive-copied-from-shadow
+        covers: hive-copied-from-shadow
+        name: Hive files copied from a shadow copy or config directory
+        purpose: >-
+          Cover the route that avoids reg.exe entirely, taking the files from a
+          snapshot or directly out of the config directory.
+        rule: |
+          <rule id="100048" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(config\\\\SAM|config\\\\SYSTEM|HarddiskVolumeShadowCopy)</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)\b(copy|xcopy|robocopy|Copy-Item|esentutl)\b</field>
+            <description>Hive files copied from a shadow copy or config directory</description>
+            <mitre><id>T1003.002</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+      - id: hives-then-archived
+        covers: hives-then-archived
+        name: Exported hives compressed for collection
+        purpose: >-
+          Catch the packaging step, which indicates the output is being prepared to
+          leave the host rather than read locally.
+        rule: |
+          <rule id="100049" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(sam|system|security)\.(hiv|hive|save|bak|dat)?\b</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)\b(Compress-Archive|7z|rar|tar|makecab|zip)\b</field>
+            <description>Exported hives compressed for collection</description>
+            <mitre><id>T1003.002</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: hive-save-commands
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: hive_export
@@ -170,7 +252,7 @@ evidence:
         The SAM, SYSTEM or SECURITY hive was saved, exported or copied out of the running
         system, producing a file from which credential material can be recovered offline.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: credential_material_capture
 
   supporting:
@@ -180,7 +262,7 @@ evidence:
         More than one hive was exported in the same activity, which is required for the
         output to be decryptable and has no purpose otherwise.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: credential_decryption_attempt
     - id: writable_output
       name: Output written to a user-writable directory
@@ -188,7 +270,7 @@ evidence:
         The exported hives were placed under a temporary or user-writable path rather than
         a backup target or a recovery staging area.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: payload_staging
     - id: archived_output
       name: Output compressed after export
@@ -196,7 +278,7 @@ evidence:
         The exported files were compressed shortly afterwards, indicating preparation for
         transfer rather than local inspection.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: collection_staging
     - id: interactive_or_remote
       name: Issued interactively or remotely
@@ -204,7 +286,7 @@ evidence:
         The export was issued from an interactive shell or a remote-execution channel
         rather than by a scheduled backup process.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: hands_on_keyboard_activity
 
   contradicting:
@@ -214,7 +296,7 @@ evidence:
         The export was performed by an approved backup product as part of its scheduled
         system-state protection.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: recorded_recovery
       name: Recorded recovery or migration activity

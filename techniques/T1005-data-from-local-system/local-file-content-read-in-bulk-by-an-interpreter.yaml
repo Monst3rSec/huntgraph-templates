@@ -86,19 +86,34 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -224,6 +239,53 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100112
+      group: huntgraph,windows,collection,data-from-local-system
+      lists: []
+
+    cases:
+      - id: bulk-read-issued-by-an-unrelated-parent
+        covers: bulk-read-issued-by-an-unrelated-parent
+        name: Bulk read issued from a parent with no document relationship
+        purpose: >-
+          Where the command itself is hopelessly common the parent is the only real
+          discriminator, which is the case here. A read pipeline started by a mail
+          client, a browser, a macro host, an archive utility or a remote-execution
+          service is not a person working on their files.
+        rule: |
+          <rule id="100112" level="5">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.parentImage" type="pcre2">(?i)^(winword\.exe|excel\.exe|powerpnt\.exe|outlook\.exe|chrome\.exe|msedge\.exe|firefox\.exe|7z(FM|G)?\.exe|winrar\.exe|wmiprvse\.exe|wsmprovhost\.exe|mshta\.exe|psexesvc\.exe)$</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(\bcopy\b|\bxcopy\b|\brobocopy\b|Copy-Item|Get-Content|Compress-Archive|-Recurse|\bdir\b[^|]{0,40}\/s)</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)\.(docx?|xlsx?|pptx?|pdf|csv|msg|eml|mdb|accdb|sqlite3?|vmdk|vhdx?)\b</field>
+            <description>Bulk read issued from a parent with no document relationship</description>
+            <mitre><id>T1005</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: several-categories-of-local-data-read-together
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+      - case: document-tree-filtered-and-read
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+      - case: read-crossing-into-other-user-profiles
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: bulk_local_read
@@ -233,7 +295,7 @@ evidence:
         or copied their content, which is collection of the data itself rather than
         enumeration of what exists on the host.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: collection_staging
 
   supporting:
@@ -252,7 +314,7 @@ evidence:
         The command named a profile tree belonging to an account other than the one running
         it, which is normal for a backup service and abnormal for an interactive user.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: unusual_activity_for_user
     - id: unrelated_parent
       name: Started by a process with no relationship to the data
@@ -260,7 +322,7 @@ evidence:
         The reading process was launched by a mail client, browser, macro host, archive tool
         or remote-execution service rather than by a shell the user is working in.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: first_seen_for_host
       name: No history of reading files this way
@@ -278,7 +340,7 @@ evidence:
         The reading process belongs to an approved backup, search-indexing, e-discovery or
         data-loss-prevention product whose entire function is to read documents in bulk.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_enterprise_activity
     - id: user_reading_own_files
       name: Account reading only its own profile
@@ -286,7 +348,7 @@ evidence:
         Every path named sits inside the profile of the account that ran the command, which
         is a person working on their own files.
       source: process_creation
-      field: UserName
+      field: user
       indicates: expected_user_behavior
     - id: fleetwide_same_read
       name: Same read across the estate

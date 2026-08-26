@@ -70,30 +70,56 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - PeFileWritten
         - NewExecutableWritten
         - NewScriptWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
-        - SHA256HashData
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+        file_hash: SHA256HashData
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
+        file_hash: win.eventdata.hashes
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -166,6 +192,46 @@ query:
             - user
             - path
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100400
+      group: huntgraph,windows,stealth,obfuscation
+      lists: []
+
+    cases:
+      - id: carving-utility-invoked
+        covers: carving-utility-invoked
+        name: Utility used to split content out of a file
+        purpose: >-
+          Catch the extraction step directly, where a stream or byte range is carved
+          from a carrier rather than an archive being unpacked.
+        rule: |
+          <rule id="100400" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(certutil(\.exe)?\s+.*-decode|ReadAllBytes|WriteAllBytes|Get-Content\s+.*-Encoding\s+Byte|\[Convert\]::FromBase64|Substring\s*\(\s*\d+|Seek\s*\(\s*\d+)</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)\\(Downloads|AppData\\Local\\Temp|Users\\Public|Content\.Outlook)\\</field>
+            <description>Utility used to split content out of a file</description>
+            <mitre><id>T1027.009</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: executable-written-by-script-host
+        reason: >-
+          Depends on a 45d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+      - case: extracted-payload-executed
+        reason: >-
+          Depends on a 45d baseline comparison (host, user, path); a stateless rule
+          holds no history.
+
 evidence:
   required:
     - id: payload_appeared_locally
@@ -175,7 +241,7 @@ evidence:
         a local process rather than arriving through a browser or installer, which is what
         an embedded payload looks like once carved out.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: payload_staging
 
   supporting:
@@ -185,7 +251,7 @@ evidence:
         A byte-range read, decode or stream extraction was performed against a file in the
         delivery directory, which is the step that produces the payload.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: payload_extraction
     - id: payload_executed
       name: Extracted payload executed
@@ -193,7 +259,7 @@ evidence:
         A process started from the extracted path under an interactive or script parent,
         confirming the carved content was intended to run.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: user_execution_foothold
     - id: script_host_writer
       name: Written by a script host rather than an installer
@@ -201,7 +267,7 @@ evidence:
         The writing process is an interpreter or document handler rather than a browser,
         installer or self-extracting package.
       source: file_creation
-      field: ContextProcessId
+      field: writer_process_id
       indicates: abnormal_execution_chain
     - id: unique_hash
       name: Hash unknown across the estate
@@ -219,7 +285,7 @@ evidence:
         The executable was produced by a recognised self-extracting package writing out its
         own contents during installation.
       source: file_creation
-      field: ContextProcessId
+      field: writer_process_id
       indicates: legitimate_enterprise_activity
     - id: application_resource
       name: Application writing out a bundled resource

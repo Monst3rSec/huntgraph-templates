@@ -86,20 +86,36 @@ requires:
     - macos
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
-        - TargetProcessId
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
+        process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -223,6 +239,53 @@ query:
             - user
             - organization
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100208
+      group: huntgraph,windows,discovery,wifi-discovery
+      lists: []
+
+    cases:
+      - id: wireless-commands-under-an-unrelated-parent
+        covers: wireless-commands-under-an-unrelated-parent
+        name: Wireless enumeration parented by software with no such role
+        purpose: >-
+          Name the actor. Support tooling and the user's own troubleshooting run these
+          commands from a console, a shell or a management agent. A document
+          application, mail client, archive tool or script host asking which networks
+          this laptop has saved is the delivery chain of a credential stealer, and a
+          single command from that lineage outweighs a burst from an administrator.
+        rule: |
+          <rule id="100208" level="8">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.parentImage" type="pcre2">(?i)^(winword|excel|powerpnt|outlook|onenote|acrord32|7zg|7zfm|winrar|mshta|wscript|cscript|regsvr32|rundll32|msbuild)\.exe$</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(netsh(\.exe)?\s+wlan\s+show|networksetup\s+-list(preferredwirelessnetworks|allhardwareports)|security\s+find-generic-password|system_profiler\s+SPAirPortDataType|\bairport\b\s+-)</field>
+            <description>Wireless enumeration parented by software with no such role</description>
+            <mitre><id>T1016.002</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: profile-keys-printed-in-the-clear
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+      - case: profiles-listed-then-keys-extracted
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, parent_process,
+          organization); a stateless rule holds no history.
+      - case: networks-in-range-surveyed
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: wireless_profile_enumeration
@@ -231,7 +294,7 @@ evidence:
         A command was executed that lists the wireless profiles the host has saved, or the
         networks and interfaces currently within range of it.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: wireless_configuration_enumeration
 
   supporting:
@@ -241,7 +304,7 @@ evidence:
         The invocation asked for the profile's pre-shared key in the clear, so the output
         is credential material rather than a description of the network.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: credential_material_exposure
     - id: enumerate_then_extract
       name: Listing and extraction paired in one lineage
@@ -257,7 +320,7 @@ evidence:
         The commands were launched by a document application, mail client, archive tool or
         script host rather than by a console, shell or endpoint management agent.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: in_range_survey
       name: Networks currently in range enumerated
@@ -265,7 +328,7 @@ evidence:
         The host surveyed the access points around it, which supports movement to an
         adjacent network or physical location of the machine.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: physical_proximity_mapping
     - id: new_for_host_and_account
       name: New for this host and account
@@ -291,7 +354,7 @@ evidence:
         The commands descend from an endpoint management or imaging agent that collects
         or writes wireless configuration as part of its documented function.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: legitimate_application_component
     - id: device_owner_activity
       name: The user acting on their own device

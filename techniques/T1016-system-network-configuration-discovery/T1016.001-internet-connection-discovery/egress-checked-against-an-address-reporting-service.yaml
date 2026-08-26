@@ -85,29 +85,56 @@ requires:
     - linux
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
-        - TargetProcessId
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
+        process_id: win.eventdata.processId
     - source: dns_request
+      connector: crowdstrike-ngsiem
       event_types:
         - DnsRequest
       fields:
-        - aid
-        - ComputerName
-        - DomainName
-        - ContextProcessId
-        - ContextBaseFileName
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_id: ContextProcessId
+        process_name: ContextBaseFileName
+    - source: dns_request
+      connector: wazuh
+      event_types:
+        - sysmon_event_22
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        query_name: win.eventdata.queryName
+        process_id: win.eventdata.processId
+        process_name: win.eventdata.image
 
 query:
   - platform: crowdstrike
@@ -223,6 +250,52 @@ query:
             - user
             - organization
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100192
+      group: huntgraph,windows,discovery,internet-connection-discovery
+      lists: []
+
+    cases:
+      - id: several-echo-services-tried-in-one-burst
+        covers: several-echo-services-tried-in-one-burst
+        name: More than one address-echo service tried by one process
+        purpose: >-
+          A product that reports the public address uses the one service its vendor
+          chose and uses it consistently. Code that does not know what the network
+          permits tries two or three in succession until one answers, so the count of
+          distinct echo services per process is a sharper discriminator than any
+          single lookup.
+        rule: |
+          <rule id="100192" level="8">
+            <if_group>sysmon_event_22</if_group>
+            <field name="win.eventdata.queryName" type="pcre2">(?i)(^|\.)(ifconfig\.(me|co|io)|icanhazip\.com|(api\d*\.)?ipify\.org|ipinfo\.io|ip-api\.com|checkip\.(amazonaws\.com|dyndns\.org)|whatismyipaddress\.com|wtfismyip\.com|myip\.(ipip\.net|com)|ident\.me|ipecho\.net|seeip\.org|myexternalip\.com)$</field>
+            <description>More than one address-echo service tried by one process</description>
+            <mitre><id>T1016.001</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: address-echo-service-queried
+        reason: >-
+          Depends on a 90d baseline comparison (host, process, domain, organization);
+          a stateless rule holds no history.
+      - case: egress-check-issued-by-an-interpreter-or-document-lineage
+        reason: >-
+          Depends on a 90d baseline comparison (host, process, parent_process); a
+          stateless rule holds no history.
+      - case: reachability-probe-to-a-public-endpoint
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: egress_address_queried
@@ -232,7 +305,7 @@ evidence:
         public address, which answers whether the host has internet egress and by what
         route.
       source: dns_request
-      field: DomainName
+      field: query_name
       indicates: egress_capability_check
 
   supporting:
@@ -251,7 +324,7 @@ evidence:
         The process performing the check is a script host, a download utility or an image
         outside the managed software estate rather than a browser or network client.
       source: dns_request
-      field: ContextBaseFileName
+      field: process_name
       indicates: untrusted_actor
     - id: delivery_lineage_parent
       name: Parent belongs to a delivery chain
@@ -260,7 +333,7 @@ evidence:
         script host, which is the shape of code that arrived rather than code that was
         deployed.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: reachability_probe_alongside
       name: Connectivity probe on the same host and lineage
@@ -268,7 +341,7 @@ evidence:
         A ping or route trace to a public resolver or well-known site accompanied the
         address lookup, which is the same question asked a second way.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: corroborating_connectivity_test
     - id: destination_new_for_estate
       name: Destination unseen in the baseline window
@@ -286,7 +359,7 @@ evidence:
         The lookup is the platform's own network connectivity indicator, performed by the
         system service that owns it against the vendor's endpoint.
       source: dns_request
-      field: ContextBaseFileName
+      field: process_name
       indicates: legitimate_application_component
     - id: vpn_or_portal_client
       name: VPN, SD-WAN or captive-portal client

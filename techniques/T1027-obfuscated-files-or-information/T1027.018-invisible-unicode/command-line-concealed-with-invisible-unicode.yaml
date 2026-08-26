@@ -89,41 +89,79 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
-        - TargetProcessId
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
+        process_id: win.eventdata.processId
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - PeFileWritten
         - NewExecutableWritten
         - NewScriptWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
-        - SHA256HashData
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+        file_hash: SHA256HashData
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
+        file_hash: win.eventdata.hashes
     - source: network_connection
+      connector: crowdstrike-ngsiem
       event_types:
         - NetworkConnectIP4
         - NetworkConnectIP6
       fields:
-        - aid
-        - ComputerName
-        - RemoteAddressIP4
-        - RemotePort
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+        process_id: ContextProcessId
+    - source: network_connection
+      connector: wazuh
+      event_types:
+        - sysmon_event3
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        remote_address: win.eventdata.destinationIp
+        remote_port: win.eventdata.destinationPort
+        process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -265,6 +303,57 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100528
+      group: huntgraph,windows,stealth,obfuscation
+      lists: []
+
+    cases:
+      - id: hidden-characters-with-runtime-reconstruction
+        covers: hidden-characters-with-runtime-reconstruction
+        name: Hidden characters alongside a decode or evaluate step
+        purpose: >-
+          Escalate from concealment to execution. Invisible code points are inert on
+          their own; they become a payload when the same command line also contains
+          the machinery that turns text back into code — base64 decoding, character
+          arithmetic, string joining, or dynamic evaluation. This pairing is the
+          technique as MITRE describes it and should be triaged ahead of the broader
+          cases.
+        rule: |
+          <rule id="100528" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">[\x{00AD}\x{061C}\x{180E}\x{200B}-\x{200F}\x{202A}-\x{202E}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{FEFF}\x{E000}-\x{F8FF}\x{FE00}-\x{FE0F}\x{E0000}-\x{E007F}\x{F0000}-\x{FFFFD}]</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(FromBase64String|Invoke-Expression|\bIEX\b|\beval\s*\(|new\s+Function\s*\(|\[char\]|\[convert\]::|-join\s|Add-Type|Proxy\s*\(|codePointAt|charCodeAt|String\.fromCharCode)</field>
+            <description>Hidden characters alongside a decode or evaluate step</description>
+            <mitre><id>T1027.018</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: zero-width-or-bidi-characters-in-a-command-line
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+      - case: private-use-or-tag-characters-in-a-command-line
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+      - case: file-written-with-hidden-characters-in-its-name
+        reason: >-
+          Depends on a 90d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+      - case: egress-from-a-process-carrying-hidden-characters
+        reason: >-
+          None of the case's filter fields have a Wazuh equivalent on windows.
+
 evidence:
   required:
     - id: invisible_codepoints_in_command_line
@@ -274,7 +363,7 @@ evidence:
         variation selector characters, so the text an analyst or a signature reads is not the
         text the interpreter parsed.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: command_obfuscation
 
   supporting:
@@ -285,7 +374,7 @@ evidence:
         dynamic evaluation, which is the machinery that turns concealed text back into
         executable code at runtime.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: payload_reconstruction
     - id: interpreter_carried_it
       name: Carried by a script host
@@ -293,7 +382,7 @@ evidence:
         The process holding the hidden characters is an interpreter or script host rather than
         an ordinary application, which is where concealed text becomes instructions.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: script_interpreter_execution
     - id: hidden_characters_in_written_path
       name: File written with invisible characters in its name
@@ -301,7 +390,7 @@ evidence:
         A script or executable was written under a path containing non-rendering code points,
         so it reads identically to a legitimate file in any listing or allowlist.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: artifact_concealment
     - id: egress_from_hidden_process
       name: The obfuscated process connected outbound
@@ -309,7 +398,7 @@ evidence:
         The process launched with concealed characters opened an external connection, showing
         the reconstruction led to retrieval or controller contact.
       source: network_connection
-      field: RemoteAddressIP4
+      field: remote_address
       indicates: execution_chain_progression
     - id: unusual_for_host
       name: No history of such characters on this host
@@ -328,7 +417,7 @@ evidence:
         argument, in an estate where those languages are used, which is what those code points
         exist for.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: legitimate_localisation
     - id: editor_emitted_byte_order_mark
       name: Byte order mark carried in from a file

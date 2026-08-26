@@ -71,28 +71,53 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - PeFileWritten
         - NewExecutableWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -170,6 +195,46 @@ query:
             - host
             - path
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100336
+      group: huntgraph,windows,stealth,obfuscation
+      lists: []
+
+    cases:
+      - id: compiler-from-delivery-parent
+        covers: compiler-from-delivery-parent
+        name: Compiler invoked by a document handler or script host
+        purpose: >-
+          Catch compilation immediately following delivery, where the parent implies a
+          user opened content rather than an engineer building software.
+        rule: |
+          <rule id="100336" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.image" type="pcre2">(?i)^(csc|vbc|jsc|ilasm)\.exe$</field>
+            <field name="win.eventdata.parentImage" type="pcre2">(?i)^(winword|excel|powerpnt|outlook|acrord32|chrome|msedge|firefox|7zfm|winrar|wscript|cscript|mshta|powershell|pwsh)\.exe$</field>
+            <description>Compiler invoked by a document handler or script host</description>
+            <mitre><id>T1027.004</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: compiler-on-non-developer-host
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+      - case: build-then-run-in-writable-path
+        reason: >-
+          Depends on a 60d baseline comparison (host, path); a stateless rule holds no
+          history.
+
 evidence:
   required:
     - id: compiler_invoked
@@ -178,7 +243,7 @@ evidence:
         A compiler shipped with the operating system was run, producing an executable on the
         host that never had to cross the network as a binary.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: local_payload_construction
 
   supporting:
@@ -196,7 +261,7 @@ evidence:
         The compiler was invoked by a document handler, archive utility, browser or script
         host rather than by an IDE or a build agent.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: writable_output
       name: Output written into a writable directory
@@ -204,7 +269,7 @@ evidence:
         The compiled executable was produced in a temporary or user-writable directory
         rather than in a build workspace or an installation path.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: payload_staging
     - id: output_executed
       name: Compiled output executed
@@ -212,7 +277,7 @@ evidence:
         A process started from the path the compiler produced, confirming the build existed
         to run rather than to be inspected.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: execution_chain_progression
 
   contradicting:
@@ -230,7 +295,7 @@ evidence:
         The compiler was invoked by a continuous-integration agent or a development
         environment, which is its intended use.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: runtime_code_generation
       name: Application generating code at runtime
@@ -238,7 +303,7 @@ evidence:
         The compilation belongs to a framework feature that builds serialisers or generated
         classes at runtime, which occurs on servers running that application.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: legitimate_application_component
 
   risk_logic:

@@ -72,29 +72,55 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
-        - SHA256HashData
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        image_hash: SHA256HashData
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
+        image_hash: win.eventdata.hashes
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - PeFileWritten
         - NewExecutableWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -177,6 +203,45 @@ query:
             - host
             - path
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100640
+      group: huntgraph,windows,stealth,masquerading
+      lists: []
+
+    cases:
+      - id: lookalike-system-name
+        covers: lookalike-system-name
+        name: Near-miss spelling of a system binary
+        purpose: >-
+          Catch transposed and substituted spellings that evade exact-name comparison
+          while still reading as familiar to an analyst.
+        rule: |
+          <rule id="100640" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.image" type="pcre2">(?i)^(scvhost|svch0st|svhost|sv chost|lsasss|lsas|csrsss|winlogin|explore|taskhosts|sppolsv)\.exe$</field>
+            <description>Near-miss spelling of a system binary</description>
+            <mitre><id>T1036.005</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: protected-name-wrong-path
+        reason: >-
+          Depends on a 60d baseline comparison (host, path, process, organization); a
+          stateless rule holds no history.
+      - case: masquerade-write-then-execute
+        reason: >-
+          Depends on a 60d baseline comparison (host, path); a stateless rule holds no
+          history.
+
 evidence:
   required:
     - id: system_name_wrong_path
@@ -186,7 +251,7 @@ evidence:
         outside System32, SysWOW64, WinSxS or the servicing directory, so the name and the
         location contradict each other.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: process_masquerading
 
   supporting:
@@ -196,7 +261,7 @@ evidence:
         The executable was created at that path by a file write shortly before it ran,
         indicating a staged payload rather than a pre-existing vendor component.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: payload_staging
     - id: delivery_parent
       name: Delivery-style parent process
@@ -204,7 +269,7 @@ evidence:
         The masquerading process was launched by a document handler, archive utility, mail
         client, browser or script host rather than by services.exe or an installer.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: unique_hash_in_estate
       name: Image hash unique to a single host
@@ -220,7 +285,7 @@ evidence:
         The image path sits under AppData, Temp, ProgramData, Public or a user profile,
         which any unprivileged process can write to and no system binary occupies.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: untrusted_execution_location
 
   contradicting:
@@ -231,7 +296,7 @@ evidence:
         recovery, virtualisation or support utility that ships its own copies of Windows
         binaries.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_application_component
     - id: fleetwide_identical_hash
       name: Same hash and path across the estate
@@ -247,7 +312,7 @@ evidence:
         The process was launched by an approved installer or software-distribution agent
         during a recorded maintenance window.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
 
   risk_logic:

@@ -70,28 +70,53 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - PeFileWritten
         - NewExecutableWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -163,6 +188,45 @@ query:
             - user
             - command_line
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100656
+      group: huntgraph,windows,stealth,masquerading
+      lists: []
+
+    cases:
+      - id: process-from-document-extension
+        covers: process-from-document-extension
+        name: Process started from a file with a document extension
+        purpose: >-
+          Surface the mismatch at its most visible point, where something executes
+          from a path whose extension says it should not be executable.
+        rule: |
+          <rule id="100656" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.image" type="pcre2">(?i)\.(pdf|doc|docx|xls|xlsx|ppt|pptx|txt|rtf|jpg|jpeg|png|gif|mp4|zip|log|dat|tmp)$</field>
+            <description>Process started from a file with a document extension</description>
+            <mitre><id>T1036.008</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: document-named-file-loaded
+        reason: >-
+          Depends on a 45d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+      - case: renamed-to-executable
+        reason: >-
+          Depends on a 45d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: extension_content_mismatch
@@ -172,7 +236,7 @@ evidence:
         file was passed to an interpreter, or such a file was renamed to an executable
         extension.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: user_facing_deception
 
   supporting:
@@ -182,7 +246,7 @@ evidence:
         The file was given an executable extension shortly before running, which is the
         step that converts a delivered document into something the shell will launch.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: payload_activation
     - id: loader_used
       name: Execution routed through a loader
@@ -190,7 +254,7 @@ evidence:
         A binary that ignores file extensions was used to run the content, so the payload
         never needed renaming at all.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: proxy_execution_of_untrusted_module
     - id: delivery_directory
       name: File in a download or extraction directory
@@ -198,7 +262,7 @@ evidence:
         The file sits in a download, extraction or temporary directory rather than in an
         application's own data location.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: payload_staging
     - id: delivery_parent
       name: Archive tool, browser or mail client as parent
@@ -206,7 +270,7 @@ evidence:
         The execution was parented by a delivery application, establishing that the file
         arrived through a channel the user acted on.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
 
   contradicting:
@@ -216,7 +280,7 @@ evidence:
         The file belongs to an application known to store working data with an extension
         unrelated to its contents.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_application_component
     - id: installer_rename
       name: Installer renaming an extracted payload
@@ -224,7 +288,7 @@ evidence:
         The rename was performed by an approved installer moving an extracted file into
         place during setup.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: packaging_workflow
       name: Build or packaging rename
