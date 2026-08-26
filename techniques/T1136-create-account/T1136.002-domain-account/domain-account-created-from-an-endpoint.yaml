@@ -70,18 +70,32 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -155,6 +169,48 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100720
+      group: huntgraph,windows,persistence,account-creation
+      lists: []
+
+    cases:
+      - id: creation-from-scripted-parent
+        covers: creation-from-scripted-parent
+        name: Account creation issued by a script host or service
+        purpose: >-
+          Isolate creations whose parent implies automation the identity platform does
+          not own, such as a web service or an interpreter reached remotely.
+        rule: |
+          <rule id="100720" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(net(\.exe)?\s+user\s+.*\/add\s+\/domain|New-ADUser|dsadd\s+user)</field>
+            <field name="win.eventdata.parentImage" type="pcre2">(?i)^(powershell|pwsh|cmd|wscript|cscript|mshta|w3wp|wsmprovhost|WmiPrvSE|winrshost)\.exe$</field>
+            <description>Account creation issued by a script host or service</description>
+            <mitre><id>T1136.002</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: domain-account-created
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+      - case: create-then-add-to-group
+        reason: >-
+          Its discriminator filters on account_created, a CQL-derived variable or
+          unmapped field with no Wazuh equivalent. Emitting the rule without that
+          condition would broaden it to the benign activity the case exists to
+          exclude.
+
 evidence:
   required:
     - id: domain_account_created
@@ -163,7 +219,7 @@ evidence:
         A directory account was created through a command line on an endpoint, establishing
         an identity that authenticates across the estate.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: persistence_established
 
   supporting:
@@ -173,7 +229,7 @@ evidence:
         The creation was issued by an interpreter, a web server process or a
         remote-execution channel rather than through the identity platform.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: group_membership_followed
       name: Privileged group membership granted afterwards
@@ -181,7 +237,7 @@ evidence:
         The new account was added to a privileged or remote-access group in the same
         activity, which is what turns a directory object into usable access.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: privilege_escalation_attempt
     - id: non_identity_host
       name: Issued from a host with no identity role
@@ -207,7 +263,7 @@ evidence:
         The account was created by the approved identity management system as part of a
         joiner or access-request workflow.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: installer_service_account
       name: Installer creating a domain service account
@@ -215,7 +271,7 @@ evidence:
         An approved installer created a directory service account required by the product
         it deploys.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: recorded_onboarding
       name: Recorded onboarding or provisioning

@@ -71,19 +71,34 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -157,6 +172,46 @@ query:
             - path
             - organization
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100320
+      group: huntgraph,windows,execution,lateral-movement
+      lists: []
+
+    cases:
+      - id: agent-runs-encoded-command
+        covers: agent-runs-encoded-command
+        name: Deployment agent running an encoded or inline command
+        purpose: >-
+          Isolate payloads whose content is concealed or supplied inline, which
+          packaged software does not require.
+        rule: |
+          <rule id="100320" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.parentImage" type="pcre2">(?i)^(ccmexec|CcmExec|TaniumClient|AeXNSAgent|ir_agent|amagent|BESClient)\.exe$</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(-enc\b|-EncodedCommand|FromBase64String|DownloadString|Invoke-Expression|\biex\b)</field>
+            <description>Deployment agent running an encoded or inline command</description>
+            <mitre><id>T1072</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: agent-spawns-interpreter
+        reason: >-
+          Depends on a 60d baseline comparison (host, parent_process, command_line,
+          organization); a stateless rule holds no history.
+      - case: payload-outside-package-cache
+        reason: >-
+          Depends on a 60d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: agent_executed_payload
@@ -166,7 +221,7 @@ evidence:
         package cache, which is script execution rather than the software installation the
         platform exists to perform.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: trusted_channel_abuse
 
   supporting:
@@ -176,7 +231,7 @@ evidence:
         The agent ran an encoded command or an inline download-and-execute construct, which
         no packaged installation requires.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: command_obfuscation
     - id: payload_outside_cache
       name: Payload outside the platform's package cache
@@ -184,7 +239,7 @@ evidence:
         The executed image sits in a user-writable or temporary directory rather than in
         the cache the platform stages content into.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: untrusted_execution_location
     - id: broad_simultaneous_reach
       name: Execution across an unusually broad population
@@ -226,7 +281,7 @@ evidence:
         The executed image resides in the platform's own cache directory, which is where
         legitimately distributed content is staged.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_enterprise_activity
 
   risk_logic:

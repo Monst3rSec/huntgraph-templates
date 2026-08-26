@@ -91,19 +91,34 @@ requires:
     - linux
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -190,6 +205,50 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100576
+      group: huntgraph,windows,collection,clipboard-data
+      lists: []
+
+    cases:
+      - id: clipboard-read-without-a-terminal
+        covers: clipboard-read-without-a-terminal
+        name: Clipboard read by a process with no interactive terminal
+        purpose: >-
+          Establish the actor where the command itself is ordinary. MITRE's macOS and
+          Linux analytics for this technique both key on whether the read is tied to a
+          user terminal session, and the Windows one on abnormal parents. A clipboard
+          read parented by an office application, a mail client, a scheduler, a
+          service host or an inbound remote shell is reading a clipboard that belongs
+          to someone else's session.
+        rule: |
+          <rule id="100576" level="8">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(\bpbpaste\b|\bxclip\b|\bxsel\b|\bwl-paste\b|Get-Clipboard|Clipboard\]::GetText|Clipboard\]::GetData)</field>
+            <field name="win.eventdata.parentImage" type="pcre2">(?i)^(winword\.exe|excel\.exe|powerpnt\.exe|outlook\.exe|msaccess\.exe|mshta\.exe|wscript\.exe|cscript\.exe|services\.exe|svchost\.exe|taskeng\.exe|schtasks\.exe|w3wp\.exe|sshd|crond?|systemd|launchd|Microsoft Word|Microsoft Excel|osascript)$</field>
+            <description>Clipboard read by a process with no interactive terminal</description>
+            <mitre><id>T1115</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: clipboard-read-chained-to-staging
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, command_line,
+          organization); a stateless rule holds no history.
+      - case: clipboard-polled-on-an-interval
+        reason: >-
+          Depends on a 30d baseline comparison (host, parent_process, organization); a
+          stateless rule holds no history.
+
 evidence:
   required:
     - id: clipboard_contents_read
@@ -198,7 +257,7 @@ evidence:
         A clipboard reading utility or cmdlet was invoked as a process, which is the only
         route to clipboard contents this telemetry can observe.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: clipboard_contents_accessed
 
   supporting:
@@ -208,7 +267,7 @@ evidence:
         The same command line encodes, archives, writes to a file or transmits the clipboard
         contents, which is collection rather than a paste.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: collection_staging
     - id: reads_repeated
       name: Clipboard re-read repeatedly from one lineage
@@ -224,7 +283,7 @@ evidence:
         The parent is an office application, mail client, service host, scheduler or remote
         shell rather than a terminal the user is sitting at.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: untrusted_execution_lineage
     - id: output_to_scratch_path
       name: Clipboard contents written to a temporary or hidden path
@@ -232,7 +291,7 @@ evidence:
         The destination named in the command line is a temporary directory, a dot-directory
         or a profile path used as a drop location rather than a working file.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: collection_staging
     - id: clipboard_tool_from_writable_path
       name: Clipboard utility running from a user-writable path
@@ -240,7 +299,7 @@ evidence:
         The acting binary is a copy of a clipboard tool under a temporary, profile or share
         directory rather than the system-installed utility.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: untrusted_execution_location
 
   contradicting:
@@ -250,7 +309,7 @@ evidence:
         The parent is a terminal emulator or login shell belonging to the interactive user,
         which is a person using their own clipboard.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: expected_user_activity
     - id: clipboard_management_product
       name: Clipboard history, sync or password management product
@@ -258,7 +317,7 @@ evidence:
         The acting process belongs to an approved clipboard manager, password manager or
         remote desktop client whose stated function includes reading the clipboard.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_application_component
     - id: engineering_host
       name: Engineering host where clipboard pipelines are routine

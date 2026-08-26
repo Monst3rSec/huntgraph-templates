@@ -73,19 +73,34 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -183,6 +198,70 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100160
+      group: huntgraph,windows,execution,javascript
+      lists: []
+
+    cases:
+      - id: mshta-inline-script-text
+        covers: mshta-inline-script-text
+        name: HTML application host given script text instead of a file
+        purpose: >-
+          Isolate the fileless route: mshta running code supplied on its command line,
+          where there is no .hta and no .js for any file-based control to inspect.
+        rule: |
+          <rule id="100160" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.image" type="pcre2">(?i)^mshta\.exe$</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(javascript|vbscript|about)\s*:</field>
+            <field name="win.eventdata.commandLine" type="pcre2" negate="yes">(?i)\.hta(\s|"|$)</field>
+            <description>HTML application host given script text instead of a file</description>
+            <mitre><id>T1059.007</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+      - id: rundll32-reaching-html-host
+        covers: rundll32-reaching-html-host
+        name: rundll32 invoking the HTML application host
+        purpose: >-
+          Cover the variant that avoids mshta entirely by calling into the HTML
+          application entry point from rundll32, which is never a normal way for
+          software to run.
+        rule: |
+          <rule id="100161" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.image" type="pcre2">(?i)^rundll32\.exe$</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(mshtml|RunHTMLApplication|javascript\s*:|\bGetObject\s*\()</field>
+            <description>rundll32 invoking the HTML application host</description>
+            <mitre><id>T1059.007</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: jscript-file-from-delivery-path
+        reason: >-
+          Depends on a 45d baseline comparison (host, user, path); a stateless rule
+          holds no history.
+      - case: engine-forced-onto-disguised-file
+        reason: >-
+          Depends on a 45d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: jscript_host_invocation
@@ -192,7 +271,7 @@ evidence:
         from a file whose extension was overridden, or from script text supplied on the
         command line.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: trusted_host_script_execution
 
   supporting:
@@ -202,7 +281,7 @@ evidence:
         The code was passed on the command line to mshta or rundll32 rather than read from a
         file, so nothing was written that a file-based control could see or retain.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: fileless_execution
     - id: signed_proxy_binary
       name: Execution proxied through a signed Microsoft binary
@@ -210,7 +289,7 @@ evidence:
         The executing image is a Microsoft-signed host rather than anything the adversary
         supplied, so application controls keyed on publisher do not fire.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: signed_binary_proxy_execution
     - id: delivery_parent
       name: Browser, mail client or archive tool as parent
@@ -218,7 +297,7 @@ evidence:
         The scripting host was launched by an application a user opened content in, which
         establishes how the code reached the host.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: rare_for_user
       name: Scripting host use rare for this user
@@ -236,7 +315,7 @@ evidence:
         The script path resolves inside a product's installation directory and the product
         itself is the parent, which is how bundled JScript components run.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: legitimate_application_component
     - id: packaging_tool_parent
       name: Packaging or deployment tool as parent
@@ -244,7 +323,7 @@ evidence:
         The invocation belongs to an approved software deployment run, where legacy JScript
         is still used for install-time logic.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: internal_hta_tool
       name: Sanctioned internal HTA tool

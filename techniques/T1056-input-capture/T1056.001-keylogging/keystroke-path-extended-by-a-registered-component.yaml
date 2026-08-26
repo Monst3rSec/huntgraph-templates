@@ -80,20 +80,34 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: registry
+      connector: crowdstrike-ngsiem
       event_types:
         - AsepValueUpdate
         - RegGenericValueUpdate
         - RegSystemConfigValueUpdate
         - RegKeyCreate
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - RegObjectName
-        - RegValueName
-        - RegStringValue
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+    - source: registry
+      connector: wazuh
+      event_types:
+        - sysmon_event_13
+        - sysmon_event_12
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        registry_path: win.eventdata.targetObject
+        registry_value: win.eventdata.targetObject
+        registry_data: win.eventdata.details
 
 query:
   - platform: crowdstrike
@@ -216,6 +230,53 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100128
+      group: huntgraph,windows,collection,credential-access
+      lists: []
+
+    cases:
+      - id: text-input-processor-registered
+        covers: text-input-processor-registered
+        name: Input processor or keyboard layout pointed at a non-system image
+        purpose: >-
+          Cover the input-method route, where a registered text service or layout
+          receives keystrokes ahead of the application. Stock layouts reference a bare
+          filename that resolves out of the system directory, so a full path is the
+          anomaly.
+        rule: |
+          <rule id="100128" level="12">
+            <if_group>sysmon_event_13</if_group>
+            <field name="win.eventdata.targetObject" type="pcre2">(?i)\\(Microsoft\\CTF\\TIP|Control\\Keyboard Layouts?)\\</field>
+            <field name="win.eventdata.targetObject" type="pcre2">(?i)^(Layout File|Layout Dll|Ime File|Layout Text)$</field>
+            <field name="win.eventdata.details" type="pcre2">(\\|\/)</field>
+            <description>Input processor or keyboard layout pointed at a non-system image</description>
+            <mitre><id>T1056.001</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: keyboard-class-filter-registered
+        reason: >-
+          Depends on a 90d baseline comparison (host, module, organization); a
+          stateless rule holds no history.
+      - case: kernel-driver-service-registered-outside-system-path
+        reason: >-
+          Depends on a 90d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+      - case: library-forced-into-processes-handling-input
+        reason: >-
+          Depends on a 90d baseline comparison (host, module, organization); a
+          stateless rule holds no history.
+
 evidence:
   required:
     - id: input_path_component_registered
@@ -225,7 +286,7 @@ evidence:
         registered at one of the few points where code can observe keystrokes before the
         application that owns them.
       source: registry
-      field: RegObjectName
+      field: registry_path
       indicates: input_capture_component_installed
 
   supporting:
@@ -235,7 +296,7 @@ evidence:
         The driver or library the registration points at lives under a profile, temporary
         or ProgramData path rather than the system directory an installer would use.
       source: registry
-      field: RegStringValue
+      field: registry_data
       indicates: untrusted_execution_location
     - id: configured_to_load_at_boot
       name: Configured as a boot-start kernel driver
@@ -243,7 +304,7 @@ evidence:
         The service was set to kernel driver type with an early start value, so capture
         resumes on every boot without anyone signing in.
       source: registry
-      field: RegValueName
+      field: registry_value
       indicates: persistence_made_operational
     - id: broad_injection_enabled
       name: Broad library loading switched on alongside the registration
@@ -251,7 +312,7 @@ evidence:
         The switch that makes the registered library load into every process handling a
         window was enabled in the same window as the value that names it.
       source: registry
-      field: RegValueName
+      field: registry_value
       indicates: process_injection_configured
     - id: unusual_for_host
       name: Input path unchanged on this host until now
@@ -269,7 +330,7 @@ evidence:
         The referenced image is a signed vendor driver for the machine's keyboard, touchpad,
         smartcard reader or docking station, installed into the system driver directory.
       source: registry
-      field: RegStringValue
+      field: registry_data
       indicates: legitimate_application_component
     - id: security_or_accessibility_product
       name: Endpoint security or accessibility product

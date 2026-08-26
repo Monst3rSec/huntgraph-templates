@@ -92,19 +92,34 @@ requires:
     - linux
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -224,6 +239,53 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100560
+      group: huntgraph,windows,collection,screen-capture
+      lists: []
+
+    cases:
+      - id: inline-capture-api-in-an-interpreter
+        covers: inline-capture-api-in-an-interpreter
+        name: Screen capture API written inline into an interpreter command line
+        purpose: >-
+          Recover the API route in the one place it is visible. A capture performed by
+          compiled code is out of reach, but the same call typed into a PowerShell or
+          shell one-liner — CopyFromScreen, a Drawing.Bitmap sized to the virtual
+          screen, an ImageGrab or mss call — appears in full in the command line. This
+          is the operator working interactively or through a downloaded one-liner
+          rather than through an implant.
+        rule: |
+          <rule id="100560" level="8">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(CopyFromScreen|Drawing\.Bitmap|Graphics\]::FromImage|Windows\.Forms\.Screen|PrimaryScreen\.Bounds|VirtualScreen|ImageGrab\.grab|mss\(\)|CGWindowListCreateImage|XGetImage)</field>
+            <description>Screen capture API written inline into an interpreter command line</description>
+            <mitre><id>T1113</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: capture-tool-run-without-a-desktop
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, parent_process,
+          organization); a stateless rule holds no history.
+      - case: capture-suppressed-and-hidden
+        reason: >-
+          Depends on a 90d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+      - case: capture-repeated-on-an-interval
+        reason: >-
+          Depends on a 30d baseline comparison (host, parent_process, organization); a
+          stateless rule holds no history.
+
 evidence:
   required:
     - id: screen_capture_invoked
@@ -232,7 +294,7 @@ evidence:
         A known screen capture utility ran, or a screen capture API call appeared inline in an
         interpreter command line, which is the observable half of this technique.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: desktop_contents_captured
 
   supporting:
@@ -242,7 +304,7 @@ evidence:
         The parent is a service host, scheduler, remote shell, office application or script
         interpreter rather than a shell or desktop the user is sitting at.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: untrusted_execution_lineage
     - id: capture_suppressed
       name: Capture taken with silencing flags
@@ -250,7 +312,7 @@ evidence:
         The command line suppresses the shutter sound, the cursor or any on-screen
         indication, which serves no purpose except to keep the user unaware.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: evasion_of_user_awareness
     - id: output_to_scratch_path
       name: Image written to a temporary, hidden or system path
@@ -258,7 +320,7 @@ evidence:
         The destination in the command line is a temporary directory, a dot-directory or a
         system path rather than a pictures or documents location.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: collection_staging
     - id: captures_repeated
       name: Captures repeat over a short window
@@ -274,7 +336,7 @@ evidence:
         The executable is a standalone or renamed capture tool running from a temporary,
         profile or share path rather than an installed product.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: untrusted_execution_location
 
   contradicting:
@@ -284,7 +346,7 @@ evidence:
         The capture belongs to an approved remote support or monitoring product operating
         during an assisted session, where screen capture is the product's purpose.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: interactive_desktop_lineage
       name: Started from the user's own desktop session
@@ -292,7 +354,7 @@ evidence:
         The parent is the desktop shell, a terminal the console user is sitting at, or a
         screenshot application, which is a person taking their own screenshot.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: expected_user_activity
     - id: test_automation_host
       name: Build or QA host running automated UI tests

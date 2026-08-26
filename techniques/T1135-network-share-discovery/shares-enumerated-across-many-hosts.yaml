@@ -83,41 +83,80 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
     - source: network_connection
+      connector: crowdstrike-ngsiem
       event_types:
         - NetworkConnectIP4
         - NetworkConnectIP6
       fields:
-        - aid
-        - ComputerName
-        - RemoteAddressIP4
-        - RemotePort
-        - ContextProcessId
-        - ContextBaseFileName
+        agent_id: aid
+        host: ComputerName
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+        process_id: ContextProcessId
+        process_name: ContextBaseFileName
+    - source: network_connection
+      connector: wazuh
+      event_types:
+        - sysmon_event3
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        remote_address: win.eventdata.destinationIp
+        remote_port: win.eventdata.destinationPort
+        process_id: win.eventdata.processId
+        process_name: win.eventdata.image
     - source: network_share_access
+      connector: crowdstrike-ngsiem
       event_types:
         - SmbClientConnect
         - SmbFileOpen
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - ShareName
-        - RemoteAddressIP4
-        - TargetFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        share_name: ShareName
+        remote_address: RemoteAddressIP4
+        file_path: TargetFileName
+    - source: network_share_access
+      connector: wazuh
+      event_types:
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.subjectUserName
+        share_name: win.eventdata.shareName
+        remote_address: win.eventdata.ipAddress
+        file_path: win.eventdata.relativeTargetName
 
 query:
   - platform: crowdstrike
@@ -234,6 +273,50 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100688
+      group: huntgraph,windows,discovery,network-share-discovery
+      lists: []
+
+    cases:
+      - id: share-hunting-tooling-invoked
+        covers: share-hunting-tooling-invoked
+        name: Share hunting module or utility executed
+        purpose: >-
+          Name the packaged form. These modules and utilities exist for no purpose
+          other than finding readable and writable shares across a domain, so the tool
+          name is the finding on its own and needs no breadth measurement behind it.
+        rule: |
+          <rule id="100688" level="8">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)\b(Invoke-ShareFinder|Find-DomainShare|Find-InterestingDomainShareFile|Invoke-FileFinder|SharpShares|Snaffler|smbmap|crackmapexec|netexec|smbclient|PowerHuntShares|Get-DomainFileServer)\b</field>
+            <description>Share hunting module or utility executed</description>
+            <mitre><id>T1135</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: smb-fan-out-from-one-process
+        reason: >-
+          Depends on a 30d baseline comparison (host, process, remote_address); a
+          stateless rule holds no history.
+      - case: share-listing-commands-executed
+        reason: >-
+          Depends on a 30d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+      - case: ipc-share-contacted-across-many-hosts
+        reason: >-
+          Depends on a 30d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: share_enumeration_observed
@@ -242,7 +325,7 @@ evidence:
         A process listed the shares offered by remote hosts, either through an explicit
         share listing command or through a share hunting module invoked on this host.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: network_share_enumeration
 
   supporting:
@@ -252,7 +335,7 @@ evidence:
         A single process opened SMB sessions to far more distinct hosts within the window
         than that host's baseline supports, which is mapping rather than using a share.
       source: network_connection
-      field: RemoteAddressIP4
+      field: remote_address
       indicates: broad_host_sweep
     - id: ipc_share_breadth
       name: Interprocess share contacted on many hosts
@@ -260,7 +343,7 @@ evidence:
         The interprocess share was contacted across many peers with no file subsequently
         opened, which is share enumeration over RPC with no use attached to it.
       source: network_share_access
-      field: ShareName
+      field: share_name
       indicates: rpc_share_enumeration
     - id: enumeration_tooling
       name: Share hunting utility present
@@ -268,7 +351,7 @@ evidence:
         A module or binary whose only function is locating readable and writable shares
         across a domain was executed on the host.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: share_enumeration_tool
     - id: untrusted_parent
       name: Enumeration launched from a shell or delivery process
@@ -276,7 +359,7 @@ evidence:
         The enumerating process was started by a command shell, script host, remote
         execution service or document handler rather than by a scanner or backup agent.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: hands_on_keyboard_activity
     - id: unused_share_opened
       name: A share this account has never used was opened
@@ -284,7 +367,7 @@ evidence:
         After the sweep the same account opened a share with no history for that account in
         the baseline window, which is the pivot from mapping the estate to taking from it.
       source: network_share_access
-      field: TargetFileName
+      field: file_path
       indicates: post_enumeration_access
     - id: rare_for_host
       name: Sweep unprecedented on this host
@@ -302,7 +385,7 @@ evidence:
         The enumerating process belongs to a vulnerability scanner, asset discovery agent or
         backup product whose function includes surveying shares across the estate.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_enterprise_activity
     - id: scanning_infrastructure_source
       name: Sweep originated from declared scanning infrastructure

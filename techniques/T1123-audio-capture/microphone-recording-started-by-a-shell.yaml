@@ -79,19 +79,33 @@ requires:
     - linux
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - audit_command
+      fields:
+        agent_id: agent.id
+        host: agent.name
+        user: audit.auid
+        image_name: audit.exe
+        image_path: audit.exe
+        command_line: audit.execve.a1
+        parent_process: audit.ppid
 
 query:
   - platform: crowdstrike
@@ -187,6 +201,51 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100624
+      group: huntgraph,linux,collection,audio-capture
+      lists: []
+
+    cases:
+      - id: sound-device-opened-by-a-generic-tool
+        covers: sound-device-opened-by-a-generic-tool
+        name: Sound device read by something that is not an audio utility
+        purpose: >-
+          Cover the case where no recognisable capture utility appears at all. An
+          operator who finds no audio tooling installed can read the ALSA or OSS
+          device directly with dd, cat or a small interpreter script, which produces
+          raw audio without ever naming a capture binary. The device path in the
+          command line is what makes this visible, and nothing in normal
+          administration reads /dev/snd or /dev/dsp that way.
+        rule: |
+          <rule id="100624" level="8">
+            <if_group>audit_command</if_group>
+            <field name="audit.execve.a1" type="pcre2">(?i)(\/dev\/snd\/|\/dev\/dsp\b|\/dev\/audio\b|\/proc\/asound\/)</field>
+            <field name="audit.execve.a1" type="pcre2">(?i)(\b(dd|cat|head|tail|cp|nc|ncat|socat|base64|gzip|tee)\b|\bopen\s*\(|pyaudio|sounddevice|soundcard|ossaudiodev)</field>
+            <field name="audit.exe" type="pcre2" negate="yes">(?i)^(arecord|parecord|pw-record|aplay|alsactl|alsamixer|pulseaudio|pipewire|wireplumber)$</field>
+            <description>Sound device read by something that is not an audio utility</description>
+            <mitre><id>T1123</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: unattended-recording-to-a-scratch-path
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, path, organization); a
+          stateless rule holds no history.
+      - case: recording-started-without-a-terminal
+        reason: >-
+          Depends on a 90d baseline comparison (host, parent_process, organization); a
+          stateless rule holds no history.
+
 evidence:
   required:
     - id: audio_capture_invoked
@@ -195,7 +254,7 @@ evidence:
         A capture utility was run against a sound device, or a sound device was opened
         directly by another tool, which is the observable start of an audio recording.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: audio_recording_started
 
   supporting:
@@ -205,7 +264,7 @@ evidence:
         The command sets no duration, backgrounds the capture, or asks for a duration far
         longer than any diagnostic would need.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: sustained_surveillance
     - id: output_to_scratch_path
       name: Recording written to a temporary, shared-memory or hidden path
@@ -213,7 +272,7 @@ evidence:
         The destination in the command line is a temporary, shared-memory or dot-directory
         location rather than a media or working directory.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: collection_staging
     - id: no_terminal_parent
       name: Started by a scheduler, service manager or remote shell
@@ -221,7 +280,7 @@ evidence:
         The parent is cron, systemd, an inbound SSH session or an interpreter rather than a
         terminal the user is sitting at.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: untrusted_execution_lineage
     - id: generic_tool_reads_sound_device
       name: Sound device opened by a non-audio tool
@@ -229,7 +288,7 @@ evidence:
         A general purpose utility or interpreter, rather than an audio application, is what
         opens the ALSA or OSS device, which is how capture is done where no tooling exists.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: living_off_the_land_capture
     - id: capture_binary_from_writable_path
       name: Capture binary running from a user-writable path
@@ -237,7 +296,7 @@ evidence:
         The executable is a copy of a capture tool under a temporary, home or shared path
         rather than a package-managed binary in a system directory.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: untrusted_execution_location
 
   contradicting:
@@ -247,7 +306,7 @@ evidence:
         The acting process belongs to an approved conferencing, transcription or media
         pipeline whose stated function is capturing audio.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_application_component
     - id: interactive_terminal_session
       name: Run from the console user's own terminal
@@ -255,7 +314,7 @@ evidence:
         The parent is a login shell or terminal belonging to the interactive user, which is
         an engineer testing a device rather than an unattended recording.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: expected_user_activity
     - id: media_or_lab_host
       name: Media, lab or conferencing-room host

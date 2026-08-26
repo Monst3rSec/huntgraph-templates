@@ -72,18 +72,32 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -157,6 +171,46 @@ query:
             - command_line
             - organization
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100352
+      group: huntgraph,windows,persistence,privilege-escalation
+      lists: []
+
+    cases:
+      - id: builtin-account-enabled
+        covers: builtin-account-enabled
+        name: Dormant built-in account enabled
+        purpose: >-
+          Catch the account being brought back into use, which is the preparatory step
+          and often the only artefact if the session itself looks ordinary.
+        rule: |
+          <rule id="100352" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(net(\.exe)?\s+user\s+(administrator|guest|defaultaccount)|Enable-LocalUser\s+.*(Administrator|Guest)|net1\s+user\s+(administrator|guest))</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(\/active\s*:\s*yes|-Name)</field>
+            <description>Dormant built-in account enabled</description>
+            <mitre><id>T1078.001</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: builtin-account-activity
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+      - case: builtin-account-granted-rights
+        reason: >-
+          Depends on a 90d baseline comparison (host, command_line, organization); a
+          stateless rule holds no history.
+
 evidence:
   required:
     - id: default_account_in_use
@@ -165,7 +219,7 @@ evidence:
         Process activity ran under a built-in or vendor default identity, or such an account
         was enabled, on a host where those accounts are meant to be dormant.
       source: process_creation
-      field: UserName
+      field: user
       indicates: dormant_identity_used
 
   supporting:
@@ -175,7 +229,7 @@ evidence:
         The identity was re-enabled before it was used, which is deliberate adoption of a
         dormant account rather than one that was already in service.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: access_path_creation
     - id: privileged_rights_added
       name: Privileged membership granted to the account
@@ -183,7 +237,7 @@ evidence:
         The account was added to an administrative or remote-access group, which makes a
         dormant identity operationally useful.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: privilege_escalation_attempt
     - id: live_production_host
       name: Host is in live production
@@ -199,7 +253,7 @@ evidence:
         The account's activity was driven by an interpreter or a remote-execution channel
         rather than an interactive console session.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
 
   contradicting:

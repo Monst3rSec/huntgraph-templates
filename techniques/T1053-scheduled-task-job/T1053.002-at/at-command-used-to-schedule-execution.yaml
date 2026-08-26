@@ -73,18 +73,32 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -152,6 +166,64 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100016
+      group: huntgraph,windows,execution,persistence
+      lists: []
+
+    cases:
+      - id: at-scheduling-interpreter
+        covers: at-scheduling-interpreter
+        name: At scheduling an interpreter or writable payload
+        purpose: >-
+          Isolate the invocations whose scheduled command is an interpreter or a
+          program outside the installation trees.
+        rule: |
+          <rule id="100016" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.image" type="pcre2">(?i)^at\.exe$</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(powershell|pwsh|cmd\.exe|wscript|cscript|mshta|rundll32|regsvr32|\\AppData\\|\\Temp\\|\\ProgramData\\|\\Users\\)</field>
+            <description>At scheduling an interpreter or writable payload</description>
+            <mitre><id>T1053.002</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+      - id: at-targeting-remote-host
+        covers: at-targeting-remote-host
+        name: At issued against a remote host
+        purpose: >-
+          Catch the lateral-movement use, where the legacy scheduler creates a task on
+          another machine.
+        rule: |
+          <rule id="100017" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.image" type="pcre2">(?i)^at\.exe$</field>
+            <field name="win.eventdata.commandLine" type="pcre2">\\\\\\\\[^\s"\\]+</field>
+            <description>At issued against a remote host</description>
+            <mitre><id>T1053.002</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: at-command-invoked
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: at_command_used
@@ -160,7 +232,7 @@ evidence:
         The legacy at command was executed, creating a scheduled task through a mechanism
         no current administrative workflow uses and which modern task review may overlook.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: legacy_mechanism_abuse
 
   supporting:
@@ -170,7 +242,7 @@ evidence:
         The command being scheduled is a script interpreter or a program in a user-writable
         directory rather than an installed maintenance utility.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: dynamic_code_execution
     - id: remote_target
       name: Task created on a remote host
@@ -178,7 +250,7 @@ evidence:
         The invocation names a remote machine, which turns scheduled execution into lateral
         movement.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: lateral_movement_attempt
     - id: scripted_parent
       name: Issued by a script host or remote channel
@@ -186,7 +258,7 @@ evidence:
         The command was issued by an interpreter or a remote-execution channel rather than
         by an interactive administrative session.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: unused_in_estate
       name: No comparable use in the estate

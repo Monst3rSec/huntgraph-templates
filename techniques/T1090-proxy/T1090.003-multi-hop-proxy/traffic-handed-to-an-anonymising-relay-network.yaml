@@ -88,39 +88,77 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: network_connection
+      connector: crowdstrike-ngsiem
       event_types:
         - NetworkConnectIP4
         - NetworkConnectIP6
       fields:
-        - aid
-        - ComputerName
-        - ContextProcessId
-        - ContextBaseFileName
-        - RemoteAddressIP4
-        - RemotePort
+        agent_id: aid
+        host: ComputerName
+        process_id: ContextProcessId
+        process_name: ContextBaseFileName
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+    - source: network_connection
+      connector: wazuh
+      event_types:
+        - sysmon_event3
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        process_id: win.eventdata.processId
+        process_name: win.eventdata.image
+        remote_address: win.eventdata.destinationIp
+        remote_port: win.eventdata.destinationPort
     - source: dns_request
+      connector: crowdstrike-ngsiem
       event_types:
         - DnsRequest
       fields:
-        - aid
-        - ComputerName
-        - ContextProcessId
-        - ContextBaseFileName
-        - DomainName
+        agent_id: aid
+        host: ComputerName
+        process_id: ContextProcessId
+        process_name: ContextBaseFileName
+        query_name: DomainName
+    - source: dns_request
+      connector: wazuh
+      event_types:
+        - sysmon_event_22
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        process_id: win.eventdata.processId
+        process_name: win.eventdata.image
+        query_name: win.eventdata.queryName
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -236,6 +274,51 @@ query:
             - process
             - organization
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100416
+      group: huntgraph,windows,command-and-control,multi-hop-proxy
+      lists: []
+
+    cases:
+      - id: hidden-service-name-resolved
+        covers: hidden-service-name-resolved
+        name: Hidden service name sent to the system resolver
+        purpose: >-
+          Onion and I2P names are meant to be resolved inside the overlay, never by
+          the corporate resolver, so a query for one is a leak rather than a lookup.
+          It fails, which is why it is cheap to hunt and why nothing legitimate
+          produces it.
+        rule: |
+          <rule id="100416" level="12">
+            <if_group>sysmon_event_22</if_group>
+            <field name="win.eventdata.queryName" type="pcre2">(?i)\.(onion|i2p|loki)$</field>
+            <description>Hidden service name sent to the system resolver</description>
+            <mitre><id>T1090.003</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: local-anonymising-listener-consumed
+        reason: >-
+          Depends on a 90d baseline comparison (host, process, organization); a
+          stateless rule holds no history.
+      - case: anonymising-client-or-transport-started
+        reason: >-
+          Depends on a 90d baseline comparison (host, process, organization); a
+          stateless rule holds no history.
+      - case: relay-fanout-without-resolution
+        reason: >-
+          Depends on a 90d baseline comparison (host, process, organization); a
+          stateless rule holds no history.
+
 evidence:
   required:
     - id: relay_transport_in_use
@@ -245,7 +328,7 @@ evidence:
         rotating set of external addresses without resolving any of them, which is how a
         chained relay network is entered.
       source: network_connection
-      field: RemoteAddressIP4
+      field: remote_address
       indicates: anonymised_transport_used
 
   supporting:
@@ -255,7 +338,7 @@ evidence:
         A recognised anonymising client or a transport designed to disguise its first hop
         was executed on the host in the same period.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: anonymising_tooling_present
     - id: local_socks_port_consumed
       name: Loopback SOCKS or control port contacted
@@ -263,7 +346,7 @@ evidence:
         A process connected to the loopback port an onion routing client offers, which means
         that process's traffic was carried over the overlay rather than sent directly.
       source: network_connection
-      field: RemotePort
+      field: remote_port
       indicates: traffic_routed_through_overlay
     - id: hidden_service_name_resolved
       name: Hidden service name sent to the corporate resolver
@@ -271,7 +354,7 @@ evidence:
         A name that only resolves inside an overlay network was queried through the system
         resolver, which is a leak from software configured to reach that overlay.
       source: dns_request
-      field: DomainName
+      field: query_name
       indicates: overlay_destination_referenced
     - id: client_in_writable_path
       name: Client running from a user-writable directory
@@ -279,7 +362,7 @@ evidence:
         The executable sits under a user profile, AppData or Temp rather than an installation
         directory, so it was carried onto the host rather than deployed to it.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: untrusted_execution_location
     - id: no_prior_anonymised_traffic
       name: Host has no history of anonymised traffic
@@ -305,7 +388,7 @@ evidence:
         The connecting image is a distributed application that discovers peers by address and
         therefore fans out widely without resolving names, which is the fan-out case by design.
       source: network_connection
-      field: ContextBaseFileName
+      field: process_name
       indicates: legitimate_application_component
     - id: sanctioned_privacy_use
       name: Approved privacy tooling or a recorded engagement

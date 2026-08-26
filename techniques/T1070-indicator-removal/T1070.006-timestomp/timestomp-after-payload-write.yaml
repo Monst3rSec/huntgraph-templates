@@ -72,28 +72,52 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - PeFileWritten
         - NewExecutableWritten
         - NewScriptWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -179,6 +203,48 @@ query:
             - host
             - path
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100288
+      group: huntgraph,windows,stealth,anti-forensics
+      lists: []
+
+    cases:
+      - id: timestamp-copied-from-system-file
+        covers: timestamp-copied-from-system-file
+        name: Timestamps copied from a system file onto another path
+        purpose: >-
+          Catch the specific pattern of sourcing timestamp values from a System32
+          file, which serves no purpose other than making a dropped file look native
+          to the host.
+        rule: |
+          <rule id="100288" level="8">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.image" type="pcre2">(?i)^(powershell|pwsh)\.exe$</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(CreationTime|LastWriteTime)\s*=\s*\(?\s*(Get-Item|\[System\.IO\.File\]::Get)</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(System32|SysWOW64|\\Windows\\)</field>
+            <description>Timestamps copied from a system file onto another path</description>
+            <mitre><id>T1070.006</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: timestamp-rewrite-command
+        reason: >-
+          Depends on a 45d baseline comparison (host, user, parent_process,
+          command_line); a stateless rule holds no history.
+      - case: write-then-timestomp-sequence
+        reason: >-
+          Depends on a 45d baseline comparison (host, path); a stateless rule holds no
+          history.
+
 evidence:
   required:
     - id: timestamp_rewrite
@@ -187,7 +253,7 @@ evidence:
         A command line assigns a creation, write or access timestamp on a file, or calls a
         timestamp-setting API, which alters file metadata rather than reading it.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: metadata_tampering
 
   supporting:
@@ -197,7 +263,7 @@ evidence:
         A PE or script file was created in a user-writable directory on the same host
         shortly before the timestamp rewrite, giving the drop-then-conceal sequence.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: anti_forensic_sequence
     - id: system_file_source
       name: Timestamps sourced from a Windows system file
@@ -205,7 +271,7 @@ evidence:
         The values being applied are read from a file under the Windows directory, which
         serves only to make the target look native to the host.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: deliberate_backdating
     - id: script_host_actor
       name: Script host performing the rewrite
@@ -214,7 +280,7 @@ evidence:
         by build, packaging or backup tooling that has a legitimate reason to normalise
         timestamps.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: non_standard_automation
     - id: rare_for_host
       name: Rewrite unprecedented on this host
@@ -232,7 +298,7 @@ evidence:
         The rewrite is performed by a build, packaging or signing pipeline that normalises
         timestamps to produce reproducible output.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: backup_or_sync_agent
       name: Backup, restore or file-sync agent
@@ -240,7 +306,7 @@ evidence:
         The process performing the rewrite is an approved backup, restore or file-sync
         client, which preserves original timestamps by design when materialising files.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: legitimate_application_component
     - id: designated_build_host
       name: Dedicated build server

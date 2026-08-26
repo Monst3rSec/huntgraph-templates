@@ -44,6 +44,7 @@ from coverage import (  # noqa: E402
     blocking_components,
     corpus_coverage,
     skip_register,
+    wazuh_coverage,
 )
 
 COLUMNS = [
@@ -62,6 +63,9 @@ COLUMNS = [
     "data_components_missing",
     "status",
     "skip_reason",
+    "wazuh_status",
+    "wazuh_rules",
+    "wazuh_not_portable",
     "hypotheses",
     "files",
 ]
@@ -78,6 +82,7 @@ def priority_of(shortname: str) -> str:
 def build_rows(atk: Attack, covered: dict, only_priority: str | None) -> list[dict]:
     tactic_objs = {t["x_mitre_shortname"]: t for t in atk.tactics.values()}
     skipped = skip_register()
+    wazuh = wazuh_coverage()
 
     # which parents decompose
     live = atk.live_techniques()
@@ -110,6 +115,13 @@ def build_rows(atk: Attack, covered: dict, only_priority: str | None) -> list[di
 
         files = covered.get(tid, [])
         skip_reason = skipped.get(tid, "")
+        wz = wazuh.get(tid)
+        if wz:
+            wazuh_status = "covered"
+        elif files:
+            wazuh_status = "crowdstrike-only"
+        else:
+            wazuh_status = ""
         if not leaf:
             status = "parent"
         elif files:
@@ -149,6 +161,9 @@ def build_rows(atk: Attack, covered: dict, only_priority: str | None) -> list[di
                 "data_components_missing": "; ".join(missing),
                 "status": status,
                 "skip_reason": skip_reason,
+                "wazuh_status": wazuh_status,
+                "wazuh_rules": wz["rules"] if wz else "",
+                "wazuh_not_portable": wz["not_portable"] if wz else "",
                 "hypotheses": len(files),
                 "files": "; ".join(files),
             })

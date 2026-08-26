@@ -87,19 +87,34 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -208,6 +223,53 @@ query:
             - user
             - organization
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100432
+      group: huntgraph,windows,persistence,privilege-escalation
+      lists: []
+
+    cases:
+      - id: folder-rights-given-to-default-or-anonymous
+        covers: folder-rights-given-to-default-or-anonymous
+        name: Mailbox folder rights assigned to Default or Anonymous
+        purpose: >-
+          Isolate the variant that needs no named grantee at all. Giving the Default
+          or Anonymous principal reviewer rights on the Inbox or the top of the
+          information store lets any account in the tenant read that mailbox, which is
+          both broader and far quieter than naming a user. Legitimate delegation names
+          a person.
+        rule: |
+          <rule id="100432" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(Add-MailboxFolderPermission|Set-MailboxFolderPermission)</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)-User\s*['"]?(Default|Anonymous)\b</field>
+            <description>Mailbox folder rights assigned to Default or Anonymous</description>
+            <mitre><id>T1098.002</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: mailbox-permission-granted-to-a-principal
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+      - case: impersonation-role-assigned
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+      - case: exchange-session-opened-from-an-unusual-host
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: delegation_granted
@@ -216,7 +278,7 @@ evidence:
         An Exchange cmdlet was executed that grants a principal access to another user's
         mailbox or its folders, which is the persistence itself rather than a step towards it.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: mailbox_delegation_granted
 
   supporting:
@@ -226,7 +288,7 @@ evidence:
         The permission was assigned to the Default or Anonymous principal instead of a named
         person, so any account in the tenant inherits access to the mailbox.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: broad_persistence_scope
     - id: session_from_a_non_admin_host
       name: Exchange session opened from a host that does not administer mail
@@ -235,7 +297,7 @@ evidence:
         workstation with no history of mail administration, which is where the grant came from
         rather than what it did.
       source: process_creation
-      field: ComputerName
+      field: host
       indicates: abnormal_administration_path
     - id: obfuscated_invocation
       name: Cmdlet delivered through an encoded or downloaded command
@@ -244,7 +306,7 @@ evidence:
         time, which keeps the mailbox and grantee arguments out of casual view and is not how
         administration is performed.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: unusual_for_host
       name: No history of mailbox administration on this host

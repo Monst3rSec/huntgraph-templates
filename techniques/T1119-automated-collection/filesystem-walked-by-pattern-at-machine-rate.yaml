@@ -82,19 +82,34 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -238,6 +253,57 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100608
+      group: huntgraph,windows,collection,automated-collection
+      lists: []
+
+    cases:
+      - id: collector-started-by-an-unexpected-parent
+        covers: collector-started-by-an-unexpected-parent
+        name: Collection pipeline started by a process with no document role
+        purpose: >-
+          Give the actor leg, which is what carries the cases whose commands are
+          otherwise ordinary. A gathering pipeline whose parent is a mail client, a
+          browser, a macro host, an archive utility or a remote-execution service did
+          not come from an administrator at a console.
+        rule: |
+          <rule id="100608" level="8">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.parentImage" type="pcre2">(?i)^(winword\.exe|excel\.exe|powerpnt\.exe|outlook\.exe|chrome\.exe|msedge\.exe|firefox\.exe|7z(FM|G)?\.exe|winrar\.exe|mshta\.exe|wscript\.exe|cscript\.exe|wmiprvse\.exe|wsmprovhost\.exe|psexesvc\.exe)$</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(Get-ChildItem|-Recurse|\bdir\b[^|]{0,40}\/s|\bforfiles\b|ForEach-Object|\bfor\b\s+\/[rfd]\b)</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(Copy-Item|\bcopy\b|\bxcopy\b|\brobocopy\b|Compress-Archive|Get-Content|Out-File)</field>
+            <description>Collection pipeline started by a process with no document role</description>
+            <mitre><id>T1119</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: enumerate-filter-and-copy-in-one-instruction
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+      - case: iteration-construct-driving-file-collection
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+      - case: collection-command-repeating-at-machine-rate
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+      - case: collection-pipeline-installed-on-a-schedule
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: patterned_file_collection
@@ -247,7 +313,7 @@ evidence:
         or read, or wrapped a loop around a matched document set, which means the selection
         was made by a rule in advance rather than by a person looking at the files.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: collection_staging
 
   supporting:
@@ -258,7 +324,7 @@ evidence:
         plausibly issue it, or in several distinct forms in quick succession, which is a
         script working through a tree.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: non_standard_automation
     - id: scheduled_collection
       name: Collection pipeline registered to run unattended
@@ -266,7 +332,7 @@ evidence:
         The gathering pipeline was installed as a scheduled task or timed job, making the
         collection recur at set intervals without anyone present.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: scheduled_automation_job
     - id: unexpected_parent
       name: Started by a process with no document-handling role
@@ -274,7 +340,7 @@ evidence:
         The collector was launched by a mail client, browser, macro host, archive utility or
         remote-execution service rather than by a shell an administrator is working in.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: no_baseline_for_command
       name: No history of this command on the host or account
@@ -292,7 +358,7 @@ evidence:
         The acting process belongs to an approved backup, archiving, indexing or
         classification product, which walks the filesystem by pattern as its entire function.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_enterprise_activity
     - id: inventory_or_compliance_sweep
       name: Inventory, licensing or compliance sweep
@@ -300,7 +366,7 @@ evidence:
         The pattern search is a scheduled inventory, licensing or compliance job run from a
         management platform against the whole estate.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: scheduled_automation_job
     - id: developer_processing_own_files
       name: Developer or analyst processing their own tree

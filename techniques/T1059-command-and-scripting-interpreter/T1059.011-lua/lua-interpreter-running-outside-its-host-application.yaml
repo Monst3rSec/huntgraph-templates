@@ -74,28 +74,53 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - NewScriptWritten
         - PeFileWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -198,6 +223,51 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100176
+      group: huntgraph,windows,execution,lua
+      lists: []
+
+    cases:
+      - id: lua-spawning-follow-on
+        covers: lua-spawning-follow-on
+        name: Lua process spawning a shell, downloader or persistence tool
+        purpose: >-
+          Confirm the interpreter was used to reach the operating system rather than
+          to run application logic, which is what an embedded engine is normally
+          confined to.
+        rule: |
+          <rule id="100176" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.parentImage" type="pcre2">(?i)^(lua|luac|luajit|wlua)[\d._]*\.exe$</field>
+            <field name="win.eventdata.image" type="pcre2">(?i)^(cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin|curl|schtasks|reg|net|net1)\.exe$</field>
+            <description>Lua process spawning a shell, downloader or persistence tool</description>
+            <mitre><id>T1059.011</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: interpreter-outside-product-tree
+        reason: >-
+          Depends on a 60d baseline comparison (host, user, path, organization); a
+          stateless rule holds no history.
+      - case: script-or-bytecode-from-delivery-path
+        reason: >-
+          Depends on a 60d baseline comparison (host, user, path); a stateless rule
+          holds no history.
+      - case: lua-artefacts-written-to-disk
+        reason: >-
+          Depends on a 60d baseline comparison (host, path); a stateless rule holds no
+          history.
+
 evidence:
   required:
     - id: detached_lua_execution
@@ -207,7 +277,7 @@ evidence:
         bytecode file from a delivery path, rather than running add-on code from inside the
         product tree of an application that embeds Lua.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: bring_your_own_interpreter
 
   supporting:
@@ -217,7 +287,7 @@ evidence:
         The file executed is compiled Lua rather than source, so the logic cannot be read
         from the artefact by anyone reviewing what ran.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: obscured_payload_content
     - id: interpreter_recently_staged
       name: Interpreter or script written shortly before use
@@ -225,7 +295,7 @@ evidence:
         The Lua binary or script was created in a delivery directory on this host, showing
         it was brought here rather than installed with a product.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: payload_staging
     - id: os_reach_from_lua
       name: Shell, downloader or persistence tool spawned by Lua
@@ -233,7 +303,7 @@ evidence:
         The Lua process created a command interpreter, transfer utility or scheduling tool,
         which an embedded scripting engine has no reason to do.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: execution_chain_progression
     - id: no_lua_product_installed
       name: No Lua-embedding product on the host
@@ -259,7 +329,7 @@ evidence:
         The interpreter and its script both resolve inside the installation tree of a
         product that embeds Lua, and that product is the parent process.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_application_component
     - id: game_or_addon_activity
       name: Game or peripheral add-on activity
@@ -275,7 +345,7 @@ evidence:
         The Lua files were written by a recognised game launcher or software updater as
         part of a normal content refresh.
       source: file_creation
-      field: ContextProcessId
+      field: writer_process_id
       indicates: legitimate_enterprise_activity
 
   risk_logic:

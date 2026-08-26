@@ -71,25 +71,46 @@ requires:
     - linux
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - audit_command
+      fields:
+        agent_id: agent.id
+        host: agent.name
+        image_path: audit.exe
+        command_line: audit.execve.a1
+        parent_process: audit.ppid
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - NewScriptWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - syscheck_entry_added
+      fields:
+        agent_id: agent.id
+        host: agent.name
+        file_path: syscheck.path
 
 query:
   - platform: crowdstrike
@@ -162,6 +183,46 @@ query:
             - path
             - organization
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100496
+      group: huntgraph,linux,persistence,privilege-escalation
+      lists: []
+
+    cases:
+      - id: key-fetched-and-written
+        covers: key-fetched-and-written
+        name: Key retrieved from the network and written
+        purpose: >-
+          Isolate the fully remote form, where the key never existed on the host
+          before and is pulled in as part of establishing access.
+        rule: |
+          <rule id="100496" level="14">
+            <if_group>audit_command</if_group>
+            <field name="audit.execve.a1" type="pcre2">authorized_keys</field>
+            <field name="audit.execve.a1" type="pcre2">(?i)(curl|wget|nc\b|base64\s+-d|https?:\/\/)</field>
+            <description>Key retrieved from the network and written</description>
+            <mitre><id>T1098.004</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: authorized-keys-appended
+        reason: >-
+          Depends on a 60d baseline comparison (host, command_line, organization); a
+          stateless rule holds no history.
+      - case: root-or-other-user-targeted
+        reason: >-
+          Depends on a 60d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: authorized_keys_modified
@@ -171,7 +232,7 @@ evidence:
         rather than through an editor, granting key-based access to whoever holds the
         matching private key.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: persistence_established
 
   supporting:
@@ -181,7 +242,7 @@ evidence:
         The file written belongs to root or to an account other than the one performing the
         write, so the change grants access the writer did not previously have.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: privilege_escalation_attempt
     - id: key_fetched_remotely
       name: Key retrieved over the network
@@ -189,7 +250,7 @@ evidence:
         The public key was fetched from a remote source in the same command, which is
         establishing new access rather than configuring existing access.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: possible_payload_retrieval
     - id: service_account_writer
       name: Written by a service account or remote shell
@@ -197,7 +258,7 @@ evidence:
         The writing process is a web service, application account or a shell reached
         remotely rather than an interactive session belonging to the file's owner.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: rare_in_fleet
       name: Change absent from comparable hosts
@@ -215,7 +276,7 @@ evidence:
         The keys were written by the approved configuration-management agent as part of a
         governed access definition.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: provisioning_seed
       name: Seeded during host build or instance launch

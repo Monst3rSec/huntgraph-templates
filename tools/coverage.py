@@ -124,6 +124,41 @@ def corpus_coverage() -> dict[str, list[str]]:
     return covered
 
 
+def wazuh_coverage() -> dict[str, dict]:
+    """ATT&CK id -> what the Wazuh side of its templates actually carries.
+
+    Reported separately from `covered` because a template with only a CrowdStrike
+    block is not covered for a Wazuh deployment, and a single "covered" column
+    would say it was.
+    """
+    out: dict[str, dict] = {}
+    if not os.path.isdir(TECHNIQUES_DIR):
+        return out
+    for dirpath, _, files in os.walk(TECHNIQUES_DIR):
+        for f in sorted(files):
+            if not f.endswith((".yaml", ".yml")):
+                continue
+            try:
+                with open(os.path.join(dirpath, f)) as fh:
+                    doc = yaml.safe_load(fh)
+            except yaml.YAMLError:
+                continue
+            if not isinstance(doc, dict) or "mitre" not in doc:
+                continue
+            blocks = [b for b in doc.get("query") or [] if b.get("platform") == "wazuh"]
+            if not blocks:
+                continue
+            rules = sum(len(b["cases"]) for b in blocks)
+            notp = sum(len(b["not_portable"]) for b in blocks)
+            m = doc["mitre"]
+            ids = list(m.get("sub_techniques") or []) or list(m.get("techniques") or [])
+            for tid in ids:
+                e = out.setdefault(tid, {"rules": 0, "not_portable": 0})
+                e["rules"] += rules
+                e["not_portable"] += notp
+    return out
+
+
 def skip_register() -> dict[str, str]:
     """Map ATT&CK id -> why this project deliberately does not cover it.
 
