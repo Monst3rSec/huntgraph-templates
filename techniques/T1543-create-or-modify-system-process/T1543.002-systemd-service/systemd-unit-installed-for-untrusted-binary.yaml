@@ -73,25 +73,47 @@ requires:
     - linux
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - audit_command
+      fields:
+        agent_id: agent.id
+        host: agent.name
+        image_path: audit.exe
+        command_line: audit.execve.a1
+        parent_process: audit.ppid
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - NewScriptWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - syscheck_entry_added
+      fields:
+        agent_id: agent.id
+        host: agent.name
+        file_path: syscheck.path
+        writer_process_id: syscheck.audit.process.id
 
 query:
   - platform: crowdstrike
@@ -163,6 +185,46 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101984
+      group: huntgraph,linux,persistence,privilege-escalation
+      lists: []
+
+    cases:
+      - id: service-running-from-writable-path
+        covers: service-running-from-writable-path
+        name: Service process executing from a writable directory
+        purpose: >-
+          Observe the outcome, where a systemd-parented process runs from a location
+          no packaged service occupies.
+        rule: |
+          <rule id="101984" level="12">
+            <if_group>audit_command</if_group>
+            <field name="audit.ppid" type="pcre2">(?i)^systemd$</field>
+            <field name="audit.exe" type="pcre2">^\/(tmp|dev\/shm|var\/tmp|home)\/</field>
+            <description>Service process executing from a writable directory</description>
+            <mitre><id>T1543.002</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: unit-file-written
+        reason: >-
+          Depends on a 60d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+      - case: unit-enabled-and-started
+        reason: >-
+          Depends on a 60d baseline comparison (host, command_line, organization); a
+          stateless rule holds no history.
+
 evidence:
   required:
     - id: untrusted_unit_installed
@@ -172,7 +234,7 @@ evidence:
         is executing from a temporary or world-writable directory, which packaged services
         never do.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: persistence_established
 
   supporting:
@@ -182,7 +244,7 @@ evidence:
         The running service image sits under /tmp, /dev/shm, /var/tmp or a home directory
         rather than in a system binary path.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: untrusted_execution_location
     - id: immediate_activation
       name: Unit enabled and started immediately
@@ -190,7 +252,7 @@ evidence:
         The unit was reloaded, enabled and started in the same activity as it was written,
         bringing the persistence into service without waiting for a reboot.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: persistence_activated
     - id: nonpackage_writer
       name: Written outside package management
@@ -198,7 +260,7 @@ evidence:
         The unit file was created by a web service account, an interactive shell or a
         script rather than by the package manager or configuration management.
       source: file_creation
-      field: ContextProcessId
+      field: writer_process_id
       indicates: abnormal_execution_chain
     - id: rare_in_fleet
       name: Unit absent from comparable hosts
@@ -216,7 +278,7 @@ evidence:
         The unit was written by the package manager as part of installing or updating
         system software.
       source: file_creation
-      field: ContextProcessId
+      field: writer_process_id
       indicates: legitimate_enterprise_activity
     - id: config_management_unit
       name: Deployed by configuration management
@@ -224,7 +286,7 @@ evidence:
         The unit was written by the approved configuration-management agent as part of a
         governed service definition.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: software_deployment_wave
     - id: fleetwide_unit
       name: Same unit across comparable hosts

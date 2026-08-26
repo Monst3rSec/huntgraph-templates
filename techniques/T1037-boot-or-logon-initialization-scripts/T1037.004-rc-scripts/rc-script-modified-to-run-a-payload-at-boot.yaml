@@ -77,26 +77,49 @@ requires:
     - linux
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - audit_command
+      fields:
+        agent_id: agent.id
+        host: agent.name
+        user: audit.auid
+        image_path: audit.exe
+        command_line: audit.execve.a1
+        parent_process: audit.ppid
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - NewScriptWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - syscheck_entry_added
+      fields:
+        agent_id: agent.id
+        host: agent.name
+        file_path: syscheck.path
+        writer_process_id: syscheck.audit.process.id
 
 query:
   - platform: crowdstrike
@@ -196,6 +219,51 @@ query:
             - path
             - organization
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101952
+      group: huntgraph,linux,persistence,privilege-escalation
+      lists: []
+
+    cases:
+      - id: rc-edit-carrying-a-payload
+        covers: rc-edit-carrying-a-payload
+        name: rc script edit embedding a fetch or a temporary path
+        purpose: >-
+          Isolate the edits whose content cannot be explained as legacy tuning: a boot
+          line that retrieves remote content or executes from a world-writable
+          directory is persistence, not a mount or a sysctl.
+        rule: |
+          <rule id="101952" level="12">
+            <if_group>audit_command</if_group>
+            <field name="audit.execve.a1" type="pcre2">\/etc\/(rc\.local|rc\.common|init\.d\/|rc\.d\/|rc\.local\.d\/)</field>
+            <field name="audit.execve.a1" type="pcre2">(?i)(curl|wget|nc\b|ncat|base64|python[0-9.]*|perl|\/tmp\/|\/dev\/shm\/|\/var\/tmp\/|\/\.[a-z0-9_-]+\/)</field>
+            <description>rc script edit embedding a fetch or a temporary path</description>
+            <mitre><id>T1037.004</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: rc-script-written
+        reason: >-
+          Depends on a 90d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+      - case: rc-local-appended-from-a-shell
+        reason: >-
+          Depends on a 90d baseline comparison (host, command_line, organization); a
+          stateless rule holds no history.
+      - case: rc-script-spawned-a-child
+        reason: >-
+          Depends on a 90d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: rc_script_modified
@@ -205,7 +273,7 @@ evidence:
         /etc/init.d or an rc run-level directory, so its contents will execute as root on
         the next restart.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: boot_persistence_installed
 
   supporting:
@@ -216,7 +284,7 @@ evidence:
         service account, which is how an operator installs a boot line and not how software
         is deployed.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: abnormal_execution_chain
     - id: payload_reference_in_edit
       name: Added line fetches content or runs from a writable path
@@ -224,7 +292,7 @@ evidence:
         The edit references a network retrieval utility or a payload under /tmp, /var/tmp,
         /dev/shm or a hidden directory, none of which legacy boot tuning requires.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: possible_payload_retrieval
     - id: rc_spawned_untrusted_child
       name: RC script executed a binary from a writable directory
@@ -232,7 +300,7 @@ evidence:
         A process parented by an rc or init script started from a temporary, home or hidden
         path, confirming the boot line runs and what it runs.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: execution_chain_progression
     - id: rc_change_rare_in_fleet
       name: Change absent from comparable hosts
@@ -250,7 +318,7 @@ evidence:
         The init script was placed by the package manager while installing software that
         still ships sysvinit compatibility, which is the ordinary reason these files change.
       source: file_creation
-      field: ContextProcessId
+      field: writer_process_id
       indicates: legitimate_enterprise_activity
     - id: config_management_rc
       name: Deployed by configuration management
@@ -258,7 +326,7 @@ evidence:
         The rc script content was written by the approved configuration-management agent as
         part of a governed host definition.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: software_deployment_wave
     - id: rc_change_fleetwide
       name: Identical change across comparable hosts

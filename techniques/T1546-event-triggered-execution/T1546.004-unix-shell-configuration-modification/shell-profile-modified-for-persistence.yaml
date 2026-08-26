@@ -72,25 +72,47 @@ requires:
     - linux
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - audit_command
+      fields:
+        agent_id: agent.id
+        host: agent.name
+        image_path: audit.exe
+        command_line: audit.execve.a1
+        parent_process: audit.ppid
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - NewScriptWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - syscheck_entry_added
+      fields:
+        agent_id: agent.id
+        host: agent.name
+        file_path: syscheck.path
+        writer_process_id: syscheck.audit.process.id
 
 query:
   - platform: crowdstrike
@@ -163,6 +185,46 @@ query:
             - path
             - organization
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 102000
+      group: huntgraph,linux,persistence,privilege-escalation
+      lists: []
+
+    cases:
+      - id: startup-file-with-fetch
+        covers: startup-file-with-fetch
+        name: Startup file edit embedding a network fetch
+        purpose: >-
+          Isolate additions that retrieve and run remote content, which re-establishes
+          the payload on every login regardless of local cleanup.
+        rule: |
+          <rule id="102000" level="12">
+            <if_group>audit_command</if_group>
+            <field name="audit.execve.a1" type="pcre2">(\.bashrc|\.profile|\.zshrc|\/etc\/profile\.d\/)</field>
+            <field name="audit.execve.a1" type="pcre2">(?i)(curl|wget|nc\b|base64|python|perl|\/tmp\/|\/dev\/shm\/|\/var\/tmp\/)</field>
+            <description>Startup file edit embedding a network fetch</description>
+            <mitre><id>T1546.004</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: startup-file-appended
+        reason: >-
+          Depends on a 60d baseline comparison (host, command_line, organization); a
+          stateless rule holds no history.
+      - case: profile-d-file-created
+        reason: >-
+          Depends on a 60d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: startup_file_modified
@@ -171,7 +233,7 @@ evidence:
         A shell startup file was appended to or created by a redirect, tee or sed rather
         than through an editor, so a command will run whenever a shell is opened.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: persistence_established
 
   supporting:
@@ -181,7 +243,7 @@ evidence:
         The addition retrieves content over the network or invokes a payload under /tmp,
         /dev/shm or /var/tmp, which no environment customisation requires.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: possible_payload_retrieval
     - id: system_wide_scope
       name: Change affects every user on the host
@@ -189,7 +251,7 @@ evidence:
         The modification targets /etc/profile, /etc/bash.bashrc or a /etc/profile.d
         drop-in, so it executes for every account rather than one.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: broad_persistence_scope
     - id: nonshell_writer
       name: Written by a service account or non-shell process
@@ -197,7 +259,7 @@ evidence:
         The writing process is a web service, application account or script rather than an
         interactive shell belonging to the file's owner.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: rare_in_fleet
       name: Change absent from comparable hosts
@@ -215,7 +277,7 @@ evidence:
         The file was created by the package manager while installing software that sets up
         environment variables or shell completion.
       source: file_creation
-      field: ContextProcessId
+      field: writer_process_id
       indicates: legitimate_enterprise_activity
     - id: config_management_profile
       name: Deployed by configuration management
@@ -223,7 +285,7 @@ evidence:
         The profile change was written by the approved configuration-management agent as
         part of a governed environment definition.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: software_deployment_wave
     - id: fleetwide_change
       name: Same change across comparable hosts

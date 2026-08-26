@@ -81,26 +81,49 @@ requires:
     - linux
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - audit_command
+      fields:
+        agent_id: agent.id
+        host: agent.name
+        user: audit.auid
+        image_path: audit.exe
+        command_line: audit.execve.a1
+        parent_process: audit.ppid
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - NewExecutableWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - syscheck_entry_added
+      fields:
+        agent_id: agent.id
+        host: agent.name
+        file_path: syscheck.path
+        writer_process_id: syscheck.audit.process.id
 
 query:
   - platform: crowdstrike
@@ -205,6 +228,51 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 102016
+      group: huntgraph,linux,persistence,credential-access
+      lists: []
+
+    cases:
+      - id: pam-module-staged-or-built-locally
+        covers: pam-module-staged-or-built-locally
+        name: PAM module compiled, fetched or copied into place
+        purpose: >-
+          Cover the staging step that precedes the replacement. Modules ship in
+          packages, so a compiler, downloader or plain copy handling a file named like
+          a PAM module describes a build the distribution never produced.
+        rule: |
+          <rule id="102016" level="14">
+            <if_group>audit_command</if_group>
+            <field name="audit.execve.a1" type="pcre2">pam_[a-z0-9_]+\.so</field>
+            <field name="audit.execve.a1" type="pcre2">(?i)(\bgcc\b|\bcc\b|\bclang\b|\bmake\b|\bcurl\b|\bwget\b|\bcp\b|\bmv\b|\binstall\b|\bpatchelf\b|\bobjcopy\b)</field>
+            <description>PAM module compiled, fetched or copied into place</description>
+            <mitre><id>T1556.003</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: pam-configuration-edited-from-a-shell
+        reason: >-
+          Depends on a 90d baseline comparison (host, command_line, organization); a
+          stateless rule holds no history.
+      - case: authentication-stack-made-permissive
+        reason: >-
+          Depends on a 90d baseline comparison (host, command_line, organization); a
+          stateless rule holds no history.
+      - case: pam-module-written-to-the-security-directory
+        reason: >-
+          Depends on a 90d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: pam_stack_modified
@@ -213,7 +281,7 @@ evidence:
         A file that decides authentication on this host was edited or a PAM module was handled
         outside the package manager, which changes how every login on the system is evaluated.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: authentication_process_modification
 
   supporting:
@@ -223,7 +291,7 @@ evidence:
         The change names a permissive module, marks a module sufficient, or allows empty
         passwords, so authentication no longer depends on the password supplied.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: authentication_bypass_installed
     - id: module_binary_replaced
       name: Shared module written into the security directory
@@ -231,7 +299,7 @@ evidence:
         A PAM module shared object appeared in the security module directory, which is the
         form of this technique that leaves the configuration files looking untouched.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: authentication_component_tampering
     - id: no_package_transaction
       name: No package transaction accounts for the change
@@ -257,7 +325,7 @@ evidence:
         The change was made beneath a package manager transaction, which is how PAM modules
         and their default configuration are normally replaced.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: config_management_run
       name: Rendered by configuration management
@@ -265,7 +333,7 @@ evidence:
         The writing process is the approved configuration-management agent applying a governed
         authentication policy, which produces the same files across the estate.
       source: file_creation
-      field: ContextProcessId
+      field: writer_process_id
       indicates: legitimate_enterprise_activity
     - id: approved_auth_integration
       name: Recorded authentication integration work
