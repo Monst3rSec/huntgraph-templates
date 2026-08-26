@@ -91,16 +91,30 @@ def rule_for_case(case: dict, source_of_event: dict, smap: dict, plat: str, rid:
 
     lines = ['<rule id="%d" level="%d">' % (rid, LEVEL.get(sev, 8)),
              "  <if_group>%s</if_group>" % anchors[0]]
-    mapped = 0
+    mapped, dropped = 0, []
     for fld, op, pattern, flags in filters:
         logical = logical_for(smap, source, fld)
         wfield = smap[source]["fields"].get(logical, {}).get(plat) if logical else None
         if not wfield:
+            dropped.append(fld)
             continue
+        # A named capture is a CQL idiom for feeding a later filter. Wazuh does
+        # not bind it to anything, so keep the group non-capturing for clarity.
+        pattern = re.sub(r"\(\?<[A-Za-z_][A-Za-z0-9_]*>", "(?:", pattern)
         pat = ("(?i)" if "i" in flags else "") + pattern
         neg = ' negate="yes"' if op == "!=" else ""
         lines.append('  <field name="%s" type="pcre2"%s>%s</field>' % (wfield, neg, escape(pat)))
         mapped += 1
+
+    # Refuse rather than emit a broader rule than the CQL asked for. A dropped
+    # filter is usually THE discriminator — a CQL-derived variable narrowing a
+    # path to the writable ones, say — and a rule missing it still matches, still
+    # validates, and fires on exactly the benign activity the case excluded.
+    if dropped:
+        return None, ("Its discriminator filters on %s, a CQL-derived variable or unmapped "
+                      "field with no Wazuh equivalent. Emitting the rule without that "
+                      "condition would broaden it to the benign activity the case exists to "
+                      "exclude." % ", ".join(sorted(set(dropped))))
     if not mapped:
         return None, "None of the case's filter fields have a Wazuh equivalent on %s." % plat
 
