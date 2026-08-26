@@ -71,18 +71,32 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -158,6 +172,47 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101888
+      group: huntgraph,windows,defense-impairment,anti-forensics
+      lists: []
+
+    cases:
+      - id: evtx-file-deletion
+        covers: evtx-file-deletion
+        name: Event log files deleted or the log service stopped
+        purpose: >-
+          Catch the cruder variant, where the .evtx files are removed on disk or the
+          service is stopped first so that they can be, which leaves no cleared-log
+          record behind at all.
+        rule: |
+          <rule id="101888" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)\.evtx\b</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)\b(del|erase|rm|Remove-Item|move|ren)\b|net\s+stop\s+eventlog|Stop-Service\s+.*eventlog</field>
+            <description>Event log files deleted or the log service stopped</description>
+            <mitre><id>T1685.005</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: wevtutil-clear
+        reason: >-
+          Depends on a 60d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+      - case: powershell-clear-eventlog
+        reason: >-
+          Depends on a 60d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: log_clearing_action
@@ -166,7 +221,7 @@ evidence:
         A command clears one or more Windows event log channels, or deletes the underlying
         .evtx files, destroying the host-side record of prior activity.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: evidence_destruction
 
   supporting:
@@ -177,7 +232,7 @@ evidence:
         noisy application log, so the record destroyed is the one that documents access
         and execution.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: targeted_evidence_destruction
     - id: service_account_actor
       name: Service or non-administrative account performing the clear
@@ -185,7 +240,7 @@ evidence:
         The clearing account is a service, shared or recently privileged account rather
         than a named administrator with a routine reason to maintain logs.
       source: process_creation
-      field: UserName
+      field: user
       indicates: suspicious_account_context
     - id: scripted_parent
       name: Script host or remote-execution parent
@@ -193,7 +248,7 @@ evidence:
         The clearing command was issued by a script host or through a remote-execution
         channel rather than from an interactive administrative console.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: unprecedented_for_host
       name: No prior clearing on this host
@@ -219,7 +274,7 @@ evidence:
         The approved build or provisioning automation issued the clear as a documented
         final step of a host build.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: application_log_only
       name: Only a noisy application log cleared
@@ -227,7 +282,7 @@ evidence:
         The single channel cleared is an application log with a known noise problem, which
         matches routine troubleshooting rather than record destruction.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: legitimate_administrative_action
 
   risk_logic:

@@ -73,19 +73,34 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -152,6 +167,63 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101648
+      group: huntgraph,windows,stealth,hide-artifacts
+      lists: []
+
+    cases:
+      - id: headless-guest-started
+        covers: headless-guest-started
+        name: Guest started headlessly
+        purpose: >-
+          Isolate guests launched without a visible window, which is how a virtual
+          machine runs on a user's desktop without the user noticing.
+        rule: |
+          <rule id="101648" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(VBoxManage\s+startvm|VBoxHeadless|qemu-system|vmrun\s+.*start|Start-VM)</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(--type\s+headless|-nographic|-display\s+none|nogui|headless)</field>
+            <description>Guest started headlessly</description>
+            <mitre><id>T1564.006</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+      - id: host-storage-attached
+        covers: host-storage-attached
+        name: Host storage attached to a guest
+        purpose: >-
+          Catch the step that gives the guest reach into the host's own files, which
+          is what makes the concealment useful rather than merely isolating.
+        rule: |
+          <rule id="101649" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(VBoxManage\s+(sharedfolder|storageattach)|vmrun\s+.*addSharedFolder|Add-VMHardDiskDrive|-drive\s+file=\\\\\\\\\.\\\\PhysicalDrive)</field>
+            <description>Host storage attached to a guest</description>
+            <mitre><id>T1564.006</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: virtualisation-installed
+        reason: >-
+          Depends on a 90d baseline comparison (host, organization); a stateless rule
+          holds no history.
+
 evidence:
   required:
     - id: guest_environment_used
@@ -160,7 +232,7 @@ evidence:
         Virtualisation was installed or enabled, or a guest was started, creating an
         execution environment the endpoint sensor cannot inspect from the host.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: sensor_visibility_gap
 
   supporting:
@@ -170,7 +242,7 @@ evidence:
         The guest was launched headlessly, so it runs on the user's machine without any
         window to notice, which no ordinary development use requires.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: execution_concealment
     - id: host_storage_attached
       name: Host storage mounted into the guest
@@ -178,7 +250,7 @@ evidence:
         Host drives or shared folders were attached to the guest, giving code inside it
         reach into the host's own files.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: host_reach_from_guest
     - id: no_virtualisation_history
       name: Host has no history of running guests
@@ -194,7 +266,7 @@ evidence:
         The installation was performed by an interpreter or a remote-execution channel
         rather than by a deployment agent or a user running an installer.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
 
   contradicting:
@@ -212,7 +284,7 @@ evidence:
         The virtualisation belongs to an approved product that uses it for containers,
         sandboxing or protection features.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_application_component
     - id: managed_deployment
       name: Managed virtualisation deployment

@@ -83,19 +83,33 @@ requires:
     - linux
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - audit_command
+      fields:
+        agent_id: agent.id
+        host: agent.name
+        user: audit.auid
+        image_name: audit.exe
+        image_path: audit.exe
+        command_line: audit.execve.a1
+        parent_process: audit.ppid
 
 query:
   - platform: crowdstrike
@@ -208,6 +222,54 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101840
+      group: huntgraph,linux,stealth,social-engineering
+      lists: []
+
+    cases:
+      - id: impersonation-language-in-a-composed-message
+        covers: impersonation-language-in-a-composed-message
+        name: Payment or urgency wording in a message composed on the command line
+        purpose: >-
+          Apply the discriminator the technique itself names. Impersonation is aimed
+          at making someone act quickly, so the subject line carries payment, wire,
+          invoice or urgency wording, and the sender is chosen to make that plausible.
+          Automated mail is repetitive and operational; a message assembled around a
+          payment request under an overridden sender is not.
+        rule: |
+          <rule id="101840" level="12">
+            <if_group>audit_command</if_group>
+            <field name="audit.execve.a1" type="pcre2">(?i)(sendmail|mailx|\bmail\b|mutt|neomutt|msmtp|swaks|sendemail|smtplib|Net::SMTP)</field>
+            <field name="audit.execve.a1" type="pcre2">(?i)(-s\s|Subject:|--body|--data)</field>
+            <field name="audit.execve.a1" type="pcre2">(?i)(wire\s*transfer|payment|invoice|remittance|bank\s*details|urgent|password\s*reset|verify\s*your|gift\s*card|payroll)</field>
+            <description>Payment or urgency wording in a message composed on the command line</description>
+            <mitre><id>T1684.001</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: sender-identity-overridden-on-a-mail-tool
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+      - case: from-header-written-into-a-piped-message
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+      - case: smtp-submission-from-an-interpreter
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: sender_identity_forged
@@ -217,7 +279,7 @@ evidence:
         From header was written by hand into a piped message, so the message leaves the host
         claiming to come from someone other than the account that sent it.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: sender_identity_forged
 
   supporting:
@@ -228,7 +290,7 @@ evidence:
         cron, systemd or an application, which is how a person sends a message by hand and not
         how service mail is produced.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: relay_bypassed_from_a_script
       name: Submitted straight to a relay from an interpreter
@@ -237,7 +299,7 @@ evidence:
         queued through the local mail system, which leaves the impersonated identity visible
         only in the command that sent it.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: mail_submission_outside_normal_path
     - id: impersonation_language_present
       name: Payment or urgency wording in the composed message
@@ -246,7 +308,7 @@ evidence:
         which is the pressure the technique relies on to get the recipient to act before
         checking who really sent it.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: social_engineering_pressure
     - id: sender_new_for_host
       name: Sender identity never used from this host
@@ -264,7 +326,7 @@ evidence:
         The submitting process is a child of cron, systemd or a monitoring daemon, which is
         how backup reports, alerts and job output are mailed on every run.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: known_notification_sender
       name: Host is a sanctioned notification sender

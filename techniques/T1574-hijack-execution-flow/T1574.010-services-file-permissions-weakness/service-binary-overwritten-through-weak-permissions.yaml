@@ -73,29 +73,55 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - PeFileWritten
         - NewExecutableWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
-        - SHA256HashData
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+        file_hash: SHA256HashData
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
+        file_hash: win.eventdata.hashes
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -176,6 +202,47 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101808
+      group: huntgraph,windows,privilege-escalation,execution
+      lists: []
+
+    cases:
+      - id: permissions-relaxed-on-service-path
+        covers: permissions-relaxed-on-service-path
+        name: Permissions relaxed on a service directory
+        purpose: >-
+          Catch the condition being created rather than inherited, which is the
+          variant that leaves a configuration artefact.
+        rule: |
+          <rule id="101808" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(icacls|cacls|takeown|Set-Acl)</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)\\(Program Files( \(x86\))?|ProgramData)\\</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(\/grant|:F\b|:M\b|everyone|users|authenticated users)</field>
+            <description>Permissions relaxed on a service directory</description>
+            <mitre><id>T1574.010</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: service-binary-overwritten
+        reason: >-
+          Depends on a 60d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+      - case: overwrite-then-service-restart
+        reason: >-
+          Depends on a 60d baseline comparison (host, path); a stateless rule holds no
+          history.
+
 evidence:
   required:
     - id: service_binary_replaced
@@ -184,7 +251,7 @@ evidence:
         A binary was written over an existing executable in an installation directory that
         a service runs from, so the service control manager will launch the new file.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: hijacked_execution_flow
 
   supporting:
@@ -194,7 +261,7 @@ evidence:
         A service was stopped and started shortly after the binary was replaced, which
         executes the new file rather than waiting for a reboot.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: privilege_escalation_attempt
     - id: permissions_relaxed
       name: Permissions widened on the service directory
@@ -202,7 +269,7 @@ evidence:
         Access control on the installation path was loosened, which is the escalation
         condition being created rather than found.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: access_path_creation
     - id: non_updater_writer
       name: Written by something other than an updater
@@ -210,7 +277,7 @@ evidence:
         The writing process is an interpreter, archive tool or delivery application rather
         than the product's own updater or a deployment agent.
       source: file_creation
-      field: ContextProcessId
+      field: writer_process_id
       indicates: abnormal_execution_chain
     - id: unknown_hash
       name: Replacement binary unknown across the estate
@@ -228,7 +295,7 @@ evidence:
         The write was performed by the product's updater or a deployment agent patching the
         software it owns.
       source: file_creation
-      field: ContextProcessId
+      field: writer_process_id
       indicates: legitimate_enterprise_activity
     - id: fleetwide_update
       name: Same replacement across the estate

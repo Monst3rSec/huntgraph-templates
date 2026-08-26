@@ -83,36 +83,70 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - PeFileWritten
         - NewExecutableWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
-        - SHA256HashData
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+        file_hash: SHA256HashData
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
+        file_hash: win.eventdata.hashes
     - source: network_connection
+      connector: crowdstrike-ngsiem
       event_types:
         - NetworkConnectIP4
         - NetworkConnectIP6
       fields:
-        - aid
-        - ComputerName
-        - ContextBaseFileName
-        - ContextProcessId
-        - RemoteAddressIP4
-        - RemotePort
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+    - source: network_connection
+      connector: wazuh
+      event_types:
+        - sysmon_event3
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        process_name: win.eventdata.image
+        process_id: win.eventdata.processId
+        remote_address: win.eventdata.destinationIp
+        remote_port: win.eventdata.destinationPort
     - source: dns_request
+      connector: crowdstrike-ngsiem
       event_types:
         - DnsRequest
       fields:
-        - aid
-        - ComputerName
-        - DomainName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_id: ContextProcessId
+    - source: dns_request
+      connector: wazuh
+      event_types:
+        - sysmon_event_22
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        query_name: win.eventdata.queryName
+        process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -224,6 +258,52 @@ query:
             - process
             - remote_address
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101072
+      group: huntgraph,windows,command-and-control,remote-access
+      lists: []
+
+    cases:
+      - id: agent-dropped-outside-an-installation-path
+        covers: agent-dropped-outside-an-installation-path
+        name: Agent written to a profile or temporary directory
+        purpose: >-
+          Separate a deployment from a drop. A product the service desk rolls out
+          lands in a program directory through an installer; a portable agent an
+          operator brings with them lands wherever they can write, and runs from
+          there.
+        rule: |
+          <rule id="101072" level="12">
+            <if_group>sysmon_event_11</if_group>
+            <field name="win.eventdata.targetFilename" type="pcre2">(?i)(teamviewer|anydesk|screenconnect|connectwise|logmein|ammyy|atera|splashtop|srmanager|supremo|netsupport|client32|rutserv|rfusclient|simplehelp|action1|ninjarmm|netbird|dwagent|zohoassist|rustdesk|todesk|meshagent|ultravnc|tightvnc|winvnc)</field>
+            <field name="win.eventdata.targetFilename" type="pcre2">(?i)\\(Users|AppData|Temp|Downloads|Public|PerfLogs|Windows\\Temp)\\</field>
+            <description>Agent written to a profile or temporary directory</description>
+            <mitre><id>T1219.002</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: remote-support-agent-binary-written
+        reason: >-
+          Depends on a 90d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+      - case: vendor-relay-contacted-from-this-host
+        reason: >-
+          Depends on a 90d baseline comparison (host, domain, organization); a
+          stateless rule holds no history.
+      - case: agent-holding-a-steady-outbound-session
+        reason: >-
+          Depends on a 90d baseline comparison (host, process, remote_address); a
+          stateless rule holds no history.
+
 evidence:
   required:
     - id: unsanctioned_remote_support_agent_written
@@ -233,7 +313,7 @@ evidence:
         not the product the organisation has standardised on, so no existing deployment
         accounts for its presence.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: remote_access_tool_deployed
 
   supporting:
@@ -243,7 +323,7 @@ evidence:
         The binary landed somewhere a user or an operator can write rather than in a program
         directory, which is how a portable agent is brought in rather than deployed.
       source: file_creation
-      field: ContextProcessId
+      field: writer_process_id
       indicates: tooling_staged_on_host
     - id: vendor_relay_resolved
       name: Vendor relay resolved from this machine
@@ -251,7 +331,7 @@ evidence:
         The host looked up the remote support vendor's relay domain, showing the agent tried
         to register rather than sitting inert on disk.
       source: dns_request
-      field: DomainName
+      field: query_name
       indicates: external_service_contacted
     - id: agent_holding_an_outbound_session
       name: Agent maintaining a session with its relay
@@ -259,7 +339,7 @@ evidence:
         The agent process kept or repeatedly re-established an outbound connection, which is
         what leaves the host joinable from the vendor's portal.
       source: network_connection
-      field: ContextBaseFileName
+      field: process_name
       indicates: inbound_access_available
     - id: relay_endpoint_new_to_the_estate
       name: Relay endpoint not contacted by anything else
@@ -267,7 +347,7 @@ evidence:
         No other host has reached this destination during the baseline window, so the channel
         belongs to this machine alone rather than to a managed deployment.
       source: network_connection
-      field: RemoteAddressIP4
+      field: remote_address
       indicates: unusual_destination
     - id: binary_unseen_elsewhere_in_the_estate
       name: Binary hash unknown across the estate

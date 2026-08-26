@@ -74,18 +74,32 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -158,6 +172,46 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101536
+      group: huntgraph,windows,credential-access,kerberos
+      lists: []
+
+    cases:
+      - id: ticket-request-tooling
+        covers: ticket-request-tooling
+        name: Ticket request or export tooling invoked
+        purpose: >-
+          Catch the harvesting step itself, where tickets are requested or pulled out
+          of memory for offline work.
+        rule: |
+          <rule id="101536" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(KerberosRequestorSecurityToken|Add-Type\s+.*System\.IdentityModel|kerberoast|Request-SPNTicket|klist\s+.*purge|sekurlsa::tickets|kerberos::list.*\/export|tgtdeleg)</field>
+            <description>Ticket request or export tooling invoked</description>
+            <mitre><id>T1558.003</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: spn-enumeration
+        reason: >-
+          Depends on a 60d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+      - case: enumerate-then-request
+        reason: >-
+          Its discriminator filters on spn_query, a CQL-derived variable or unmapped
+          field with no Wazuh equivalent. Emitting the rule without that condition
+          would broaden it to the benign activity the case exists to exclude.
+
 evidence:
   required:
     - id: ticket_harvesting_activity
@@ -167,7 +221,7 @@ evidence:
         to request or export service tickets, which is the mechanism by which crackable
         credential material is obtained.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: credential_material_capture
 
   supporting:
@@ -177,7 +231,7 @@ evidence:
         Service principal enumeration was followed by ticket requests on the same host and
         account, which is the harvesting sequence rather than an isolated directory query.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: hands_on_keyboard_activity
     - id: export_tooling
       name: Ticket export tooling invoked
@@ -185,7 +239,7 @@ evidence:
         Tooling capable of extracting tickets from memory was used, indicating collection
         for offline cracking rather than ordinary Kerberos use.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: credential_decryption_attempt
     - id: workstation_origin
       name: Activity originating from a workstation
@@ -219,7 +273,7 @@ evidence:
         An approved monitoring or inventory product queries service accounts on a schedule
         as part of its documented behaviour.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: scheduled_automation_job
     - id: sanctioned_assessment
       name: Recorded security assessment

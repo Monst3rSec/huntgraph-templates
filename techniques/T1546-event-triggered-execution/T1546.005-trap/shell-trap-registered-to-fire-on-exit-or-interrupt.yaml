@@ -77,18 +77,31 @@ requires:
     - linux
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - audit_command
+      fields:
+        agent_id: agent.id
+        host: agent.name
+        user: audit.auid
+        image_path: audit.exe
+        command_line: audit.execve.a1
+        parent_process: audit.ppid
 
 query:
   - platform: crowdstrike
@@ -192,6 +205,52 @@ query:
             - user
             - organization
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101184
+      group: huntgraph,linux,persistence,privilege-escalation
+      lists: []
+
+    cases:
+      - id: trap-command-list-carrying-a-payload
+        covers: trap-command-list-carrying-a-payload
+        name: Trap whose command list fetches or executes content
+        purpose: >-
+          Apply the discriminator directly. Cleanup traps delete temporary files and
+          remove locks; a trap that retrieves remote content, decodes a blob or
+          launches an interpreter from a writable path is doing something no cleanup
+          handler needs to do.
+        rule: |
+          <rule id="101184" level="8">
+            <if_group>audit_command</if_group>
+            <field name="audit.execve.a1" type="pcre2">\btrap\b</field>
+            <field name="audit.execve.a1" type="pcre2">(?i)(curl|wget|nc\b|ncat|socat|base64|openssl\s+enc|python[0-9.]*\s|perl\s|\/tmp\/|\/dev\/shm\/|\/var\/tmp\/|\/\.[a-z0-9_-]+\/|bash\s+-i|sh\s+-i|&gt;&amp;\s*\/dev\/tcp)</field>
+            <description>Trap whose command list fetches or executes content</description>
+            <mitre><id>T1546.005</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: trap-appended-to-a-startup-file
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+      - case: trap-on-a-session-ending-signal
+        reason: >-
+          Depends on a 60d baseline comparison (host, command_line, organization); a
+          stateless rule holds no history.
+      - case: trap-on-debug-or-err
+        reason: >-
+          Depends on a 60d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: trap_registered
@@ -200,7 +259,7 @@ evidence:
         A trap command bound a command list to a signal, so the shell will execute that list
         when the signal arrives rather than at any point the operator initiates.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: event_triggered_persistence
 
   supporting:
@@ -210,7 +269,7 @@ evidence:
         The registration was appended to a login or interactive startup file, so the trap
         re-arms in every shell the account opens instead of living for one script run.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: persistence_established
     - id: trap_payload_in_command_list
       name: Command list fetches, decodes or spawns
@@ -218,7 +277,7 @@ evidence:
         The trapped command list retrieves remote content, decodes data or launches an
         interpreter or shell from a writable path, which no cleanup handler requires.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: possible_payload_retrieval
     - id: trap_registered_noninteractively
       name: Registered by a service account or non-shell process
@@ -226,7 +285,7 @@ evidence:
         The trap was installed by a web service, application account or downloaded script
         rather than by a person working in their own shell.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: trap_rare_in_fleet
       name: Trap absent from comparable hosts
@@ -244,7 +303,7 @@ evidence:
         The registration belongs to an installed or vendor-supplied script that traps EXIT
         to remove its temporary files, which is standard defensive shell practice.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_application_component
     - id: build_tooling_trap
       name: Trap set by build or deployment tooling
@@ -252,7 +311,7 @@ evidence:
         The trap was registered by a build, packaging or deployment process that reports or
         rolls back on failure, which is why ERR and INT handlers exist in that tooling.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: trap_fleetwide
       name: Same trap across comparable hosts

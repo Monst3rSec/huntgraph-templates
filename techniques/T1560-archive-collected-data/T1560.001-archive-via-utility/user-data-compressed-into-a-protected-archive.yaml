@@ -93,19 +93,34 @@ requires:
     - macos
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -257,6 +272,56 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101584
+      group: huntgraph,windows,collection,archive-collected-data
+      lists: []
+
+    cases:
+      - id: archiver-spawned-by-an-unusual-parent
+        covers: archiver-spawned-by-an-unusual-parent
+        name: Archiving utility spawned by an application that has no archiving role
+        purpose: >-
+          Cover the case where the command line looks ordinary and only the lineage is
+          wrong. An archiver parented by an office application, a browser, a mail
+          client, a web service account or a remote shell is compressing on someone
+          else's behalf, which is the shape MITRE's macOS analytic calls out directly.
+        rule: |
+          <rule id="101584" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)\b(7z|7za|7zr|rar|winrar|zip|tar|makecab|diantz|certutil|ditto|hdiutil|Compress-Archive)\b</field>
+            <field name="win.eventdata.parentImage" type="pcre2">(?i)^(winword\.exe|excel\.exe|powerpnt\.exe|outlook\.exe|msaccess\.exe|mshta\.exe|wscript\.exe|cscript\.exe|w3wp\.exe|httpd|nginx|java|node|chrome\.exe|msedge\.exe|firefox\.exe|Microsoft Word|Microsoft Excel|Terminal)$</field>
+            <description>Archiving utility spawned by an application that has no archiving role</description>
+            <mitre><id>T1560.001</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: archive-over-user-data-trees
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, command_line,
+          organization); a stateless rule holds no history.
+      - case: password-protected-archive
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+      - case: archive-written-to-a-scratch-path
+        reason: >-
+          Depends on a 90d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+      - case: many-sources-one-output
+        reason: >-
+          Depends on a 30d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: collected_data_archived
@@ -266,7 +331,7 @@ evidence:
         is the step that turns a set of collected files into a single object suitable for
         transfer.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: data_packaged_for_transfer
 
   supporting:
@@ -276,7 +341,7 @@ evidence:
         The paths being compressed are document trees, profile directories, mail stores or
         browser profiles rather than build output, logs or configuration.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: sensitive_data_targeted
     - id: archive_password_protected
       name: Archive protected with a password or encrypted headers
@@ -284,7 +349,7 @@ evidence:
         The command line carries a password or header-encryption flag, which prevents
         anything inspecting the transfer from reading, or even listing, the contents.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: inspection_resistance
     - id: archive_in_scratch_path
       name: Output written to a temporary, hidden or system directory
@@ -292,7 +357,7 @@ evidence:
         The archive lands in a temporary, hidden or system path rather than anywhere a user
         would keep a file they intended to retain.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: collection_staging
     - id: many_sources_one_output
       name: Breadth of sources or repeated appends to one archive
@@ -308,7 +373,7 @@ evidence:
         The parent is an office application, browser, mail client, web service or script
         host rather than a user shell, a build agent or an installer.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: untrusted_execution_lineage
     - id: archiver_from_writable_path
       name: Archiver binary is portable or in a user-writable path
@@ -316,7 +381,7 @@ evidence:
         The archiving executable is a standalone copy in a temporary, profile or share path
         rather than an installed product under Program Files or a system directory.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: untrusted_execution_location
 
   contradicting:
@@ -326,7 +391,7 @@ evidence:
         The acting process is an approved backup agent or a log rotation utility whose entire
         function is to compress data on a schedule.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_application_component
     - id: build_or_release_pipeline
       name: Build or release pipeline packaging its own output
@@ -334,7 +399,7 @@ evidence:
         The source paths are build, artefact or package directories and the parent is a build
         agent, which is compression of output rather than of collected data.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: expected_developer_activity
     - id: support_bundle_collection
       name: Diagnostic or support bundle being assembled
@@ -342,7 +407,7 @@ evidence:
         The command matches a vendor support-bundle collector gathering configuration and log
         paths for a raised case, which legitimately archives to a temporary path.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: legitimate_enterprise_activity
     - id: engineering_host
       name: Engineering host where archiving is constant

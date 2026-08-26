@@ -77,19 +77,34 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -193,6 +208,52 @@ query:
             - user
             - organization
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101936
+      group: huntgraph,windows,defense-impairment,anti-forensics
+      lists: []
+
+    cases:
+      - id: history-file-deleted
+        covers: history-file-deleted
+        name: Existing history file removed through the PSReadLine option
+        purpose: >-
+          Separate suppression of future records from destruction of past ones.
+          Resolving the path through Get-PSReadLineOption before deleting it is a
+          deliberate anti-forensic step, not something a user does while tidying a
+          machine.
+        rule: |
+          <rule id="101936" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(Remove-Item|del\b|erase\b|Clear-Content|\[System\.IO\.File\]::Delete)</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(Get-PSReadLineOption|ConsoleHost_history\.txt|PSReadLine\\+ConsoleHost)</field>
+            <description>Existing history file removed through the PSReadLine option</description>
+            <mitre><id>T1690</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: history-saving-turned-off
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+      - case: history-path-redirected
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+      - case: suppression-written-into-profile
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: psreadline_history_disabled
@@ -202,7 +263,7 @@ evidence:
         file, so interactive activity from this point onwards leaves no durable record on the
         host.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: defensive_control_degradation
 
   supporting:
@@ -212,7 +273,7 @@ evidence:
         The save path was moved to a temporary file, a null device or a location the operator
         controls, which keeps the option looking enabled while the default file stops growing.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: targeted_evidence_destruction
     - id: history_file_removed
       name: Existing history file deleted
@@ -220,7 +281,7 @@ evidence:
         The history file was removed as well as stopped, which destroys the record of commands
         already run rather than only preventing new ones.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: anti_forensic_cleanup
     - id: suppression_persisted_in_profile
       name: Suppression written into a PowerShell profile
@@ -228,7 +289,7 @@ evidence:
         The option was persisted into a profile so that every future session on the host
         starts with history saving already disabled.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: persistent_control_degradation
     - id: unprecedented_for_user
       name: No prior PSReadLine configuration by this user
@@ -246,7 +307,7 @@ evidence:
         The option arrived through a deployed PowerShell profile pushed by the management
         platform rather than being typed into a live session.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_enterprise_activity
     - id: credential_handling_host
       name: Host where history is deliberately disabled

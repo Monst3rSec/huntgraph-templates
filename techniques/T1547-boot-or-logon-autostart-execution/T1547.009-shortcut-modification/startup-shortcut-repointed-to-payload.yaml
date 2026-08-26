@@ -73,27 +73,51 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - NewScriptWritten
         - PeFileWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -166,6 +190,46 @@ query:
             - path
             - organization
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101232
+      group: huntgraph,windows,persistence,privilege-escalation
+      lists: []
+
+    cases:
+      - id: shortcut-target-interpreter
+        covers: shortcut-target-interpreter
+        name: Shortcut target set to an interpreter or writable path
+        purpose: >-
+          Isolate shortcuts whose target is not an application, which is the contrast
+          between a launcher and a persistence mechanism.
+        rule: |
+          <rule id="101232" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)\.(TargetPath|Arguments)\s*=</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(powershell|pwsh|cmd\.exe|wscript|cscript|mshta|rundll32|regsvr32|\\AppData\\|\\Temp\\|\\ProgramData\\)</field>
+            <description>Shortcut target set to an interpreter or writable path</description>
+            <mitre><id>T1547.009</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: shortcut-written-by-script-host
+        reason: >-
+          Depends on a 60d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+      - case: shortcut-in-startup-folder
+        reason: >-
+          Depends on a 60d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: shortcut_manipulated
@@ -174,7 +238,7 @@ evidence:
         A shortcut file was created or its target rewritten by a process other than an
         installer, changing what runs when a user activates an icon they already trust.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: persistence_established
 
   supporting:
@@ -184,7 +248,7 @@ evidence:
         The shortcut points at a script interpreter or an executable under a user-writable
         directory rather than at an installed application.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: untrusted_execution_location
     - id: script_host_actor
       name: Modified by a script host
@@ -192,7 +256,7 @@ evidence:
         The manipulation was performed by PowerShell, cmd or a Windows script host rather
         than by setup or profile-management tooling.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: non_standard_automation
     - id: startup_folder_placement
       name: Shortcut placed in the Startup folder
@@ -200,7 +264,7 @@ evidence:
         The shortcut was written where Windows launches it at logon, which converts a user
         convenience into automatic execution.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: autostart_established
     - id: rare_for_host
       name: Manipulation unprecedented for this host
@@ -218,7 +282,7 @@ evidence:
         An approved installer or updater created or rewrote the shortcut for the
         application it deploys.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: managed_shortcut_deployment
       name: Managed shortcut deployment
@@ -234,7 +298,7 @@ evidence:
         The shortcut was created through explorer during an interactive session and points
         at an installed application.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
 
   risk_logic:

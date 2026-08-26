@@ -93,18 +93,32 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -207,6 +221,53 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101520
+      group: huntgraph,windows,defense-impairment,persistence
+      lists: []
+
+    cases:
+      - id: mfa-endpoint-redirected-to-loopback
+        covers: mfa-endpoint-redirected-to-loopback
+        name: MFA or RADIUS server redirected to a loopback address
+        purpose: >-
+          Detect the fail-open route, which never touches an identity object at all.
+          Writing the MFA provider's hostname to a loopback address in the hosts file
+          makes the challenge unreachable, and any policy that fails open then grants
+          the session on the password alone.
+        rule: |
+          <rule id="101520" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(drivers\\+etc\\+hosts|System32\\+drivers\\+etc)</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(127\.0\.0\.1|0\.0\.0\.0|::1)</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(duo|okta|rsa|securid|radius|mfa|pingid|authpoint|entrust|azuremfa)</field>
+            <description>MFA or RADIUS server redirected to a loopback address</description>
+            <mitre><id>T1556.006</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: mfa-requirement-cleared
+        reason: >-
+          Depends on a 90d baseline comparison (user, host, organization); a stateless
+          rule holds no history.
+      - case: additional-factor-registered-for-another-user
+        reason: >-
+          Depends on a 90d baseline comparison (user, organization); a stateless rule
+          holds no history.
+      - case: conditional-access-exclusion-added
+        reason: >-
+          Depends on a 90d baseline comparison (user, organization); a stateless rule
+          holds no history.
+
 evidence:
   required:
     - id: mfa_control_changed
@@ -216,7 +277,7 @@ evidence:
         registered method, excludes the account from the policy that enforces MFA, or breaks
         the path to the MFA service, so a password alone becomes sufficient.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: authentication_control_weakened
 
   supporting:
@@ -227,7 +288,7 @@ evidence:
         the command, which leaves MFA enabled and passing while the adversary holds a factor
         that satisfies it.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: adversary_controlled_second_factor
     - id: offensive_identity_tooling
       name: Offensive identity tooling used to make the change
@@ -235,7 +296,7 @@ evidence:
         The change was made by a binary or module associated with adversary identity tooling
         rather than by the platform's own administration cmdlets or console.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: offensive_tooling_present
     - id: shell_issued_change
       name: Change issued from a shell or script host
@@ -243,7 +304,7 @@ evidence:
         The parent of the process making the change is a command shell or script host rather
         than the identity management platform that owns authentication methods.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: operator_without_identity_role
       name: Operator with no identity administration history
@@ -270,7 +331,7 @@ evidence:
         The change was issued by the sanctioned identity management or helpdesk tooling under
         its own service context, which is how factor resets are supposed to reach the tenant.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: recorded_factor_reset
       name: Recorded helpdesk factor reset

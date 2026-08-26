@@ -75,18 +75,31 @@ requires:
     - linux
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - audit_command
+      fields:
+        agent_id: agent.id
+        host: agent.name
+        user: audit.auid
+        image_path: audit.exe
+        command_line: audit.execve.a1
+        parent_process: audit.ppid
 
 query:
   - platform: crowdstrike
@@ -191,6 +204,51 @@ query:
             - user
             - command_line
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101568
+      group: huntgraph,linux,credential-access,kerberos
+      lists: []
+
+    cases:
+      - id: ticket-extraction-or-conversion-tooling
+        covers: ticket-extraction-or-conversion-tooling
+        name: Ticket extraction or format conversion tooling run
+        purpose: >-
+          Catch the processing step. Converting a cache to another ticket format, or
+          running the toolkits built to manipulate tickets, has no operational purpose
+          on a normal server and is a much narrower observation than reading a file in
+          the temporary directory.
+        rule: |
+          <rule id="101568" level="12">
+            <if_group>audit_command</if_group>
+            <field name="audit.execve.a1" type="pcre2">(?i)(ticketConverter|ticket_converter|getST\.py|getTGT\.py|ticketer\.py|secretsdump|\bkekeo\b|\bimpacket\b|\.kirbi\b|klist\s+-c\s+\/)</field>
+            <description>Ticket extraction or format conversion tooling run</description>
+            <mitre><id>T1558.005</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: ccache-file-copied-or-encoded
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+      - case: cache-location-pointed-at-a-foreign-cache
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+      - case: borrowed-cache-used-to-authenticate
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: ccache_accessed_out_of_context
@@ -200,7 +258,7 @@ evidence:
         line rather than being used implicitly by its owner's session, which is how live
         tickets are taken rather than used.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: credential_material_capture
 
   supporting:
@@ -210,7 +268,7 @@ evidence:
         The numeric user id embedded in the cache path does not match the account running the
         process, so the tickets being handled belong to somebody else.
       source: process_creation
-      field: UserName
+      field: user
       indicates: identity_impersonation
     - id: ticket_tooling_present
       name: Ticket extraction or conversion tooling on the host
@@ -218,7 +276,7 @@ evidence:
         A toolkit for extracting, forging or converting Kerberos tickets was executed, which
         has no place in normal operation of the host.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: credential_tooling_present
     - id: ticket_reused_for_authentication
       name: Borrowed cache presented to a service
@@ -226,7 +284,7 @@ evidence:
         A network client was invoked with an explicit cache selected, meaning the collected
         tickets were spent against a real service as the cache's owner.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: credential_use_progression
     - id: unprecedented_cache_access
       name: No comparable cache handling in the baseline
@@ -252,7 +310,7 @@ evidence:
         The cache was created by the same job from its own keytab and exported so its children
         inherit the session, which is the standard pattern for scheduled Kerberos work.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_enterprise_activity
     - id: temp_directory_sweep
       name: Backup or cleanup sweep of the temporary directory

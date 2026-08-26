@@ -74,18 +74,32 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -154,6 +168,64 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101504
+      group: huntgraph,windows,defense-impairment,persistence
+      lists: []
+
+    cases:
+      - id: reversible-flag-set
+        covers: reversible-flag-set
+        name: Reversible encryption flag set on an account
+        purpose: >-
+          Surface the flag being enabled, which is rare enough that any occurrence is
+          worth reading regardless of who did it.
+        rule: |
+          <rule id="101504" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(AllowReversiblePasswordEncryption|ENCRYPTED_TEXT_PWD_ALLOWED|userAccountControl.*128\b|Set-ADUser\s+.*-AllowReversiblePasswordEncryption\s+\$?true)</field>
+            <description>Reversible encryption flag set on an account</description>
+            <mitre><id>T1556.005</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+      - id: policy-level-enablement
+        covers: policy-level-enablement
+        name: Reversible encryption enabled through policy
+        purpose: >-
+          Catch the form that affects many accounts at once, which is far more
+          consequential than a single account being flagged.
+        rule: |
+          <rule id="101505" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(ClearTextPassword|AllowReversiblePasswordEncryption)</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(Set-GPRegistryValue|secedit|gpupdate|Default Domain Policy|New-GPO|Set-ADDefaultDomainPasswordPolicy)</field>
+            <description>Reversible encryption enabled through policy</description>
+            <mitre><id>T1556.005</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: flag-set-then-password-reset
+        reason: >-
+          Its discriminator filters on flag_set, a CQL-derived variable or unmapped
+          field with no Wazuh equivalent. Emitting the rule without that condition
+          would broaden it to the benign activity the case exists to exclude.
+
 evidence:
   required:
     - id: reversible_encryption_enabled
@@ -162,7 +234,7 @@ evidence:
         The reversible-encryption flag was set on an account or through a password policy,
         so the directory will store a recoverable form of the password at the next set.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: authentication_process_weakened
 
   supporting:
@@ -172,7 +244,7 @@ evidence:
         A password change was forced or performed after the flag was set, which is what
         writes the recoverable form and makes the change useful.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: credential_material_capture
     - id: policy_scope
       name: Applied through policy rather than to one account
@@ -180,7 +252,7 @@ evidence:
         The change was made in a password policy, so it affects every account in scope
         rather than a single identity.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: estate_wide_impact
     - id: endpoint_shell_origin
       name: Change issued from an endpoint shell
@@ -188,7 +260,7 @@ evidence:
         The modification came from a command shell or script host rather than through the
         identity management platform that owns account attributes.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: unusual_administrator
       name: Actor without directory administration history
@@ -222,7 +294,7 @@ evidence:
         The attribute was set by the approved identity management system as part of a
         governed account workflow.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
 
   risk_logic:

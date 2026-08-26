@@ -84,38 +84,75 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
     - source: network_connection
+      connector: crowdstrike-ngsiem
       event_types:
         - NetworkConnectIP4
         - NetworkConnectIP6
       fields:
-        - aid
-        - ComputerName
-        - ContextBaseFileName
-        - ContextProcessId
-        - RemoteAddressIP4
-        - RemotePort
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+    - source: network_connection
+      connector: wazuh
+      event_types:
+        - sysmon_event3
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        process_name: win.eventdata.image
+        process_id: win.eventdata.processId
+        remote_address: win.eventdata.destinationIp
+        remote_port: win.eventdata.destinationPort
     - source: dns_request
+      connector: crowdstrike-ngsiem
       event_types:
         - DnsRequest
       fields:
-        - aid
-        - ComputerName
-        - DomainName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_id: ContextProcessId
+    - source: dns_request
+      connector: wazuh
+      event_types:
+        - sysmon_event_22
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        query_name: win.eventdata.queryName
+        process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -234,6 +271,56 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101696
+      group: huntgraph,windows,exfiltration,web-service
+      lists: []
+
+    cases:
+      - id: command-line-carrying-a-paste-upload
+        covers: command-line-carrying-a-paste-upload
+        name: Paste endpoint named together with a request body
+        purpose: >-
+          Recover the direction the network layer cannot show. The endpoint sees only
+          an encrypted session, but a command line that pairs a paste endpoint with a
+          body, form or data argument states outright that content is being sent
+          rather than fetched.
+        rule: |
+          <rule id="101696" level="8">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(pastebin\.com|paste\.ee|hastebin\.com|hasteb\.in|ghostbin\.com|controlc\.com|rentry\.co|dpaste\.(com|org)|justpaste\.it|termbin\.com|privatebin|paste\.rs|0x0\.st|ix\.io)</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(-Method\s+Post|Invoke-RestMethod|Invoke-WebRequest|-Body\b|-InFile\b|--data|--data-binary|-d\s|-F\s|--form|UploadString|UploadFile|UploadData)</field>
+            <description>Paste endpoint named together with a request body</description>
+            <mitre><id>T1567.003</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: paste-service-reached-by-a-non-browser-process
+        reason: >-
+          Depends on a 90d baseline comparison (host, process, domain); a stateless
+          rule holds no history.
+      - case: repeated-contact-with-one-paste-service
+        reason: >-
+          Its discriminator filters on DomainName, paste_domain, a CQL-derived
+          variable or unmapped field with no Wazuh equivalent. Emitting the rule
+          without that condition would broaden it to the benign activity the case
+          exists to exclude.
+      - case: collection-preceded-the-post
+        reason: >-
+          Its discriminator filters on collected, posted, a CQL-derived variable or
+          unmapped field with no Wazuh equivalent. Emitting the rule without that
+          condition would broaden it to the benign activity the case exists to
+          exclude.
+
 evidence:
   required:
     - id: paste_service_reached_without_a_browser
@@ -243,7 +330,7 @@ evidence:
         public paste service, which is the part of this technique the endpoint can see and
         which no legitimate use of the product produces.
       source: network_connection
-      field: ContextBaseFileName
+      field: process_name
       indicates: unexpected_process_web_session
 
   supporting:
@@ -253,7 +340,7 @@ evidence:
         The host looked up a paste service domain, tying the session to a named destination
         class rather than to an unattributed address.
       source: dns_request
-      field: DomainName
+      field: query_name
       indicates: external_service_contacted
     - id: upload_shape_in_the_command_line
       name: Paste endpoint named together with a request body
@@ -261,7 +348,7 @@ evidence:
         The command line pairs a paste endpoint with a body, file or form argument, which
         establishes that content was being sent rather than retrieved.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: outbound_data_transfer
     - id: repeated_posts_to_one_service
       name: The same service contacted many times by one process
@@ -269,7 +356,7 @@ evidence:
         A single process went back to the same paste service repeatedly, which is the
         chunking that the service's size limit forces on anything larger than a snippet.
       source: network_connection
-      field: RemoteAddressIP4
+      field: remote_address
       indicates: chunked_transfer
     - id: collection_preceded_the_post
       name: Files read or packaged before the posts began
@@ -277,7 +364,7 @@ evidence:
         The same lineage read or compressed local content shortly before contacting the paste
         service, which is what makes the post an exfiltration step rather than a lookup.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: collection_then_exfiltration
     - id: no_paste_service_history
       name: No history of paste service use on this host or account
@@ -295,7 +382,7 @@ evidence:
         The connection to the paste service was opened by a browser, which is a person
         reading or sharing a snippet and is the product being used as intended.
       source: network_connection
-      field: ContextBaseFileName
+      field: process_name
       indicates: expected_interactive_use
     - id: intelligence_feed_collector
       name: Host is a threat intelligence collector

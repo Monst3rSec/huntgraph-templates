@@ -78,31 +78,59 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
     - source: registry
+      connector: crowdstrike-ngsiem
       event_types:
         - RegKeyCreate
         - RegSystemConfigValueUpdate
         - RegGenericValueUpdate
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - RegObjectName
-        - RegValueName
-        - RegStringValue
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+    - source: registry
+      connector: wazuh
+      event_types:
+        - sysmon_event_13
+        - sysmon_event_12
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        registry_path: win.eventdata.targetObject
+        registry_value: win.eventdata.targetObject
+        registry_data: win.eventdata.details
 
 query:
   - platform: crowdstrike
@@ -209,6 +237,54 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101920
+      group: huntgraph,windows,defense-impairment,safe-mode-boot
+      lists: []
+
+    cases:
+      - id: safeboot-flag-cleared-again
+        covers: safeboot-flag-cleared-again
+        name: Safe mode flag deleted after the host returns
+        purpose: >-
+          Confirm the round trip. Deleting the safeboot value is the cleanup step that
+          makes the next boot look ordinary, so its presence indicates the safe-mode
+          session was used rather than merely configured, and it is the surviving
+          artefact once the flag itself is gone.
+        rule: |
+          <rule id="101920" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)bcdedit(\.exe)?\s+.*\/deletevalue\b</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)\bsafeboot(alternateshell)?\b</field>
+            <description>Safe mode flag deleted after the host returns</description>
+            <mitre><id>T1688</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: safeboot-flag-set-in-bcd
+        reason: >-
+          Depends on a 90d baseline comparison (host, command_line, organization); a
+          stateless rule holds no history.
+      - case: service-added-to-safeboot-minimal
+        reason: >-
+          Depends on a 90d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+      - case: safeboot-set-then-forced-restart
+        reason: >-
+          Its discriminator filters on boot_change, forced_restart, a CQL-derived
+          variable or unmapped field with no Wazuh equivalent. Emitting the rule
+          without that condition would broaden it to the benign activity the case
+          exists to exclude.
+
 evidence:
   required:
     - id: safeboot_configured
@@ -218,7 +294,7 @@ evidence:
         with a limited driver set, which is the state in which the endpoint sensor does not
         load.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: defensive_control_degradation
 
   supporting:
@@ -228,7 +304,7 @@ evidence:
         A service, driver or COM registration was written under the SafeBoot key, which grants
         that component execution inside the limited session where security tooling is absent.
       source: registry
-      field: RegObjectName
+      field: registry_path
       indicates: execution_reserved_for_impaired_session
     - id: forced_immediate_restart
       name: Forced restart issued in the same window
@@ -236,7 +312,7 @@ evidence:
         A restart was forced immediately after the boot configuration changed, which turns a
         latent setting into an active session with no sensor loaded.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: impairment_activated
     - id: script_host_actor
       name: Boot change issued by a script host or remote channel
@@ -245,7 +321,7 @@ evidence:
         rather than from an interactive support session, which is how the change is normally
         made.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: unprecedented_for_host
       name: No boot configuration changes in the baseline

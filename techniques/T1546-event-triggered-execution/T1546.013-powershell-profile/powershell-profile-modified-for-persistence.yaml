@@ -74,26 +74,50 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - NewScriptWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -166,6 +190,46 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101216
+      group: huntgraph,windows,persistence,privilege-escalation
+      lists: []
+
+    cases:
+      - id: profile-edit-with-fetch
+        covers: profile-edit-with-fetch
+        name: Profile edit embedding a remote fetch
+        purpose: >-
+          Isolate additions that retrieve and run remote content, which re-establishes
+          the payload on every session regardless of local cleanup.
+        rule: |
+          <rule id="101216" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(profile\.ps1|\$PROFILE)</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(DownloadString|Invoke-WebRequest|Invoke-RestMethod|\biex\b|Invoke-Expression|FromBase64String|\\AppData\\|\\Temp\\)</field>
+            <description>Profile edit embedding a remote fetch</description>
+            <mitre><id>T1546.013</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: profile-written-programmatically
+        reason: >-
+          Depends on a 60d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+      - case: profile-file-created
+        reason: >-
+          Depends on a 60d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: profile_modified
@@ -174,7 +238,7 @@ evidence:
         A PowerShell profile script was written or appended to by a command rather than
         through an editor, so a command will run at the start of every session.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: persistence_established
 
   supporting:
@@ -184,7 +248,7 @@ evidence:
         The profile written applies to every account on the host rather than to one user,
         widening the persistence to anyone who opens PowerShell.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: broad_persistence_scope
     - id: fetch_or_temp_payload
       name: Added line fetches remote content or uses a temporary path
@@ -192,7 +256,7 @@ evidence:
         The addition retrieves content over the network or references a writable directory,
         which profile customisation does not require.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: possible_payload_retrieval
     - id: remote_or_service_writer
       name: Written by a remote channel or service context
@@ -200,7 +264,7 @@ evidence:
         The writing process was reached remotely or runs as a service rather than being an
         interactive session belonging to the profile's owner.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: first_profile_on_host
       name: No profile previously present
@@ -218,7 +282,7 @@ evidence:
         The profile was modified by a module installer or shell framework that appends
         import and completion lines as part of its setup.
       source: file_creation
-      field: ContextProcessId
+      field: writer_process_id
       indicates: legitimate_application_component
     - id: config_management_profile
       name: Deployed by configuration management
@@ -226,7 +290,7 @@ evidence:
         The profile was written by the approved configuration-management agent as part of a
         standard shell environment.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: software_deployment_wave
     - id: owner_interactive_edit
       name: Owner editing their own profile interactively
@@ -234,7 +298,7 @@ evidence:
         The profile belongs to the user performing the edit and the session is interactive,
         which is ordinary shell customisation.
       source: process_creation
-      field: UserName
+      field: user
       indicates: expected_developer_activity
 
   risk_logic:

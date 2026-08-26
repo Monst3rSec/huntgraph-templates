@@ -84,29 +84,54 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: registry
+      connector: crowdstrike-ngsiem
       event_types:
         - RegSystemConfigValueUpdate
         - RegGenericValueUpdate
         - AsepValueUpdate
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - RegObjectName
-        - RegValueName
-        - RegStringValue
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+    - source: registry
+      connector: wazuh
+      event_types:
+        - sysmon_event_13
+        - sysmon_event_12
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        registry_path: win.eventdata.targetObject
+        registry_value: win.eventdata.targetObject
+        registry_data: win.eventdata.details
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - PeFileWritten
         - NewExecutableWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
-        - SHA256HashData
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+        file_hash: SHA256HashData
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
+        file_hash: win.eventdata.hashes
 
 query:
   - platform: crowdstrike
@@ -216,6 +241,53 @@ query:
             - path
             - organization
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101760
+      group: huntgraph,windows,stealth,execution
+      lists: []
+
+    cases:
+      - id: system-directory-variable-redefined-per-user
+        covers: system-directory-variable-redefined-per-user
+        name: System-directory variable redefined for a single account
+        purpose: >-
+          Cover the variant that leaves PATH alone and redefines the variables that
+          name the system directories. windir, SystemRoot and ComSpec are supplied by
+          the machine configuration and have no reason to exist under a user's
+          Environment key, so a per-user definition is an override rather than a
+          setting.
+        rule: |
+          <rule id="101760" level="12">
+            <if_group>sysmon_event_13</if_group>
+            <field name="win.eventdata.targetObject" type="pcre2">(?i)\\Environment$</field>
+            <field name="win.eventdata.targetObject" type="pcre2">(?i)^(windir|SystemRoot|ComSpec|SystemDrive|PATHEXT)$</field>
+            <description>System-directory variable redefined for a single account</description>
+            <mitre><id>T1574.007</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: machine-scope-path-value-rewritten
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+      - case: user-scope-path-value-rewritten
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+      - case: executable-planted-in-a-candidate-path-directory
+        reason: >-
+          Depends on a 60d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: path_variable_repointed
@@ -225,7 +297,7 @@ evidence:
         the system directories, was written with content pointing at a location outside the
         managed program and system directories.
       source: registry
-      field: RegStringValue
+      field: registry_data
       indicates: hijacked_execution_flow
 
   supporting:
@@ -236,7 +308,7 @@ evidence:
         hive, so the new search order applies to every account on the host, including
         services and scheduled tasks running as SYSTEM.
       source: registry
-      field: RegObjectName
+      field: registry_path
       indicates: change_affects_all_accounts
     - id: system_variable_redefined
       name: System-directory variable overridden for one account
@@ -244,7 +316,7 @@ evidence:
         windir, SystemRoot, ComSpec or SystemDrive was defined under a user's Environment
         key, overriding the machine value for anything that expands it in that session.
       source: registry
-      field: RegValueName
+      field: registry_value
       indicates: execution_path_override
     - id: payload_in_path_directory
       name: Executable placed in a directory shaped like a PATH entry
@@ -253,7 +325,7 @@ evidence:
         user-writable root, which is what makes a rewritten search order actually resolve
         to adversary code.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: staged_payload_present
     - id: writer_is_script_host
       name: Directory populated by a script host
@@ -261,7 +333,7 @@ evidence:
         The executable was written by an interpreter, archive utility or delivery
         application rather than by an installer or package manager.
       source: file_creation
-      field: ContextProcessId
+      field: writer_process_id
       indicates: abnormal_execution_chain
     - id: no_history_of_path_change
       name: No PATH history on this host
@@ -279,7 +351,7 @@ evidence:
         The directory added to PATH is the installation path of a product present on the
         host, which is how installers and SDKs make their tools callable by name.
       source: registry
-      field: RegStringValue
+      field: registry_data
       indicates: legitimate_application_component
     - id: developer_toolchain_host
       name: Registered engineering host

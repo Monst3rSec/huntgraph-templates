@@ -73,27 +73,52 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
     - source: network_connection
+      connector: crowdstrike-ngsiem
       event_types:
         - NetworkConnectIP4
       fields:
-        - aid
-        - ComputerName
-        - ContextProcessId
-        - RemoteAddressIP4
-        - RemotePort
+        agent_id: aid
+        host: ComputerName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+    - source: network_connection
+      connector: wazuh
+      event_types:
+        - sysmon_event3
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        process_id: win.eventdata.processId
+        remote_address: win.eventdata.destinationIp
+        remote_port: win.eventdata.destinationPort
 
 query:
   - platform: crowdstrike
@@ -172,6 +197,45 @@ query:
             - user
             - remote_address
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101312
+      group: huntgraph,windows,lateral-movement,credential-reuse
+      lists: []
+
+    cases:
+      - id: credential-injection-tooling
+        covers: credential-injection-tooling
+        name: Credential-injection tooling invoked
+        purpose: >-
+          Surface the mechanisms that create a logon session from supplied credential
+          material, which is the step that has no legitimate counterpart.
+        rule: |
+          <rule id="101312" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(sekurlsa::pth|pth\s+\/user|Invoke-Mimikatz|\/ntlm\s*:|\/aes256\s*:|Invoke-SMBExec|Invoke-WMIExec|-Hash\s+[A-Fa-f0-9]{32})</field>
+            <description>Credential-injection tooling invoked</description>
+            <mitre><id>T1550.002</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: alternate-credential-launch
+        reason: >-
+          Depends on a 45d baseline comparison (host, user, command_line,
+          organization); a stateless rule holds no history.
+      - case: injected-session-reaches-remote-hosts
+        reason: >-
+          Depends on a 45d baseline comparison (host, user, remote_address); a
+          stateless rule holds no history.
+
 evidence:
   required:
     - id: credential_injection
@@ -181,7 +245,7 @@ evidence:
         was launched with explicit alternate credentials, allowing action as another
         account without that account logging on.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: credential_reuse
 
   supporting:
@@ -191,7 +255,7 @@ evidence:
         The command line carries hash-injection syntax rather than ordinary alternate
         credential use, which has no administrative equivalent.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: credential_material_capture
     - id: remote_admin_fanout
       name: Administrative connections to several hosts
@@ -199,7 +263,7 @@ evidence:
         The host reached multiple remote systems on administrative ports after the
         injection, which is the purpose of a stolen hash.
       source: network_connection
-      field: RemoteAddressIP4
+      field: remote_address
       indicates: lateral_movement_attempt
     - id: workstation_origin
       name: Activity originating from a workstation
@@ -233,7 +297,7 @@ evidence:
         The activity runs under the service account of an approved platform that
         authenticates to hosts as a documented part of its operation.
       source: process_creation
-      field: UserName
+      field: user
       indicates: legitimate_enterprise_activity
     - id: recorded_assessment
       name: Recorded security assessment

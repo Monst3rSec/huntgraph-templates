@@ -74,29 +74,55 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - PeFileWritten
         - NewExecutableWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
-        - SHA256HashData
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+        file_hash: SHA256HashData
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
+        file_hash: win.eventdata.hashes
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -169,6 +195,46 @@ query:
             - command_line
             - organization
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101792
+      group: huntgraph,windows,privilege-escalation,execution
+      lists: []
+
+    cases:
+      - id: process-started-from-drive-root
+        covers: process-started-from-drive-root
+        name: Service-parented process running from a drive root
+        purpose: >-
+          Catch the interception succeeding, where the service control manager starts
+          a binary from a truncation point rather than the intended path.
+        rule: |
+          <rule id="101792" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.image" type="pcre2">(?i)^[A-Za-z]:\\[^\\]*\.exe$</field>
+            <field name="win.eventdata.parentImage" type="pcre2">(?i)^(services|svchost)\.exe$</field>
+            <description>Service-parented process running from a drive root</description>
+            <mitre><id>T1574.009</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: executable-at-interception-point
+        reason: >-
+          Depends on a 90d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+      - case: unquoted-service-registered
+        reason: >-
+          Depends on a 90d baseline comparison (host, command_line, organization); a
+          stateless rule holds no history.
+
 evidence:
   required:
     - id: interception_point_populated
@@ -178,7 +244,7 @@ evidence:
         that an unquoted service path would truncate to, which is where the service control
         manager looks before the intended binary.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: hijacked_execution_flow
 
   supporting:
@@ -188,7 +254,7 @@ evidence:
         The process running from the truncation point was parented by the service control
         manager, confirming the interception worked rather than merely being possible.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: privilege_escalation_attempt
     - id: unquoted_service_created
       name: Unquoted service path registered
@@ -196,7 +262,7 @@ evidence:
         A service was registered with an unquoted binary path containing spaces, creating
         the interception condition rather than inheriting it.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: access_path_creation
     - id: script_host_writer
       name: Written by a script host rather than an installer
@@ -204,7 +270,7 @@ evidence:
         The executable was placed by an interpreter or a remote-execution channel rather
         than by an installer or deployment agent.
       source: file_creation
-      field: ContextProcessId
+      field: writer_process_id
       indicates: abnormal_execution_chain
     - id: rare_in_estate
       name: File at that path rare across the estate
@@ -222,7 +288,7 @@ evidence:
         The file was placed by an approved installer or deployment agent that stages
         content at a drive root or in a top-level directory.
       source: file_creation
-      field: ContextProcessId
+      field: writer_process_id
       indicates: legitimate_enterprise_activity
     - id: vendor_misconfiguration
       name: Vendor service registered unquoted

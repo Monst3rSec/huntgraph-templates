@@ -80,18 +80,31 @@ requires:
     - linux
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - audit_command
+      fields:
+        agent_id: agent.id
+        host: agent.name
+        user: audit.auid
+        image_path: audit.exe
+        command_line: audit.execve.a1
+        parent_process: audit.ppid
 
 query:
   - platform: crowdstrike
@@ -196,6 +209,52 @@ query:
             - user
             - command_line
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101680
+      group: huntgraph,linux,stealth,hide-artifacts
+      lists: []
+
+    cases:
+      - id: attribute-read-back-and-decoded
+        covers: attribute-read-back-and-decoded
+        name: Attribute value read back and decoded
+        purpose: >-
+          This is the loader. Reading an attribute raw and feeding the value straight
+          into a decoder or an interpreter is retrieval of hidden code, and it is the
+          shape that distinguishes a payload store from a metadata tag.
+        rule: |
+          <rule id="101680" level="12">
+            <if_group>audit_command</if_group>
+            <field name="audit.execve.a1" type="pcre2">\bgetfattr\b</field>
+            <field name="audit.execve.a1" type="pcre2">(?i)(--only-values|-e\s+(base64|text)|--encoding)</field>
+            <field name="audit.execve.a1" type="pcre2">\b(base64|openssl|xxd|gunzip|zcat|bash|sh|dash|python[0-9.]*|perl|ruby|eval)\b</field>
+            <description>Attribute value read back and decoded</description>
+            <mitre><id>T1564.014</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: payload-written-into-a-user-namespace-attribute
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+      - case: attribute-set-on-a-system-owned-file
+        reason: >-
+          Depends on a 90d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+      - case: xattr-syscalls-made-from-an-interpreter
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: attribute_written_with_a_value
@@ -204,7 +263,7 @@ evidence:
         A process wrote a named extended attribute carrying a value onto a file, which stores
         data outside anything a directory listing, a size check or a content hash will show.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: concealed_payload_storage
 
   supporting:
@@ -214,7 +273,7 @@ evidence:
         The attribute was read raw and its value handed to a decoder or an interpreter,
         which is how a hidden second stage is retrieved and run without a payload file.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: payload_extraction
     - id: interpreter_level_xattr_call
       name: Attribute manipulated through interpreter syscalls
@@ -222,7 +281,7 @@ evidence:
         The attribute work was done from a scripting runtime rather than the attr utilities,
         which avoids the tooling most monitoring watches for.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: tooling_evasion
     - id: interactive_shell_lineage
       name: Written from an interactive or remote shell
@@ -230,7 +289,7 @@ evidence:
         The acting process descends from a shell or remote session rather than from a
         package manager, policy tool or configuration agent.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: no_xattr_history_on_host
       name: No history of attribute writes on this host
@@ -248,7 +307,7 @@ evidence:
         The acting binary is a package manager, configuration management client, backup
         agent or SELinux tool, all of which set and restore attributes as routine work.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_enterprise_activity
     - id: security_namespace_relabelling
       name: Security or system namespace relabelling
@@ -256,7 +315,7 @@ evidence:
         The attribute written lives in the security or system namespace and carries a short
         structured label or capability set, which is policy work rather than data hiding.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: legitimate_administrative_action
     - id: identical_write_fleetwide
       name: Same attribute written across the estate

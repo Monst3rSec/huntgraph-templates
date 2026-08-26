@@ -70,29 +70,55 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - PeFileWritten
         - NewExecutableWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
-        - SHA256HashData
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+        file_hash: SHA256HashData
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
+        file_hash: win.eventdata.hashes
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -166,6 +192,47 @@ query:
             - organization
             - path
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101456
+      group: huntgraph,windows,persistence,supply-path
+      lists: []
+
+    cases:
+      - id: overwrite-by-delivery-application
+        covers: overwrite-by-delivery-application
+        name: Application binary written by a script host or delivery tool
+        purpose: >-
+          Isolate writers that have no business modifying installed software, which is
+          the clearest separation from patching.
+        rule: |
+          <rule id="101456" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)\\Program Files( \(x86\))?\\[^",]+\.(exe|dll)\b</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)\b(copy|xcopy|robocopy|Copy-Item|move|Move-Item|certutil|Invoke-WebRequest)\b</field>
+            <field name="win.eventdata.parentImage" type="pcre2">(?i)^(powershell|pwsh|cmd|wscript|cscript|mshta|7zfm|winrar|explorer|chrome|msedge|outlook)\.exe$</field>
+            <description>Application binary written by a script host or delivery tool</description>
+            <mitre><id>T1554</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: application-binary-overwritten
+        reason: >-
+          Depends on a 60d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+      - case: modified-binary-executed
+        reason: >-
+          Depends on a 60d baseline comparison (organization, path); a stateless rule
+          holds no history.
+
 evidence:
   required:
     - id: application_binary_modified
@@ -174,7 +241,7 @@ evidence:
         An executable or library inside an installed application directory was overwritten,
         replacing software the user already runs rather than adding anything new.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: trusted_software_tampering
 
   supporting:
@@ -184,7 +251,7 @@ evidence:
         The writing process is a script host, archive utility or delivery application
         rather than the product's own updater, an installer or a deployment agent.
       source: file_creation
-      field: ContextProcessId
+      field: writer_process_id
       indicates: abnormal_execution_chain
     - id: unknown_hash_for_path
       name: Replacement hash unknown across the estate
@@ -200,7 +267,7 @@ evidence:
         A process started from the rewritten path, so the replacement is what the user is
         actually running.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: execution_chain_progression
     - id: delivery_parent
       name: Delivery-style parent for the write
@@ -208,7 +275,7 @@ evidence:
         The copy was performed under a document handler, archive tool, browser or mail
         client, placing the modification immediately after delivered content.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: user_execution_foothold
 
   contradicting:
@@ -218,7 +285,7 @@ evidence:
         The write was performed by the application's own updater replacing its binaries
         with a new version.
       source: file_creation
-      field: ContextProcessId
+      field: writer_process_id
       indicates: legitimate_enterprise_activity
     - id: fleetwide_patch
       name: Same replacement across the estate

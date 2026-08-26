@@ -72,27 +72,51 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - NewScriptWritten
         - PeFileWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -166,6 +190,47 @@ query:
             - host
             - path
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101120
+      group: huntgraph,windows,persistence,web-shell
+      lists: []
+
+    cases:
+      - id: web-shell-discovery-commands
+        covers: web-shell-discovery-commands
+        name: Discovery commands issued from a web worker
+        purpose: >-
+          Isolate the subset where the command is reconnaissance, which is the first
+          thing an operator does through a new shell and is never part of an
+          application feature.
+        rule: |
+          <rule id="101120" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.parentImage" type="pcre2">(?i)^(w3wp|httpd|nginx|tomcat\d*|java|php-cgi|node)\.exe$</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(whoami|net\s+user|net\s+group|net\s+localgroup|systeminfo|ipconfig\s*\/all|nltest|net\s+view|tasklist|query\s+user)</field>
+            <description>Discovery commands issued from a web worker</description>
+            <mitre><id>T1505.003</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: web-worker-spawns-shell
+        reason: >-
+          Depends on a 60d baseline comparison (host, parent_process, process,
+          organization); a stateless rule holds no history.
+      - case: script-written-into-web-root
+        reason: >-
+          Depends on a 60d baseline comparison (host, path); a stateless rule holds no
+          history.
+
 evidence:
   required:
     - id: web_worker_child_process
@@ -174,7 +239,7 @@ evidence:
         A web server worker process created a shell or command-line utility, a lineage
         relationship that ordinary web request handling does not produce.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: web_shell_execution
 
   supporting:
@@ -185,7 +250,7 @@ evidence:
         configuration or domain trust, which is operator reconnaissance rather than
         application functionality.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: hands_on_keyboard_activity
     - id: script_in_web_root
       name: Script written into a web-accessible directory
@@ -193,7 +258,7 @@ evidence:
         A server-side script file was created under the web root, which is how a shell is
         placed and is not part of normal runtime behaviour for a deployed application.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: web_shell_staging
     - id: general_purpose_shell
       name: Child is a general-purpose shell
@@ -201,7 +266,7 @@ evidence:
         The spawned process is cmd or PowerShell rather than a specific media or document
         utility, so the application is being used as a command channel.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: remote_execution_channel
     - id: new_for_server
       name: Behaviour new for this server
@@ -227,7 +292,7 @@ evidence:
         The file write or execution belongs to an approved deployment run that publishes
         application content to the web root.
       source: file_creation
-      field: ContextProcessId
+      field: writer_process_id
       indicates: legitimate_enterprise_activity
     - id: recurring_utility_child
       name: Recurring specific utility invocation

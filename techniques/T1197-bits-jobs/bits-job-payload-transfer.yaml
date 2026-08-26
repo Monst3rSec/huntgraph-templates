@@ -74,19 +74,34 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
-        - TargetProcessId
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
+        process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -160,6 +175,47 @@ query:
             - user
             - command_line
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100768
+      group: huntgraph,windows,stealth,persistence
+      lists: []
+
+    cases:
+      - id: bits-notify-command
+        covers: bits-notify-command
+        name: BITS job with a completion command attached
+        purpose: >-
+          Isolate jobs that carry a notification command line, which converts a file
+          transfer into delayed execution and is the persistence-flavoured use of
+          BITS.
+        rule: |
+          <rule id="100768" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.image" type="pcre2">(?i)^bitsadmin\.exe$</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)setnotifycmdline|\/SetNotifyFlags</field>
+            <description>BITS job with a completion command attached</description>
+            <mitre><id>T1197</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: bitsadmin-external-transfer
+        reason: >-
+          Depends on a 45d baseline comparison (host, domain, parent_process); a
+          stateless rule holds no history.
+      - case: powershell-bits-cmdlets
+        reason: >-
+          Depends on a 45d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: bits_job_queued
@@ -168,7 +224,7 @@ evidence:
         A BITS transfer was queued through bitsadmin.exe, the BITS PowerShell cmdlets or
         the BITS COM object, rather than by the operating system's own update path.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: background_transfer_requested
 
   supporting:
@@ -178,7 +234,7 @@ evidence:
         The job pulls content from an external URL rather than from an internal
         distribution point or update server.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: possible_payload_retrieval
     - id: notify_command
       name: Completion command attached to the job
@@ -186,7 +242,7 @@ evidence:
         A notification command line is set on the job, so a program runs when the transfer
         finishes, turning a download into deferred execution that survives reboots.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: deferred_execution_persistence
     - id: script_host_caller
       name: Script host or document handler queued the job
@@ -194,7 +250,7 @@ evidence:
         The process that queued the transfer is a script interpreter, document handler or
         archive tool rather than a management agent or the update service.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: rare_bits_usage
       name: BITS usage unprecedented for this host
@@ -212,7 +268,7 @@ evidence:
         The approved patching, distribution or monitoring agent created the transfer,
         which is its documented content-delivery mechanism.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: internal_distribution_source
       name: Source is an internal distribution point
@@ -220,7 +276,7 @@ evidence:
         The transfer source resolves to an internal update server or content
         distribution host operated by the organisation.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: legitimate_enterprise_activity
     - id: fleetwide_job_pattern
       name: Identical job across many hosts

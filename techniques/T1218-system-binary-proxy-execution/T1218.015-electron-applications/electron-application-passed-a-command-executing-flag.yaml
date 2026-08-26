@@ -80,19 +80,34 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -196,6 +211,51 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101040
+      group: huntgraph,windows,stealth,proxy-execution
+      lists: []
+
+    cases:
+      - id: electron-run-as-node-set-inline
+        covers: electron-run-as-node-set-inline
+        name: Electron application switched into Node interpreter mode
+        purpose: >-
+          Find the variant that drops the graphical application entirely. With
+          ELECTRON_RUN_AS_NODE set, a signed desktop application becomes a general
+          Node interpreter that will run whatever script it is given, and setting it
+          on the same command line makes that visible.
+        rule: |
+          <rule id="101040" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)ELECTRON_RUN_AS_NODE</field>
+            <description>Electron application switched into Node interpreter mode</description>
+            <mitre><id>T1218.015</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: launcher-switch-naming-a-command
+        reason: >-
+          Depends on a 60d baseline comparison (host, command_line, organization); a
+          stateless rule holds no history.
+      - case: electron-loading-external-javascript
+        reason: >-
+          Depends on a 60d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+      - case: electron-application-spawning-an-interpreter
+        reason: >-
+          Depends on a 90d baseline comparison (host, parent_process, organization); a
+          stateless rule holds no history.
+
 evidence:
   required:
     - id: command_executing_flag
@@ -205,7 +265,7 @@ evidence:
         is launched or loaded by the runtime, so the application is acting as an execution
         vehicle for a command the caller chose.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: trusted_binary_proxy_execution
 
   supporting:
@@ -215,7 +275,7 @@ evidence:
         The application, module or extension path handed to the runtime resolves to a temp,
         profile or download directory rather than to the vendor's own install tree.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: untrusted_execution_location
     - id: interpreter_child_process
       name: Interpreter spawned by the application
@@ -223,7 +283,7 @@ evidence:
         The application's child is a command shell or script host rather than one of the
         named helper processes it normally launches.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: abnormal_execution_chain
     - id: node_interpreter_mode
       name: Application switched into Node mode
@@ -231,7 +291,7 @@ evidence:
         ELECTRON_RUN_AS_NODE was set for the invocation, which turns the signed desktop
         application into a general-purpose script interpreter.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: runtime_repurposed_as_interpreter
     - id: delivery_parent
       name: Application launched by a delivery-style parent
@@ -240,7 +300,7 @@ evidence:
         utility or mail client rather than by the shell, its own updater or the user's
         session.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: unprecedented_command_line
       name: No precedent for this invocation
@@ -260,7 +320,7 @@ evidence:
         directory, which is how the runtime starts its own GPU, utility and renderer
         processes.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_application_component
     - id: updater_or_launcher_parent
       name: Vendor updater or launcher as parent
@@ -268,7 +328,7 @@ evidence:
         The invocation came from the application's own updater, launcher or relaunch path,
         which passes flags by design after an install or update.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_application_component
     - id: engineering_asset
       name: Registered engineering host

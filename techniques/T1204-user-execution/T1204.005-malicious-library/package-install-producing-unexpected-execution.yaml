@@ -78,30 +78,56 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
-        - TargetProcessId
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
+        process_id: win.eventdata.processId
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - PeFileWritten
         - NewExecutableWritten
         - NewScriptWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -214,6 +240,52 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100816
+      group: huntgraph,windows,execution,user-execution
+      lists: []
+
+    cases:
+      - id: payload-running-out-of-a-package-path
+        covers: payload-running-out-of-a-package-path
+        name: Executable running from a package or module directory
+        purpose: >-
+          Cover the stage after installation, where the installed library is the thing
+          that runs. Code inside node_modules or site-packages is normally executed by
+          the interpreter, not started as its own process from a shell or a logon.
+        rule: |
+          <rule id="100816" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.image" type="pcre2">(?i)\\(node_modules|site-packages|npm-cache|_npx|\.yarn|Roaming\\npm|Python\d*\\Scripts)\\</field>
+            <field name="win.eventdata.image" type="pcre2">(?i)\.(exe|scr|com|pif|js|jse|vbs|vbe|wsf|hta|bat|cmd|ps1|dll)$</field>
+            <field name="win.eventdata.parentImage" type="pcre2" negate="yes">(?i)^(node|python|python3|npm|npx|yarn|pnpm|pip|pip3)(\.exe|\.cmd)?$</field>
+            <description>Executable running from a package or module directory</description>
+            <mitre><id>T1204.005</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: package-manager-spawning-a-shell-or-downloader
+        reason: >-
+          Depends on a 45d baseline comparison (host, user, parent_process, process);
+          a stateless rule holds no history.
+      - case: library-installed-from-a-non-registry-source
+        reason: >-
+          Depends on a 45d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+      - case: executable-written-under-the-user-profile-during-an-install
+        reason: >-
+          Depends on a 45d baseline comparison (host, path); a stateless rule holds no
+          history.
+
 evidence:
   required:
     - id: install_produced_unexpected_execution
@@ -223,7 +295,7 @@ evidence:
         downloader or proxy-execution binary, which installing a dependency does not
         require even when the dependency has to build itself.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: user_execution_foothold
 
   supporting:
@@ -233,7 +305,7 @@ evidence:
         The package was fetched from a URL, a git reference or an index other than the
         sanctioned mirror, which bypasses whatever curation the mirror provides.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: untrusted_source_retrieval
     - id: executable_written_to_user_path
       name: Executable written outside the package tree during the install
@@ -242,7 +314,7 @@ evidence:
         while the install was running, which is a payload being staged rather than a
         dependency being unpacked.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: payload_staging
     - id: payload_running_from_package_path
       name: Executable started from inside a package directory
@@ -250,7 +322,7 @@ evidence:
         Content inside node_modules, site-packages or a package cache was launched as its
         own process by something other than the interpreter that owns that tree.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: execution_chain_progression
     - id: package_never_seen_before
       name: Package not previously installed in the estate
@@ -268,7 +340,7 @@ evidence:
         The child process is a compiler, linker or build driver that packages with C or C++
         extensions legitimately invoke while installing.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: legitimate_application_component
     - id: internal_mirror_install
       name: Install served by the organisation's own mirror

@@ -72,18 +72,32 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -153,6 +167,47 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101424
+      group: huntgraph,windows,defense-impairment,trust-controls
+      lists: []
+
+    cases:
+      - id: root-store-registry-write
+        covers: root-store-registry-write
+        name: Trusted root store written directly in the registry
+        purpose: >-
+          Cover the route that avoids the certificate utilities entirely by writing
+          the store keys directly.
+        rule: |
+          <rule id="101424" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)SystemCertificates\\\\(Root|AuthRoot|TrustedPublisher)\\\\Certificates</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(reg(\.exe)?\s+add|Set-ItemProperty|New-Item)</field>
+            <description>Trusted root store written directly in the registry</description>
+            <mitre><id>T1553.004</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: root-store-import
+        reason: >-
+          Depends on a 90d baseline comparison (host, command_line, organization); a
+          stateless rule holds no history.
+      - case: certificate-from-writable-path
+        reason: >-
+          Its discriminator filters on cert_path, a CQL-derived variable or unmapped
+          field with no Wazuh equivalent. Emitting the rule without that condition
+          would broaden it to the benign activity the case exists to exclude.
+
 evidence:
   required:
     - id: root_trust_modified
@@ -161,7 +216,7 @@ evidence:
         A certificate was installed into the Root, AuthRoot or TrustedPublisher store,
         changing what the host accepts as trusted for TLS validation and code signing.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: trust_control_subversion
 
   supporting:
@@ -171,7 +226,7 @@ evidence:
         The certificate being installed was read from AppData, Temp, ProgramData or a user
         profile rather than delivered through a managed distribution path.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: untrusted_execution_location
     - id: script_host_actor
       name: Installed by a script host or delivery application
@@ -179,7 +234,7 @@ evidence:
         The installation was performed by an interpreter, document handler or archive
         utility rather than by a certificate-distribution agent or an installer.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: local_deviation
       name: Local change against a managed trust baseline
@@ -205,7 +260,7 @@ evidence:
         The certificate arrived through Group Policy or the certificate-distribution
         mechanism the organisation operates.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: inspection_proxy
       name: Inspection proxy or gateway certificate
@@ -213,7 +268,7 @@ evidence:
         The certificate belongs to the approved TLS inspection proxy or secure web gateway,
         which installs its own root by design.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: legitimate_enterprise_activity
     - id: engineering_test_certificate
       name: Test certificate on an engineering host

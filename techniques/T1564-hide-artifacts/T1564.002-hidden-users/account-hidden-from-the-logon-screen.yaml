@@ -70,18 +70,32 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -158,6 +172,50 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101616
+      group: huntgraph,windows,stealth,hide-artifacts
+      lists: []
+
+    cases:
+      - id: special-accounts-key-written
+        covers: special-accounts-key-written
+        name: Account suppressed through the special accounts key
+        purpose: >-
+          Surface the specific registry write that removes an account from the logon
+          screen, which has essentially one purpose.
+        rule: |
+          <rule id="101616" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)SpecialAccounts\\\\UserList</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(reg(\.exe)?\s+add|Set-ItemProperty|New-ItemProperty|New-Item)</field>
+            <description>Account suppressed through the special accounts key</description>
+            <mitre><id>T1564.002</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: account-created-then-hidden
+        reason: >-
+          Its discriminator filters on account_created, a CQL-derived variable or
+          unmapped field with no Wazuh equivalent. Emitting the rule without that
+          condition would broaden it to the benign activity the case exists to
+          exclude.
+      - case: hidden-account-granted-rights
+        reason: >-
+          Its discriminator filters on account_hidden, a CQL-derived variable or
+          unmapped field with no Wazuh equivalent. Emitting the rule without that
+          condition would broaden it to the benign activity the case exists to
+          exclude.
+
 evidence:
   required:
     - id: account_suppressed
@@ -166,7 +224,7 @@ evidence:
         A registry value was written under the special accounts key removing an account
         from the logon screen and user listings while leaving it fully usable.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: artifact_concealment
 
   supporting:
@@ -176,7 +234,7 @@ evidence:
         The account was created and suppressed in the same session, which is an identity
         being established covertly rather than an existing service account being tidied.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: persistence_established
     - id: privileged_rights_granted
       name: Hidden account granted privileged membership
@@ -184,7 +242,7 @@ evidence:
         The concealed account was added to an administrative or remote-access group, which
         makes it operationally useful rather than merely present.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: privilege_escalation_attempt
     - id: script_host_actor
       name: Suppression performed by a script host
@@ -192,7 +250,7 @@ evidence:
         The registry write was issued by an interpreter or a remote-execution channel rather
         than by an installer creating its own service identity.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: rare_in_estate
       name: Change confined to very few hosts
@@ -210,7 +268,7 @@ evidence:
         An approved installer created and suppressed a service identity its product
         requires, which some products do by design.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: provisioning_context
       name: Host being imaged or provisioned

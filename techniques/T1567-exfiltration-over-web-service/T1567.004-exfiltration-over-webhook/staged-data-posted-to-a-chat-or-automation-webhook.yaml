@@ -84,38 +84,75 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
     - source: network_connection
+      connector: crowdstrike-ngsiem
       event_types:
         - NetworkConnectIP4
         - NetworkConnectIP6
       fields:
-        - aid
-        - ComputerName
-        - ContextBaseFileName
-        - ContextProcessId
-        - RemoteAddressIP4
-        - RemotePort
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+    - source: network_connection
+      connector: wazuh
+      event_types:
+        - sysmon_event3
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        process_name: win.eventdata.image
+        process_id: win.eventdata.processId
+        remote_address: win.eventdata.destinationIp
+        remote_port: win.eventdata.destinationPort
     - source: dns_request
+      connector: crowdstrike-ngsiem
       event_types:
         - DnsRequest
       fields:
-        - aid
-        - ComputerName
-        - DomainName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_id: ContextProcessId
+    - source: dns_request
+      connector: wazuh
+      event_types:
+        - sysmon_event_22
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        query_name: win.eventdata.queryName
+        process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -233,6 +270,54 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101712
+      group: huntgraph,windows,exfiltration,web-service
+      lists: []
+
+    cases:
+      - id: webhook-endpoint-named-in-a-command-line
+        covers: webhook-endpoint-named-in-a-command-line
+        name: Webhook URL and token appearing in a process command line
+        purpose: >-
+          Carry the sharpest observable this technique has. The endpoint cannot be
+          reached without naming it, and a webhook path with its opaque token is a far
+          more specific artefact than the domain it sits on.
+        rule: |
+          <rule id="101712" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(discord(app)?\.com\/api\/(v\d+\/)?webhooks\/|hooks\.slack\.com\/services\/|webhook\.site\/|api\.telegram\.org\/bot\d+|hooks\.zapier\.com\/hooks\/|hook\.(eu|us)\d*\.make\.com\/|\.webhook\.office\.com\/webhookb2\/|\.pipedream\.net\/|requestbin\.com\/r\/|beeceptor\.com)</field>
+            <description>Webhook URL and token appearing in a process command line</description>
+            <mitre><id>T1567.004</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: webhook-service-reached-by-a-scripting-host
+        reason: >-
+          Depends on a 90d baseline comparison (host, process, domain); a stateless
+          rule holds no history.
+      - case: repeated-automated-posts-to-one-endpoint
+        reason: >-
+          Its discriminator filters on DomainName, webhook_domain, a CQL-derived
+          variable or unmapped field with no Wazuh equivalent. Emitting the rule
+          without that condition would broaden it to the benign activity the case
+          exists to exclude.
+      - case: staging-or-encoding-preceded-the-post
+        reason: >-
+          Its discriminator filters on posted, staged, a CQL-derived variable or
+          unmapped field with no Wazuh equivalent. Emitting the rule without that
+          condition would broaden it to the benign activity the case exists to
+          exclude.
+
 evidence:
   required:
     - id: webhook_endpoint_in_a_command_line
@@ -242,7 +327,7 @@ evidence:
         that authorises posting to it, which is the transfer channel itself rather than a
         precursor to one.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: data_transfer_to_external_service
 
   supporting:
@@ -252,7 +337,7 @@ evidence:
         The host looked up the chat or automation platform hosting the endpoint, tying the
         command line to egress that actually occurred.
       source: dns_request
-      field: DomainName
+      field: query_name
       indicates: external_service_contacted
     - id: session_from_a_scripting_host
       name: Webhook session opened by an interpreter or office application
@@ -260,7 +345,7 @@ evidence:
         The connection to the platform came from a scripting host or a document application
         rather than from the platform's own client or a browser.
       source: network_connection
-      field: ContextBaseFileName
+      field: process_name
       indicates: abnormal_execution_chain
     - id: repeated_posts_to_the_same_endpoint
       name: The same endpoint contacted repeatedly by one process
@@ -268,7 +353,7 @@ evidence:
         A single process kept posting to the same webhook host at a volume consistent with an
         automated loop rather than with event-driven notifications.
       source: network_connection
-      field: RemoteAddressIP4
+      field: remote_address
       indicates: automated_exfiltration
     - id: staging_preceded_the_post
       name: Data packaged or encoded before the post
@@ -276,7 +361,7 @@ evidence:
         The same lineage compressed or base64-encoded content shortly before the request,
         which is how material is fitted into a webhook body.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: collection_then_exfiltration
     - id: no_integration_with_this_service
       name: No history of this service being used by the estate
@@ -310,7 +395,7 @@ evidence:
         The traffic to the chat service was opened by the installed desktop client or a
         browser, which is a person using the platform rather than something posting through it.
       source: network_connection
-      field: ContextBaseFileName
+      field: process_name
       indicates: expected_interactive_use
 
   risk_logic:

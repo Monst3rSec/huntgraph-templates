@@ -73,27 +73,51 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - PeFileWritten
         - NewExecutableWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -168,6 +192,47 @@ query:
             - host
             - organization
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100960
+      group: huntgraph,windows,stealth,proxy-execution
+      lists: []
+
+    cases:
+      - id: installutil-logging-suppressed
+        covers: installutil-logging-suppressed
+        name: InstallUtil run with its logging disabled
+        purpose: >-
+          Surface the flag combination that suppresses all record of what was
+          installed, which a genuine service registration has no reason to use.
+        rule: |
+          <rule id="100960" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.image" type="pcre2">(?i)^installutil\.exe$</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)\/logfile\s*=\s*(\s|$|")</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)\/LogToConsole\s*=\s*false</field>
+            <description>InstallUtil run with its logging disabled</description>
+            <mitre><id>T1218.004</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: installutil-writable-assembly
+        reason: >-
+          Depends on a 60d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+      - case: installutil-on-non-developer-host
+        reason: >-
+          Depends on a 90d baseline comparison (host, organization); a stateless rule
+          holds no history.
+
 evidence:
   required:
     - id: installutil_assembly_execution
@@ -176,7 +241,7 @@ evidence:
         InstallUtil was run against a .NET assembly, meaning its installer methods execute
         inside a signed Microsoft utility before the assembly's own entry point.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: proxy_execution_of_untrusted_module
 
   supporting:
@@ -186,7 +251,7 @@ evidence:
         The invocation supplies an empty logfile argument and disables console output,
         removing the record that a genuine installation would produce.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: execution_concealment
     - id: writable_assembly_path
       name: Assembly in a user-writable directory
@@ -194,7 +259,7 @@ evidence:
         The target assembly sits under AppData, Temp, ProgramData, Public or a user
         profile rather than in an installation directory.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: untrusted_execution_location
     - id: assembly_recently_written
       name: Assembly written shortly before invocation
@@ -202,7 +267,7 @@ evidence:
         The assembly was created on the host shortly before InstallUtil ran, indicating
         staging rather than registration of installed software.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: payload_staging
     - id: non_developer_host
       name: Host with no service-installation history
@@ -228,7 +293,7 @@ evidence:
         InstallUtil was invoked by an approved installer or deployment agent registering a
         product's own service components.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: fleetwide_registration
       name: Same registration across the estate

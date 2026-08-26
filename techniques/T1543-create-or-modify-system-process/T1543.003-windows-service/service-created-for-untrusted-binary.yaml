@@ -74,27 +74,51 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - PeFileWritten
         - NewExecutableWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -169,6 +193,46 @@ query:
             - command_line
             - organization
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101136
+      group: huntgraph,windows,persistence,privilege-escalation
+      lists: []
+
+    cases:
+      - id: service-runs-interpreter
+        covers: service-runs-interpreter
+        name: Service configured to run an interpreter
+        purpose: >-
+          Isolate services whose image is a script interpreter or proxy-execution
+          binary, which packaged software never requires.
+        rule: |
+          <rule id="101136" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(sc(\.exe)?\s+.*\bcreate\b|New-Service|sc(\.exe)?\s+.*\bconfig\b.*binpath)</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(powershell|pwsh|cmd\.exe\s*\/c|wscript|cscript|mshta|rundll32|regsvr32|-enc\b|FromBase64String)</field>
+            <description>Service configured to run an interpreter</description>
+            <mitre><id>T1543.003</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: service-image-writable-path
+        reason: >-
+          Depends on a 60d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+      - case: existing-service-repointed
+        reason: >-
+          Depends on a 60d baseline comparison (host, command_line, organization); a
+          stateless rule holds no history.
+
 evidence:
   required:
     - id: service_untrusted_image
@@ -178,7 +242,7 @@ evidence:
         temporary or user-writable directory, or an interpreter, rather than an installed
         service binary.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: persistence_established
 
   supporting:
@@ -188,7 +252,7 @@ evidence:
         The service launches a script interpreter or proxy-execution binary, often with an
         encoded argument, which no packaged product does.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: dynamic_code_execution
     - id: image_recently_written
       name: Service binary written shortly before registration
@@ -196,7 +260,7 @@ evidence:
         The executable was created on the host shortly before the service was registered,
         which is staging rather than installation.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: payload_staging
     - id: script_host_creator
       name: Created by a script host or remote-execution channel
@@ -204,7 +268,7 @@ evidence:
         The registration was issued by an interpreter or a remote-execution channel rather
         than by an installer or management agent.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: existing_service_repointed
       name: Existing service repointed rather than created
@@ -212,7 +276,7 @@ evidence:
         An established service's binary path was changed, which preserves the appearance of
         the service list while altering what actually runs.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: deliberate_evasion
 
   contradicting:
@@ -221,7 +285,7 @@ evidence:
       description: >-
         An approved installer or updater created the service for a product it deploys.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: agent_service_path
       name: Image inside an approved agent directory
@@ -229,7 +293,7 @@ evidence:
         The service binary resolves to an installation directory belonging to an approved
         management, security or backup agent.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: legitimate_application_component
     - id: fleetwide_service
       name: Same service across the estate

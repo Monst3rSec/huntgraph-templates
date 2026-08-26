@@ -71,29 +71,55 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - PeFileWritten
         - NewExecutableWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
-        - SHA256HashData
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+        file_hash: SHA256HashData
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
+        file_hash: win.eventdata.hashes
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -169,6 +195,46 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101776
+      group: huntgraph,windows,privilege-escalation,execution
+      lists: []
+
+    cases:
+      - id: path-prepended-with-writable-directory
+        covers: path-prepended-with-writable-directory
+        name: PATH prepended with a writable directory
+        purpose: >-
+          Identify the other half of the technique, where the search order itself is
+          changed rather than a file being placed in an existing early entry.
+        rule: |
+          <rule id="101776" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(setx\s+path|\[Environment\]::SetEnvironmentVariable\s*\(\s*["']path|reg(\.exe)?\s+add.*Environment.*\/v\s+path)</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)\\(AppData|Temp|ProgramData|Users|Public|Downloads)\\</field>
+            <description>PATH prepended with a writable directory</description>
+            <mitre><id>T1574.008</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: utility-name-written-outside-system
+        reason: >-
+          Depends on a 60d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+      - case: utility-executed-from-non-system-path
+        reason: >-
+          Depends on a 60d baseline comparison (host, path, process, organization); a
+          stateless rule holds no history.
+
 evidence:
   required:
     - id: shadowing_binary_present
@@ -178,7 +244,7 @@ evidence:
         executed from, a location outside System32 and SysWOW64, so a bare-name invocation
         will resolve to it.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: hijacked_execution_flow
 
   supporting:
@@ -188,7 +254,7 @@ evidence:
         A process ran from the non-system copy rather than from the system directory,
         confirming the search order resolved to the planted file.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: execution_chain_progression
     - id: path_prepended
       name: Search order changed to favour a writable directory
@@ -196,7 +262,7 @@ evidence:
         A user-writable directory was placed at the front of PATH, which redirects
         bare-name resolution without any file needing to sit in an existing early entry.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: access_path_creation
     - id: script_host_writer
       name: Written by a script host rather than a toolchain
@@ -204,7 +270,7 @@ evidence:
         The file was placed by an interpreter, archive utility or delivery application
         rather than by a package manager, installer or build tool.
       source: file_creation
-      field: ContextProcessId
+      field: writer_process_id
       indicates: abnormal_execution_chain
     - id: unknown_hash
       name: Hash unknown across the estate
@@ -230,7 +296,7 @@ evidence:
         The file is a build shim written by a package manager or build tool that places
         wrappers ahead of system binaries by design.
       source: file_creation
-      field: ContextProcessId
+      field: writer_process_id
       indicates: legitimate_enterprise_activity
     - id: fleetwide_toolchain
       name: Same copy across the estate

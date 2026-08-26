@@ -70,18 +70,32 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -148,6 +162,64 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100912
+      group: huntgraph,windows,stealth,proxy-execution
+      lists: []
+
+    cases:
+      - id: appended-expression
+        covers: appended-expression
+        name: Expression appended after the publishing argument
+        purpose: >-
+          Catch the documented syntax, where a semicolon separates the expected value
+          from script the component will execute.
+        rule: |
+          <rule id="100912" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)SyncAppvPublishingServer</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i);|\biex\b|Invoke-Expression|Start-Process|DownloadString|FromBase64String|New-Object</field>
+            <description>Expression appended after the publishing argument</description>
+            <mitre><id>T1216.002</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+      - id: invocation-from-delivery-parent
+        covers: invocation-from-delivery-parent
+        name: Component invoked by a delivery application
+        purpose: >-
+          Establish the delivery route, which is what places the invocation
+          immediately after a user opened content.
+        rule: |
+          <rule id="100913" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)SyncAppvPublishingServer</field>
+            <field name="win.eventdata.parentImage" type="pcre2">(?i)^(winword|excel|powerpnt|outlook|acrord32|acrobat|chrome|msedge|firefox|7zfm|winrar|mshta|wscript|cscript)\.exe$</field>
+            <description>Component invoked by a delivery application</description>
+            <mitre><id>T1216.002</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: any-invocation-where-not-deployed
+        reason: >-
+          Depends on a 90d baseline comparison (host, organization); a stateless rule
+          holds no history.
+
 evidence:
   required:
     - id: syncappv_invocation
@@ -156,7 +228,7 @@ evidence:
         The application virtualisation publishing component was invoked, which forwards its
         argument to PowerShell and therefore can execute arbitrary script.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: proxy_execution_of_untrusted_module
 
   supporting:
@@ -166,7 +238,7 @@ evidence:
         The argument contains a semicolon or scripting constructs rather than a publishing
         server value, meaning script is being forwarded for execution.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: dynamic_code_execution
     - id: platform_not_deployed
       name: Application virtualisation absent from the estate
@@ -182,7 +254,7 @@ evidence:
         The component was invoked by a document handler, archive utility, mail client or
         script host rather than by the virtualisation platform.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: rare_for_host
       name: Invocation unprecedented on this host
@@ -208,7 +280,7 @@ evidence:
         The component was launched by the application virtualisation client as part of a
         scheduled or user-triggered publishing refresh.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_application_component
     - id: administrative_session
       name: Interactive administrative troubleshooting

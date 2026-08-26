@@ -75,17 +75,30 @@ requires:
     - linux
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -158,6 +171,46 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101392
+      group: huntgraph,windows,credential-access,private-keys
+      lists: []
+
+    cases:
+      - id: keys-archived
+        covers: keys-archived
+        name: Key material collected into an archive
+        purpose: >-
+          Identify the packaging step, which converts a search into a collection
+          prepared for transfer.
+        rule: |
+          <rule id="101392" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)\b(tar|zip|gzip|7z|rar|Compress-Archive|base64)\b</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(\.pem\b|\.key\b|\.pfx\b|\.p12\b|\.ppk\b|id_rsa|id_ed25519|\.ssh\b)</field>
+            <description>Key material collected into an archive</description>
+            <mitre><id>T1552.004</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: key-file-search
+        reason: >-
+          Depends on a 60d baseline comparison (host, command_line, organization); a
+          stateless rule holds no history.
+      - case: certificate-exported-with-key
+        reason: >-
+          Depends on a 60d baseline comparison (host, command_line); a stateless rule
+          holds no history.
+
 evidence:
   required:
     - id: key_material_targeted
@@ -167,7 +220,7 @@ evidence:
         private key, or key files were archived, all of which target credentials rather
         than using them.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: credential_material_capture
 
   supporting:
@@ -177,7 +230,7 @@ evidence:
         The search covers home directories, system paths or the filesystem broadly rather
         than opening the single key an application owns.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: systematic_collection
     - id: exported_with_private_half
       name: Export includes the private key
@@ -185,7 +238,7 @@ evidence:
         The certificate export includes the private key, which is what makes the output
         usable for signing or impersonation rather than for distribution.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: high_impact_credential_theft
     - id: material_archived
       name: Key material compressed for transfer
@@ -193,7 +246,7 @@ evidence:
         Keys were archived shortly after being located, indicating collection for
         exfiltration rather than local use.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: collection_staging
     - id: untrusted_actor
       name: Actor is a script host or a binary in a writable path
@@ -201,7 +254,7 @@ evidence:
         The acting process is an interpreter or an executable from a user-writable
         directory rather than an installed certificate or backup tool.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: untrusted_execution_location
 
   contradicting:
@@ -211,7 +264,7 @@ evidence:
         The activity belongs to approved certificate lifecycle tooling that enumerates and
         exports keys during issuance or renewal.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_enterprise_activity
     - id: backup_sweep
       name: Backup agent including key directories
@@ -219,7 +272,7 @@ evidence:
         The acting process is an approved backup client whose sweep necessarily covers
         directories holding keys.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_application_component
     - id: engineering_host
       name: Engineering host where keys are handled routinely

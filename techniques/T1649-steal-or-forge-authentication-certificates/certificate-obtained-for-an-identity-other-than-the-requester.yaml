@@ -86,20 +86,36 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
-        - SHA256HashData
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        image_hash: SHA256HashData
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
+        image_hash: win.eventdata.hashes
 
 query:
   - platform: crowdstrike
@@ -195,6 +211,71 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101824
+      group: huntgraph,windows,credential-access,certificates
+      lists: []
+
+    cases:
+      - id: template-or-ca-permitted-supplied-subjects
+        covers: template-or-ca-permitted-supplied-subjects
+        name: Template or CA configured to accept requester-supplied subjects
+        purpose: >-
+          Find the enabling change rather than the abuse. Setting the attribute that
+          lets a requester name the subject, or the equivalent name flag on a
+          template, converts an ordinary enrolment right into the ability to
+          impersonate anyone in the domain.
+        rule: |
+          <rule id="101824" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(EDITF_ATTRIBUTESUBJECTALTNAME2|msPKI-Certificate-Name-Flag|ENROLLEE_SUPPLIES_SUBJECT|Set-CertificateTemplate|Set-CATemplate|dstemplate)</field>
+            <description>Template or CA configured to accept requester-supplied subjects</description>
+            <mitre><id>T1649</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+      - id: certificate-used-to-request-a-ticket
+        covers: certificate-used-to-request-a-ticket
+        name: Certificate presented to obtain a Kerberos ticket
+        purpose: >-
+          Confirm the credential was not merely obtained but exercised. A ticket
+          request that presents a certificate for a named user is the moment the
+          impersonation becomes an authenticated session, and it separates a stolen
+          file from an active one.
+        rule: |
+          <rule id="101825" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(asktgt|\/certificate:|-pfx\s|getcredentials|pkinit|Rubeus|certipy\s+auth)</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(\/user:|-username|\/domain:|-domain|\.pfx|\.p12)</field>
+            <description>Certificate presented to obtain a Kerberos ticket</description>
+            <mitre><id>T1649</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: enrolment-supplying-another-subject
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+      - case: certificate-and-private-key-exported
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: certificate_material_acquired
@@ -204,7 +285,7 @@ evidence:
         enrolling with the certificate authority or by exporting an existing certificate and
         its private key out of the store.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: authentication_certificate_obtained
 
   supporting:
@@ -215,7 +296,7 @@ evidence:
         a different account, which is what makes the issued certificate a credential for that
         identity rather than for the requester.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: identity_impersonation_in_certificate
     - id: template_permits_supplied_subject
       name: Template or CA flag permitting supplied subjects changed
@@ -224,7 +305,7 @@ evidence:
         names was modified, which is the configuration that makes impersonation through
         enrolment possible at all.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: certificate_template_weakened
     - id: certificate_used_for_authentication
       name: Certificate presented for a ticket request
@@ -232,7 +313,7 @@ evidence:
         A binary was run that presents a certificate to obtain a Kerberos ticket for a named
         user, showing the certificate is being exercised as a credential.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: certificate_authentication_attempted
     - id: shell_issued_enrolment
       name: Enrolment issued from a shell or unusual binary
@@ -240,7 +321,7 @@ evidence:
         The request came from a command shell, script host or standalone tool rather than the
         certificate enrolment service that normally performs issuance on a managed host.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: no_enrolment_history
       name: Host has no history of manual enrolment
@@ -259,7 +340,7 @@ evidence:
         which is how the estate issues and renews most of its certificates and which never
         supplies a subject of its own.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: pki_administration_role
       name: Host or operator holds a PKI role

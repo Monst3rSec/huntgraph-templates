@@ -70,37 +70,73 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
-        - TargetProcessId
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
+        process_id: win.eventdata.processId
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - NewScriptWritten
         - PeFileWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
     - source: network_connection
+      connector: crowdstrike-ngsiem
       event_types:
         - NetworkConnectIP4
       fields:
-        - aid
-        - ComputerName
-        - ContextProcessId
-        - RemoteAddressIP4
-        - RemotePort
+        agent_id: aid
+        host: ComputerName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+    - source: network_connection
+      connector: wazuh
+      event_types:
+        - sysmon_event3
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        process_id: win.eventdata.processId
+        remote_address: win.eventdata.destinationIp
+        remote_port: win.eventdata.destinationPort
 
 query:
   - platform: crowdstrike
@@ -177,6 +213,47 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100944
+      group: huntgraph,windows,stealth,proxy-execution
+      lists: []
+
+    cases:
+      - id: hh-spawns-interpreter
+        covers: hh-spawns-interpreter
+        name: Help viewer spawning a command interpreter
+        purpose: >-
+          Surface the lineage that no legitimate help topic produces, which is the
+          strongest single observation for this technique.
+        rule: |
+          <rule id="100944" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.parentImage" type="pcre2">(?i)^hh\.exe$</field>
+            <field name="win.eventdata.image" type="pcre2">(?i)^(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin|msiexec)\.exe$</field>
+            <description>Help viewer spawning a command interpreter</description>
+            <mitre><id>T1218.001</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: chm-opened-from-writable-path
+        reason: >-
+          Depends on a 60d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+      - case: hh-network-egress
+        reason: >-
+          Its discriminator filters on FileName, a CQL-derived variable or unmapped
+          field with no Wazuh equivalent. Emitting the rule without that condition
+          would broaden it to the benign activity the case exists to exclude.
+
 evidence:
   required:
     - id: chm_execution_behaviour
@@ -185,7 +262,7 @@ evidence:
         hh.exe either spawned a command interpreter, which no genuine help topic requires,
         or rendered a help file located outside any installed application directory.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: proxy_execution_of_untrusted_module
 
   supporting:
@@ -195,7 +272,7 @@ evidence:
         The viewer created a command interpreter or proxy-execution binary, confirming the
         help file carried an executable shortcut object rather than documentation.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: execution_chain_progression
     - id: delivery_parent
       name: Archive tool, browser or mail client as parent
@@ -203,7 +280,7 @@ evidence:
         The help file was opened through an archive utility, browser or mail client,
         establishing that it arrived through a delivery channel.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: recently_written_chm
       name: Help file written shortly before opening
@@ -211,7 +288,7 @@ evidence:
         The .chm was created on the host shortly before it was opened, consistent with
         delivery followed immediately by user interaction.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: payload_staging
     - id: external_egress
       name: Outbound connection from the viewer
@@ -219,7 +296,7 @@ evidence:
         The hh.exe process connected to a routable external address, which locally
         rendered documentation does not do.
       source: network_connection
-      field: RemoteAddressIP4
+      field: remote_address
       indicates: possible_payload_retrieval
 
   contradicting:
@@ -229,7 +306,7 @@ evidence:
         The .chm resides in an application installation directory and is opened from that
         product's own help mechanism.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: legitimate_application_component
     - id: application_parent
       name: Application opening its own help
@@ -237,7 +314,7 @@ evidence:
         hh.exe was launched by the application whose documentation it is rendering, which
         is the ordinary Help menu path.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_application_component
     - id: fleetwide_help_usage
       name: Same help file opened across the estate

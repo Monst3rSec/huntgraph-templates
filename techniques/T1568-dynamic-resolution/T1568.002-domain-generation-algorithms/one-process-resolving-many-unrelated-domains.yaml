@@ -86,39 +86,77 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: dns_request
+      connector: crowdstrike-ngsiem
       event_types:
         - DnsRequest
       fields:
-        - aid
-        - ComputerName
-        - DomainName
-        - IP4Records
-        - ContextProcessId
-        - ContextBaseFileName
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        query_results: IP4Records
+        process_id: ContextProcessId
+        process_name: ContextBaseFileName
+    - source: dns_request
+      connector: wazuh
+      event_types:
+        - sysmon_event_22
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        query_name: win.eventdata.queryName
+        query_results: win.eventdata.queryResults
+        process_id: win.eventdata.processId
+        process_name: win.eventdata.image
     - source: network_connection
+      connector: crowdstrike-ngsiem
       event_types:
         - NetworkConnectIP4
         - NetworkConnectIP6
       fields:
-        - aid
-        - ComputerName
-        - RemoteAddressIP4
-        - RemotePort
-        - ContextProcessId
-        - ContextBaseFileName
+        agent_id: aid
+        host: ComputerName
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+        process_id: ContextProcessId
+        process_name: ContextBaseFileName
+    - source: network_connection
+      connector: wazuh
+      event_types:
+        - sysmon_event3
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        remote_address: win.eventdata.destinationIp
+        remote_port: win.eventdata.destinationPort
+        process_id: win.eventdata.processId
+        process_name: win.eventdata.image
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -257,6 +295,53 @@ query:
             - parent_process
             - process
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101744
+      group: huntgraph,windows,command-and-control,dynamic-resolution
+      lists: []
+
+    cases:
+      - id: gibberish-labels-queried-in-bulk
+        covers: gibberish-labels-queried-in-bulk
+        name: Consonant-heavy generated labels queried in bulk
+        purpose: >-
+          Cover the letter-by-letter form of the algorithm, whose output is lexically
+          unlike anything a human registers. This is deliberately a supporting route,
+          not the spine: word-list algorithms concatenate real words and defeat it
+          entirely, and matching only the registrable label misses generators that
+          vary a subdomain under one fixed parent.
+        rule: |
+          <rule id="101744" level="12">
+            <if_group>sysmon_event_22</if_group>
+            <field name="win.eventdata.queryName" type="pcre2">(?i)^[a-z0-9-]{12,32}\.(com|net|org|info|biz|top|xyz|ru|su|cc|ws|pw|club|online|site)$</field>
+            <field name="win.eventdata.queryName" type="pcre2">(?i)[bcdfghjklmnpqrstvwxz]{5,}</field>
+            <description>Consonant-heavy generated labels queried in bulk</description>
+            <mitre><id>T1568.002</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: many-distinct-domains-from-one-process
+        reason: >-
+          Depends on a 45d baseline comparison (host, process, organization); a
+          stateless rule holds no history.
+      - case: failed-burst-with-one-answer-and-a-connection
+        reason: >-
+          Depends on a 45d baseline comparison (host, process, domain); a stateless
+          rule holds no history.
+      - case: lookup-burst-from-a-delivery-lineage
+        reason: >-
+          Depends on a 45d baseline comparison (host, parent_process, process); a
+          stateless rule holds no history.
+
 evidence:
   required:
     - id: burst_of_distinct_lookups
@@ -266,7 +351,7 @@ evidence:
         short window, with no shared parent domain or naming convention between them, which
         is what a generator produces and what an ordinary client does not.
       source: dns_request
-      field: DomainName
+      field: query_name
       indicates: algorithmic_domain_generation
 
   supporting:
@@ -277,7 +362,7 @@ evidence:
         result when an algorithm produces hundreds of candidates and only one of them has
         been registered by the operator.
       source: dns_request
-      field: IP4Records
+      field: query_results
       indicates: failed_resolution_burst
     - id: random_looking_labels
       name: Queried labels have generated structure
@@ -294,7 +379,7 @@ evidence:
         The lookups came from an interpreter, proxy-execution binary or unnamed process
         rather than from software whose job is to resolve many third-party names.
       source: dns_request
-      field: ContextBaseFileName
+      field: process_name
       indicates: untrusted_actor
     - id: one_answer_then_connection
       name: The one answered name was immediately contacted
@@ -302,7 +387,7 @@ evidence:
         The single candidate that resolved was followed by an outbound session from the same
         process to the address it returned, which closes the loop between generation and use.
       source: network_connection
-      field: RemoteAddressIP4
+      field: remote_address
       indicates: active_command_and_control_attempt
     - id: delivery_lineage
       name: Process descends from a delivery chain
@@ -311,7 +396,7 @@ evidence:
         document application, mail client or archive tool, which is the shape of code that
         arrived rather than code that was installed.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
 
   contradicting:
@@ -322,7 +407,7 @@ evidence:
         a lookup zone as its normal function, which produces both high distinct-name counts
         and large numbers of negative answers.
       source: dns_request
-      field: ContextBaseFileName
+      field: process_name
       indicates: legitimate_application_component
     - id: estate_wide_domain_set
       name: The same names are queried across the estate

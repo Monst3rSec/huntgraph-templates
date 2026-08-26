@@ -72,28 +72,54 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
-        - TargetProcessId
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
+        process_id: win.eventdata.processId
     - source: network_connection
+      connector: crowdstrike-ngsiem
       event_types:
         - NetworkConnectIP4
       fields:
-        - aid
-        - ComputerName
-        - ContextProcessId
-        - RemoteAddressIP4
-        - RemotePort
+        agent_id: aid
+        host: ComputerName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+    - source: network_connection
+      connector: wazuh
+      event_types:
+        - sysmon_event3
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        process_id: win.eventdata.processId
+        remote_address: win.eventdata.destinationIp
+        remote_port: win.eventdata.destinationPort
 
 query:
   - platform: crowdstrike
@@ -165,6 +191,46 @@ query:
             - parent_process
             - process
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100976
+      group: huntgraph,windows,stealth,proxy-execution
+      lists: []
+
+    cases:
+      - id: mshta-inline-script
+        covers: mshta-inline-script
+        name: Mshta running inline script content
+        purpose: >-
+          Catch script supplied directly on the command line, which no packaged HTA
+          application produces and which leaves no file for later analysis.
+        rule: |
+          <rule id="100976" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.image" type="pcre2">(?i)^mshta\.exe$</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(vbscript|javascript)\s*:</field>
+            <description>Mshta running inline script content</description>
+            <mitre><id>T1218.005</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: mshta-remote-url
+        reason: >-
+          Depends on a 45d baseline comparison (host, domain, command_line); a
+          stateless rule holds no history.
+      - case: mshta-spawns-interpreter
+        reason: >-
+          Depends on a 45d baseline comparison (host, parent_process, process); a
+          stateless rule holds no history.
+
 evidence:
   required:
     - id: untrusted_hta_source
@@ -174,7 +240,7 @@ evidence:
         vbscript or javascript content, so the executed script did not come from a known
         local application file.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: fileless_script_execution
 
   supporting:
@@ -184,7 +250,7 @@ evidence:
         mshta.exe was launched by an Office application, PDF reader, mail client, browser
         or archive utility, placing the execution immediately after a user opened a file.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: interpreter_child
       name: Interpreter or LOLBin spawned by mshta
@@ -192,7 +258,7 @@ evidence:
         The mshta process created a command interpreter or another proxy-execution binary,
         which is the handoff from initial script to a working foothold.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: execution_chain_progression
     - id: external_egress
       name: Outbound connection from the mshta process
@@ -200,7 +266,7 @@ evidence:
         The mshta process connected to a routable external address, consistent with
         fetching the HTA body or beaconing after execution.
       source: network_connection
-      field: RemoteAddressIP4
+      field: remote_address
       indicates: possible_payload_retrieval
     - id: unseen_hta_source
       name: HTA source new to the environment
@@ -218,7 +284,7 @@ evidence:
         The HTA is served from an intranet path or file share belonging to a documented
         line-of-business application.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: legitimate_application_component
     - id: helpdesk_tooling_parent
       name: Sanctioned IT tooling as parent
@@ -226,7 +292,7 @@ evidence:
         mshta.exe was launched by an approved helpdesk or management console that uses HTA
         front-ends by design.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: recurring_business_usage
       name: Stable recurring usage across the estate

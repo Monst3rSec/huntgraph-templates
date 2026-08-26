@@ -77,26 +77,48 @@ requires:
     - linux
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - audit_command
+      fields:
+        agent_id: agent.id
+        host: agent.name
+        user: audit.auid
+        image_path: audit.exe
+        command_line: audit.execve.a1
+        parent_process: audit.ppid
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - NewExecutableWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - syscheck_entry_added
+      fields:
+        agent_id: agent.id
+        host: agent.name
+        file_path: syscheck.path
 
 query:
   - platform: crowdstrike
@@ -220,6 +242,76 @@ query:
             - user
             - organization
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101280
+      group: huntgraph,linux,privilege-escalation,elevation-control
+      lists: []
+
+    cases:
+      - id: setuid-bit-set-outside-system-paths
+        covers: setuid-bit-set-outside-system-paths
+        name: Setuid bit set on a file in a writable directory
+        purpose: >-
+          Apply the discriminator. No packaged setuid program lives under /tmp,
+          /var/tmp, /dev/shm or a home directory, so a bit set on a path there cannot
+          be explained by a package update regardless of who ran the command.
+        rule: |
+          <rule id="101280" level="12">
+            <if_group>audit_command</if_group>
+            <field name="audit.execve.a1" type="pcre2">\b(chmod|install)\b</field>
+            <field name="audit.execve.a1" type="pcre2">([ugo,+]s\b|[+]s\b|\s[46][0-7]{3}\b|\s[26][0-7]{3}\b)</field>
+            <field name="audit.execve.a1" type="pcre2">(\/tmp\/|\/var\/tmp\/|\/dev\/shm\/|\/home\/|\/root\/|\/var\/www\/|\/\.[a-z0-9_-]+\/)</field>
+            <description>Setuid bit set on a file in a writable directory</description>
+            <mitre><id>T1548.001</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+      - id: setuid-bit-set-on-a-shell-or-interpreter
+        covers: setuid-bit-set-on-a-shell-or-interpreter
+        name: Setuid bit set on a shell or interpreter
+        purpose: >-
+          Isolate the case with no benign reading at all. A setuid helper exists to do
+          one narrow privileged job; a setuid shell, interpreter or copy of one is a
+          general root primitive and nothing in a distribution ships that way.
+        rule: |
+          <rule id="101281" level="12">
+            <if_group>audit_command</if_group>
+            <field name="audit.execve.a1" type="pcre2">\b(chmod|install)\b</field>
+            <field name="audit.execve.a1" type="pcre2">([ugo,+]s\b|[+]s\b|\s[46][0-7]{3}\b|\s[26][0-7]{3}\b)</field>
+            <field name="audit.execve.a1" type="pcre2">\b(ba|da|k|z|c|tc)?sh\b|\b(python[0-9.]*|perl|ruby|php|lua|awk|find|nmap|vim?|nano|env|busybox)\b</field>
+            <description>Setuid bit set on a shell or interpreter</description>
+            <mitre><id>T1548.001</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: setuid-bit-set-with-chmod
+        reason: >-
+          Depends on a 90d baseline comparison (host, command_line, organization); a
+          stateless rule holds no history.
+      - case: executable-planted-in-a-writable-path
+        reason: >-
+          Depends on a 60d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+      - case: setuid-binaries-enumerated
+        reason: >-
+          Depends on a 60d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: setuid_bit_set
@@ -229,7 +321,7 @@ evidence:
         numeric mode, so the file will execute with its owner's privileges rather than the
         caller's from that point on.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: privilege_elevation_configured
 
   supporting:
@@ -239,7 +331,7 @@ evidence:
         The flagged path is under a temporary, home, web or hidden directory, where no
         distribution places a setuid program, so a package update cannot account for it.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: nonstandard_privileged_binary
     - id: target_is_a_shell_or_interpreter
       name: Target is a shell, interpreter or a copy of one
@@ -247,7 +339,7 @@ evidence:
         The bit was applied to a general-purpose shell or interpreter rather than a narrow
         privileged helper, which yields an unrestricted root primitive.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: root_primitive_created
     - id: binary_planted_before_change
       name: Executable written into a writable path
@@ -255,7 +347,7 @@ evidence:
         A binary was created in a temporary, home or web directory on the same host, which
         pairs with the permission change as plant-then-flag rather than a permissions fix.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: payload_staged
     - id: setuid_search_performed
       name: Existing setuid binaries enumerated
@@ -263,7 +355,7 @@ evidence:
         The host was searched for files already carrying the setuid or setgid bits, which is
         how an adversary finds an abusable binary instead of creating one.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: privilege_escalation_reconnaissance
     - id: setuid_change_rare_in_fleet
       name: Change absent from comparable hosts
@@ -281,7 +373,7 @@ evidence:
         The permission change was made by dpkg, rpm or a package post-install script while
         installing or updating the distribution's own privileged programs.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: packaged_setuid_target
       name: Target is a known packaged setuid program

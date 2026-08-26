@@ -76,20 +76,36 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
-        - SHA256HashData
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        image_hash: SHA256HashData
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
+        image_hash: win.eventdata.hashes
 
 query:
   - platform: crowdstrike
@@ -201,6 +217,54 @@ query:
             - process
             - path
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101872
+      group: huntgraph,windows,defense-impairment,tool-ui-spoofing
+      lists: []
+
+    cases:
+      - id: security-ui-launched-by-shell
+        covers: security-ui-launched-by-shell
+        name: Security interface process launched by a shell or script host
+        purpose: >-
+          Isolate the launcher. The real tray and health components are started by the
+          shell session or the service control manager at logon, never by an
+          interpreter, an archiver or a remote-execution channel, so the parent alone
+          separates the genuine component from a planted one.
+        rule: |
+          <rule id="101872" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.image" type="pcre2">(?i)^(SecurityHealthSystray|SecurityHealthService|SecurityHealthHost|MSASCui|MSASCuiL|MsMpEng|SecHealthUI)\.exe$</field>
+            <field name="win.eventdata.parentImage" type="pcre2">(?i)^(cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|winrshost|wmiprvse|7z|winrar|python)\.exe$</field>
+            <description>Security interface process launched by a shell or script host</description>
+            <mitre><id>T1685.003</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: security-ui-binary-from-writable-path
+        reason: >-
+          Depends on a 90d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+      - case: protection-stopped-then-ui-appears
+        reason: >-
+          Its discriminator filters on defense_stopped, ui_process, a CQL-derived
+          variable or unmapped field with no Wazuh equivalent. Emitting the rule
+          without that condition would broaden it to the benign activity the case
+          exists to exclude.
+      - case: rare-hash-for-common-ui-binary
+        reason: >-
+          Depends on a 90d baseline comparison (organization, process, path); a
+          stateless rule holds no history.
+
 evidence:
   required:
     - id: spoofed_security_interface
@@ -210,7 +274,7 @@ evidence:
         from outside the vendor's installation path, or with contents unique to this host, so
         the status it presents is not being produced by the protection product.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: security_status_misrepresented
 
   supporting:
@@ -221,7 +285,7 @@ evidence:
         off close in time to the interface process appearing, which is the loss the spoofed
         interface exists to conceal.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: defensive_control_degradation
     - id: launched_by_script_host
       name: Interface process launched by a shell or script host
@@ -230,7 +294,7 @@ evidence:
         than by the service control manager or the logon shell, which is how the genuine
         component is always started.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: unique_binary_contents
       name: Binary contents unique within the estate
@@ -238,7 +302,7 @@ evidence:
         The executable's hash appears on a single host while the filename is common across the
         estate, indicating a substituted binary rather than a version difference.
       source: process_creation
-      field: SHA256HashData
+      field: image_hash
       indicates: masquerading_binary
     - id: unprecedented_for_host
       name: No prior execution of this component from this path
@@ -272,7 +336,7 @@ evidence:
         The executable is a vendor-signed support tool that reproduces the console layout for
         diagnostics, distributed by the security team rather than planted.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: legitimate_application_component
 
   risk_logic:

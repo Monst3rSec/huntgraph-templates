@@ -73,18 +73,32 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -159,6 +173,48 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101600
+      group: huntgraph,windows,lateral-movement,session-hijacking
+      lists: []
+
+    cases:
+      - id: service-created-running-tscon
+        covers: service-created-running-tscon
+        name: Service created to run tscon as SYSTEM
+        purpose: >-
+          Catch the privilege route, where a service is registered purely so the
+          attach runs with the rights the technique requires.
+        rule: |
+          <rule id="101600" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(sc(\.exe)?\s+.*\bcreate\b|New-Service)</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)tscon</field>
+            <description>Service created to run tscon as SYSTEM</description>
+            <mitre><id>T1563.002</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: tscon-session-attach
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, command_line,
+          organization); a stateless rule holds no history.
+      - case: session-enumeration-then-attach
+        reason: >-
+          Its discriminator filters on session_enum, a CQL-derived variable or
+          unmapped field with no Wazuh equivalent. Emitting the rule without that
+          condition would broaden it to the benign activity the case exists to
+          exclude.
+
 evidence:
   required:
     - id: session_attached
@@ -167,7 +223,7 @@ evidence:
         tscon was invoked to attach a terminal session, which transfers an existing
         authenticated session to the caller without any credential being supplied.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: session_hijacking
 
   supporting:
@@ -177,7 +233,7 @@ evidence:
         A service was registered whose command line contains tscon, which exists only to
         obtain the SYSTEM context the operation requires.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: privilege_escalation_attempt
     - id: enumeration_preceded
       name: Session enumeration immediately before
@@ -185,7 +241,7 @@ evidence:
         Sessions were listed shortly before the attach, which is an operator identifying a
         target rather than an administrator reconnecting to their own session.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: hands_on_keyboard_activity
     - id: scripted_context
       name: Issued from a script host or remote channel
@@ -193,7 +249,7 @@ evidence:
         The attach was issued by an interpreter or a remote-execution channel rather than
         from an interactive administrative console.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: unprecedented_use
       name: No comparable use in the baseline
@@ -211,7 +267,7 @@ evidence:
         The operation was performed by a sanctioned session management or remote support
         product that reconnects sessions as part of its documented behaviour.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: terminal_server_administration
       name: Terminal server administration host

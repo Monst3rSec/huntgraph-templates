@@ -78,18 +78,31 @@ requires:
     - linux
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - audit_command
+      fields:
+        agent_id: agent.id
+        host: agent.name
+        user: audit.auid
+        image_path: audit.exe
+        command_line: audit.execve.a1
+        parent_process: audit.ppid
 
 query:
   - platform: crowdstrike
@@ -192,6 +205,53 @@ query:
             - user
             - path
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101248
+      group: huntgraph,linux,persistence,privilege-escalation
+      lists: []
+
+    cases:
+      - id: autostart-exec-line-not-a-packaged-binary
+        covers: autostart-exec-line-not-a-packaged-binary
+        name: Exec directive naming an interpreter or a writable path
+        purpose: >-
+          Apply the real discriminator. The presence of an autostart entry says
+          nothing; an Exec line that runs a shell, an interpreter or a file under a
+          temporary or hidden directory is not how an installed application starts
+          itself.
+        rule: |
+          <rule id="101248" level="12">
+            <if_group>audit_command</if_group>
+            <field name="audit.execve.a1" type="pcre2">Exec\s*=</field>
+            <field name="audit.execve.a1" type="pcre2">(?i)(autostart|\.desktop)</field>
+            <field name="audit.execve.a1" type="pcre2">(?i)(\/tmp\/|\/var\/tmp\/|\/dev\/shm\/|\/\.[a-z0-9_-]+\/|bash\s+-c|sh\s+-c|python[0-9.]*\s|perl\s|curl\s|wget\s|base64\s)</field>
+            <description>Exec directive naming an interpreter or a writable path</description>
+            <mitre><id>T1547.013</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: user-autostart-entry-written
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+      - case: system-autostart-entry-written
+        reason: >-
+          Depends on a 90d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+      - case: session-child-from-a-writable-path
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, path); a stateless rule
+          holds no history.
+
 evidence:
   required:
     - id: autostart_entry_written
@@ -201,7 +261,7 @@ evidence:
         shell, a script or a copy rather than by an application installer, so the desktop
         environment will launch it at the next graphical login.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: logon_persistence_installed
 
   supporting:
@@ -212,7 +272,7 @@ evidence:
         temporary or hidden directory, which is not how a packaged startup application
         launches itself.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: suspicious_launch_target
     - id: system_wide_autostart
       name: Entry affects every graphical user
@@ -220,7 +280,7 @@ evidence:
         The .desktop file was placed in /etc/xdg/autostart, so it executes for every account
         that starts a desktop session rather than for one user.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: broad_persistence_scope
     - id: session_started_untrusted_child
       name: Session manager launched a process from a writable path
@@ -228,7 +288,7 @@ evidence:
         A child of the desktop session manager executed from a temporary directory or a
         hidden folder in a home, confirming the autostart entry runs and what it runs.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: execution_chain_progression
     - id: autostart_rare_in_fleet
       name: Entry absent from comparable workstations
@@ -248,7 +308,7 @@ evidence:
         sync client or tray applet, which is the ordinary reason autostart directories
         change.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: packaged_exec_target
       name: Exec directive names an installed binary
@@ -256,7 +316,7 @@ evidence:
         The program the entry launches is an installed binary in a system path belonging to
         a known package, which is what a genuine startup application looks like.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: legitimate_application_component
     - id: autostart_fleetwide
       name: Same entry across comparable workstations

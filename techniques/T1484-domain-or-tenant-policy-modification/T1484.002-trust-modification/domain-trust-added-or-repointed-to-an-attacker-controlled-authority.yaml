@@ -80,19 +80,34 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -195,6 +210,51 @@ query:
             - user
             - command_line
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101104
+      group: huntgraph,windows,defense-impairment,privilege-escalation
+      lists: []
+
+    cases:
+      - id: domain-converted-to-federated
+        covers: domain-converted-to-federated
+        name: Domain converted to federated authentication
+        purpose: >-
+          Catch the federation route, where the domain stops validating credentials
+          itself and starts accepting assertions from an external authority.
+          Conversion is a rare, deliberate act and the cmdlets that perform it are
+          unambiguous.
+        rule: |
+          <rule id="101104" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(Set-MsolDomainAuthentication|Set-MgDomainFederationConfiguration|New-MgDomainFederationConfiguration|Update-MsolFederatedDomain|Convert-MsolDomainToFederated|Set-AADIntDomainAuthentication|ConvertTo-AADIntBackdoor|New-AADIntBackdoor|AADInternals)</field>
+            <description>Domain converted to federated authentication</description>
+            <mitre><id>T1484.002</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: trust-created-or-altered-from-command-line
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+      - case: trust-object-attributes-written
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+      - case: federation-claim-rules-or-certificate-changed
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: trust_configuration_changed
@@ -204,7 +264,7 @@ evidence:
         domain was converted to federated authentication, moving identity decisions to
         another authority.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: authentication_authority_change
 
   supporting:
@@ -214,7 +274,7 @@ evidence:
         A tool whose purpose is to convert a domain to federated and install an
         attacker-held signing certificate was executed on the host.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: identity_backdoor_tool
     - id: claim_or_certificate_change
       name: Claim rules or signing material altered
@@ -222,7 +282,7 @@ evidence:
         The rules that decide which assertions are honoured, or the certificate that signs
         them, were changed, which is what makes an altered trust usable for authentication.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: token_issuance_manipulation
     - id: workstation_origin
       name: Change made from a host that does not administer the directory
@@ -230,7 +290,7 @@ evidence:
         The change originated on a workstation or ordinary member server rather than on a
         management host or federation server where this work belongs.
       source: process_creation
-      field: ComputerName
+      field: host
       indicates: unexpected_administrative_origin
     - id: unfamiliar_actor
       name: Account with no directory engineering history

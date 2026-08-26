@@ -73,18 +73,32 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -158,6 +172,46 @@ query:
             - user
             - process
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101264
+      group: huntgraph,windows,persistence,privilege-escalation
+      lists: []
+
+    cases:
+      - id: stubpath-points-at-interpreter
+        covers: stubpath-points-at-interpreter
+        name: StubPath pointing at an interpreter or writable payload
+        purpose: >-
+          Isolate entries whose command is a script interpreter or a program outside
+          the installation trees, which packaged software does not require.
+        rule: |
+          <rule id="101264" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)StubPath</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(powershell|pwsh|cmd\.exe|wscript|cscript|mshta|rundll32|regsvr32|\\AppData\\|\\Temp\\|\\ProgramData\\|\\Users\\)</field>
+            <description>StubPath pointing at an interpreter or writable payload</description>
+            <mitre><id>T1547.014</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: active-setup-entry-written
+        reason: >-
+          Depends on a 90d baseline comparison (host, command_line, organization); a
+          stateless rule holds no history.
+      - case: userinit-spawned-interpreter
+        reason: >-
+          Depends on a 60d baseline comparison (host, user, process); a stateless rule
+          holds no history.
+
 evidence:
   required:
     - id: active_setup_registered
@@ -167,7 +221,7 @@ evidence:
         initialisation path spawned an interpreter, meaning a command runs once for every
         user who signs in.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: persistence_established
 
   supporting:
@@ -177,7 +231,7 @@ evidence:
         The registered command launches a script interpreter or a program under a
         user-writable directory rather than a product's own configuration step.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: dynamic_code_execution
     - id: logon_spawned_interpreter
       name: Interpreter spawned during logon initialisation
@@ -185,7 +239,7 @@ evidence:
         The per-user setup path became the parent of an interpreter, which is the entry
         executing rather than merely being present.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: execution_chain_progression
     - id: script_host_creator
       name: Registered by a script host or remote channel
@@ -193,7 +247,7 @@ evidence:
         The entry was created by an interpreter or a remote-execution channel rather than
         by an installer performing per-user setup.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: rare_in_estate
       name: Entry confined to very few hosts
@@ -211,7 +265,7 @@ evidence:
         The entry was created by an installer completing per-user configuration for the
         product it deploys, which is the mechanism's intended use.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: windows_component
       name: Windows component performing first-logon setup

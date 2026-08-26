@@ -78,28 +78,54 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
     - source: network_connection
+      connector: crowdstrike-ngsiem
       event_types:
         - NetworkConnectIP4
       fields:
-        - aid
-        - ComputerName
-        - RemoteAddressIP4
-        - RemotePort
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+        process_id: ContextProcessId
+    - source: network_connection
+      connector: wazuh
+      event_types:
+        - sysmon_event3
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        remote_address: win.eventdata.destinationIp
+        remote_port: win.eventdata.destinationPort
+        process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -203,6 +229,50 @@ query:
             - remote_address
             - organization
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 100832
+      group: huntgraph,windows,defense-impairment,active-directory
+      lists: []
+
+    cases:
+      - id: rogue-dc-tooling-invoked
+        covers: rogue-dc-tooling-invoked
+        name: Rogue controller tooling invoked
+        purpose: >-
+          Identify the packaged form. The modules that automate this perform
+          registration, push and teardown in one run, so the tool name is a stronger
+          signal than any of the individual directory writes it makes.
+        rule: |
+          <rule id="100832" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(lsadump::dcshadow|dcshadow::|\bdcshadow\b|misc::memssp|privilege::debug.{0,60}lsadump)</field>
+            <description>Rogue controller tooling invoked</description>
+            <mitre><id>T1207</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: replication-spn-registered
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+      - case: configuration-partition-object-written
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, command_line); a stateless
+          rule holds no history.
+      - case: replication-rpc-from-unusual-host
+        reason: >-
+          Depends on a 90d baseline comparison (host, remote_address, organization); a
+          stateless rule holds no history.
+
 evidence:
   required:
     - id: replication_registration_for_non_dc
@@ -212,7 +282,7 @@ evidence:
         that describe a controller, were written for a machine that is not a domain
         controller, making it addressable as a replication partner.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: rogue_replication_partner
 
   supporting:
@@ -222,7 +292,7 @@ evidence:
         A module whose only purpose is to register a machine as a controller and push
         changes over replication was executed on the host.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: directory_manipulation_tool
     - id: replication_rpc_from_non_dc
       name: Replication-style traffic to a controller
@@ -230,7 +300,7 @@ evidence:
         The host opened the RPC conversation used to carry replication calls to a domain
         controller, which a member server or workstation has no reason to do.
       source: network_connection
-      field: RemoteAddressIP4
+      field: remote_address
       indicates: replication_channel_use
     - id: shell_origin
       name: Registration made from a shell rather than promotion tooling
@@ -238,7 +308,7 @@ evidence:
         The directory writes were made by a command shell, script host or remote-execution
         service instead of the promotion process that normally creates these objects.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: hands_on_keyboard_activity
     - id: first_seen_partner
       name: Host has never been a replication partner
@@ -256,7 +326,7 @@ evidence:
         The objects were created or removed by the promotion tooling as part of installing or
         retiring a real domain controller, which writes exactly these attributes.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: legitimate_administrative_action
     - id: approved_topology_change
       name: Approved topology or recovery work

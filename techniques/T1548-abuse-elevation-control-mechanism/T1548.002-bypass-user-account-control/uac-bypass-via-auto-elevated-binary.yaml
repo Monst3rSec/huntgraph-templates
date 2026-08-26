@@ -71,18 +71,32 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -146,6 +160,82 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101296
+      group: huntgraph,windows,privilege-escalation,uac-bypass
+      lists: []
+
+    cases:
+      - id: hijackable-handler-written
+        covers: hijackable-handler-written
+        name: Shell open command written under a hijackable key
+        purpose: >-
+          Surface writes to the specific keys the known bypasses depend on, each of
+          which has no purpose other than being consulted by an auto-elevating binary.
+        rule: |
+          <rule id="101296" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(ms-settings|mscfile|Folder\\\\shell\\\\open|exefile\\\\shell\\\\runas|AppX[a-z0-9]+)\\\\shell\\\\open\\\\command</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(reg(\.exe)?\s+add|Set-ItemProperty|New-ItemProperty|New-Item)</field>
+            <description>Shell open command written under a hijackable key</description>
+            <mitre><id>T1548.002</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+      - id: delegate-execute-set
+        covers: delegate-execute-set
+        name: DelegateExecute value written
+        purpose: >-
+          Catch the accompanying value that makes the shell honour a redirected
+          command, which is close to unique to this technique.
+        rule: |
+          <rule id="101297" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)DelegateExecute</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(reg(\.exe)?\s+add|Set-ItemProperty|New-ItemProperty)</field>
+            <description>DelegateExecute value written</description>
+            <mitre><id>T1548.002</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+      - id: auto-elevating-binary-child
+        covers: auto-elevating-binary-child
+        name: Auto-elevating binary spawning an interpreter
+        purpose: >-
+          Observe the elevation succeeding, where a silently elevating binary becomes
+          the parent of a shell it has no reason to launch.
+        rule: |
+          <rule id="101298" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.parentImage" type="pcre2">(?i)^(fodhelper|computerdefaults|sdclt|eventvwr|slui|wsreset|dccw|cmstp|msconfig|CompMgmtLauncher)\.exe$</field>
+            <field name="win.eventdata.image" type="pcre2">(?i)^(cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32)\.exe$</field>
+            <description>Auto-elevating binary spawning an interpreter</description>
+            <mitre><id>T1548.002</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable: []
+
 evidence:
   required:
     - id: elevation_hijack
@@ -155,7 +245,7 @@ evidence:
         consults, or such a binary spawned a command interpreter, indicating the silent
         elevation path is being used to run attacker-chosen code.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: elevation_control_bypass
 
   supporting:
@@ -165,7 +255,7 @@ evidence:
         The accompanying DelegateExecute value was written, which makes the shell honour
         the redirected command and has essentially no other use.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: deliberate_evasion
     - id: interpreter_target
       name: Redirected command is an interpreter
@@ -173,7 +263,7 @@ evidence:
         The command placed in the handler is a script interpreter or a program in a
         user-writable directory rather than an installed application.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: dynamic_code_execution
     - id: script_host_writer
       name: Written by a script host or delivery application
@@ -181,7 +271,7 @@ evidence:
         The registry write was performed by an interpreter, document handler or archive
         utility rather than by an installer registering its own file associations.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: rare_for_estate
       name: Pattern rare across the estate
@@ -199,7 +289,7 @@ evidence:
         An approved installer wrote a shell open command for a file type its product owns,
         which is normal association registration.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: legitimate_tool_use
       name: Auto-elevating binary used for its own purpose
@@ -207,7 +297,7 @@ evidence:
         The binary was launched interactively and performed its intended function without
         spawning an interpreter.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: legitimate_administrative_action
     - id: fleetwide_association
       name: Same association across the estate

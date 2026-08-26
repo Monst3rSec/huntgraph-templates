@@ -79,28 +79,53 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: dns_request
+      connector: crowdstrike-ngsiem
       event_types:
         - DnsRequest
       fields:
-        - aid
-        - ComputerName
-        - DomainName
-        - IP4Records
-        - ContextProcessId
-        - ContextBaseFileName
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        query_results: IP4Records
+        process_id: ContextProcessId
+        process_name: ContextBaseFileName
+    - source: dns_request
+      connector: wazuh
+      event_types:
+        - sysmon_event_22
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        query_name: win.eventdata.queryName
+        query_results: win.eventdata.queryResults
+        process_id: win.eventdata.processId
+        process_name: win.eventdata.image
     - source: network_connection
+      connector: crowdstrike-ngsiem
       event_types:
         - NetworkConnectIP4
         - NetworkConnectIP6
       fields:
-        - aid
-        - ComputerName
-        - RemoteAddressIP4
-        - RemotePort
-        - ContextProcessId
-        - ContextBaseFileName
+        agent_id: aid
+        host: ComputerName
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+        process_id: ContextProcessId
+        process_name: ContextBaseFileName
+    - source: network_connection
+      connector: wazuh
+      event_types:
+        - sysmon_event3
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        remote_address: win.eventdata.destinationIp
+        remote_port: win.eventdata.destinationPort
+        process_id: win.eventdata.processId
+        process_name: win.eventdata.image
 
 query:
   - platform: crowdstrike
@@ -227,6 +252,51 @@ query:
             - process
             - remote_address
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101728
+      group: huntgraph,windows,command-and-control,dynamic-resolution
+      lists: []
+
+    cases:
+      - id: single-answer-carrying-a-large-address-pool
+        covers: single-answer-carrying-a-large-address-pool
+        name: One answer returning an unusually large address set
+        purpose: >-
+          Catch the single-flux pool directly. Ordinary services return one to three
+          addresses; a flux name advertises a slice of a botnet. This reads the answer
+          as a delimited list of addresses, so it depends on the sensor recording the
+          full record set rather than only the first address.
+        rule: |
+          <rule id="101728" level="8">
+            <if_group>sysmon_event_22</if_group>
+            <field name="win.eventdata.queryResults" type="pcre2">(\d{1,3}\.){3}\d{1,3};(\d{1,3}\.){3}\d{1,3};(\d{1,3}\.){3}\d{1,3};(\d{1,3}\.){3}\d{1,3};(\d{1,3}\.){3}\d{1,3}</field>
+            <description>One answer returning an unusually large address set</description>
+            <mitre><id>T1568.001</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: same-name-re-queried-with-changing-answers
+        reason: >-
+          Depends on a 45d baseline comparison (host, domain, organization); a
+          stateless rule holds no history.
+      - case: churning-name-almost-nobody-asks-for
+        reason: >-
+          Depends on a 45d baseline comparison (domain, organization); a stateless
+          rule holds no history.
+      - case: process-following-the-rotation
+        reason: >-
+          Depends on a 45d baseline comparison (host, process, remote_address); a
+          stateless rule holds no history.
+
 evidence:
   required:
     - id: rotating_answer_set_for_one_name
@@ -236,7 +306,7 @@ evidence:
         different addresses each time, which is the address rotation the technique depends
         on rather than an occasional record change.
       source: dns_request
-      field: IP4Records
+      field: query_results
       indicates: rotating_resolution
 
   supporting:
@@ -247,7 +317,7 @@ evidence:
         happens when the previous answer has already expired and is the record lifetime
         made visible without the value being in the telemetry.
       source: dns_request
-      field: DomainName
+      field: query_name
       indicates: short_record_lifetime
     - id: few_hosts_resolve_the_name
       name: Almost no other host resolves the name
@@ -263,7 +333,7 @@ evidence:
         The lookups came from an interpreter, proxy-execution binary or unnamed process
         rather than from software that routinely follows delivery-network answers.
       source: dns_request
-      field: ContextBaseFileName
+      field: process_name
       indicates: untrusted_actor
     - id: pool_consumed_by_the_process
       name: The process connected to several of the rotating addresses
@@ -272,7 +342,7 @@ evidence:
         names by the same process, which means the pool is being used as a channel rather
         than simply appearing in answers.
       source: network_connection
-      field: RemoteAddressIP4
+      field: remote_address
       indicates: active_command_and_control_attempt
 
   contradicting:
@@ -292,7 +362,7 @@ evidence:
         regional addresses, so contacting several of them in turn is its documented failover
         behaviour.
       source: dns_request
-      field: ContextBaseFileName
+      field: process_name
       indicates: legitimate_application_component
     - id: roaming_or_test_host
       name: Roaming laptop or network test system

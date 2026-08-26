@@ -73,27 +73,51 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - PeFileWritten
         - NewExecutableWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -158,6 +182,83 @@ query:
           window: null
           compare: []
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101200
+      group: huntgraph,windows,persistence,privilege-escalation
+      lists: []
+
+    cases:
+      - id: ifeo-debugger-on-accessibility-binary
+        covers: ifeo-debugger-on-accessibility-binary
+        name: Debugger registered for an accessibility binary
+        purpose: >-
+          Surface the registry form, which is the cleanest signal because no
+          legitimate workflow attaches a debugger to these particular binaries.
+        rule: |
+          <rule id="101200" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)Image File Execution Options</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(sethc|utilman|osk|magnify|narrator|displayswitch|atbroker)\.exe</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(Debugger|reg(\.exe)?\s+add|Set-ItemProperty|New-ItemProperty)</field>
+            <description>Debugger registered for an accessibility binary</description>
+            <mitre><id>T1546.008</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+      - id: accessibility-binary-overwritten
+        covers: accessibility-binary-overwritten
+        name: Accessibility binary written in a system directory
+        purpose: >-
+          Catch outright replacement, which leaves no registry artefact and is
+          therefore invisible to a review that only inspects Image File Execution
+          Options.
+        rule: |
+          <rule id="101201" level="14">
+            <if_group>sysmon_event_11</if_group>
+            <field name="win.eventdata.targetFilename" type="pcre2">(?i)\\(System32|SysWOW64)\\(sethc|utilman|osk|magnify|narrator|displayswitch|atbroker)\.exe$</field>
+            <description>Accessibility binary written in a system directory</description>
+            <mitre><id>T1546.008</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+      - id: accessibility-binary-spawns-shell
+        covers: accessibility-binary-spawns-shell
+        name: Accessibility binary spawning a shell
+        purpose: >-
+          Observe the backdoor in use, which confirms exploitation rather than only
+          preparation.
+        rule: |
+          <rule id="101202" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.parentImage" type="pcre2">(?i)^(sethc|utilman|osk|magnify|narrator|displayswitch|atbroker)\.exe$</field>
+            <field name="win.eventdata.image" type="pcre2">(?i)^(cmd|powershell|pwsh|wscript|cscript|mshta|explorer)\.exe$</field>
+            <description>Accessibility binary spawning a shell</description>
+            <mitre><id>T1546.008</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable: []
+
 evidence:
   required:
     - id: accessibility_hijack
@@ -167,7 +268,7 @@ evidence:
         overwritten, or such a binary spawned a shell, any of which converts a logon-screen
         key combination into SYSTEM execution.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: pre_authentication_backdoor
 
   supporting:
@@ -177,7 +278,7 @@ evidence:
         The debugger value points at cmd, PowerShell or another interpreter rather than at
         a debugging tool, which is the backdoor configuration rather than diagnostics.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: dynamic_code_execution
     - id: system_binary_overwritten
       name: System32 accessibility binary overwritten
@@ -185,7 +286,7 @@ evidence:
         An accessibility executable in a system directory was rewritten outside the
         servicing process, meaning the shipped binary no longer runs.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: system_binary_tampering
     - id: shell_spawned_from_helper
       name: Shell spawned by an accessibility binary
@@ -193,7 +294,7 @@ evidence:
         An accessibility helper became the parent of an interpreter, which is the backdoor
         being exercised rather than merely installed.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: hands_on_keyboard_activity
     - id: script_host_actor
       name: Change made by a script host or remote channel
@@ -201,7 +302,7 @@ evidence:
         The modification was issued by an interpreter or a remote-execution channel rather
         than by servicing or a development tool.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
 
   contradicting:
@@ -211,7 +312,7 @@ evidence:
         The binary was replaced by the servicing stack during a patch, which legitimately
         rewrites System32 executables.
       source: file_creation
-      field: ContextProcessId
+      field: writer_process_id
       indicates: operating_system_behaviour
     - id: developer_debugging
       name: Developer debugging application startup
@@ -227,7 +328,7 @@ evidence:
         An approved accessibility or compatibility product registered its own components
         through the same mechanism.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_application_component
 
   risk_logic:

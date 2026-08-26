@@ -75,30 +75,58 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: registry
+      connector: crowdstrike-ngsiem
       event_types:
         - AsepValueUpdate
         - RegGenericValueUpdate
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - RegObjectName
-        - RegValueName
-        - RegStringValue
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+    - source: registry
+      connector: wazuh
+      event_types:
+        - sysmon_event_13
+        - sysmon_event_12
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        registry_path: win.eventdata.targetObject
+        registry_value: win.eventdata.targetObject
+        registry_data: win.eventdata.details
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
 
 query:
   - platform: crowdstrike
@@ -200,6 +228,51 @@ query:
             - path
             - organization
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101152
+      group: huntgraph,windows,persistence,privilege-escalation
+      lists: []
+
+    cases:
+      - id: screensaver-settings-written-by-shell
+        covers: screensaver-settings-written-by-shell
+        name: Screensaver configuration written from a command line
+        purpose: >-
+          Isolate the writer, since personalisation goes through the control panel
+          while an adversary sets the same values from a shell or script host.
+        rule: |
+          <rule id="101152" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(SCRNSAVE\.EXE|ScreenSaveActive|ScreenSaverIsSecure|ScreenSaveTimeout|Control Panel\\+Desktop)</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(reg(\.exe)?\s+add|Set-ItemProperty|New-ItemProperty|rundll32.*desk\.cpl)</field>
+            <description>Screensaver configuration written from a command line</description>
+            <mitre><id>T1546.002</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: screensaver-program-repointed
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+      - case: screensaver-settings-weakened
+        reason: >-
+          Its discriminator filters on enabled, a CQL-derived variable or unmapped
+          field with no Wazuh equivalent. Emitting the rule without that condition
+          would broaden it to the benign activity the case exists to exclude.
+      - case: screensaver-executed-from-user-path
+        reason: >-
+          Depends on a 90d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: screensaver_program_repointed
@@ -208,7 +281,7 @@ evidence:
         The value naming the screensaver program was written with a path outside the system
         directories, so user inactivity will launch that executable instead.
       source: registry
-      field: RegStringValue
+      field: registry_data
       indicates: event_triggered_persistence
 
   supporting:
@@ -219,7 +292,7 @@ evidence:
         requirement on resume cleared, which makes the trigger fire sooner and resume
         without challenge.
       source: registry
-      field: RegValueName
+      field: registry_value
       indicates: persistence_made_operational
     - id: shell_written_configuration
       name: Configuration written from a shell or script host
@@ -227,7 +300,7 @@ evidence:
         The values were set from a command line rather than through desktop personalisation,
         which is how the setting is normally changed.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: payload_executed
       name: Screensaver executable ran from a user-writable path
@@ -235,7 +308,7 @@ evidence:
         A screensaver process started from a location a user or adversary can write to,
         confirming the configured payload actually ran.
       source: process_creation
-      field: ImageFileName
+      field: image_path
       indicates: execution_chain_progression
     - id: unusual_for_host
       name: No history of screensaver configuration on this host
@@ -253,7 +326,7 @@ evidence:
         The configuration arrived through Group Policy or the management platform as part of
         a corporate lock and personalisation standard.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: corporate_screensaver
       name: Approved corporate or product screensaver

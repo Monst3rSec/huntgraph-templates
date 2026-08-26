@@ -71,28 +71,54 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
-        - TargetProcessId
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
+        process_id: win.eventdata.processId
     - source: network_connection
+      connector: crowdstrike-ngsiem
       event_types:
         - NetworkConnectIP4
       fields:
-        - aid
-        - ComputerName
-        - ContextProcessId
-        - RemoteAddressIP4
-        - RemotePort
+        agent_id: aid
+        host: ComputerName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+    - source: network_connection
+      connector: wazuh
+      event_types:
+        - sysmon_event3
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        process_id: win.eventdata.processId
+        remote_address: win.eventdata.destinationIp
+        remote_port: win.eventdata.destinationPort
 
 query:
   - platform: crowdstrike
@@ -167,6 +193,47 @@ query:
             - path
             - parent_process
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101008
+      group: huntgraph,windows,stealth,proxy-execution
+      lists: []
+
+    cases:
+      - id: regsvr32-remote-scriptlet
+        covers: regsvr32-remote-scriptlet
+        name: Regsvr32 registering a scriptlet from a URL
+        purpose: >-
+          Surface the fully remote form, where the scriptlet body never touches disk
+          and the only artefact is the command line and the resulting network
+          activity.
+        rule: |
+          <rule id="101008" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.image" type="pcre2">(?i)^regsvr32\.exe$</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(?:https?\s*:?\s*(\[:\])?\/\/[^\s"']+)</field>
+            <description>Regsvr32 registering a scriptlet from a URL</description>
+            <mitre><id>T1218.010</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: regsvr32-scrobj-or-sct
+        reason: >-
+          Depends on a 45d baseline comparison (host, parent_process, command_line); a
+          stateless rule holds no history.
+      - case: regsvr32-user-writable-object
+        reason: >-
+          Depends on a 45d baseline comparison (host, path, parent_process); a
+          stateless rule holds no history.
+
 evidence:
   required:
     - id: untrusted_registration_target
@@ -176,7 +243,7 @@ evidence:
         points at a library in a user-writable directory, none of which describe a normal
         software registration.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: proxy_execution_of_untrusted_module
 
   supporting:
@@ -186,7 +253,7 @@ evidence:
         regsvr32.exe was launched by a document handler, archive utility, mail client,
         browser or script host rather than by an installer or a maintenance script.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: silent_flags
       name: Silent registration flags present
@@ -194,7 +261,7 @@ evidence:
         The invocation suppresses its dialog output with /s alongside /i or /u, which
         keeps the registration invisible to a user who is present at the keyboard.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: execution_concealment
     - id: external_egress
       name: Outbound connection from the regsvr32 process
@@ -202,7 +269,7 @@ evidence:
         The regsvr32 process connected to a routable external address, consistent with
         retrieving a remote scriptlet or with post-execution communication.
       source: network_connection
-      field: RemoteAddressIP4
+      field: remote_address
       indicates: possible_payload_retrieval
     - id: rare_registration
       name: Registration unprecedented for this host
@@ -220,7 +287,7 @@ evidence:
         regsvr32.exe was launched by an approved installer, patching agent or repair
         routine, which registers COM components as part of normal setup.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: legitimate_enterprise_activity
     - id: vendor_component_path
       name: Object inside a vendor installation directory
@@ -228,7 +295,7 @@ evidence:
         The registered library resolves to a Program Files subtree or another documented
         vendor directory.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: legitimate_application_component
     - id: rollout_pattern
       name: Same registration across the estate

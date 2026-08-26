@@ -88,48 +88,96 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - ImageFileName
-        - CommandLine
-        - ParentBaseFileName
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        image_path: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
     - source: file_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - PeFileWritten
         - NewExecutableWritten
       fields:
-        - aid
-        - ComputerName
-        - TargetFileName
-        - ContextProcessId
-        - SHA256HashData
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+        file_hash: SHA256HashData
+    - source: file_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event_11
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        file_path: win.eventdata.targetFilename
+        writer_process_id: win.eventdata.processId
+        file_hash: win.eventdata.hashes
     - source: network_connection
+      connector: crowdstrike-ngsiem
       event_types:
         - NetworkConnectIP4
         - NetworkConnectIP6
       fields:
-        - aid
-        - ComputerName
-        - ContextBaseFileName
-        - ContextProcessId
-        - RemoteAddressIP4
-        - RemotePort
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+    - source: network_connection
+      connector: wazuh
+      event_types:
+        - sysmon_event3
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        process_name: win.eventdata.image
+        process_id: win.eventdata.processId
+        remote_address: win.eventdata.destinationIp
+        remote_port: win.eventdata.destinationPort
     - source: dns_request
+      connector: crowdstrike-ngsiem
       event_types:
         - DnsRequest
       fields:
-        - aid
-        - ComputerName
-        - DomainName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_id: ContextProcessId
+    - source: dns_request
+      connector: wazuh
+      event_types:
+        - sysmon_event_22
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        query_name: win.eventdata.queryName
+        process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -241,6 +289,52 @@ query:
             - path
             - organization
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101056
+      group: huntgraph,windows,command-and-control,remote-access
+      lists: []
+
+    cases:
+      - id: tunnel-registered-to-survive-a-restart
+        covers: tunnel-registered-to-survive-a-restart
+        name: Tunnel installed as a service or named for reconnection
+        purpose: >-
+          Separate a session from a foothold. A developer opens a tunnel while they
+          are working and it ends when they stop; registering it as a service, naming
+          it and suppressing sleep turns the same feature into access that comes back
+          on its own.
+        rule: |
+          <rule id="101056" level="12">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)\btunnel\b</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(service\s+install|--accept-server-license-terms|--no-sleep|--random-name|--name\s+\S+|user\s+login\s+--provider)</field>
+            <description>Tunnel installed as a service or named for reconnection</description>
+            <mitre><id>T1219.001</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: ide-cli-invoked-with-tunnel-arguments
+        reason: >-
+          Depends on a 90d baseline comparison (host, user, organization); a stateless
+          rule holds no history.
+      - case: tunnel-relay-contacted-from-this-host
+        reason: >-
+          Depends on a 90d baseline comparison (host, domain, organization); a
+          stateless rule holds no history.
+      - case: ide-cli-binary-written-to-a-user-writable-path
+        reason: >-
+          Depends on a 90d baseline comparison (host, path, organization); a stateless
+          rule holds no history.
+
 evidence:
   required:
     - id: ide_tunnel_command_executed
@@ -250,7 +344,7 @@ evidence:
         vendor's tunnel relay, which is the remote access channel itself rather than a
         precursor to one.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: remote_access_channel_established
 
   supporting:
@@ -260,7 +354,7 @@ evidence:
         The tunnel was registered so it re-establishes without anyone starting it, turning an
         interactive session into access that survives a restart.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: persistent_remote_access
     - id: tunnel_relay_resolved
       name: Vendor tunnel relay resolved from this machine
@@ -268,7 +362,7 @@ evidence:
         The host looked up the domain the tunnelling feature uses, showing the registration
         reached the vendor rather than failing locally.
       source: dns_request
-      field: DomainName
+      field: query_name
       indicates: external_service_contacted
     - id: relay_session_held_open
       name: Session held with the tunnel relay
@@ -276,7 +370,7 @@ evidence:
         A process on the host maintained a connection to the relay, which is what makes the
         machine reachable through the vendor's portal.
       source: network_connection
-      field: ContextBaseFileName
+      field: process_name
       indicates: inbound_access_available
     - id: cli_binary_dropped
       name: IDE command-line binary written outside an installation path
@@ -284,7 +378,7 @@ evidence:
         The tunnelling binary was written into a temporary or profile directory rather than
         being present as part of an installed development environment.
       source: file_creation
-      field: TargetFileName
+      field: file_path
       indicates: tooling_staged_on_host
     - id: no_tunnelling_history_here
       name: No tunnelling activity on this host in the baseline window
@@ -318,7 +412,7 @@ evidence:
         The command was issued by the IDE running in the logged-on user's desktop session
         rather than by a shell, a script host or a remote-execution channel.
       source: process_creation
-      field: FileName
+      field: image_name
       indicates: expected_interactive_use
 
   risk_logic:

@@ -71,27 +71,52 @@ requires:
     - windows
   connectors:
     - crowdstrike-ngsiem
+    - wazuh
   logs:
     - source: process_creation
+      connector: crowdstrike-ngsiem
       event_types:
         - ProcessRollup2
         - SyntheticProcessRollup2
       fields:
-        - aid
-        - ComputerName
-        - UserName
-        - FileName
-        - CommandLine
-        - ParentBaseFileName
-        - TargetProcessId
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: process_creation
+      connector: wazuh
+      event_types:
+        - sysmon_event1
+        - windows_security
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        user: win.eventdata.user
+        image_name: win.eventdata.image
+        command_line: win.eventdata.commandLine
+        parent_process: win.eventdata.parentImage
+        process_id: win.eventdata.processId
     - source: dns_request
+      connector: crowdstrike-ngsiem
       event_types:
         - DnsRequest
       fields:
-        - aid
-        - ComputerName
-        - DomainName
-        - ContextProcessId
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_id: ContextProcessId
+    - source: dns_request
+      connector: wazuh
+      event_types:
+        - sysmon_event_22
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        query_name: win.eventdata.queryName
+        process_id: win.eventdata.processId
 
 query:
   - platform: crowdstrike
@@ -169,6 +194,67 @@ query:
             - domain
             - host
 
+  - platform: wazuh
+    language: wazuh-rules
+    ruleset:
+      base_id: 101024
+      group: huntgraph,windows,stealth,proxy-execution
+      lists: []
+
+    cases:
+      - id: protocol-handler-invocation
+        covers: protocol-handler-invocation
+        name: Rundll32 invoked with a script protocol and RunHTMLApplication
+        purpose: >-
+          Catch the mshtml RunHTMLApplication syntax in any spacing or casing variant,
+          which is the defining artefact of script execution through rundll32.
+        rule: |
+          <rule id="101024" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.image" type="pcre2">(?i)^rundll32\.exe$</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(javascript|vbscript)\s*:</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)RunHTMLApplication|mshtml</field>
+            <description>Rundll32 invoked with a script protocol and RunHTMLApplication</description>
+            <mitre><id>T1218.011</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+      - id: remote-scriptlet-moniker
+        covers: remote-scriptlet-moniker
+        name: Rundll32 pulling a remote scriptlet
+        purpose: >-
+          Isolate the subset that reaches out for remote script content through a
+          GetObject script moniker, which converts an in-memory execution into a
+          staged download.
+        rule: |
+          <rule id="101025" level="14">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.image" type="pcre2">(?i)^rundll32\.exe$</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)GetObject\s*\(\s*["']?script(let)?\s*:</field>
+            <field name="win.eventdata.commandLine" type="pcre2">(?i)(?:https?\s*:?\s*(\[:\])?\/\/[^\s"']+)</field>
+            <description>Rundll32 pulling a remote scriptlet</description>
+            <mitre><id>T1218.011</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - Derived from the CQL filter chain; the aggregation in the original case
+            is not represented.
+
+    not_portable:
+      - case: rundll32-dns-followup
+        reason: >-
+          Depends on a 30d baseline comparison (domain, host); a stateless rule holds
+          no history.
+
 evidence:
   required:
     - id: script_protocol_invocation
@@ -178,7 +264,7 @@ evidence:
         together with mshtml or RunHTMLApplication, which is the documented syntax for
         executing script through the binary.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: fileless_script_execution
 
   supporting:
@@ -188,7 +274,7 @@ evidence:
         A GetObject script moniker references an http or https URL, showing that the
         in-memory stub is designed to fetch further code at runtime.
       source: process_creation
-      field: CommandLine
+      field: command_line
       indicates: possible_payload_retrieval
     - id: delivery_parent
       name: Document or mail application as parent
@@ -197,7 +283,7 @@ evidence:
         browser or archive utility, which places the execution immediately after a
         user-opened lure.
       source: process_creation
-      field: ParentBaseFileName
+      field: parent_process
       indicates: abnormal_execution_chain
     - id: outbound_resolution
       name: DNS resolution from the invoking process
@@ -205,7 +291,7 @@ evidence:
         The same rundll32.exe process issued a DNS query, confirming the script attempted
         to reach an external host rather than failing inertly.
       source: dns_request
-      field: DomainName
+      field: query_name
       indicates: active_command_and_control_attempt
 
   contradicting:
