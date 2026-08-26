@@ -31,6 +31,7 @@ import json
 import os
 import re
 import sys
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 
 try:
@@ -45,6 +46,10 @@ from attack_extract import Attack, attack_id, load_bundle  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCHEMA_PATH = os.path.join(ROOT, "schema", "detection.schema.json")
 TECHNIQUES_DIR = os.path.join(ROOT, "techniques")
+
+# Rule ids are allocated to templates in blocks of this size. Wazuh ids must be
+# globally unique, so a template may only use ids inside the block it owns.
+RULE_BLOCK_SIZE = 16
 
 # Evidence may come from correlation context that is not a raw log source.
 PSEUDO_SOURCES = {
@@ -298,21 +303,38 @@ def check_evidence(doc, rep: Report) -> None:
         rep.warn("L3", "verdict.high_risk_when (%d ids) is not stronger than suspicious_when "
                        "(%d ids)" % (len(vd["high_risk_when"]), len(vd["suspicious_when"])))
 
-    # every evidence field must be collectable from a declared log source
-    declared_fields = {}
+    # Every evidence field must be collectable from a declared log source — and
+    # once a file declares more than one connector, from EVERY one of them.
+    # Without the second half, a Wazuh block could claim evidence the Wazuh
+    # telemetry never carries, which is this project's central failure mode
+    # wearing a vendor label.
+    #
+    # set() over the fields value works for both shapes: a legacy list yields
+    # vendor names, a migrated map yields the logical names that are its keys.
+    connectors = doc["requires"]["connectors"]
+    per_conn = {c: {} for c in connectors}
     for log in doc["requires"]["logs"]:
-        declared_fields[log["source"]] = set(log["fields"])
+        conn = log_connector(log)
+        if conn in per_conn:
+            per_conn[conn][log["source"]] = set(log["fields"])
+
     for bucket, items in buckets.items():
         for item in items:
             src, field = item["source"], item["field"]
             if src in PSEUDO_SOURCES:
                 continue
-            if src not in declared_fields:
-                rep.error("L3", "evidence %r uses source %r which is not in requires.logs (%s)"
-                          % (item["id"], src, ", ".join(sorted(declared_fields))))
-            elif field not in declared_fields[src]:
-                rep.error("L3", "evidence %r uses field %r not declared under requires.logs "
-                                "source %r" % (item["id"], field, src))
+            for conn in connectors:
+                declared = per_conn[conn]
+                if src not in declared:
+                    rep.error("L3", "evidence %r uses source %r which %s does not declare (%s)"
+                              % (item["id"], src, conn, ", ".join(sorted(declared)) or "nothing"))
+                elif field not in declared[src]:
+                    rep.error("L3", "evidence %r uses field %r which %s does not declare under "
+                                    "source %r" % (item["id"], field, conn, src))
+
+    declared_fields = {}
+    for log in doc["requires"]["logs"]:
+        declared_fields.setdefault(log["source"], set()).update(log["fields"])
 
     unused = declared_fields.keys() - {
         i["source"] for items in buckets.values() for i in items
@@ -324,16 +346,55 @@ def check_evidence(doc, rep: Report) -> None:
 # --------------------------------------------------------------------------
 # L4 query hygiene
 # --------------------------------------------------------------------------
+_RULE_REGISTRY = None
+
+
+def rule_id_registry() -> dict:
+    """Template id -> allocated Wazuh rule-id block base. Cached per run."""
+    global _RULE_REGISTRY
+    if _RULE_REGISTRY is None:
+        path = os.path.join(ROOT, "ruleset", "wazuh-id-allocations.yaml")
+        try:
+            doc = yaml.safe_load(open(path)) or {}
+            _RULE_REGISTRY = doc.get("allocations") or {}
+        except (OSError, yaml.YAMLError):
+            _RULE_REGISTRY = {}
+    return _RULE_REGISTRY
+
+
+def log_connector(log: dict) -> str:
+    """Which connector a requires.logs entry belongs to.
+
+    Absent means crowdstrike-ngsiem: the corpus predates the second connector and
+    unmigrated files carry no marker.
+    """
+    return log.get("connector", "crowdstrike-ngsiem")
+
+
+def declared_events_for(doc, connector: str) -> set:
+    return {
+        e for log in doc["requires"]["logs"]
+        if log_connector(log) == connector
+        for e in log["event_types"]
+    }
+
+
 def check_query(doc, rep: Report) -> None:
-    declared_events = {e for log in doc["requires"]["logs"] for e in log["event_types"]}
     seen_cases = set()
+    cql_case_ids = set()
+    wazuh_blocks = []
 
     for block in doc["query"]:
+        if block["platform"] == "wazuh":
+            wazuh_blocks.append(block)
+            continue
+        declared_events = declared_events_for(doc, "crowdstrike-ngsiem")
         for case in block["cases"]:
             cid, q = case["id"], case["query"]
             if cid in seen_cases:
                 rep.error("L4", "duplicate query case id %r" % cid)
             seen_cases.add(cid)
+            cql_case_ids.add(cid)
 
             for pattern, dialect in FOREIGN_DIALECT:
                 if re.search(pattern, q, re.IGNORECASE | re.MULTILINE):
@@ -361,6 +422,107 @@ def check_query(doc, rep: Report) -> None:
             if len(q.strip().splitlines()) < 2:
                 rep.warn("L4", "case %r is a single-line query; a one-condition hunt is usually "
                                "a weak indicator" % cid)
+
+    for block in wazuh_blocks:
+        check_wazuh_block(doc, block, cql_case_ids, rep)
+
+
+def check_wazuh_block(doc, block, cql_case_ids: set, rep: Report) -> None:
+    """A Wazuh rules block is a second expression of the same hypothesis.
+
+    The load-bearing check is completeness: every CQL case must either have a rule
+    mirroring it or be named in not_portable with a reason. Without that a partial
+    port reads as a full one, which is this project's central failure mode wearing
+    a vendor label.
+    """
+    rs = block["ruleset"]
+    base = rs["base_id"]
+
+    # The registry, not the file, is the authority on which block a template owns.
+    # A template that picks its own base_id will eventually collide with another,
+    # and a duplicate rule id makes every historical alert carrying it ambiguous.
+    reg = rule_id_registry()
+    owned = reg.get(doc["id"])
+    if owned is None:
+        rep.error("L4", "template has a wazuh block but no rule-id allocation; run "
+                        "tools/alloc_rule_ids.py --alloc on this file")
+    elif owned != base:
+        rep.error("L4", "ruleset.base_id %d disagrees with the allocation registry (%d)"
+                  % (base, owned))
+    declared_lists = {l["path"] for l in rs["lists"]}
+    used_ids = set()
+
+    for case in block["cases"]:
+        cid, xml = case["id"], case["rule"]
+
+        try:
+            root = ET.fromstring("<wrap>%s</wrap>" % xml)
+        except ET.ParseError as exc:
+            rep.error("L4", "wazuh case %r is not well-formed XML: %s" % (cid, exc))
+            continue
+
+        rules = root.findall("rule")
+        if not rules:
+            rep.error("L4", "wazuh case %r contains no <rule> element" % cid)
+            continue
+
+        for rule in rules:
+            rid = rule.get("id")
+            if not rid or not rid.isdigit():
+                rep.error("L4", "wazuh case %r has a <rule> with no numeric id" % cid)
+                continue
+            rid = int(rid)
+            if not base <= rid < base + RULE_BLOCK_SIZE:
+                rep.error("L4", "wazuh case %r uses rule id %d outside its allocated block "
+                                "%d-%d" % (cid, rid, base, base + RULE_BLOCK_SIZE - 1))
+            if rid in used_ids:
+                rep.error("L4", "wazuh rule id %d used more than once in this file" % rid)
+            used_ids.add(rid)
+
+            if not rule.get("level"):
+                rep.error("L4", "wazuh rule %d has no level" % rid)
+
+            mitre = [e.text for e in rule.findall("./mitre/id") if e.text]
+            if not mitre:
+                rep.error("L4", "wazuh rule %d declares no <mitre><id>" % rid)
+            else:
+                claimed = set(doc["mitre"]["sub_techniques"]) or set(doc["mitre"]["techniques"])
+                stray = set(mitre) - claimed
+                if stray:
+                    rep.error("L4", "wazuh rule %d cites MITRE id(s) %s which the file does not "
+                                    "declare (%s)"
+                              % (rid, sorted(stray), sorted(claimed)))
+
+            if not (rule.findall("if_group") or rule.findall("if_sid")
+                    or rule.findall("if_matched_sid")):
+                rep.error("L4", "wazuh rule %d chains from nothing; a rule with no if_group/"
+                                "if_sid evaluates against every event on the manager" % rid)
+
+            for lst in rule.findall("list"):
+                if lst.text and lst.text.strip() not in declared_lists:
+                    rep.error("L4", "wazuh rule %d references list %r which is not declared in "
+                                    "ruleset.lists" % (rid, lst.text.strip()))
+
+        if case["covers"] not in cql_case_ids:
+            rep.error("L4", "wazuh case %r covers %r which is not a cql case id (%s)"
+                      % (cid, case["covers"], ", ".join(sorted(cql_case_ids))))
+
+        corr = case["correlation"]
+        if corr["frequency"] and not corr["timeframe"]:
+            rep.error("L4", "wazuh case %r sets frequency but no timeframe" % cid)
+
+    covered = {c["covers"] for c in block["cases"]}
+    excused = {n["case"] for n in block["not_portable"]}
+    for stray in sorted(excused - cql_case_ids):
+        rep.error("L4", "not_portable names %r which is not a cql case id" % stray)
+    missing = cql_case_ids - covered - excused
+    for m in sorted(missing):
+        rep.error("L4", "cql case %r has no wazuh rule and is not listed in not_portable; a "
+                        "partial port must say what it dropped" % m)
+    both = covered & excused
+    for b in sorted(both):
+        rep.error("L4", "cql case %r is both covered by a wazuh rule and listed as "
+                        "not_portable" % b)
 
 
 # --------------------------------------------------------------------------
