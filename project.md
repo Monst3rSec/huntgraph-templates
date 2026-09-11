@@ -116,20 +116,26 @@ Two other honest limits, stated in the files themselves:
   local compilation are meaningless on an engineering workstation and significant on a finance
   endpoint. Those depend on asset groups being accurate.
 
-## Known defect: queries return less than they declare
+## Evidence completeness
 
-Every query terminates in `groupBy()` keyed on some subset of `ComputerName`, `UserName`,
-`ParentBaseFileName` and `FileName`, preserving detail only through
-`collect([...], limit=3..5)`. The result is that **all 289 templates declare at least one
-CQL field in `requires.logs` that never reaches query output** — `aid` is declared by all
-289 and emitted by none — so the agent is asked to reason over evidence the hunt does not
-hand it.
+A hunt's `requires.logs` block is a promise about what it collects, and `evidence` and
+`risk_logic` reason over that promise. The corpus once broke it in all 289 files: queries
+terminated in `groupBy()` keyed on `ComputerName`, `UserName`, `ParentBaseFileName` and
+`FileName`, kept detail only in `collect([...], limit=3..5)`, and dropped the rest. `aid`
+was declared by every file and returned by none.
 
-The correction is not to remove the aggregation, and it is emphatically not to replace it
-with `sort()`, which truncates on its own terms and discards the counts the risk logic
-reads. It is to make each grouped row a complete evidence record and to give every
-hypothesis a raw drill-down case. See [intent.md](intent.md) for the measurements and the
-validator checks that should own this.
+L4 `check_query_emits_declared` now makes that a validator error: every declared
+CrowdStrike field must reach the output of at least one CQL case, as a `groupBy` key, a
+`collect()` entry, an aggregate alias or a pre-aggregation assignment. `test_validator.py`
+carries the matching mutation. All 289 files now return 100% of what they declare, with
+50-sample `collect()` rather than 3.
+
+The fix was not to remove the aggregation. Aggregation is what makes process-event volume
+tractable, and `sort()` is not an open alternative — it truncates on its own terms and
+discards the counts `risk_logic` compares against the baseline.
+
+One gap remains: no hypothesis exposes a raw, unaggregated case, so an interesting row
+cannot be resolved down to the events behind it. See [intent.md](intent.md).
 
 ## Status
 

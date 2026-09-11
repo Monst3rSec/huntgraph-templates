@@ -379,6 +379,65 @@ def declared_events_for(doc, connector: str) -> set:
     }
 
 
+_OUT_GROUPBY = re.compile(r"groupBy\(\s*\[([^\]]*)\]")
+_OUT_COLLECT = re.compile(r"collect\(\s*\[([^\]]*)\]")
+_OUT_ASSIGN = re.compile(r"(\w+)\s*:=")
+_OUT_AS = re.compile(r"as\s*=\s*(\w+)")
+
+
+def emitted_fields(query: str) -> set:
+    """Fields a CQL case actually puts in its result rows.
+
+    A field survives aggregation only as a groupBy key, inside a collect(), as an
+    aggregate alias, or as an assignment made before the aggregation. Anything
+    else is filtered on and then discarded, which is invisible in the query text
+    and is exactly the failure this check exists to catch.
+    """
+    out = set()
+    for pattern in (_OUT_GROUPBY, _OUT_COLLECT):
+        for m in pattern.finditer(query):
+            out |= {f.strip() for f in m.group(1).split(",") if f.strip()}
+    out |= set(_OUT_ASSIGN.findall(query))
+    out |= set(_OUT_AS.findall(query))
+    return out
+
+
+def check_query_emits_declared(doc, rep: Report) -> None:
+    """Every field a CQL hunt declares must reach the agent.
+
+    requires.logs is a promise about what the hunt collects, and evidence and
+    risk_logic reason over it. A field that is declared, filtered on, then
+    aggregated away leaves the agent arguing from telemetry it was never given.
+    The corpus shipped 289 files in that state, every one of them declaring
+    `aid` and none of them returning it, so this is a hard error rather than a
+    warning.
+    """
+    declared = {}
+    for log in doc["requires"]["logs"]:
+        if log_connector(log) != "crowdstrike-ngsiem":
+            continue
+        fields = log["fields"]
+        vendor = fields.values() if isinstance(fields, dict) else fields
+        for name in vendor:
+            declared.setdefault(name, log["source"])
+
+    if not declared:
+        return
+
+    emitted = set()
+    for block in doc["query"]:
+        if block["platform"] == "wazuh":
+            continue
+        for case in block["cases"]:
+            emitted |= emitted_fields(case["query"])
+
+    missing = sorted(set(declared) - emitted)
+    if missing:
+        rep.error("L4", "requires.logs declares %s which no cql case returns; a declared "
+                        "field that never reaches a result row is evidence the agent "
+                        "cannot reason over" % ", ".join(repr(m) for m in missing))
+
+
 def check_query(doc, rep: Report) -> None:
     seen_cases = set()
     cql_case_ids = set()
@@ -591,6 +650,7 @@ def validate_file(path: str, schema, atk: Attack) -> Report:
     check_mitre(doc, atk, rep)
     check_evidence(doc, rep)
     check_query(doc, rep)
+    check_query_emits_declared(doc, rep)
     check_convention(doc, path, rep)
     return rep
 

@@ -70,43 +70,37 @@ enforces all of this at L4.
 | L4 query | CQL only in `cql` cases; declared event types actually used; Wazuh block well-formed |
 | L5 convention | directory encodes the technique; ids unique and correctly suffixed |
 
-## Open defect: aggregation collapses the evidence
+## The evidence-completeness rule (enforced)
 
-**Status: known, unfixed, affects all 289 files.**
+**L4 `check_query_emits_declared`: every field a `crowdstrike-ngsiem` `requires.logs`
+stanza declares must reach the output of at least one CQL case.**
 
-Every query ends in `groupBy()` keyed on some subset of `ComputerName`, `UserName`,
-`ParentBaseFileName`, `FileName`, with detail carried only by `collect([...], limit=N)`
-where N is 3 to 5 in 670 of 1029 stanzas.
+A field survives aggregation only as a `groupBy` key, inside a `collect([...])`, as an
+aggregate alias, or as an assignment made before the aggregation. Filtering on a field
+and then aggregating it away is invisible in the query text, which is why this is a
+validator error and not a review convention. Mutation case: *"declared field that no
+query returns"*.
 
-Measured consequence: **289 of 289 templates declare at least one CQL field in
-`requires.logs` that never appears in query output.** `aid` is declared by all 289 and
-emitted by none — the agent id, the one field you pivot on in NG-SIEM, is documented as
-required and thrown away by every query. Also commonly lost: `ImageFileName` (63),
-`ContextProcessId` (46), `TargetProcessId` (39), `TargetFileName` (28).
+The corpus shipped 289 files violating it — every one declaring `aid` and none returning
+it. That is now fixed: 100% of declared CQL telemetry reaches the result row, and
+`collect()` samples are 50 rather than 3.
 
-The agent is therefore asked to reason about evidence the query does not return.
+When you add or edit a query:
 
-**When you touch a query, fix it in that file.** The correction is not "remove the
-aggregation":
+- **Anything you declare, you return.** The validator will catch you, but the point is to
+  ask what the agent needs, not to satisfy the check.
+- **Keep the group key narrow.** Keying on four fields fragments one behaviour across
+  many rows and hides the count `risk_logic` reads. Detail belongs in `collect()`, not in
+  the key.
+- **Do not "fix" width by removing the aggregation.** Aggregation is load-bearing at
+  process-event volume. And `sort()` is not the open alternative it appears to be: it
+  carries its own result limit and discards the aggregates the risk logic compares
+  against the baseline. Strictly worse on both axes.
 
-- Aggregation is what makes 40 million process events a tractable triage surface.
-  Deleting it does not help the agent, it drowns it.
-- Replacing `groupBy()` with `sort()` is worse, not better. `sort()` in this dialect
-  takes its own limit and truncates the result set; you would trade a summarised 500
-  rows for an arbitrary first 200, and lose the counts the risk logic reads.
+### Still open: no raw drill-down
 
-Do this instead:
-
-1. **Every field in `requires.logs` reaches the output.** Add the missing ones to the
-   `collect([...])` list. Cheap, mechanical, and it closes the declared-versus-emitted
-   gap on its own.
-2. **Raise the sample limits.** 3 command lines is not a sample of a hunt, it is a
-   rounding error. 50 costs nothing at these row counts.
-3. **Give every case a drill-down twin** — identical filters, no `groupBy`, so the agent
-   can pivot from an interesting row to the full untruncated events behind it. This is
-   the part that actually answers "I cannot figure out the threat from this".
-4. **Keep the group key narrow.** Keying on four fields at once fragments one behaviour
-   across many rows and hides the count that the risk logic depends on.
-
-Do not do a repo-wide mechanical rewrite without the validator gaining a check for it
-first. Add the check, let it fail 289 times, then fix under a green test.
+No hypothesis exposes a case that returns unaggregated events, so an interesting row
+cannot be resolved to the events behind it. Closing this means a drill-down case per
+hypothesis and a matching `not_portable` entry for each (L4 requires every CQL case to
+have a Wazuh rule or be declared non-portable). It belongs behind its own validator check,
+added first and allowed to fail, same as this one.

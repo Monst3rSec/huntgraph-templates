@@ -139,6 +139,13 @@ def m_foreign_platform(d):
     d["query"][0]["platform"] = "splunk"
 
 
+def m_declared_field_never_returned(d):
+    # the corpus's original failure: a field is declared, filtered on, and then
+    # aggregated away, so the agent is asked to reason over telemetry the query
+    # never hands back
+    d["requires"]["logs"][0]["fields"].append("SourceProcessId")
+
+
 CASES = [
     ("L1", "unknown top-level key rejected", m_unknown_key, None),
     ("L1", "missing required key rejected", m_missing_version, None),
@@ -165,6 +172,7 @@ CASES = [
     ("L4", "query ignoring every declared event type", m_query_ignores_event_types, None),
     ("L4", "baseline required without a window", m_baseline_missing_window, None),
     ("L4", "baseline required without comparators", m_baseline_missing_compare, None),
+    ("L4", "declared field that no query returns", m_declared_field_never_returned, None),
 ]
 
 
@@ -182,6 +190,7 @@ def main() -> int:
         V.check_mitre(base, atk, rep)
         V.check_evidence(base, rep)
         V.check_query(base, rep)
+        V.check_query_emits_declared(base, rep)
         V.check_convention(base, GOOD, rep)
     failures = []
     if rep.errors:
@@ -196,6 +205,7 @@ def main() -> int:
             V.check_mitre(doc, atk, r)
             V.check_evidence(doc, r)
             V.check_query(doc, r)
+            V.check_query_emits_declared(doc, r)
             V.check_convention(doc, GOOD, r)
         caught = [e for e in r.errors if e.startswith("[%s]" % layer)]
         if caught:

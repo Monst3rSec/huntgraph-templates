@@ -58,68 +58,67 @@ over.
 
 ## Where the current implementation betrays the intent
 
-### The aggregation defect
+### The aggregation defect (fixed for width, open for depth)
 
-This is the live one, and it is a direct contradiction of intent #1.
+This was a direct contradiction of intent #1, and it is what the field report described:
+*"it minimises the data and I cannot find the threat."* Correctly observed.
 
-Every query terminates in `groupBy()` keyed on `ComputerName`, `UserName`,
-`ParentBaseFileName`, `FileName`, with detail preserved only through
-`collect([...], limit=3..5)`. Measured across the corpus:
+Every query terminated in `groupBy()` keyed on `ComputerName`, `UserName`,
+`ParentBaseFileName` and `FileName`, preserving detail only through
+`collect([...], limit=3..5)`. Measured before and after:
 
-| | |
-|---|---:|
-| Templates | 289 |
-| `groupBy` stanzas | 1029 |
-| Stanzas capped at 3-5 samples | 670 |
-| Queries with a raw drill-down path | 0 |
-| Templates declaring a CQL field that never reaches output | **289 (100%)** |
-| Templates that declare `aid` and emit it | **0 of 289** |
+| | before | after |
+|---|---:|---:|
+| Declared CQL telemetry reaching the result row | 77% | **100%** |
+| Templates declaring a field no query returns | 289 of 289 | **0** |
+| Templates declaring `aid` and returning it | 0 of 289 | **289** |
+| Evidence fields per aggregated row (median) | 1 | 2 |
+| `collect()` sample size | 3-5 | 50 |
+| Hypotheses exposing a raw drill-down case | 0 | **0** |
 
-So the file tells the agent "this hunt collects `aid`, `TargetProcessId`,
-`TargetFileName`", the risk logic reasons over them, and the query returns a host name, a
-user name and three truncated command lines. The agent is reasoning over evidence it was
-never given. That is not a query-tuning nit; it is the evidence contract being violated
-by every file in the repository.
+The file told the agent "this hunt collects `aid`, `TargetProcessId`, `TargetFileName`",
+the risk logic reasoned over them, and the query returned a host name, a user name and
+three truncated command lines. The agent was reasoning over evidence it was never given.
 
-The symptom reported from the field — *"it minimises the data and I cannot find the
-threat"* — is exactly this, correctly observed.
+### The fix, and the fix that would have made it worse
 
-### The fix, and the fix that would make it worse
-
-The tempting correction is "drop `groupBy()`, use `sort()`, return everything". Do not.
+The tempting correction was "drop `groupBy()`, use `sort()`, return everything". It was
+rejected, and it is worth recording why, because the instinct will recur:
 
 - Aggregation is load-bearing. Process-creation volume on a real estate is millions of
-  events per hour. An unaggregated hunt returns a result the agent cannot read either,
-  and the counts that `risk_logic` compares against the baseline disappear.
+  events per hour. An unaggregated hunt returns something the agent cannot read either,
+  and the counts `risk_logic` compares against the baseline disappear.
 - `sort()` is not the open alternative it looks like. It carries its own result limit and
-  truncates; swapping `groupBy()` for it trades a summarised view for an arbitrary
-  truncated one, while also discarding the aggregates. Strictly worse on both axes.
+  truncates, so swapping `groupBy()` for it trades a summarised view for an arbitrary
+  truncated one while also discarding the aggregates. Worse on both axes.
+- `table()`, named in the original report, does not appear anywhere in the corpus.
 
-The defect is not that the data is grouped. It is that **the grouped row is not a
-complete evidence record, and there is no way down to the raw events.** Four corrections,
-in priority order:
+The defect was never that the data is grouped. It was that **the grouped row was not a
+complete evidence record, and there was no way down to the raw events.** The first half is
+closed. The second is not.
 
-1. **Close the declared-versus-emitted gap.** Every field in `requires.logs` appears in
-   the `collect([...])` list. Mechanical, verifiable, and it alone fixes the contract
-   violation in all 289 files.
-2. **Add a drill-down case per hypothesis** — same filters, no aggregation — so the agent
-   can pivot from a row to the untruncated events behind it. This is what actually
-   restores "figure out the threat".
-3. **Raise sample limits** from 3-5 to something that is a sample.
-4. **Narrow group keys.** Keying on four fields fragments one behaviour across many rows
-   and destroys the count the risk logic reads.
+### Still open: depth
+
+An analyst or agent can now see every field the hunt promised, but still only as an
+aggregate. There is no case that returns unaggregated events, so an interesting row cannot
+be resolved to the events behind it. That is the remaining half of "figure out the threat",
+and it is a structural change: a drill-down case per hypothesis, each needing a
+`not_portable` entry, because L4 requires every CQL case to carry a Wazuh rule or declare
+itself non-portable.
 
 ### Make the validator own it
 
 The repo's central claim is that the validator is the contract and the mutation tests are
 what make it trustworthy. Then this belongs in the validator, not in a style guide:
 
-> **L3 (proposed):** every field declared in a `crowdstrike-ngsiem` `requires.logs`
-> stanza must appear in the query output of at least one case in that file.
+> **L4 `check_query_emits_declared` (shipped):** every field declared in a
+> `crowdstrike-ngsiem` `requires.logs` stanza must appear in the query output of at least
+> one case in that file. Mutation: *"declared field that no query returns"*.
 >
-> **L4 (proposed):** every hypothesis must expose at least one case that returns raw
+> **L4 (still to write):** every hypothesis must expose at least one case that returns raw
 > events, so an aggregated finding is always resolvable to evidence.
 
-Add the checks first and let them fail 289 times. Fixing the corpus under a failing test
-is a migration; fixing it by hand-editing YAML is 289 chances to regress silently, which
-is the failure mode this repo was built to refuse.
+The first was added before the corpus was touched, allowed to fail 289 times, and the
+migration then ran under it. Do the same for the second. Fixing the corpus under a failing
+test is a migration; fixing it by hand-editing YAML is 289 chances to regress silently,
+which is the failure mode this repo was built to refuse.
