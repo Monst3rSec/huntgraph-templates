@@ -72,7 +72,7 @@ python3 tools/test_validator.py
 | L1 structure | schema conformance; unknown keys are errors |
 | L2 mitre | every id exists, and the relationships a file asserts are the ones MITRE publishes |
 | L3 evidence | referential integrity between evidence, risk logic and verdict; every field declared |
-| L4 query | CQL only; no SPL, KQL, EQL, SQL or Sigma; declared event types actually used |
+| L4 query | CQL cases carry CQL only — no SPL, KQL, EQL, SQL or Sigma; declared event types actually used; Wazuh blocks well-formed and id-allocated |
 | L5 convention | directory encodes the technique; ids unique and correctly suffixed |
 
 `test_validator.py` injects 25 known defects and asserts the right layer catches each. That
@@ -102,8 +102,12 @@ Two other honest limits, stated in the files themselves:
 
 ## Conventions worth knowing before reading the files
 
-- Queries are CrowdStrike CQL. The schema is multi-platform by construction; other dialects
-  are reserved and deliberately not generated.
+- Two connectors are emitted. All 289 files carry a CrowdStrike CQL block
+  (`language: cql`); 127 also carry a Wazuh block (`language: wazuh-rules`), with rule
+  ids allocated from `ruleset/wazuh-id-allocations.yaml` and field names from
+  `ruleset/field-map.yaml`. A CQL case with no Wazuh rule must be listed in
+  `not_portable`; the validator enforces that at L4. Other dialects are reserved and
+  deliberately not generated.
 - `mitre.data_components` records what MITRE says the analytic produces. `requires.logs`
   records what this hunt actually collects. They can legitimately disagree — DCSync is the
   clearest case, where the domain controller sees the object access and the endpoint only
@@ -111,6 +115,21 @@ Two other honest limits, stated in the files themselves:
 - Several templates key on **host role** rather than command content: MSBuild, InstallUtil and
   local compilation are meaningless on an engineering workstation and significant on a finance
   endpoint. Those depend on asset groups being accurate.
+
+## Known defect: queries return less than they declare
+
+Every query terminates in `groupBy()` keyed on some subset of `ComputerName`, `UserName`,
+`ParentBaseFileName` and `FileName`, preserving detail only through
+`collect([...], limit=3..5)`. The result is that **all 289 templates declare at least one
+CQL field in `requires.logs` that never reaches query output** — `aid` is declared by all
+289 and emitted by none — so the agent is asked to reason over evidence the hunt does not
+hand it.
+
+The correction is not to remove the aggregation, and it is emphatically not to replace it
+with `sort()`, which truncates on its own terms and discards the counts the risk logic
+reads. It is to make each grouped row a complete evidence record and to give every
+hypothesis a raw drill-down case. See [intent.md](intent.md) for the measurements and the
+validator checks that should own this.
 
 ## Status
 
