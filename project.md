@@ -116,20 +116,31 @@ Two other honest limits, stated in the files themselves:
   local compilation are meaningless on an engineering workstation and significant on a finance
   endpoint. Those depend on asset groups being accurate.
 
-## Known defect: queries return less than they declare
+## What a query returns
 
-Every query terminates in `groupBy()` keyed on some subset of `ComputerName`, `UserName`,
-`ParentBaseFileName` and `FileName`, preserving detail only through
-`collect([...], limit=3..5)`. The result is that **all 289 templates declare at least one
-CQL field in `requires.logs` that never reaches query output** — `aid` is declared by all
-289 and emitted by none — so the agent is asked to reason over evidence the hunt does not
-hand it.
+A case returns **raw events** by default: filter the stream down to the behaviour and stop.
+The agent receives every field on every matching event and does its own counting, grouping
+and pivoting. That is the whole point of an agentic consumer — a pre-computed row is a
+summary someone else chose, and nothing recovers what it dropped.
 
-The correction is not to remove the aggregation, and it is emphatically not to replace it
-with `sort()`, which truncates on its own terms and discards the counts the risk logic
-reads. It is to make each grouped row a complete evidence record and to give every
-hypothesis a raw drill-down case. See [intent.md](intent.md) for the measurements and the
-validator checks that should own this.
+The corpus did not start this way. All 1028 CQL cases once ended in `groupBy()` keyed on
+some subset of `ComputerName`, `UserName`, `ParentBaseFileName` and `FileName`, preserving
+detail only through `collect([...], limit=3..5)`. Every one of the 289 templates declared
+`aid` in `requires.logs` and no query returned it. 774 cases are now raw, where that
+question no longer arises.
+
+254 cases still aggregate, because in those the aggregation *is* the hypothesis:
+
+- **159 joins.** A `case { ... }` block tags two event streams and `groupBy` on a shared
+  key puts them on one row, so a trailing line can demand both:
+  `| enumerated=/.+/ and controlled=/.+/`. Without the `groupBy` those fields never appear
+  together on one event and the query returns nothing.
+- **179 threshold lines.** "At breadth" and "at machine rate" are stated as
+  `| hosts >= 20`, `| connections >= 6`, `| distinct_categories >= 3`. The count exists
+  only because of the `groupBy`.
+
+Where aggregation survives, every field `requires.logs` declares must still reach the row.
+See [intent.md](intent.md) for the measurements and the tradeoff.
 
 ## Status
 

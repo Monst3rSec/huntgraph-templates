@@ -19,12 +19,15 @@ short list.**
 pip install -r tools/requirements.txt
 
 python3 tools/validate.py --strict        # the contract. must pass before any commit
-python3 tools/test_validator.py           # 25 injected defects, each must be caught
+python3 tools/test_validator.py           # injected defects, each must be caught
 python3 tools/coverage.py --priority 1 --remaining
 python3 tools/coverage.py --priority 1 --blocked
 python3 tools/coverage.py --markdown > task.md     # regenerate, never hand-edit
 python3 tools/export_csv.py -o coverage.csv        # regenerate, never hand-edit
 ```
+
+On a machine with an externally-managed Python (recent macOS), create a venv rather than
+installing into the system interpreter. Nothing in the toolchain requires a global install.
 
 `task.md` and `coverage.csv` are generated artefacts. Editing them by hand produces a
 file that is wrong and will be silently overwritten.
@@ -43,12 +46,10 @@ file that is wrong and will be silently overwritten.
    Process Access or OS API Execution, which this deployment does not collect. A
    command-line approximation of DLL injection detects nothing while looking like
    coverage. Record it in `skipped.yaml` or leave it uncovered.
-6. **Every field declared in `requires.logs` must actually reach the query output.**
-   See the open defect below; this is currently violated by every file in the repo.
+6. **Return the events, not a summary of them.** See the query output policy below. A
+   query that aggregates by default hands the agent a row it cannot reason past.
 
 ## Connectors
-
-Two are emitted. `project.md` used to claim CQL only; that is no longer true.
 
 | Connector | `language` | Files |
 |---|---|---:|
@@ -70,43 +71,46 @@ enforces all of this at L4.
 | L4 query | CQL only in `cql` cases; declared event types actually used; Wazuh block well-formed |
 | L5 convention | directory encodes the technique; ids unique and correctly suffixed |
 
-## Open defect: aggregation collapses the evidence
+## Query output policy
 
-**Status: known, unfixed, affects all 289 files.**
+**Default: a case returns raw events.** Filter the event stream down to the behaviour and
+stop. The agent gets every field on every matching event and can count, group, sort and
+pivot for itself. A pre-baked `groupBy` row is a summary someone else chose, and the agent
+cannot get back what it discarded.
 
-Every query ends in `groupBy()` keyed on some subset of `ComputerName`, `UserName`,
-`ParentBaseFileName`, `FileName`, with detail carried only by `collect([...], limit=N)`
-where N is 3 to 5 in 670 of 1029 stanzas.
+The corpus originally ended all 1028 CQL cases in `groupBy()` keyed on `ComputerName`,
+`UserName`, `ParentBaseFileName`, `FileName`, keeping detail only in
+`collect([...], limit=3..5)`. 774 of those are now raw. Every one of the 289 templates
+declared `aid` in `requires.logs` and no query returned it; in a raw case that is moot,
+because the event carries all of its fields.
 
-Measured consequence: **289 of 289 templates declare at least one CQL field in
-`requires.logs` that never appears in query output.** `aid` is declared by all 289 and
-emitted by none — the agent id, the one field you pivot on in NG-SIEM, is documented as
-required and thrown away by every query. Also commonly lost: `ImageFileName` (63),
-`ContextProcessId` (46), `TargetProcessId` (39), `TargetFileName` (28).
+**Aggregate only when the aggregation is the hypothesis.** Two cases qualify, and 254
+cases in the corpus are held back by them:
 
-The agent is therefore asked to reason about evidence the query does not return.
+- **A join.** A `case { ... }` block tags two event streams, and `groupBy` on a shared key
+  (usually `ContextProcessId`) is what puts them on one row so a trailing line can require
+  both: `| enumerated=/.+/ and controlled=/.+/`. Delete the `groupBy` and those two fields
+  never coexist on a single event — the query returns nothing at all. 159 cases.
+- **A threshold.** The hypothesis is "at breadth" or "at machine rate", and a trailing line
+  states it: `| hosts >= 20`, `| connections >= 6`, `| distinct_categories >= 3`. The count
+  only exists because of the `groupBy`. 179 such lines.
 
-**When you touch a query, fix it in that file.** The correction is not "remove the
-aggregation":
+When you must aggregate, **every field declared in `requires.logs` still has to reach the
+row** — as a `groupBy` key, inside `collect([...])`, or as an aggregate alias. That is the
+rule the original corpus broke in all 289 files, and it still holds wherever aggregation
+survives.
 
-- Aggregation is what makes 40 million process events a tractable triage surface.
-  Deleting it does not help the agent, it drowns it.
-- Replacing `groupBy()` with `sort()` is worse, not better. `sort()` in this dialect
-  takes its own limit and truncates the result set; you would trade a summarised 500
-  rows for an arbitrary first 200, and lose the counts the risk logic reads.
+`sort()` goes with the `groupBy` it serves: 721 of the corpus's 722 `sort()` calls sorted on
+an aggregate alias, so they have nothing to sort once the aggregate is gone.
 
-Do this instead:
+### Still open
 
-1. **Every field in `requires.logs` reaches the output.** Add the missing ones to the
-   `collect([...])` list. Cheap, mechanical, and it closes the declared-versus-emitted
-   gap on its own.
-2. **Raise the sample limits.** 3 command lines is not a sample of a hunt, it is a
-   rounding error. 50 costs nothing at these row counts.
-3. **Give every case a drill-down twin** — identical filters, no `groupBy`, so the agent
-   can pivot from an interesting row to the full untruncated events behind it. This is
-   the part that actually answers "I cannot figure out the threat from this".
-4. **Keep the group key narrow.** Keying on four fields at once fragments one behaviour
-   across many rows and hides the count that the risk logic depends on.
+14 templates consist entirely of join/threshold cases and so return no raw events anywhere.
+All 14 still declare fields — `aid` among them — that no query returns. Closing that means
+either giving each a raw companion case (which needs a matching `not_portable` entry, since
+L4 requires every CQL case to carry a Wazuh rule or declare itself non-portable), or
+widening their `collect([...])` lists to carry the declared fields.
 
-Do not do a repo-wide mechanical rewrite without the validator gaining a check for it
-first. Add the check, let it fail 289 times, then fix under a green test.
+Neither the raw-by-default rule nor the declared-fields rule is enforced by the validator
+yet. Adding them means writing the check first, letting it fail, and migrating under it —
+never a hand pass over 289 files.
