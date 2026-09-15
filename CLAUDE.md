@@ -71,6 +71,78 @@ enforces all of this at L4.
 | L4 query | CQL only in `cql` cases; declared event types actually used; Wazuh block well-formed |
 | L5 convention | directory encodes the technique; ids unique and correctly suffixed |
 
+## Upstream rule ingestion
+
+Two public rule sets are triaged against this corpus:
+
+| Source | Upstream | Tracker |
+|---|---|---|
+| Splunk | [research.splunk.com/detections](https://research.splunk.com/detections/) (`splunk/security_content`) | `splunk_tracker.md` |
+| Elastic | [detection-rules-explorer](https://elastic.github.io/detection-rules-explorer/) (`elastic/detection-rules`) | `elk_tracker.md` |
+
+```bash
+python3 tools/track_sources.py     # refetch upstream, rewrite both trackers
+```
+
+Both trackers are **generated artefacts** — regenerate, never hand-edit, same rule as
+`task.md` and `coverage.csv`. Every upstream rule appears in one of them with a routing
+decision, so a rule that was considered and rejected stays rejected instead of being
+re-litigated the next time someone finds these repos.
+
+A rule is queued as `convert` only when **both** halves hold:
+
+- **The technique** is a leaf this repo does not cover, is observable on Windows, Linux or
+  macOS, is not missing the telemetry its hypothesis would need, and carries at least one
+  ATT&CK detection strategy — without one, L2 can never pass.
+- **The upstream rule reads endpoint telemetry.** Judge this from the rule's own metadata
+  (Splunk `data_source`, Elastic `index`), never from its title. A technique can be
+  endpoint-observable while a particular rule for it reads CloudTrail; those are marked
+  `cloud-surface`, because this connector does not ingest them.
+
+Everything else is recorded with its reason: `covered`, `blocked-telemetry`,
+`out-of-scope`, `parent`, `skipped`, `unresolved-id`, `no-detection-strategy`,
+`non-endpoint-surface`.
+
+**`convert` is a technique-level judgement, not a behaviour-level one.** The tracker asks
+whether a rule's *technique* has a template. It cannot tell you whether the *behaviour* is
+already covered under a different technique, and upstream labelling differs from this
+corpus's. The worked example: a dozen Splunk rules labelled T1566.001 ("Windows Office
+Product Spawned Uncommon Process", "… Spawned MSDT", "Suspicious MS Office Child Process")
+describe exactly what `document-spawning-execution-chain.yaml` already covers as
+`document-parent-interpreter-child` under T1204.002. T1566.001 is uncovered, so they all
+queue as `convert`; authoring them would duplicate an existing hypothesis under a second id.
+
+So before writing anything, read the queued rule's behaviour against the existing corpus,
+not just its technique id. If a template already expresses it, the rule is a duplicate:
+leave the template alone and move on. A found duplicate is a correct outcome of triage, not
+a gap.
+
+Also treat `surface` as a floor, not a guarantee. It reads the upstream rule's own
+`data_source`/`index`; a rule that declares neither is classed `unknown` and refused,
+because absence of a declared source is not evidence of endpoint visibility — GitHub audit,
+mail-gateway and ML rules all land there.
+
+### Converting is authoring, not porting
+
+An upstream rule is not a hunting hypothesis — that distinction is the reason this corpus
+exists. A conversion rewrites the behaviour as a hypothesis with its own evidence buckets,
+risk logic and verdict, and the query becomes hand-written CQL against CrowdStrike event
+names. Splunk SPL, Elastic EQL/KQL/ES|QL are all rejected outright by L4, so nothing is
+translated mechanically. Expect several rules to collapse into one hypothesis, and expect
+some to be dropped after reading them.
+
+**Put the upstream raw URL in `info.references`.** That is how `track_sources.py` marks a
+rule converted; omit it and the tracker will keep reporting the rule as outstanding.
+
+### Unmapped rules
+
+Rules with no ATT&CK mapping go to `unclassified-threat-check/<source>-unmapped.md` as a
+staged list. They are **not** templates and are not validated: the schema requires every
+`id` to end in a MITRE technique number, and L5 rejects any file outside `techniques/`, so
+an unclassified detection is currently unrepresentable. Making it representable means
+changing the id pattern, L5, the mitre block in schema and L2, and the mutation tests —
+do that as its own piece of work, not as a side effect of an import.
+
 ## Query output policy
 
 **Default: a case returns raw events.** Filter the event stream down to the behaviour and

@@ -53,6 +53,7 @@ tools/attack_extract.py          the only sanctioned source of MITRE facts
 tools/validate.py                five-layer contract enforcement
 tools/test_validator.py          25 injected defects, asserts each is caught
 tools/coverage.py                what is done, what is left, what is blocked
+tools/track_sources.py           triages upstream Splunk and Elastic rules
 ```
 
 The directory carries the technique; the filename carries the behaviour. Ids are stable —
@@ -144,12 +145,19 @@ See [intent.md](intent.md) for the measurements and the tradeoff.
 
 ## Status
 
-Both status artefacts are generated. Neither is safe to edit by hand.
+Every status artefact is generated. None is safe to edit by hand.
 
 ```bash
 python3 tools/coverage.py --markdown > task.md    # summary tracker
 python3 tools/export_csv.py -o coverage.csv       # full matrix, one row per tactic-technique
+python3 tools/track_sources.py                    # splunk_tracker.md and elk_tracker.md
 ```
+
+[splunk_tracker.md](splunk_tracker.md) and [elk_tracker.md](elk_tracker.md) triage every
+upstream Splunk and Elastic rule against this corpus, recording for each one whether it is
+queued for conversion or why it is not. Rules with no ATT&CK mapping are staged under
+`unclassified-threat-check/`, which holds lists rather than templates — the schema requires
+a MITRE id in every `id`. See [CLAUDE.md](CLAUDE.md) for the routing rules.
 
 [task.md](task.md) is the per-tactic summary. [coverage.csv](coverage.csv) is the whole
 Enterprise matrix — every tactic, technique and sub-technique, the data components its
