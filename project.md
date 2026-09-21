@@ -54,6 +54,8 @@ tools/validate.py                five-layer contract enforcement
 tools/test_validator.py          27 injected defects, asserts each is caught
 tools/coverage.py                what is done, what is left, what is blocked
 tools/track_sources.py           triages upstream Splunk and Elastic rules
+tools/import_sigma.py            stores SigmaHQ threat-hunting rules by category
+upstream/<category>/sigma/       those rules, unmodified (Detection Rule License 1.1)
 ```
 
 The directory carries the technique; the filename carries the behaviour. Ids are stable —
@@ -144,7 +146,13 @@ Every status artefact is generated. None is safe to edit by hand.
 python3 tools/coverage.py --markdown > task.md    # summary tracker
 python3 tools/export_csv.py -o coverage.csv       # full matrix, one row per tactic-technique
 python3 tools/track_sources.py                    # splunk_tracker.md and elk_tracker.md
+python3 tools/import_sigma.py                     # upstream/<category>/sigma/ and sigma_tracker.md
 ```
+
+[sigma_tracker.md](sigma_tracker.md) lists every imported Sigma threat-hunting rule by
+category, technique, description and path. The rules themselves live unmodified under
+[upstream/](upstream/), filed by Elastic's prebuilt-rule categories; they are reference
+material, not templates.
 
 [splunk_tracker.md](splunk_tracker.md) and [elk_tracker.md](elk_tracker.md) triage every
 upstream Splunk and Elastic rule against this corpus, recording for each one whether it is
