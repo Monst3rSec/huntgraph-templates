@@ -147,7 +147,12 @@ python3 tools/coverage.py --markdown > task.md    # summary tracker
 python3 tools/export_csv.py -o coverage.csv       # full matrix, one row per tactic-technique
 python3 tools/track_sources.py                    # splunk_tracker.md and elk_tracker.md
 python3 tools/import_sigma.py                     # upstream/<category>/sigma/ and sigma_tracker.md
+python3 tools/stats.py                            # stats.md
 ```
+
+[stats.md](stats.md) counts the corpus from the files on disk: templates by category,
+tactic, platform and severity, query shape, evidence, ATT&CK coverage, upstream rules, and
+an index of every technique family by category.
 
 [sigma_tracker.md](sigma_tracker.md) lists every imported Sigma threat-hunting rule by
 category, technique, description and path. The rules themselves live unmodified under

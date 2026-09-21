@@ -24,12 +24,13 @@ python3 tools/coverage.py --priority 1 --remaining
 python3 tools/coverage.py --priority 1 --blocked
 python3 tools/coverage.py --markdown > task.md     # regenerate, never hand-edit
 python3 tools/export_csv.py -o coverage.csv        # regenerate, never hand-edit
+python3 tools/stats.py                             # stats.md, regenerate, never hand-edit
 ```
 
 On a machine with an externally-managed Python (recent macOS), create a venv rather than
 installing into the system interpreter. Nothing in the toolchain requires a global install.
 
-`task.md` and `coverage.csv` are generated artefacts. Editing them by hand produces a
+`task.md`, `coverage.csv` and `stats.md` are generated artefacts. Editing them by hand produces a
 file that is wrong and will be silently overwritten.
 
 ## Hard invariants
