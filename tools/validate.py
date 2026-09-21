@@ -17,7 +17,7 @@ one pass reports everything wrong with a template.
   L5 convention  category + technique directory layout, id format, id uniqueness
 
     python3 tools/validate.py                    # whole repo
-    python3 tools/validate.py techniques/T1218-*  # a subtree
+    python3 tools/validate.py hunt/endpoint/T1218-*  # a subtree
     python3 tools/validate.py --strict           # warnings fail too
     python3 tools/validate.py --json             # machine readable
 
@@ -45,7 +45,10 @@ from attack_extract import Attack, attack_id, load_bundle  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCHEMA_PATH = os.path.join(ROOT, "schema", "detection.schema.json")
-TECHNIQUES_DIR = os.path.join(ROOT, "techniques")
+HUNT_DIR = os.path.join(ROOT, "hunt")
+# Upstream rule sets stored beside the templates, e.g. hunt/endpoint/sigma/. They are
+# third-party material, not templates, so nothing walks into them.
+UPSTREAM_SOURCES = {"sigma"}
 
 # Rule ids are allocated to templates in blocks of this size. Wazuh ids must be
 # globally unique, so a template may only use ids inside the block it owns.
@@ -625,11 +628,11 @@ def check_convention(doc, path: str, rep: Report) -> None:
     rel = os.path.relpath(path, ROOT)
     parts = rel.split(os.sep)
 
-    if parts[0] != "techniques":
-        rep.error("L5", "detection files must live under techniques/, found %s" % rel)
+    if parts[0] != "hunt":
+        rep.error("L5", "detection files must live under hunt/, found %s" % rel)
         return
     if len(parts) not in (4, 5):
-        rep.error("L5", "expected techniques/<category>/<Txxxx-slug>[/<Txxxx.yyy-slug>]/"
+        rep.error("L5", "expected hunt/<category>/<Txxxx-slug>[/<Txxxx.yyy-slug>]/"
                         "<name>.yaml, found %s" % rel)
         return
     if parts[1] not in CATEGORIES:
@@ -694,13 +697,14 @@ def validate_file(path: str, schema, atk: Attack) -> Report:
 
 
 def collect(paths: list[str]) -> list[str]:
-    roots = paths or [TECHNIQUES_DIR]
+    roots = paths or [HUNT_DIR]
     found = []
     for root in roots:
         if os.path.isfile(root):
             found.append(root)
             continue
-        for dirpath, _, files in os.walk(root):
+        for dirpath, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in UPSTREAM_SOURCES]
             for f in sorted(files):
                 if f.endswith((".yaml", ".yml")):
                     found.append(os.path.join(dirpath, f))

@@ -105,161 +105,161 @@ One row per technique or sub-technique in the pinned ATT&CK release. Per-tactic 
 
 ## Index
 
-Every technique family, by category. Templates live at `techniques/<category>/<family>/[<sub-technique>/]<behaviour>.yaml`.
+Every technique family, by category. Templates live at `hunt/<category>/<family>/[<sub-technique>/]<behaviour>.yaml`.
 
 ### endpoint — 202 templates
 
 | Technique | Name | Templates | Sub-techniques |
 |---|---|---:|---|
-| [T1003](techniques/endpoint/T1003-os-credential-dumping) | OS Credential Dumping | 4 | T1003.001, T1003.002, T1003.003, T1003.008 |
-| [T1005](techniques/endpoint/T1005-data-from-local-system) | Data from Local System | 1 | — |
-| [T1007](techniques/endpoint/T1007-system-service-discovery) | System Service Discovery | 1 | — |
-| [T1012](techniques/endpoint/T1012-query-registry) | Query Registry | 1 | — |
-| [T1016](techniques/endpoint/T1016-system-network-configuration-discovery) | System Network Configuration Discovery | 2 | T1016.001, T1016.002 |
-| [T1018](techniques/endpoint/T1018-remote-system-discovery) | Remote System Discovery | 1 | — |
-| [T1027](techniques/endpoint/T1027-obfuscated-files-or-information) | Obfuscated Files or Information | 15 | T1027.001, T1027.003, T1027.004, T1027.005, T1027.006, T1027.008, T1027.009, T1027.010, T1027.011, T1027.012, T1027.013, T1027.015, T1027.017, T1027.018 |
-| [T1033](techniques/endpoint/T1033-system-owner-user-discovery) | System Owner/User Discovery | 1 | — |
-| [T1036](techniques/endpoint/T1036-masquerading) | Masquerading | 10 | T1036.001, T1036.002, T1036.003, T1036.004, T1036.005, T1036.006, T1036.007, T1036.008, T1036.010, T1036.012 |
-| [T1037](techniques/endpoint/T1037-boot-or-logon-initialization-scripts) | Boot or Logon Initialization Scripts | 5 | T1037.001, T1037.002, T1037.003, T1037.004, T1037.005 |
-| [T1039](techniques/endpoint/T1039-data-from-network-shared-drive) | Data from Network Shared Drive | 1 | — |
-| [T1047](techniques/endpoint/T1047-windows-management-instrumentation) | Windows Management Instrumentation | 1 | — |
-| [T1049](techniques/endpoint/T1049-system-network-connections-discovery) | System Network Connections Discovery | 1 | — |
-| [T1053](techniques/endpoint/T1053-scheduled-task-job) | Scheduled Task/Job | 4 | T1053.002, T1053.003, T1053.005, T1053.006 |
-| [T1056](techniques/endpoint/T1056-input-capture) | Input Capture | 3 | T1056.001, T1056.002, T1056.003 |
-| [T1057](techniques/endpoint/T1057-process-discovery) | Process Discovery | 1 | — |
-| [T1059](techniques/endpoint/T1059-command-and-scripting-interpreter) | Command and Scripting Interpreter | 8 | T1059.001, T1059.002, T1059.003, T1059.004, T1059.005, T1059.006, T1059.007, T1059.011 |
-| [T1069](techniques/endpoint/T1069-permission-groups-discovery) | Permission Groups Discovery | 2 | T1069.001, T1069.002 |
-| [T1070](techniques/endpoint/T1070-indicator-removal) | Indicator Removal | 8 | T1070.003, T1070.004, T1070.005, T1070.006, T1070.007, T1070.008, T1070.009, T1070.010 |
-| [T1072](techniques/endpoint/T1072-software-deployment-tools) | Software Deployment Tools | 1 | — |
-| [T1074](techniques/endpoint/T1074-data-staged) | Data Staged | 2 | T1074.001, T1074.002 |
-| [T1080](techniques/endpoint/T1080-taint-shared-content) | Taint Shared Content | 1 | — |
-| [T1082](techniques/endpoint/T1082-system-information-discovery) | System Information Discovery | 1 | — |
-| [T1083](techniques/endpoint/T1083-file-and-directory-discovery) | File and Directory Discovery | 1 | — |
-| [T1087](techniques/endpoint/T1087-account-discovery) | Account Discovery | 3 | T1087.001, T1087.002, T1087.003 |
-| [T1112](techniques/endpoint/T1112-modify-registry) | Modify Registry | 1 | — |
-| [T1113](techniques/endpoint/T1113-screen-capture) | Screen Capture | 1 | — |
-| [T1115](techniques/endpoint/T1115-clipboard-data) | Clipboard Data | 1 | — |
-| [T1119](techniques/endpoint/T1119-automated-collection) | Automated Collection | 1 | — |
-| [T1123](techniques/endpoint/T1123-audio-capture) | Audio Capture | 1 | — |
-| [T1127](techniques/endpoint/T1127-trusted-developer-utilities-proxy-execution) | Trusted Developer Utilities Proxy Execution | 2 | T1127.001, T1127.003 |
-| [T1135](techniques/endpoint/T1135-network-share-discovery) | Network Share Discovery | 1 | — |
-| [T1137](techniques/endpoint/T1137-office-application-startup) | Office Application Startup | 2 | T1137.001, T1137.006 |
-| [T1140](techniques/endpoint/T1140-deobfuscate-decode-files-or-information) | Deobfuscate/Decode Files or Information | 1 | — |
-| [T1176](techniques/endpoint/T1176-software-extensions) | Software Extensions | 2 | T1176.001, T1176.002 |
-| [T1197](techniques/endpoint/T1197-bits-jobs) | BITS Jobs | 1 | — |
-| [T1201](techniques/endpoint/T1201-password-policy-discovery) | Password Policy Discovery | 1 | — |
-| [T1202](techniques/endpoint/T1202-indirect-command-execution) | Indirect Command Execution | 1 | — |
-| [T1203](techniques/endpoint/T1203-exploitation-for-client-execution) | Exploitation for Client Execution | 1 | — |
-| [T1204](techniques/endpoint/T1204-user-execution) | User Execution | 4 | T1204.001, T1204.002, T1204.004, T1204.005 |
-| [T1211](techniques/endpoint/T1211-exploitation-for-stealth) | Exploitation for Stealth | 1 | — |
-| [T1212](techniques/endpoint/T1212-exploitation-for-credential-access) | Exploitation for Credential Access | 1 | — |
-| [T1213](techniques/endpoint/T1213-data-from-information-repositories) | Data from Information Repositories | 1 | T1213.006 |
-| [T1216](techniques/endpoint/T1216-system-script-proxy-execution) | System Script Proxy Execution | 2 | T1216.001, T1216.002 |
-| [T1217](techniques/endpoint/T1217-browser-information-discovery) | Browser Information Discovery | 1 | — |
-| [T1218](techniques/endpoint/T1218-system-binary-proxy-execution) | System Binary Proxy Execution | 8 | T1218.001, T1218.004, T1218.005, T1218.007, T1218.010, T1218.011, T1218.015 |
-| [T1220](techniques/endpoint/T1220-xsl-script-processing) | XSL Script Processing | 1 | — |
-| [T1221](techniques/endpoint/T1221-template-injection) | Template Injection | 1 | — |
-| [T1222](techniques/endpoint/T1222-file-and-directory-permissions-modification) | File and Directory Permissions Modification | 2 | T1222.001, T1222.002 |
-| [T1480](techniques/endpoint/T1480-execution-guardrails) | Execution Guardrails | 1 | T1480.001 |
-| [T1497](techniques/endpoint/T1497-virtualization-sandbox-evasion) | Virtualization/Sandbox Evasion | 1 | T1497.001 |
-| [T1518](techniques/endpoint/T1518-software-discovery) | Software Discovery | 2 | T1518.001, T1518.002 |
-| [T1543](techniques/endpoint/T1543-create-or-modify-system-process) | Create or Modify System Process | 4 | T1543.001, T1543.002, T1543.003, T1543.004 |
-| [T1546](techniques/endpoint/T1546-event-triggered-execution) | Event Triggered Execution | 11 | T1546.001, T1546.002, T1546.003, T1546.004, T1546.005, T1546.008, T1546.013, T1546.014, T1546.016, T1546.017, T1546.018 |
-| [T1547](techniques/endpoint/T1547-boot-or-logon-autostart-execution) | Boot or Logon Autostart Execution | 6 | T1547.001, T1547.006, T1547.007, T1547.009, T1547.013, T1547.014 |
-| [T1548](techniques/endpoint/T1548-abuse-elevation-control-mechanism) | Abuse Elevation Control Mechanism | 3 | T1548.001, T1548.002, T1548.003 |
-| [T1552](techniques/endpoint/T1552-unsecured-credentials) | Unsecured Credentials | 5 | T1552.001, T1552.002, T1552.003, T1552.004, T1552.006 |
-| [T1553](techniques/endpoint/T1553-subvert-trust-controls) | Subvert Trust Controls | 5 | T1553.001, T1553.002, T1553.004, T1553.005, T1553.006 |
-| [T1554](techniques/endpoint/T1554-compromise-host-software-binary) | Compromise Host Software Binary | 1 | — |
-| [T1555](techniques/endpoint/T1555-credentials-from-password-stores) | Credentials from Password Stores | 2 | T1555.003, T1555.004 |
-| [T1560](techniques/endpoint/T1560-archive-collected-data) | Archive Collected Data | 1 | T1560.001 |
-| [T1564](techniques/endpoint/T1564-hide-artifacts) | Hide Artifacts | 12 | T1564.001, T1564.002, T1564.003, T1564.004, T1564.005, T1564.006, T1564.007, T1564.008, T1564.009, T1564.011, T1564.012, T1564.014 |
-| [T1569](techniques/endpoint/T1569-system-services) | System Services | 3 | T1569.001, T1569.002, T1569.003 |
-| [T1574](techniques/endpoint/T1574-hijack-execution-flow) | Hijack Execution Flow | 7 | T1574.001, T1574.006, T1574.007, T1574.008, T1574.009, T1574.010, T1574.012 |
-| [T1614](techniques/endpoint/T1614-system-location-discovery) | System Location Discovery | 1 | T1614.001 |
-| [T1615](techniques/endpoint/T1615-group-policy-discovery) | Group Policy Discovery | 1 | — |
-| [T1647](techniques/endpoint/T1647-plist-file-modification) | Plist File Modification | 1 | — |
-| [T1652](techniques/endpoint/T1652-device-driver-discovery) | Device Driver Discovery | 1 | — |
-| [T1653](techniques/endpoint/T1653-power-settings) | Power Settings | 1 | — |
-| [T1654](techniques/endpoint/T1654-log-enumeration) | Log Enumeration | 1 | — |
-| [T1673](techniques/endpoint/T1673-virtual-machine-discovery) | Virtual Machine Discovery | 1 | — |
-| [T1678](techniques/endpoint/T1678-delay-execution) | Delay Execution | 1 | — |
-| [T1679](techniques/endpoint/T1679-selective-exclusion) | Selective Exclusion | 1 | — |
-| [T1680](techniques/endpoint/T1680-local-storage-discovery) | Local Storage Discovery | 1 | — |
-| [T1684](techniques/endpoint/T1684-social-engineering) | Social Engineering | 1 | T1684.001 |
-| [T1685](techniques/endpoint/T1685-disable-or-modify-tools) | Disable or Modify Tools | 4 | T1685.001, T1685.003, T1685.005, T1685.006 |
-| [T1686](techniques/endpoint/T1686-disable-or-modify-system-firewall) | Disable or Modify System Firewall | 1 | T1686.003 |
-| [T1687](techniques/endpoint/T1687-exploitation-for-defense-impairment) | Exploitation for Defense Impairment | 1 | — |
-| [T1688](techniques/endpoint/T1688-safe-mode-boot) | Safe Mode Boot | 1 | — |
-| [T1689](techniques/endpoint/T1689-downgrade-attack) | Downgrade Attack | 1 | — |
-| [T1690](techniques/endpoint/T1690-prevent-command-history-logging) | Prevent Command History Logging | 1 | — |
+| [T1003](hunt/endpoint/T1003-os-credential-dumping) | OS Credential Dumping | 4 | T1003.001, T1003.002, T1003.003, T1003.008 |
+| [T1005](hunt/endpoint/T1005-data-from-local-system) | Data from Local System | 1 | — |
+| [T1007](hunt/endpoint/T1007-system-service-discovery) | System Service Discovery | 1 | — |
+| [T1012](hunt/endpoint/T1012-query-registry) | Query Registry | 1 | — |
+| [T1016](hunt/endpoint/T1016-system-network-configuration-discovery) | System Network Configuration Discovery | 2 | T1016.001, T1016.002 |
+| [T1018](hunt/endpoint/T1018-remote-system-discovery) | Remote System Discovery | 1 | — |
+| [T1027](hunt/endpoint/T1027-obfuscated-files-or-information) | Obfuscated Files or Information | 15 | T1027.001, T1027.003, T1027.004, T1027.005, T1027.006, T1027.008, T1027.009, T1027.010, T1027.011, T1027.012, T1027.013, T1027.015, T1027.017, T1027.018 |
+| [T1033](hunt/endpoint/T1033-system-owner-user-discovery) | System Owner/User Discovery | 1 | — |
+| [T1036](hunt/endpoint/T1036-masquerading) | Masquerading | 10 | T1036.001, T1036.002, T1036.003, T1036.004, T1036.005, T1036.006, T1036.007, T1036.008, T1036.010, T1036.012 |
+| [T1037](hunt/endpoint/T1037-boot-or-logon-initialization-scripts) | Boot or Logon Initialization Scripts | 5 | T1037.001, T1037.002, T1037.003, T1037.004, T1037.005 |
+| [T1039](hunt/endpoint/T1039-data-from-network-shared-drive) | Data from Network Shared Drive | 1 | — |
+| [T1047](hunt/endpoint/T1047-windows-management-instrumentation) | Windows Management Instrumentation | 1 | — |
+| [T1049](hunt/endpoint/T1049-system-network-connections-discovery) | System Network Connections Discovery | 1 | — |
+| [T1053](hunt/endpoint/T1053-scheduled-task-job) | Scheduled Task/Job | 4 | T1053.002, T1053.003, T1053.005, T1053.006 |
+| [T1056](hunt/endpoint/T1056-input-capture) | Input Capture | 3 | T1056.001, T1056.002, T1056.003 |
+| [T1057](hunt/endpoint/T1057-process-discovery) | Process Discovery | 1 | — |
+| [T1059](hunt/endpoint/T1059-command-and-scripting-interpreter) | Command and Scripting Interpreter | 8 | T1059.001, T1059.002, T1059.003, T1059.004, T1059.005, T1059.006, T1059.007, T1059.011 |
+| [T1069](hunt/endpoint/T1069-permission-groups-discovery) | Permission Groups Discovery | 2 | T1069.001, T1069.002 |
+| [T1070](hunt/endpoint/T1070-indicator-removal) | Indicator Removal | 8 | T1070.003, T1070.004, T1070.005, T1070.006, T1070.007, T1070.008, T1070.009, T1070.010 |
+| [T1072](hunt/endpoint/T1072-software-deployment-tools) | Software Deployment Tools | 1 | — |
+| [T1074](hunt/endpoint/T1074-data-staged) | Data Staged | 2 | T1074.001, T1074.002 |
+| [T1080](hunt/endpoint/T1080-taint-shared-content) | Taint Shared Content | 1 | — |
+| [T1082](hunt/endpoint/T1082-system-information-discovery) | System Information Discovery | 1 | — |
+| [T1083](hunt/endpoint/T1083-file-and-directory-discovery) | File and Directory Discovery | 1 | — |
+| [T1087](hunt/endpoint/T1087-account-discovery) | Account Discovery | 3 | T1087.001, T1087.002, T1087.003 |
+| [T1112](hunt/endpoint/T1112-modify-registry) | Modify Registry | 1 | — |
+| [T1113](hunt/endpoint/T1113-screen-capture) | Screen Capture | 1 | — |
+| [T1115](hunt/endpoint/T1115-clipboard-data) | Clipboard Data | 1 | — |
+| [T1119](hunt/endpoint/T1119-automated-collection) | Automated Collection | 1 | — |
+| [T1123](hunt/endpoint/T1123-audio-capture) | Audio Capture | 1 | — |
+| [T1127](hunt/endpoint/T1127-trusted-developer-utilities-proxy-execution) | Trusted Developer Utilities Proxy Execution | 2 | T1127.001, T1127.003 |
+| [T1135](hunt/endpoint/T1135-network-share-discovery) | Network Share Discovery | 1 | — |
+| [T1137](hunt/endpoint/T1137-office-application-startup) | Office Application Startup | 2 | T1137.001, T1137.006 |
+| [T1140](hunt/endpoint/T1140-deobfuscate-decode-files-or-information) | Deobfuscate/Decode Files or Information | 1 | — |
+| [T1176](hunt/endpoint/T1176-software-extensions) | Software Extensions | 2 | T1176.001, T1176.002 |
+| [T1197](hunt/endpoint/T1197-bits-jobs) | BITS Jobs | 1 | — |
+| [T1201](hunt/endpoint/T1201-password-policy-discovery) | Password Policy Discovery | 1 | — |
+| [T1202](hunt/endpoint/T1202-indirect-command-execution) | Indirect Command Execution | 1 | — |
+| [T1203](hunt/endpoint/T1203-exploitation-for-client-execution) | Exploitation for Client Execution | 1 | — |
+| [T1204](hunt/endpoint/T1204-user-execution) | User Execution | 4 | T1204.001, T1204.002, T1204.004, T1204.005 |
+| [T1211](hunt/endpoint/T1211-exploitation-for-stealth) | Exploitation for Stealth | 1 | — |
+| [T1212](hunt/endpoint/T1212-exploitation-for-credential-access) | Exploitation for Credential Access | 1 | — |
+| [T1213](hunt/endpoint/T1213-data-from-information-repositories) | Data from Information Repositories | 1 | T1213.006 |
+| [T1216](hunt/endpoint/T1216-system-script-proxy-execution) | System Script Proxy Execution | 2 | T1216.001, T1216.002 |
+| [T1217](hunt/endpoint/T1217-browser-information-discovery) | Browser Information Discovery | 1 | — |
+| [T1218](hunt/endpoint/T1218-system-binary-proxy-execution) | System Binary Proxy Execution | 8 | T1218.001, T1218.004, T1218.005, T1218.007, T1218.010, T1218.011, T1218.015 |
+| [T1220](hunt/endpoint/T1220-xsl-script-processing) | XSL Script Processing | 1 | — |
+| [T1221](hunt/endpoint/T1221-template-injection) | Template Injection | 1 | — |
+| [T1222](hunt/endpoint/T1222-file-and-directory-permissions-modification) | File and Directory Permissions Modification | 2 | T1222.001, T1222.002 |
+| [T1480](hunt/endpoint/T1480-execution-guardrails) | Execution Guardrails | 1 | T1480.001 |
+| [T1497](hunt/endpoint/T1497-virtualization-sandbox-evasion) | Virtualization/Sandbox Evasion | 1 | T1497.001 |
+| [T1518](hunt/endpoint/T1518-software-discovery) | Software Discovery | 2 | T1518.001, T1518.002 |
+| [T1543](hunt/endpoint/T1543-create-or-modify-system-process) | Create or Modify System Process | 4 | T1543.001, T1543.002, T1543.003, T1543.004 |
+| [T1546](hunt/endpoint/T1546-event-triggered-execution) | Event Triggered Execution | 11 | T1546.001, T1546.002, T1546.003, T1546.004, T1546.005, T1546.008, T1546.013, T1546.014, T1546.016, T1546.017, T1546.018 |
+| [T1547](hunt/endpoint/T1547-boot-or-logon-autostart-execution) | Boot or Logon Autostart Execution | 6 | T1547.001, T1547.006, T1547.007, T1547.009, T1547.013, T1547.014 |
+| [T1548](hunt/endpoint/T1548-abuse-elevation-control-mechanism) | Abuse Elevation Control Mechanism | 3 | T1548.001, T1548.002, T1548.003 |
+| [T1552](hunt/endpoint/T1552-unsecured-credentials) | Unsecured Credentials | 5 | T1552.001, T1552.002, T1552.003, T1552.004, T1552.006 |
+| [T1553](hunt/endpoint/T1553-subvert-trust-controls) | Subvert Trust Controls | 5 | T1553.001, T1553.002, T1553.004, T1553.005, T1553.006 |
+| [T1554](hunt/endpoint/T1554-compromise-host-software-binary) | Compromise Host Software Binary | 1 | — |
+| [T1555](hunt/endpoint/T1555-credentials-from-password-stores) | Credentials from Password Stores | 2 | T1555.003, T1555.004 |
+| [T1560](hunt/endpoint/T1560-archive-collected-data) | Archive Collected Data | 1 | T1560.001 |
+| [T1564](hunt/endpoint/T1564-hide-artifacts) | Hide Artifacts | 12 | T1564.001, T1564.002, T1564.003, T1564.004, T1564.005, T1564.006, T1564.007, T1564.008, T1564.009, T1564.011, T1564.012, T1564.014 |
+| [T1569](hunt/endpoint/T1569-system-services) | System Services | 3 | T1569.001, T1569.002, T1569.003 |
+| [T1574](hunt/endpoint/T1574-hijack-execution-flow) | Hijack Execution Flow | 7 | T1574.001, T1574.006, T1574.007, T1574.008, T1574.009, T1574.010, T1574.012 |
+| [T1614](hunt/endpoint/T1614-system-location-discovery) | System Location Discovery | 1 | T1614.001 |
+| [T1615](hunt/endpoint/T1615-group-policy-discovery) | Group Policy Discovery | 1 | — |
+| [T1647](hunt/endpoint/T1647-plist-file-modification) | Plist File Modification | 1 | — |
+| [T1652](hunt/endpoint/T1652-device-driver-discovery) | Device Driver Discovery | 1 | — |
+| [T1653](hunt/endpoint/T1653-power-settings) | Power Settings | 1 | — |
+| [T1654](hunt/endpoint/T1654-log-enumeration) | Log Enumeration | 1 | — |
+| [T1673](hunt/endpoint/T1673-virtual-machine-discovery) | Virtual Machine Discovery | 1 | — |
+| [T1678](hunt/endpoint/T1678-delay-execution) | Delay Execution | 1 | — |
+| [T1679](hunt/endpoint/T1679-selective-exclusion) | Selective Exclusion | 1 | — |
+| [T1680](hunt/endpoint/T1680-local-storage-discovery) | Local Storage Discovery | 1 | — |
+| [T1684](hunt/endpoint/T1684-social-engineering) | Social Engineering | 1 | T1684.001 |
+| [T1685](hunt/endpoint/T1685-disable-or-modify-tools) | Disable or Modify Tools | 4 | T1685.001, T1685.003, T1685.005, T1685.006 |
+| [T1686](hunt/endpoint/T1686-disable-or-modify-system-firewall) | Disable or Modify System Firewall | 1 | T1686.003 |
+| [T1687](hunt/endpoint/T1687-exploitation-for-defense-impairment) | Exploitation for Defense Impairment | 1 | — |
+| [T1688](hunt/endpoint/T1688-safe-mode-boot) | Safe Mode Boot | 1 | — |
+| [T1689](hunt/endpoint/T1689-downgrade-attack) | Downgrade Attack | 1 | — |
+| [T1690](hunt/endpoint/T1690-prevent-command-history-logging) | Prevent Command History Logging | 1 | — |
 
 ### network — 52 templates
 
 | Technique | Name | Templates | Sub-techniques |
 |---|---|---:|---|
-| [T1001](techniques/network/T1001-data-obfuscation) | Data Obfuscation | 1 | T1001.002 |
-| [T1008](techniques/network/T1008-fallback-channels) | Fallback Channels | 1 | — |
-| [T1011](techniques/network/T1011-exfiltration-over-other-network-medium) | Exfiltration Over Other Network Medium | 1 | T1011.001 |
-| [T1021](techniques/network/T1021-remote-services) | Remote Services | 5 | T1021.001, T1021.002, T1021.004, T1021.005, T1021.006 |
-| [T1030](techniques/network/T1030-data-transfer-size-limits) | Data Transfer Size Limits | 1 | — |
-| [T1040](techniques/network/T1040-network-sniffing) | Network Sniffing | 1 | — |
-| [T1041](techniques/network/T1041-exfiltration-over-c2-channel) | Exfiltration Over C2 Channel | 1 | — |
-| [T1046](techniques/network/T1046-network-service-discovery) | Network Service Discovery | 1 | — |
-| [T1048](techniques/network/T1048-exfiltration-over-alternative-protocol) | Exfiltration Over Alternative Protocol | 2 | T1048.001, T1048.003 |
-| [T1071](techniques/network/T1071-application-layer-protocol) | Application Layer Protocol | 5 | T1071.001, T1071.002, T1071.003, T1071.004, T1071.005 |
-| [T1090](techniques/network/T1090-proxy) | Proxy | 3 | T1090.001, T1090.002, T1090.003 |
-| [T1095](techniques/network/T1095-non-application-layer-protocol) | Non-Application Layer Protocol | 1 | — |
-| [T1102](techniques/network/T1102-web-service) | Web Service | 3 | T1102.001, T1102.002, T1102.003 |
-| [T1104](techniques/network/T1104-multi-stage-channels) | Multi-Stage Channels | 1 | — |
-| [T1105](techniques/network/T1105-ingress-tool-transfer) | Ingress Tool Transfer | 1 | — |
-| [T1132](techniques/network/T1132-data-encoding) | Data Encoding | 1 | T1132.001 |
-| [T1133](techniques/network/T1133-external-remote-services) | External Remote Services | 1 | — |
-| [T1187](techniques/network/T1187-forced-authentication) | Forced Authentication | 1 | — |
-| [T1205](techniques/network/T1205-traffic-signaling) | Traffic Signaling | 2 | T1205.001, T1205.002 |
-| [T1210](techniques/network/T1210-exploitation-of-remote-services) | Exploitation of Remote Services | 1 | — |
-| [T1219](techniques/network/T1219-remote-access-tools) | Remote Access Tools | 2 | T1219.001, T1219.002 |
-| [T1557](techniques/network/T1557-adversary-in-the-middle) | Adversary-in-the-Middle | 3 | T1557.001, T1557.002, T1557.003 |
-| [T1563](techniques/network/T1563-remote-service-session-hijacking) | Remote Service Session Hijacking | 2 | T1563.001, T1563.002 |
-| [T1567](techniques/network/T1567-exfiltration-over-web-service) | Exfiltration Over Web Service | 4 | T1567.001, T1567.002, T1567.003, T1567.004 |
-| [T1568](techniques/network/T1568-dynamic-resolution) | Dynamic Resolution | 3 | T1568.001, T1568.002, T1568.003 |
-| [T1570](techniques/network/T1570-lateral-tool-transfer) | Lateral Tool Transfer | 1 | — |
-| [T1571](techniques/network/T1571-non-standard-port) | Non-Standard Port | 1 | — |
-| [T1572](techniques/network/T1572-protocol-tunneling) | Protocol Tunneling | 1 | — |
-| [T1659](techniques/network/T1659-content-injection) | Content Injection | 1 | — |
+| [T1001](hunt/network/T1001-data-obfuscation) | Data Obfuscation | 1 | T1001.002 |
+| [T1008](hunt/network/T1008-fallback-channels) | Fallback Channels | 1 | — |
+| [T1011](hunt/network/T1011-exfiltration-over-other-network-medium) | Exfiltration Over Other Network Medium | 1 | T1011.001 |
+| [T1021](hunt/network/T1021-remote-services) | Remote Services | 5 | T1021.001, T1021.002, T1021.004, T1021.005, T1021.006 |
+| [T1030](hunt/network/T1030-data-transfer-size-limits) | Data Transfer Size Limits | 1 | — |
+| [T1040](hunt/network/T1040-network-sniffing) | Network Sniffing | 1 | — |
+| [T1041](hunt/network/T1041-exfiltration-over-c2-channel) | Exfiltration Over C2 Channel | 1 | — |
+| [T1046](hunt/network/T1046-network-service-discovery) | Network Service Discovery | 1 | — |
+| [T1048](hunt/network/T1048-exfiltration-over-alternative-protocol) | Exfiltration Over Alternative Protocol | 2 | T1048.001, T1048.003 |
+| [T1071](hunt/network/T1071-application-layer-protocol) | Application Layer Protocol | 5 | T1071.001, T1071.002, T1071.003, T1071.004, T1071.005 |
+| [T1090](hunt/network/T1090-proxy) | Proxy | 3 | T1090.001, T1090.002, T1090.003 |
+| [T1095](hunt/network/T1095-non-application-layer-protocol) | Non-Application Layer Protocol | 1 | — |
+| [T1102](hunt/network/T1102-web-service) | Web Service | 3 | T1102.001, T1102.002, T1102.003 |
+| [T1104](hunt/network/T1104-multi-stage-channels) | Multi-Stage Channels | 1 | — |
+| [T1105](hunt/network/T1105-ingress-tool-transfer) | Ingress Tool Transfer | 1 | — |
+| [T1132](hunt/network/T1132-data-encoding) | Data Encoding | 1 | T1132.001 |
+| [T1133](hunt/network/T1133-external-remote-services) | External Remote Services | 1 | — |
+| [T1187](hunt/network/T1187-forced-authentication) | Forced Authentication | 1 | — |
+| [T1205](hunt/network/T1205-traffic-signaling) | Traffic Signaling | 2 | T1205.001, T1205.002 |
+| [T1210](hunt/network/T1210-exploitation-of-remote-services) | Exploitation of Remote Services | 1 | — |
+| [T1219](hunt/network/T1219-remote-access-tools) | Remote Access Tools | 2 | T1219.001, T1219.002 |
+| [T1557](hunt/network/T1557-adversary-in-the-middle) | Adversary-in-the-Middle | 3 | T1557.001, T1557.002, T1557.003 |
+| [T1563](hunt/network/T1563-remote-service-session-hijacking) | Remote Service Session Hijacking | 2 | T1563.001, T1563.002 |
+| [T1567](hunt/network/T1567-exfiltration-over-web-service) | Exfiltration Over Web Service | 4 | T1567.001, T1567.002, T1567.003, T1567.004 |
+| [T1568](hunt/network/T1568-dynamic-resolution) | Dynamic Resolution | 3 | T1568.001, T1568.002, T1568.003 |
+| [T1570](hunt/network/T1570-lateral-tool-transfer) | Lateral Tool Transfer | 1 | — |
+| [T1571](hunt/network/T1571-non-standard-port) | Non-Standard Port | 1 | — |
+| [T1572](hunt/network/T1572-protocol-tunneling) | Protocol Tunneling | 1 | — |
+| [T1659](hunt/network/T1659-content-injection) | Content Injection | 1 | — |
 
 ### identity — 28 templates
 
 | Technique | Name | Templates | Sub-techniques |
 |---|---|---:|---|
-| [T1003](techniques/identity/T1003-os-credential-dumping) | OS Credential Dumping | 1 | T1003.006 |
-| [T1078](techniques/identity/T1078-valid-accounts) | Valid Accounts | 3 | T1078.001, T1078.002, T1078.003 |
-| [T1098](techniques/identity/T1098-account-manipulation) | Account Manipulation | 4 | T1098.002, T1098.004, T1098.005, T1098.007 |
-| [T1110](techniques/identity/T1110-brute-force) | Brute Force | 4 | T1110.001, T1110.002, T1110.003, T1110.004 |
-| [T1136](techniques/identity/T1136-create-account) | Create Account | 2 | T1136.001, T1136.002 |
-| [T1207](techniques/identity/T1207-rogue-domain-controller) | Rogue Domain Controller | 1 | — |
-| [T1484](techniques/identity/T1484-domain-or-tenant-policy-modification) | Domain or Tenant Policy Modification | 2 | T1484.001, T1484.002 |
-| [T1550](techniques/identity/T1550-use-alternate-authentication-material) | Use Alternate Authentication Material | 2 | T1550.002, T1550.003 |
-| [T1556](techniques/identity/T1556-modify-authentication-process) | Modify Authentication Process | 3 | T1556.003, T1556.005, T1556.006 |
-| [T1558](techniques/identity/T1558-steal-or-forge-kerberos-tickets) | Steal or Forge Kerberos Tickets | 3 | T1558.003, T1558.004, T1558.005 |
-| [T1606](techniques/identity/T1606-forge-web-credentials) | Forge Web Credentials | 1 | T1606.001 |
-| [T1621](techniques/identity/T1621-multi-factor-authentication-request-generation) | Multi-Factor Authentication Request Generation | 1 | — |
-| [T1649](techniques/identity/T1649-steal-or-forge-authentication-certificates) | Steal or Forge Authentication Certificates | 1 | — |
+| [T1003](hunt/identity/T1003-os-credential-dumping) | OS Credential Dumping | 1 | T1003.006 |
+| [T1078](hunt/identity/T1078-valid-accounts) | Valid Accounts | 3 | T1078.001, T1078.002, T1078.003 |
+| [T1098](hunt/identity/T1098-account-manipulation) | Account Manipulation | 4 | T1098.002, T1098.004, T1098.005, T1098.007 |
+| [T1110](hunt/identity/T1110-brute-force) | Brute Force | 4 | T1110.001, T1110.002, T1110.003, T1110.004 |
+| [T1136](hunt/identity/T1136-create-account) | Create Account | 2 | T1136.001, T1136.002 |
+| [T1207](hunt/identity/T1207-rogue-domain-controller) | Rogue Domain Controller | 1 | — |
+| [T1484](hunt/identity/T1484-domain-or-tenant-policy-modification) | Domain or Tenant Policy Modification | 2 | T1484.001, T1484.002 |
+| [T1550](hunt/identity/T1550-use-alternate-authentication-material) | Use Alternate Authentication Material | 2 | T1550.002, T1550.003 |
+| [T1556](hunt/identity/T1556-modify-authentication-process) | Modify Authentication Process | 3 | T1556.003, T1556.005, T1556.006 |
+| [T1558](hunt/identity/T1558-steal-or-forge-kerberos-tickets) | Steal or Forge Kerberos Tickets | 3 | T1558.003, T1558.004, T1558.005 |
+| [T1606](hunt/identity/T1606-forge-web-credentials) | Forge Web Credentials | 1 | T1606.001 |
+| [T1621](hunt/identity/T1621-multi-factor-authentication-request-generation) | Multi-Factor Authentication Request Generation | 1 | — |
+| [T1649](hunt/identity/T1649-steal-or-forge-authentication-certificates) | Steal or Forge Authentication Certificates | 1 | — |
 
 ### email — 4 templates
 
 | Technique | Name | Templates | Sub-techniques |
 |---|---|---:|---|
-| [T1114](techniques/email/T1114-email-collection) | Email Collection | 3 | T1114.001, T1114.002, T1114.003 |
-| [T1534](techniques/email/T1534-internal-spearphishing) | Internal Spearphishing | 1 | — |
+| [T1114](hunt/email/T1114-email-collection) | Email Collection | 3 | T1114.001, T1114.002, T1114.003 |
+| [T1534](hunt/email/T1534-internal-spearphishing) | Internal Spearphishing | 1 | — |
 
 ### web — 2 templates
 
 | Technique | Name | Templates | Sub-techniques |
 |---|---|---:|---|
-| [T1505](techniques/web/T1505-server-software-component) | Server Software Component | 2 | T1505.001, T1505.003 |
+| [T1505](hunt/web/T1505-server-software-component) | Server Software Component | 2 | T1505.001, T1505.003 |
 
 ### containers — 1 templates
 
 | Technique | Name | Templates | Sub-techniques |
 |---|---|---:|---|
-| [T1611](techniques/containers/T1611-escape-to-host) | Escape to Host | 1 | — |
+| [T1611](hunt/containers/T1611-escape-to-host) | Escape to Host | 1 | — |

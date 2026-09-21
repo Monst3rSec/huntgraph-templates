@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import validate as V  # noqa: E402
 
 GOOD = os.path.join(
-    V.ROOT, "techniques", "endpoint", "T1218-system-binary-proxy-execution",
+    V.ROOT, "hunt", "endpoint", "T1218-system-binary-proxy-execution",
     "T1218.011-rundll32", "rundll32-user-writable-dll.yaml",
 )
 

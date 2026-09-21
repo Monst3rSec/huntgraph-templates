@@ -19,7 +19,7 @@ and reported — declaring the connector anyway would fail the L3 cross-connecto
 check, which is the check working as intended.
 
     python3 tools/add_wazuh_block.py --limit 25
-    python3 tools/add_wazuh_block.py techniques/T1036-*/T1036.007-*/*.yaml
+    python3 tools/add_wazuh_block.py hunt/endpoint/T1036-*/T1036.007-*/*.yaml
 """
 
 from __future__ import annotations
@@ -304,7 +304,8 @@ def main() -> int:
     paths = args.paths
     if not paths:
         paths = []
-        for dp, _, fs in os.walk(os.path.join(ROOT, "techniques")):
+        for dp, dirs, fs in os.walk(os.path.join(ROOT, "hunt")):
+            dirs[:] = [d for d in dirs if d != "sigma"]
             paths += [os.path.join(dp, f) for f in fs if f.endswith(".yaml")]
         paths.sort()
 

@@ -78,7 +78,7 @@ def main() -> int:
         return o["name"] if o else tid
 
     T = []
-    for p in sorted(glob.glob(os.path.join(ROOT, "techniques", "**", "*.yaml"), recursive=True)):
+    for p in sorted(glob.glob(os.path.join(ROOT, "hunt", "*", "T*", "**", "*.yaml"), recursive=True)):
         rel = os.path.relpath(p, ROOT)
         d = yaml.safe_load(open(p))
         parts = rel.split(os.sep)
@@ -183,7 +183,7 @@ def main() -> int:
 
     out.append("## Upstream rules\n")
     sig = collections.Counter(p.split(os.sep)[1] for p in
-                              (os.path.relpath(x, ROOT) for x in glob.glob(os.path.join(ROOT, "upstream", "*", "sigma", "**", "*.yml"), recursive=True)))
+                              (os.path.relpath(x, ROOT) for x in glob.glob(os.path.join(ROOT, "hunt", "*", "sigma", "**", "*.yml"), recursive=True)))
     rows = [["Sigma threat-hunting (stored)", sum(sig.values()), ", ".join("%s %d" % kv for kv in sig.most_common()) or "—"]]
     for name, f in (("Splunk (tracked)", "splunk_tracker.md"), ("Elastic (tracked)", "elk_tracker.md")):
         r = tracker_routing(os.path.join(ROOT, f))
@@ -195,7 +195,7 @@ def main() -> int:
 
     out.append("## Index\n")
     out.append("Every technique family, by category. Templates live at "
-               "`techniques/<category>/<family>/[<sub-technique>/]<behaviour>.yaml`.\n")
+               "`hunt/<category>/<family>/[<sub-technique>/]<behaviour>.yaml`.\n")
     for cat in sorted(by_cat, key=lambda c: -len(by_cat[c])):
         fam = collections.defaultdict(list)
         for t in by_cat[cat]:
@@ -204,7 +204,7 @@ def main() -> int:
         rows = []
         for f in sorted(fam):
             ts = fam[f]
-            folder = os.path.join("techniques", cat, next(p for p in os.listdir(os.path.join(ROOT, "techniques", cat)) if p.startswith(f + "-")))
+            folder = os.path.join("hunt", cat, next(p for p in os.listdir(os.path.join(ROOT, "hunt", cat)) if p.startswith(f + "-")))
             subs = sorted({x for t in ts for x in t["techniques"] if x.startswith(f + ".")})
             rows.append(["[%s](%s)" % (f, folder), tname(f), len(ts), ", ".join(subs) or "—"])
         out += table(["Technique", "Name", "Templates", "Sub-techniques"], rows, {2})

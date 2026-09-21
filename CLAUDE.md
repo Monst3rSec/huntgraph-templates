@@ -53,7 +53,9 @@ file that is wrong and will be silently overwritten.
 
 ## Categories
 
-Templates live at `techniques/<category>/<Txxxx-slug>[/<Txxxx.yyy-slug>]/<behaviour>.yaml`.
+Templates live at `hunt/<category>/<Txxxx-slug>[/<Txxxx.yyy-slug>]/<behaviour>.yaml`. The same
+category folder also holds `sigma/`, the upstream Sigma rules for that category — reference
+material that `validate.py` and every other tool skip (see Upstream rules by category).
 The category is one of Elastic's prebuilt-rule domains — cloud, containers, email,
 endpoint, identity, kubernetes, llm, network, saas, unspecified, web — and L5 rejects
 anything else. It records **what the hunt is about**, not what the query reads: every
@@ -154,15 +156,17 @@ mail-gateway and ML rules all land there.
 ### Upstream rules by category
 
 Sigma rules are also **stored**, not just tracked: `python3 tools/import_sigma.py` copies
-them byte-for-byte from a pinned commit into `upstream/<category>/sigma/` and writes
+them byte-for-byte from a pinned commit into `hunt/<category>/sigma/` and writes
 `sigma_tracker.md` (Category | TTP | Rule | Description | Path). Categories are Elastic's
 prebuilt-rule domains — cloud, containers, email, endpoint, identity, kubernetes, llm,
 network, saas, unspecified, web — and a rule is filed by the telemetry it reads, not the
 technique it maps to. All 128 current rules read Windows host logs, so all are `endpoint`.
 
-`upstream/` is reference material: `validate.py` does not scan it, and its files are under
-the Detection Rule License 1.1, not Apache-2.0 — keep them unmodified so the authors'
-attribution survives. Never edit them in place; rerun the import.
+`sigma/` folders are reference material: `validate.py`, `coverage.py`, `stats.py` and the
+other tools skip them, and their files are under the Detection Rule License 1.1, not
+Apache-2.0 — keep them unmodified so the authors' attribution survives. Never edit them in
+place; rerun the import, which also regenerates every category `README.md`. Never put a
+template inside `sigma/`: it would silently go unvalidated.
 
 ### Converting is authoring, not porting
 
@@ -180,7 +184,8 @@ rule converted; omit it and the tracker will keep reporting the rule as outstand
 
 Rules with no ATT&CK mapping go to `unclassified-threat-check/<source>-unmapped.md` as a
 staged list. They are **not** templates and are not validated: the schema requires every
-`id` to end in a MITRE technique number, and L5 rejects any file outside `techniques/`, so
+`id` to end in a MITRE technique number, and L5 rejects any template outside a technique
+folder under `hunt/`, so
 an unclassified detection is currently unrepresentable. Making it representable means
 changing the id pattern, L5, the mitre block in schema and L2, and the mutation tests —
 do that as its own piece of work, not as a side effect of an import.
@@ -192,51 +197,42 @@ stop. The agent gets every field on every matching event and can count, group, s
 pivot for itself. A pre-baked `groupBy` row is a summary someone else chose, and the agent
 cannot get back what it discarded.
 
-Where the corpus stands, measured:
+Current counts — raw versus aggregating, and what each aggregating case does — are in
+[stats.md](stats.md) under "Query shape". Its buckets do not overlap: a join is counted as a
+join even when it also ends in a threshold.
 
-| | |
-|---|---:|
-| CQL cases | 1041 |
-| Return raw events | **793** |
-| Still end in `groupBy` | 248 |
-| `sort()` calls | **0** |
-| Files: all-raw / mixed / all-aggregated | 138 / 138 / 13 |
+**Aggregate only when the aggregation is the hypothesis.** Two shapes qualify:
 
-How it got here. All 1028 cases once ended in `groupBy()` keyed on `ComputerName`,
-`UserName`, `ParentBaseFileName`, `FileName`, keeping detail only in
-`collect([...], limit=3..5)`; every template declared `aid` and none returned it. 774 purely
-summarising cases were made raw. Later, every remaining query ending `groupBy ... sort`
-(128) lost its last two lines at the owner's direction: the `sort` went everywhere, and with
-it the filter written just before it — in most cases a count threshold or join condition —
-while the `groupBy` stayed. Seven of those were left with an unclosed `groupBy` and were
-made raw.
+- **A join.** A `case { ... }` block tags two event streams and `groupBy` on a shared key
+  puts them on one row, so a trailing `| a=/.+/ and b=/.+/` can require both. Removing the
+  `groupBy` alone leaves that line asking for two fields that never share an event — the
+  query returns nothing.
+- **A threshold.** The hypothesis is "at breadth" or "at machine rate", written as
+  `| hosts >= 20` or `| connections >= 6`; the count exists only because of the `groupBy`.
 
-**What the 248 aggregating cases do now:**
-
-- **153 are joins.** A `case { ... }` block tags two event streams and `groupBy` on a shared
-  key puts them on one row. Removing that `groupBy` alone would leave a trailing
-  `| a=/.+/ and b=/.+/` asking for two fields that never share an event, returning nothing.
-- **65 still end in a count threshold** (74 threshold lines), e.g. `| hosts >= 20`: the
-  count exists only because of the `groupBy`.
-- **82 end at the `groupBy` itself.** Most lost their threshold or join condition in the
-  two-line removal, so they now return **every grouped row rather than only the rows that
-  meet the hypothesis**. The agent has to apply that condition itself.
+Some aggregating cases end at the `groupBy` with no condition after it. Most lost their
+threshold or join condition when the last two lines of every `groupBy ... sort` query were
+removed at the owner's direction, so they return **every grouped row rather than only the
+rows that meet the hypothesis**, and the agent has to apply the condition. No `sort()`
+remains anywhere.
 
 **An aggregating case must still carry every declared field to the row** — as a `groupBy`
-key, a `collect([...])` entry or an aggregate alias. L4 enforces this. A case only gets credit
-for a field its own event types carry: naming a file-creation field in a `collect()` over
-process events returns nothing and does not count. `collect()` samples are 50, not 3-5.
+key, a `collect([...])` entry or an aggregate alias. L4 enforces this, and credits a field
+only to a case whose own event types carry it: naming a file-creation field in a `collect()`
+over process events returns nothing and does not count. `collect()` samples are 50.
+
+**Every declared log source must be read by some case.** L4 reports an unread source as a
+warning and `--strict` fails on warnings. When one appears, the fix is at the evidence: add a
+case that collects it, source the evidence from telemetry that can see it, or remove the
+evidence item if nothing this connector collects ever could — never paste the field into an
+unrelated `collect()` to satisfy the check.
 
 ### Still open
 
-- A declared log source that no case queries is an L4 warning, and `--strict` fails on
-  warnings. 19 templates had one, each backing a `supporting` evidence item nothing collected
-  (an earlier pass had hidden them by pasting the field names into a `collect()` over process
-  events). 13 now have a raw case that collects that evidence; SAM and NTDS read their output
-  path from the export command line instead; four evidence items were removed — a `.chm`,
-  `.msi`, document or stream host arriving "recently" is visible only to a generic file-write
-  event, which the CrowdStrike connector does not have here, and evidence must be collectable
-  from every connector a file declares.
 - **13 templates have no raw case at all**, only joins and thresholds.
+- **471 evidence items cite the `baseline` pseudo-source**, plus 27 `derived` and 16
+  `identity_context`. Their reasoning assumed counts the query used to pre-compute; many of
+  those counts and the thresholds on them are gone, and nothing in the files yet tells the
+  agent that deriving them is now its job.
 - **Raw-by-default is not enforced.** Nothing stops a new case from ending in `groupBy`.
   Adding that check means writing it first, letting it fail, and migrating under it.
