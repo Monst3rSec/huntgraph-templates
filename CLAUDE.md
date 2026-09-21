@@ -154,9 +154,9 @@ Where the corpus stands, measured:
 
 | | |
 |---|---:|
-| CQL cases | 1028 |
-| Return raw events | **781** |
-| Still end in `groupBy` | 247 |
+| CQL cases | 1041 |
+| Return raw events | **793** |
+| Still end in `groupBy` | 248 |
 | `sort()` calls | **0** |
 | Files: all-raw / mixed / all-aggregated | 138 / 138 / 13 |
 
@@ -169,9 +169,9 @@ it the filter written just before it — in most cases a count threshold or join
 while the `groupBy` stayed. Seven of those were left with an unclosed `groupBy` and were
 made raw.
 
-**What the 247 aggregating cases do now:**
+**What the 248 aggregating cases do now:**
 
-- **152 are joins.** A `case { ... }` block tags two event streams and `groupBy` on a shared
+- **153 are joins.** A `case { ... }` block tags two event streams and `groupBy` on a shared
   key puts them on one row. Removing that `groupBy` alone would leave a trailing
   `| a=/.+/ and b=/.+/` asking for two fields that never share an event, returning nothing.
 - **65 still end in a count threshold** (74 threshold lines), e.g. `| hosts >= 20`: the
@@ -187,12 +187,14 @@ process events returns nothing and does not count. `collect()` samples are 50, n
 
 ### Still open
 
-- **19 templates declare a log source no case queries** — mostly a `file_creation` source
-  (`PeFileWritten`, `NewScriptWritten`) on hunts whose every case reads process events, or a
-  `network_connection` source nothing reads. L4 reports each as a warning, not an error,
-  because fixing it means authoring a query, not editing one. An earlier pass made these
-  "pass" by pasting the field names into a `collect()` over process events; the validator no
-  longer accepts that.
+- A declared log source that no case queries is an L4 warning, and `--strict` fails on
+  warnings. 19 templates had one, each backing a `supporting` evidence item nothing collected
+  (an earlier pass had hidden them by pasting the field names into a `collect()` over process
+  events). 13 now have a raw case that collects that evidence; SAM and NTDS read their output
+  path from the export command line instead; four evidence items were removed — a `.chm`,
+  `.msi`, document or stream host arriving "recently" is visible only to a generic file-write
+  event, which the CrowdStrike connector does not have here, and evidence must be collectable
+  from every connector a file declares.
 - **13 templates have no raw case at all**, only joins and thresholds.
 - **Raw-by-default is not enforced.** Nothing stops a new case from ending in `groupBy`.
   Adding that check means writing it first, letting it fail, and migrating under it.

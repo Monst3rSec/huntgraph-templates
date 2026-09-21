@@ -75,8 +75,8 @@ threat"* — was exactly this, correctly observed.
 
 | | original | first pass | now |
 |---|---:|---:|---:|
-| CQL cases ending in `groupBy` | 1028 | 254 | **247** |
-| Cases returning raw events | 0 | 774 | **781** |
+| CQL cases ending in `groupBy` | 1028 | 254 | **248** |
+| Cases returning raw events | 0 | 774 | **793** |
 | `sort()` calls | 722 | 128 | **0** |
 | Files: all-raw / mixed / all-aggregated | 0 / 0 / 289 | 137 / 138 / 14 | 138 / 138 / 13 |
 | `collect()` sample size | 3-5 | 3-5 | 50 |
@@ -126,12 +126,15 @@ why 594 of them were removed alongside the `groupBy` they served.
 
 ### What is still open
 
-- **19 templates declare a log source no case queries.** Most declare a `file_creation`
-  source on hunts whose every case reads process events. An earlier pass claimed "100% of
-  declared telemetry" by pasting those field names into a `collect()` over process events,
-  where they can never be populated; that claim was false for these files. The validator now
-  credits a field only to a case whose event types carry it, and reports these as warnings
-  because the fix is a new query, not an edit.
+- **Resolved: 19 templates declared a log source no case queried**, each backing a
+  `supporting` evidence item nothing collected. An earlier pass claimed "100% of declared
+  telemetry" by pasting those field names into a `collect()` over process events, where they
+  can never be populated; that claim was false for these files. The validator now credits a
+  field only to a case whose event types carry it. 13 files gained a raw case collecting the
+  evidence; SAM and NTDS now read their output path from the export command line; four
+  evidence items (a `.chm`, `.msi`, document or stream host arriving recently) were removed,
+  because only a generic file-write event could see them and the CrowdStrike connector has
+  none here. The CHM hunt's `suspicious` tier now rests on its required evidence alone.
 - **13 templates have no raw case at all.**
 - **471 evidence items cite the `baseline` pseudo-source**, plus 27 `derived` and 16
   `identity_context`. Their reasoning assumed counts the query pre-computed; many of those

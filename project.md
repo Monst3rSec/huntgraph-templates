@@ -124,8 +124,8 @@ The agent receives every field on every matching event and does its own counting
 and pivoting — a pre-computed row is a summary someone else chose, and nothing recovers what
 it dropped.
 
-Of 1028 CQL cases, **781 return raw events** and 247 still end in `groupBy`; no `sort()`
-remains. The 247 are 152 joins (a `case { ... }` block whose two tagged streams only meet on
+Of 1041 CQL cases, **793 return raw events** and 248 still end in `groupBy`; no `sort()`
+remains. The 248 are 153 joins (a `case { ... }` block whose two tagged streams only meet on
 one row because of the `groupBy`), 65 that still end in a count threshold such as
 `| hosts >= 20`, and 82 that end at the `groupBy` itself. Most of those 82 lost their
 threshold or join condition when the last two lines of every `groupBy ... sort` query were
@@ -133,8 +133,8 @@ removed, so they return every grouped row and leave the condition to the agent.
 
 Where a case aggregates, every field `requires.logs` declares must still reach the row, and
 L4 enforces it — crediting a field only to a case whose event types actually carry it.
-19 templates declare a log source that no case queries at all; those are reported as
-warnings, because closing them means writing a query. See [intent.md](intent.md).
+A declared log source that no case queries is a warning, and `--strict` fails on warnings,
+so every declared source is read by at least one case. See [intent.md](intent.md).
 
 ## Status
 
