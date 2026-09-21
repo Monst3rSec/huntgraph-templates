@@ -22,15 +22,18 @@ verdict, which is the entire point of the format.
 
 ## Layout
 
-The MITRE technique and sub-technique are carried by the directory, not by the filename.
-The filename is the behaviour.
+The first directory is the category — what the hunt is about (`endpoint`, `network`,
+`identity`, `email`, `web`, `containers`, …). Below it, the MITRE technique and
+sub-technique are carried by the directory, not by the filename. The filename is the
+behaviour.
 
 ```
 techniques/
-└── T1218-system-binary-proxy-execution/
-    └── T1218.011-rundll32/
-        ├── rundll32-user-writable-dll.yaml
-        └── rundll32-script-protocol-handler.yaml
+└── endpoint/
+    └── T1218-system-binary-proxy-execution/
+        └── T1218.011-rundll32/
+            ├── rundll32-user-writable-dll.yaml
+            └── rundll32-script-protocol-handler.yaml
 ```
 
 Stable ids: `hg-<platform>-<behaviour>-<mitre-id>`, e.g.
@@ -122,7 +125,7 @@ everything wrong with a template.
 | **L2 mitre** | every ATT&CK id exists, and the relationships the file asserts are the ones MITRE publishes — technique↔tactic, sub↔parent, DET↔technique, AN↔DET, platform↔technique, DC↔analytic; the technique URL is cited |
 | **L3 evidence** | evidence ids unique; `risk_logic` and `verdict` reference only real ids; `risk_logic.required` equals `evidence.required`; escalation tiers include the required evidence and never cite contradicting evidence; every evidence field is declared in `requires.logs` |
 | **L4 query** | CrowdStrike CQL only; no SPL/KQL/EQL/SQL/Sigma; the event stream is constrained; queries use the declared event types; baselines are complete when required |
-| **L5 convention** | directory encodes the technique; id ends with its most specific MITRE id; kebab-case filenames; ids unique across the corpus |
+| **L5 convention** | directory encodes the category and technique; id ends with its most specific MITRE id; kebab-case filenames; ids unique across the corpus |
 
 `tools/test_validator.py` injects 24 known defects into a good file and asserts the
 right layer catches each one. A validator nobody tests is indistinguishable from no

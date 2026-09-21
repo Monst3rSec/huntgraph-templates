@@ -38,7 +38,8 @@ file that is wrong and will be silently overwritten.
    strategies (`DET*`), analytics (`AN*`) and data components come from
    `tools/attack_extract.py` reading the STIX bundle. The validator has already caught
    one fabricated data component that was plausible and wrong.
-2. **The directory carries the technique, the filename carries the behaviour.**
+2. **The first directory carries the category, the next the technique, the filename the behaviour.**
+   See Categories below.
 3. **Ids are stable.** `hg-<platform>-<behaviour>-<mitre-id>` survives rewrites of the
    description and the query. Only a change of hypothesis justifies a new id.
 4. **One file, one hypothesis.** If a file needs "or" in its statement, it is two files.
@@ -48,6 +49,32 @@ file that is wrong and will be silently overwritten.
    coverage. Record it in `skipped.yaml` or leave it uncovered.
 6. **Return the events, not a summary of them.** See the query output policy below. A
    query that aggregates by default hands the agent a row it cannot reason past.
+
+## Categories
+
+Templates live at `techniques/<category>/<Txxxx-slug>[/<Txxxx.yyy-slug>]/<behaviour>.yaml`.
+The category is one of Elastic's prebuilt-rule domains — cloud, containers, email,
+endpoint, identity, kubernetes, llm, network, saas, unspecified, web — and L5 rejects
+anything else. It records **what the hunt is about**, not what the query reads: every
+template reads the CrowdStrike endpoint sensor, so filing by telemetry would put all of them
+in one folder.
+
+A whole technique family shares one category, so its sub-technique folders move with it:
+
+| Category | Technique families |
+|---|---|
+| network | C2 and exfiltration (T1001, T1008, T1071, T1090, T1095, T1102, T1104, T1105, T1132, T1205, T1219, T1568, T1571, T1572, T1659; T1011, T1030, T1041, T1048, T1567), traffic interception and probing (T1040, T1046, T1187, T1557), host-to-host movement (T1021, T1133, T1210, T1563, T1570) |
+| identity | accounts and authentication (T1078, T1098, T1110, T1136, T1550, T1556, T1558, T1606, T1621, T1649), directory (T1207, T1484), and T1003.006 DCSync |
+| email | T1114, T1534 |
+| web | T1505 |
+| containers | T1611 |
+| endpoint | everything else, including discovery run on the host |
+
+T1003.006 is the one split: DCSync is domain-controller replication, so it sits under
+`identity/T1003-os-credential-dumping/` while the rest of T1003 stays in `endpoint`. A new
+technique goes where its behaviour belongs; when in doubt, it is `endpoint`. Moving a
+template between categories changes only its path — ids, Wazuh rule ids and tracker links
+are keyed by id.
 
 ## Connectors
 
@@ -69,7 +96,7 @@ enforces all of this at L4.
 | L2 mitre | ids exist, and the relationships asserted are the ones MITRE publishes |
 | L3 evidence | referential integrity between evidence, risk logic and verdict |
 | L4 query | CQL only in `cql` cases; declared event types actually used; every declared field reaches a result row; Wazuh block well-formed |
-| L5 convention | directory encodes the technique; ids unique and correctly suffixed |
+| L5 convention | directory encodes the category and technique; ids unique and correctly suffixed |
 
 ## Upstream rule ingestion
 

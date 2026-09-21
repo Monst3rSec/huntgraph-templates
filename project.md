@@ -43,7 +43,7 @@ wrong.
 ## Layout
 
 ```
-techniques/T1218-system-binary-proxy-execution/
+techniques/endpoint/T1218-system-binary-proxy-execution/
 └── T1218.011-rundll32/
     ├── rundll32-user-writable-dll.yaml
     └── rundll32-script-protocol-handler.yaml
@@ -58,7 +58,7 @@ tools/import_sigma.py            stores SigmaHQ threat-hunting rules by category
 upstream/<category>/sigma/       those rules, unmodified (Detection Rule License 1.1)
 ```
 
-The directory carries the technique; the filename carries the behaviour. Ids are stable —
+The first directory carries the category (what the hunt is about), the next the technique; the filename carries the behaviour. Ids are stable —
 `hg-win-rundll32-user-writable-dll-t1218-011` survives rewrites of its description and query,
 and only a change of hypothesis justifies a new one.
 
@@ -76,7 +76,7 @@ python3 tools/test_validator.py
 | L2 mitre | every id exists, and the relationships a file asserts are the ones MITRE publishes |
 | L3 evidence | referential integrity between evidence, risk logic and verdict; every field declared |
 | L4 query | CQL cases carry CQL only — no SPL, KQL, EQL, SQL or Sigma; declared event types actually used; every declared field reaches a result row; Wazuh blocks well-formed and id-allocated |
-| L5 convention | directory encodes the technique; ids unique and correctly suffixed |
+| L5 convention | directory encodes the category and technique; ids unique and correctly suffixed |
 
 `test_validator.py` injects 27 known defects and asserts the right layer catches each. That
 matters more than it sounds: when the validator once produced a *false* positive, the

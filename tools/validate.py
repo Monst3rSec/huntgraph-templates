@@ -14,7 +14,7 @@ one pass reports everything wrong with a template.
                  that exist; every evidence field is declared in requires.logs
   L4 query       CrowdStrike CQL only; no foreign dialects; queries reference
                  declared event types; baselines are complete when required
-  L5 convention  directory layout, id format, id uniqueness across the corpus
+  L5 convention  category + technique directory layout, id format, id uniqueness
 
     python3 tools/validate.py                    # whole repo
     python3 tools/validate.py techniques/T1218-*  # a subtree
@@ -613,6 +613,14 @@ def check_wazuh_block(doc, block, cql_case_ids: set, rep: Report) -> None:
 # --------------------------------------------------------------------------
 # L5 convention
 # --------------------------------------------------------------------------
+# Elastic's prebuilt-rule domains. A template is filed by what the hunt is about:
+# traffic on the wire and host-to-host movement under network, accounts and
+# authentication under identity, and so on; anything that happens on the host is
+# endpoint. See "Categories" in CLAUDE.md.
+CATEGORIES = ("cloud", "containers", "email", "endpoint", "identity", "kubernetes",
+              "llm", "network", "saas", "unspecified", "web")
+
+
 def check_convention(doc, path: str, rep: Report) -> None:
     rel = os.path.relpath(path, ROOT)
     parts = rel.split(os.sep)
@@ -620,10 +628,14 @@ def check_convention(doc, path: str, rep: Report) -> None:
     if parts[0] != "techniques":
         rep.error("L5", "detection files must live under techniques/, found %s" % rel)
         return
-    if len(parts) not in (3, 4):
-        rep.error("L5", "expected techniques/<Txxxx-slug>[/<Txxxx.yyy-slug>]/<name>.yaml, "
-                        "found %s" % rel)
+    if len(parts) not in (4, 5):
+        rep.error("L5", "expected techniques/<category>/<Txxxx-slug>[/<Txxxx.yyy-slug>]/"
+                        "<name>.yaml, found %s" % rel)
         return
+    if parts[1] not in CATEGORIES:
+        rep.error("L5", "category directory %r is not one of %s"
+                  % (parts[1], ", ".join(CATEGORIES)))
+    parts = [parts[0]] + parts[2:]   # below the category the layout is unchanged
 
     tech_dir = parts[1]
     mt = re.match(r"^(T\d{4})-[a-z0-9-]+$", tech_dir)
