@@ -1,0 +1,304 @@
+type: detection
+
+id: hg-any-hosts-file-rewritten-to-redirect-name-resolution-t1565-001
+version: 1.0.0
+
+info:
+  name: Hosts file rewritten to redirect name resolution
+  description: >-
+    Every major operating system consults a local hosts file before it asks DNS, so a
+    line added there silently decides where a name resolves for every process on the
+    host. An adversary uses that to send an update server, a security vendor's cloud or
+    a login portal to infrastructure they control, or to black-hole the endpoint agent's
+    reporting address. The file almost never changes on a managed host: VPN clients,
+    container runtimes and a handful of security products rewrite it as a product
+    behaviour, and anything else writing to it from a command line is worth reading.
+  severity: medium
+  author: huntgraph
+  tags:
+    - impact
+    - hosts-file
+    - name-resolution
+    - traffic-redirection
+    - cross-platform
+  references:
+    - https://attack.mitre.org/techniques/T1565/001
+    - https://attack.mitre.org/detectionstrategies/DET0193
+    - https://attack.mitre.org/techniques/T1565
+    - https://raw.githubusercontent.com/elastic/detection-rules/main/rules/cross-platform/impact_hosts_file_modified.toml
+
+mitre:
+  tactics:
+    - TA0040
+  techniques:
+    - T1565
+  sub_techniques:
+    - T1565.001
+  detection_strategies:
+    - DET0193
+  analytics:
+    - AN0555
+    - AN0556
+    - AN0557
+  platforms:
+    - Windows
+    - Linux
+    - macOS
+  data_sources:
+    - WinEventLog:Sysmon
+    - auditd:SYSCALL
+    - macos:unifiedlog
+  data_components:
+    - File Modification
+
+hypothesis:
+  statement: >-
+    An adversary may add or replace entries in the local hosts file so that chosen
+    names resolve to addresses they control, redirecting the host's traffic for those
+    names without touching DNS or the network path.
+  attacker_behavior:
+    - Appends a mapping to the hosts file with a shell redirect, tee or a PowerShell write cmdlet.
+    - Replaces the hosts file wholesale with a copy staged elsewhere.
+    - Clears a read-only or immutable attribute first so the write succeeds.
+    - Points a security vendor or update domain at 127.0.0.1 or 0.0.0.0 to cut the agent off.
+  legitimate_behavior:
+    - VPN and zero-trust clients add split-tunnel mappings while connected.
+    - Container runtimes and local development tools map service names to loopback.
+    - Administrators pin a name during a migration or a DNS outage.
+    - Ad-blocking and parental-control tools manage large block lists in the file.
+  risk_indicator:
+    - The write came from an interpreter or shell rather than a known product service.
+    - The mapping targets a security, update or authentication domain.
+    - The file's protective attribute was removed immediately before the write.
+    - The host is a server or a user workstation with no development role.
+
+requires:
+  platforms:
+    - windows
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: windows-hosts-file-written-from-a-command-line
+        name: Windows hosts file written from a shell or PowerShell
+        purpose: >-
+          Catch the write where it is visible on Windows: the sensor does not report
+          writes to a plain text file, but the command that performs one carries the
+          path and the verb.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/drivers\\etc\\hosts\b/i
+          | CommandLine=/(>>|>\s*"?[A-Za-z%]|Add-Content|Set-Content|Out-File|WriteAllText|AppendAllText|\bac\s|\bsc\s|copy\s|move\s|xcopy\s|Copy-Item|Move-Item|\btype\s)/i
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of the approved VPN, container and security product services"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: unix-hosts-file-written-from-a-command-line
+        name: Linux or macOS hosts file edited or appended from a shell
+        purpose: >-
+          Catch the same write on Unix hosts, where an operator uses a redirect, tee, an
+          in-place sed or an editor opened on the file.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(^|[\s"'=])(\/private)?\/etc\/hosts(\s|"|'|$)/
+          | CommandLine=/(>>|>\s*(\/private)?\/etc\/hosts|\btee\b|\bsed\s+-i|\bperl\s+-p?i|\bcp\b|\bmv\b|\binstall\b|\bdd\b|\bnano\b|\bvim?\b|\bemacs\b|\bed\b)/i
+          | CommandLine!=/sed -i \/Added by Google\/d \/etc\/hosts/
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of dhclient-script, google_set_hostname, cloud-init and the configuration-management agent"
+        baseline:
+          required: true
+          window: 90d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: hosts-file-protection-removed
+        name: Read-only or immutable attribute removed from the hosts file
+        purpose: >-
+          Surface the preparation step. Hardened builds lock the file, and clearing the
+          lock is something only a change to the file needs.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(drivers\\etc\\hosts\b|(\/private)?\/etc\/hosts(\s|"|'|$))/i
+          | CommandLine=/(attrib(\.exe)?\s+[^|&]*-[rsh]\b|icacls|takeown|chattr\s+-[a-z]*i|chflags\s+no(uchg|schg)|chmod\s+[0-7]*[2367][0-7]*\s)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: redirect-of-security-or-update-domains
+        name: Hosts entry naming a security, update or identity domain
+        purpose: >-
+          Separate tampering from convenience. A mapping for a security vendor, an update
+          service or a login provider is the redirection the hypothesis is about, and a
+          development mapping to a local service name is not.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(drivers\\etc\\hosts\b|(\/private)?\/etc\/hosts(\s|"|'|$))/i
+          | CommandLine=/(crowdstrike|cloudsink|windowsupdate|update\.microsoft|defender|smartscreen|symantec|sophos|sentinelone|mcafee|trendmicro|eset|kaspersky|login\.microsoftonline|okta|apple\.com|swscan|mesu\.apple)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: hosts_file_written
+      name: Hosts file written from a command line
+      description: >-
+        A process command line wrote, appended to, replaced or opened for editing the
+        Windows, Linux or macOS hosts file, which changes how the host resolves names.
+      source: process_creation
+      field: CommandLine
+      indicates: name_resolution_tampering
+
+  supporting:
+    - id: protection_removed
+      name: File protection cleared first
+      description: >-
+        The read-only, system or immutable attribute was removed from the hosts file,
+        which a product rewriting its own entries does not need to do.
+      source: process_creation
+      field: CommandLine
+      indicates: defense_preparation
+    - id: sensitive_domain_redirected
+      name: Security, update or identity domain named
+      description: >-
+        The written mapping names a security vendor, an operating-system update service
+        or an identity provider, which cuts the host off from protection or sends its
+        logins elsewhere.
+      source: process_creation
+      field: CommandLine
+      indicates: traffic_redirection
+    - id: interactive_writer
+      name: Written by a shell or interpreter
+      description: >-
+        The writing process descends from a user shell, a script host or an interpreter
+        rather than from a product service that manages the file.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: hosts_change_rare_for_host
+      name: No hosts change on this host in the baseline window
+      description: >-
+        The host has not had its hosts file written during the baseline period, so this
+        change is not part of a recurring product behaviour.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: product_managed_hosts
+      name: Written by a product that manages the file
+      description: >-
+        The writer is a VPN client, container runtime or security product that rewrites
+        the hosts file as its documented behaviour.
+      source: process_creation
+      field: ImageFileName
+      indicates: legitimate_application_component
+    - id: developer_workstation
+      name: Development workstation mapping a local service
+      description: >-
+        The host is in a development asset group and the mapping points a local service
+        name at loopback.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_developer_activity
+    - id: change_ticketed
+      name: Change made under a recorded change
+      description: >-
+        The user making the change is an administrator acting under a recorded change,
+        such as pinning a name during a migration.
+      source: identity_context
+      field: UserName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - hosts_file_written
+
+    supporting:
+      any:
+        - protection_removed
+        - sensitive_domain_redirected
+        - interactive_writer
+        - hosts_change_rare_for_host
+      all:
+        - sensitive_domain_redirected
+        - interactive_writer
+
+    contradicting:
+      any:
+        - product_managed_hosts
+        - developer_workstation
+        - change_ticketed
+      all: []
+
+  verdict:
+    low_risk_when:
+      - hosts_file_written
+      - product_managed_hosts
+      - developer_workstation
+      - change_ticketed
+    suspicious_when:
+      - hosts_file_written
+      - hosts_change_rare_for_host
+    high_risk_when:
+      - hosts_file_written
+      - sensitive_domain_redirected
+      - interactive_writer
+      - protection_removed
+
+  false_positive:
+    - condition: A VPN or zero-trust client rewrites the hosts file while connecting.
+      explanation: >-
+        Split-tunnel clients add and remove mappings as a product behaviour. The writer is
+        the client's own service binary and the change recurs on every connection.
+    - condition: A developer maps a local service name to loopback.
+      explanation: >-
+        Local development routinely adds loopback entries. The host is in a development
+        group and the names are internal service names, not vendor or identity domains.
+    - condition: An administrator pins a name during a migration or outage.
+      explanation: >-
+        Operations staff do edit the file by hand under a change. The user, the ticket and
+        a later removal of the entry distinguish it.
+    - condition: Ad-blocking or parental-control software manages a block list.
+      explanation: >-
+        These tools write many entries at once, all pointing at a sink address, from a
+        signed product binary.

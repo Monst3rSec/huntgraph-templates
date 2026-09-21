@@ -1,0 +1,306 @@
+type: detection
+
+id: hg-win-internet-shortcut-delivered-and-opened-from-a-remote-share-t1566-002
+version: 1.0.0
+
+info:
+  name: Internet shortcut delivered and opened against a remote share
+  description: >-
+    Phishing has moved from macro documents to shortcuts: a .url or .lnk file sent as a
+    link or a zipped attachment points at a WebDAV or SMB share the adversary runs, and
+    opening it pulls the payload straight from that share. Because the shortcut is only
+    a pointer, it never looks like an executable to a mail filter, and on older builds a
+    file:// or search-ms: target also escapes the mark-of-the-web prompt. The sensor
+    does not report the shortcut being written, but it does report what opening one
+    does on Windows: the URL handler invoked on a file in a download or attachment
+    directory, the WebDAV client starting, and content executed from a remote path.
+  severity: high
+  author: huntgraph
+  tags:
+    - initial-access
+    - phishing
+    - internet-shortcut
+    - webdav
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1566/002
+    - https://attack.mitre.org/detectionstrategies/DET0107
+    - https://attack.mitre.org/techniques/T1566
+    - https://raw.githubusercontent.com/elastic/detection-rules/main/rules/windows/execution_downloaded_url_file.toml
+    - https://raw.githubusercontent.com/elastic/detection-rules/main/rules/windows/execution_downloaded_shortcut_files.toml
+
+mitre:
+  tactics:
+    - TA0001
+  techniques:
+    - T1566
+  sub_techniques:
+    - T1566.002
+  detection_strategies:
+    - DET0107
+  analytics:
+    - AN0298
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may send a user an internet shortcut or shell link whose target is a
+    WebDAV, SMB or search-ms location they control, so that opening the shortcut
+    retrieves and runs a payload from that remote share instead of from a delivered file.
+  attacker_behavior:
+    - Sends a .url or .lnk file by mail, often inside a ZIP, or links to one from a message.
+    - Sets the shortcut target to a WebDAV path (\\host@SSL\...) or a file:// URL on the internet.
+    - Uses a search-ms URI so Explorer displays the remote share as if it were a local folder.
+    - Places a script, HTA, LNK or executable on the share for the user to open.
+  legitimate_behavior:
+    - Intranet portals and SharePoint libraries are opened through WebDAV.
+    - Users keep .url shortcuts to internal applications on the desktop.
+    - Explorer mounts mapped drives and DFS shares at logon.
+    - Software launchers start installers from an internal distribution share.
+  risk_indicator:
+    - The shortcut opened sits in Downloads, the Outlook attachment cache or an archive extraction directory.
+    - The WebDAV target is an external host or an IP address, not an intranet name.
+    - A script host, mshta, rundll32 or cmd runs with a UNC path as its argument.
+    - The user had never contacted that share before.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: internet-shortcut-opened-from-a-delivery-directory
+        name: URL handler invoked on a shortcut in a download or attachment directory
+        purpose: >-
+          Catch the open itself. Double-clicking a .url file hands it to the URL handler,
+          whose command line names the shortcut file, so a shortcut opened straight out
+          of Downloads, the Outlook cache or an extracted archive is visible here.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(ieframe\.dll|shdocvw\.dll|url\.dll)\s*,\s*(OpenURL|OpenURLA|FileProtocolHandler)/i
+          | CommandLine=/\\(Downloads|Content\.Outlook|INetCache|AppData\\Local\\Temp\\(Temp\d?_|7z|Rar\$))/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: webdav-client-started-for-a-remote-host
+        name: WebDAV client starting a session with a named server
+        purpose: >-
+          Surface the network half without network telemetry. Windows starts
+          davclnt.dll through rundll32 with the server name whenever a shortcut or path
+          points at a WebDAV share, so the command line names the host the user was sent to.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^rundll32\.exe$/i
+          | CommandLine=/davclnt\.dll\s*,\s*DavSetCookie/i
+        filters:
+          include: []
+          exclude:
+            - "CommandLine naming the organisation's own SharePoint and intranet hosts"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: content-executed-from-a-remote-share
+        name: Script host or loader executing content from a UNC or WebDAV path
+        purpose: >-
+          Confirm the payload ran. A shortcut whose target is a remote share starts the
+          interpreter with that share in its arguments, or starts an image that lives on
+          it, which is where the retrieval turns into execution.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(explorer|rundll32|cmd|wscript|cscript|mshta)\.exe$/i
+          | CommandLine=/(\\\\[^\\\s"]+@(SSL|\d+)\\|\\DavWWWRoot\\|\\\\\d{1,3}(\.\d{1,3}){3}\\|file:\/\/[^\s"]+\/)/i
+          | FileName=/^(wscript|cscript|mshta|rundll32|regsvr32|cmd|powershell|pwsh|msiexec|explorer)\.exe$/i
+        filters:
+          include: []
+          exclude:
+            - "CommandLine naming the organisation's distribution shares"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: search-ms-or-remote-folder-opened
+        name: Explorer opened on a search-ms or remote file URI
+        purpose: >-
+          Catch the disguise. A search-ms: URI or file:// link makes Explorer present an
+          attacker's share as a local folder of documents; its command line carries the
+          remote location.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^explorer\.exe$/i
+          | CommandLine=/(search-ms:|search:query=|file:\/\/[^\s"\/]+\/)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: shortcut_opened_against_remote_target
+      name: Shortcut opened or remote share contacted
+      description: >-
+        A shortcut in a download or attachment directory was opened, or the WebDAV client
+        or Explorer was started against a remote share, which is how a delivered pointer
+        reaches the adversary's infrastructure.
+      source: process_creation
+      field: CommandLine
+      indicates: phishing_delivery
+
+  supporting:
+    - id: delivery_directory_shortcut
+      name: Shortcut came from a download or attachment directory
+      description: >-
+        The opened shortcut sat in Downloads, the Outlook attachment cache or an archive
+        extraction directory rather than on the desktop or in the Start menu.
+      source: process_creation
+      field: CommandLine
+      indicates: payload_staging
+    - id: external_webdav_host
+      name: WebDAV server outside the organisation
+      description: >-
+        The server named to the WebDAV client is an IP address or an internet host rather
+        than an intranet or SharePoint name.
+      source: process_creation
+      field: CommandLine
+      indicates: possible_payload_retrieval
+    - id: interpreter_on_remote_path
+      name: Interpreter ran content from the remote share
+      description: >-
+        A script host, loader or shell started with a UNC or WebDAV path as its argument,
+        so content from the share executed.
+      source: process_creation
+      field: ImageFileName
+      indicates: execution_chain_progression
+    - id: explorer_parent
+      name: Started by the user's shell
+      description: >-
+        The chain began with Explorer or the URL handler, meaning the user opened
+        something rather than a scheduled or service process reaching the share.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: user_execution_foothold
+    - id: share_new_for_user
+      name: Share never contacted by this user
+      description: >-
+        The user has not reached this server during the baseline window.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: intranet_webdav
+      name: Intranet or SharePoint WebDAV
+      description: >-
+        The WebDAV server is an internal SharePoint or intranet host that users open
+        through Explorer as normal work.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_enterprise_activity
+    - id: distribution_share_launch
+      name: Launch from the software distribution share
+      description: >-
+        The remote path is the organisation's own software or script distribution share.
+      source: process_creation
+      field: CommandLine
+      indicates: software_deployment_wave
+    - id: user_saved_shortcut
+      name: Shortcut the user keeps
+      description: >-
+        The shortcut is a long-standing link to an internal application that the user
+        opens regularly.
+      source: identity_context
+      field: UserName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - shortcut_opened_against_remote_target
+
+    supporting:
+      any:
+        - delivery_directory_shortcut
+        - external_webdav_host
+        - interpreter_on_remote_path
+        - explorer_parent
+        - share_new_for_user
+      all:
+        - external_webdav_host
+        - interpreter_on_remote_path
+
+    contradicting:
+      any:
+        - intranet_webdav
+        - distribution_share_launch
+        - user_saved_shortcut
+      all: []
+
+  verdict:
+    low_risk_when:
+      - shortcut_opened_against_remote_target
+      - intranet_webdav
+      - distribution_share_launch
+      - user_saved_shortcut
+    suspicious_when:
+      - shortcut_opened_against_remote_target
+      - share_new_for_user
+    high_risk_when:
+      - shortcut_opened_against_remote_target
+      - delivery_directory_shortcut
+      - external_webdav_host
+      - interpreter_on_remote_path
+
+  false_positive:
+    - condition: Users open SharePoint document libraries in Explorer.
+      explanation: >-
+        SharePoint's "open in Explorer" starts the WebDAV client against the tenant's own
+        host. The server name is the organisation's, and no interpreter runs from it.
+    - condition: A software launcher starts an installer from a distribution share.
+      explanation: >-
+        Internal deployment runs content from UNC paths. The share is the organisation's
+        own and the launch recurs across many hosts.
+    - condition: A user keeps .url shortcuts to internal web applications.
+      explanation: >-
+        Opening those runs the URL handler on a shortcut on the desktop or in the Start
+        menu, not one in Downloads or the attachment cache.

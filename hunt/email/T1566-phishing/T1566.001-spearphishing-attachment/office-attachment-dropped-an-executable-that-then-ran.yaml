@@ -1,0 +1,330 @@
+type: detection
+
+id: hg-win-office-attachment-dropped-an-executable-that-then-ran-t1566-001
+version: 1.0.0
+
+info:
+  name: Office attachment dropped an executable that then ran
+  description: >-
+    A weaponised attachment does not always spawn its payload directly. Macro, template
+    injection and equation-editor exploits commonly write an executable to disk first and
+    start it a moment later, which keeps the Office process out of the payload's
+    lineage. The write is the durable trace: Word, Excel, PowerPoint and Outlook have no
+    reason to author portable executables, and the attachment and preview caches they
+    use are not places software is installed from. This file follows the executable
+    from the Office process that wrote it to the moment it runs.
+  severity: high
+  author: huntgraph
+  tags:
+    - initial-access
+    - phishing
+    - office-attachment
+    - payload-drop
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1566/001
+    - https://attack.mitre.org/detectionstrategies/DET0236
+    - https://attack.mitre.org/techniques/T1566
+    - https://raw.githubusercontent.com/elastic/detection-rules/main/rules/windows/execution_ms_office_written_file.toml
+
+mitre:
+  tactics:
+    - TA0001
+  techniques:
+    - T1566
+  sub_techniques:
+    - T1566.001
+  detection_strategies:
+    - DET0236
+  analytics:
+    - AN0655
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - File Creation
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may deliver an Office document by mail whose content, once opened, writes
+    an executable to disk and starts it, so the payload runs as a separate process that
+    does not descend from the Office application.
+  attacker_behavior:
+    - Sends a macro-enabled or exploit-bearing document as a mail attachment.
+    - Uses the macro or exploit to write a portable executable into a temporary or cache directory.
+    - Starts the dropped executable through WMI, a scheduled task or a shell so the Office process is not its parent.
+    - Names the executable after a legitimate updater or system component.
+  legitimate_behavior:
+    - Office itself installs updates and add-ins through its own click-to-run service.
+    - Outlook saves attachments that users then run, including vendor installers.
+    - Some line-of-business add-ins unpack helper executables on first use.
+    - Users save executables sent by colleagues and open them from the attachment cache.
+  risk_indicator:
+    - The executable was written by WINWORD, EXCEL, POWERPNT, MSPUB, MSACCESS or EQNEDT32 rather than by an installer.
+    - The executable sits in Content.Outlook, Content.MSO, Content.Word or a user temporary directory.
+    - The same content hash later runs as a process on the host.
+    - The hash is unknown elsewhere in the estate.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - SHA256HashData
+        - TargetProcessId
+    - source: file_creation
+      event_types:
+        - PeFileWritten
+        - NewExecutableWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
+        - SHA256HashData
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: executable-written-into-an-office-cache
+        name: Executable written into an Office attachment or preview cache
+        purpose: >-
+          Return every executable that lands where Outlook stores opened attachments and
+          where Word and the shared Office cache keep downloaded content. Installers are
+          not written there, so each row is a file that arrived through a document or a
+          message.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+          | TargetFileName=/\\(Content\.Outlook|Content\.MSO|Content\.Word|Content\.Excel|Content\.PowerPoint)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: process-started-from-an-office-cache
+        name: Process started from an Office attachment or preview cache
+        purpose: >-
+          Return the execution half on its own, so the agent sees a payload that ran out
+          of an Office cache even when the write was not observed.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/\\(Content\.Outlook|Content\.MSO|Content\.Word|Content\.Excel|Content\.PowerPoint)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - path
+
+      - id: executable-written-by-an-office-process
+        name: Executable written by a running Office process
+        purpose: >-
+          Establish authorship. The file-write event carries only the writing process id,
+          so it is joined to the Office process that owns that id on the same host; a row
+          with both halves is an executable an Office application wrote, wherever it put
+          it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2|PeFileWritten|NewExecutableWritten)$/
+          | case {
+              #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+                | FileName=/^(winword|excel|powerpnt|outlook|mspub|msaccess|eqnedt32|fltldr|onenote)\.exe$/i
+                | office_process := FileName
+                | writer_pid := TargetProcessId ;
+              #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+                | dropped_path := TargetFileName
+                | dropped_hash := SHA256HashData
+                | writer_pid := ContextProcessId ;
+            }
+          | groupBy([aid, writer_pid],
+                    function=[collect([ComputerName, UserName, office_process, CommandLine,
+                                       dropped_path, dropped_hash], limit=50),
+                              count(as=events)])
+          | office_process=/.+/ and dropped_path=/.+/
+        filters:
+          include: []
+          exclude:
+            - "dropped_path under the Office click-to-run installation directory"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: office-dropped-executable-then-ran
+        name: Executable dropped into an Office or user temporary path, then run
+        purpose: >-
+          Confirm the payload took effect. Joining the write and the execution on the
+          content hash is independent of the file name and of how the process was
+          started, which is exactly what a dropper changes to hide its parent.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2|PeFileWritten|NewExecutableWritten)$/
+          | case {
+              #event_simpleName=/^(PeFileWritten|NewExecutableWritten)$/
+                | TargetFileName=/\\(Content\.Outlook|Content\.MSO|Content\.Word|AppData\\Local\\Temp|AppData\\Roaming)\\/i
+                | written_path := TargetFileName ;
+              #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+                | executed_image := ImageFileName ;
+            }
+          | groupBy([ComputerName, SHA256HashData],
+                    function=[collect([written_path, executed_image, CommandLine,
+                                       ParentBaseFileName, UserName], limit=50),
+                              count(as=events)])
+          | written_path=/.+/ and executed_image=/.+/
+        filters:
+          include: []
+          exclude:
+            - "SHA256HashData of signed vendor installers distributed through the software portal"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: office_cache_executable
+      name: Executable written into or run from an Office cache
+      description: >-
+        A portable executable was written into, or started from, an Outlook attachment
+        cache or an Office content cache, which is where an opened attachment or a
+        document-fetched payload lands.
+      source: file_creation
+      field: TargetFileName
+      indicates: payload_staging
+
+  supporting:
+    - id: office_process_authored
+      name: Office application wrote the executable
+      description: >-
+        The process that wrote the executable is Word, Excel, PowerPoint, Outlook,
+        Publisher, Access or the equation editor, none of which author executables as
+        part of editing a document.
+      source: file_creation
+      field: ContextProcessId
+      indicates: user_execution_foothold
+    - id: dropped_file_executed
+      name: The dropped executable ran
+      description: >-
+        A process started whose image hash matches the executable written into the
+        Office or temporary path, so the drop was followed by execution.
+      source: process_creation
+      field: SHA256HashData
+      indicates: execution_chain_progression
+    - id: launched_out_of_lineage
+      name: Payload not parented by Office
+      description: >-
+        The dropped executable was started by WMI, a scheduled task, explorer or a shell
+        rather than by the Office application, which is how droppers keep Office out of
+        the process tree.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: hash_rare_in_estate
+      name: Hash seen on few hosts
+      description: >-
+        The dropped executable's hash has been observed on very few hosts during the
+        baseline window, unlike a distributed installer.
+      source: baseline
+      field: SHA256HashData
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: click_to_run_update
+      name: Office servicing
+      description: >-
+        The executable is part of an Office click-to-run update, written under the Office
+        installation directory by the servicing process.
+      source: process_creation
+      field: ImageFileName
+      indicates: software_deployment_wave
+    - id: approved_add_in_helper
+      name: Approved add-in helper
+      description: >-
+        The executable is a helper that an approved Office add-in unpacks on first use,
+        with the same hash across the estate.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_application_component
+    - id: expected_installer_from_colleague
+      name: Known installer opened from mail
+      description: >-
+        The executable is a signed vendor installer that a user received from a known
+        sender and ran deliberately.
+      source: identity_context
+      field: UserName
+      indicates: legitimate_enterprise_activity
+
+  risk_logic:
+    required:
+      - office_cache_executable
+
+    supporting:
+      any:
+        - office_process_authored
+        - dropped_file_executed
+        - launched_out_of_lineage
+        - hash_rare_in_estate
+      all:
+        - office_process_authored
+        - dropped_file_executed
+
+    contradicting:
+      any:
+        - click_to_run_update
+        - approved_add_in_helper
+        - expected_installer_from_colleague
+      all: []
+
+  verdict:
+    low_risk_when:
+      - office_cache_executable
+      - click_to_run_update
+      - approved_add_in_helper
+      - expected_installer_from_colleague
+    suspicious_when:
+      - office_cache_executable
+      - hash_rare_in_estate
+    high_risk_when:
+      - office_cache_executable
+      - office_process_authored
+      - dropped_file_executed
+      - launched_out_of_lineage
+
+  false_positive:
+    - condition: Office click-to-run servicing writes and runs its own executables.
+      explanation: >-
+        The servicing process writes signed Microsoft binaries under the Office
+        installation directory, not under Content.Outlook or a user temporary path.
+    - condition: A user runs an installer they were sent by mail.
+      explanation: >-
+        Outlook opens attachments from its cache, so a legitimate installer produces the
+        same path. The hash is a known signed vendor binary and the sender is expected.
+    - condition: A line-of-business add-in unpacks a helper executable.
+      explanation: >-
+        Some add-ins drop helpers on first use. The hash is identical across the estate
+        and the add-in is on the approved list.

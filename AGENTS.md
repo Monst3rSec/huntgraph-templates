@@ -4,7 +4,7 @@ Operating instructions for an agent working in this repository.
 
 ## What this repo is
 
-289 YAML files of threat-hunting detection knowledge, consumed by the **huntgraph**
+293 YAML files of threat-hunting detection knowledge, consumed by the **huntgraph**
 threat-hunting agent. Each file is one hypothesis: what to query, what evidence the
 result carries, and how to reason from that evidence to a verdict.
 
@@ -68,7 +68,7 @@ A whole technique family shares one category, so its sub-technique folders move 
 |---|---|
 | network | C2 and exfiltration (T1001, T1008, T1071, T1090, T1095, T1102, T1104, T1105, T1132, T1205, T1219, T1568, T1571, T1572, T1659; T1011, T1030, T1041, T1048, T1567), traffic interception and probing (T1040, T1046, T1187, T1557), host-to-host movement (T1021, T1133, T1210, T1563, T1570) |
 | identity | accounts and authentication (T1078, T1098, T1110, T1136, T1550, T1556, T1558, T1606, T1621, T1649), directory (T1207, T1484), and T1003.006 DCSync |
-| email | T1114, T1534 |
+| email | T1114, T1534, and phishing delivery T1566 (attachment, link) |
 | web | T1505 |
 | containers | T1611 |
 | endpoint | everything else, including discovery run on the host |
@@ -83,7 +83,7 @@ are keyed by id.
 
 | Connector | `language` | Files |
 |---|---|---:|
-| `crowdstrike-ngsiem` | `cql` | 289 |
+| `crowdstrike-ngsiem` | `cql` | 293 |
 | Wazuh | `wazuh-rules` | 127 |
 
 Wazuh rule ids are allocated from `ruleset/wazuh-id-allocations.yaml`; field names come
@@ -167,6 +167,30 @@ other tools skip them, and their files are under the Detection Rule License 1.1,
 Apache-2.0 — keep them unmodified so the authors' attribution survives. Never edit them in
 place; rerun the import, which also regenerates every category `README.md`. Never put a
 template inside `sigma/`: it would silently go unvalidated.
+
+### Every rule lands as a hunt template
+
+Rules may come from anywhere — Elastic, Splunk, Sigma, a vendor blog, a report, an analyst's
+own idea — but they enter this repository in **one form only**: a YAML template in the
+`hunt/<category>/<Txxxx-slug>/[<Txxxx.yyy-slug>/]<behaviour>.yaml` structure, validated like
+every other. Never add a rule in its upstream format (EQL, KQL, ES|QL, SPL, TOML, Sigma YAML),
+never create a new per-source folder beside the templates, and never keep a "raw" copy to
+convert later. The Sigma `sigma/` folders are the one existing exception, kept as licensed
+reference material; do not extend that pattern to another source.
+
+Working a rule is create, update or reject — the CRUD of this corpus:
+
+- **Create** a new template when the behaviour has no template yet.
+- **Update** the existing template when it already holds the hypothesis and the rule adds
+  something it lacked — a case, a child process, a path. Bump `version` (minor), add the
+  case's Wazuh rule or its `not_portable` entry, wire any new evidence into `risk_logic` and
+  `verdict`, and add the rule's URL to `info.references`.
+- **Reject** the rule when its distinguishing evidence needs telemetry this deployment does
+  not collect (module load, process access, OS API) or when a template already covers it
+  completely. Do not reference a rule from a template that does not actually cover it just
+  to clear the tracker; an outstanding row is honest, a false "done" is not.
+- **Delete** a template only when its hypothesis is wrong or fully duplicated, never because
+  an upstream rule was removed. Its Wazuh ids stay allocated.
 
 ### Converting is authoring, not porting
 

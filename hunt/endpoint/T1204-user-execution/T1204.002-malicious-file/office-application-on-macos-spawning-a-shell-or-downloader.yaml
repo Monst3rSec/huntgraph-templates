@@ -1,0 +1,275 @@
+type: detection
+
+id: hg-mac-office-application-spawning-a-shell-or-downloader-t1204-002
+version: 1.0.0
+
+info:
+  name: Office application on macOS spawning a shell or downloader
+  description: >-
+    Office for Mac runs macros too, and a malicious document there does what it does on
+    Windows in Unix terms: Word or Excel starts sh, bash, osascript, curl or python to
+    fetch and launch the next stage, often stripping the quarantine attribute on the way.
+    Office's own sandboxed helpers rarely need a shell, and the few that do — version
+    probes and error reporting — have recognisable arguments. A shell, interpreter or
+    downloader whose parent is an Office application is the moment a document became
+    code.
+  severity: high
+  author: huntgraph
+  tags:
+    - execution
+    - malicious-document
+    - office-macro
+    - macos
+  references:
+    - https://attack.mitre.org/techniques/T1204/002
+    - https://attack.mitre.org/detectionstrategies/DET0294
+    - https://attack.mitre.org/techniques/T1204
+    - https://raw.githubusercontent.com/elastic/detection-rules/main/rules/macos/initial_access_suspicious_mac_ms_office_child_process.toml
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1204
+  sub_techniques:
+    - T1204.002
+  detection_strategies:
+    - DET0294
+  analytics:
+    - AN0820
+  platforms:
+    - macOS
+  data_sources:
+    - macos:endpointsecurity
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    A user on macOS may be induced to open a delivered Office document whose macro starts
+    a shell, script interpreter or download utility, so the document application becomes
+    the parent of the intrusion's first stage.
+  attacker_behavior:
+    - Sends a macro-enabled Word, Excel or PowerPoint document to a Mac user.
+    - Uses the macro to run sh, bash, zsh or osascript with an inline command.
+    - Fetches a second stage with curl or nscurl and marks it executable with chmod.
+    - Removes the quarantine attribute with xattr so Gatekeeper does not prompt.
+  legitimate_behavior:
+    - Office probes the OS version and hardware model through a shell at start-up.
+    - Microsoft Error Reporting is launched when an Office application crashes.
+    - Reference managers such as Zotero talk to Word through a shell pipe.
+    - Enterprise add-ins occasionally shell out for configuration.
+  risk_indicator:
+    - The child is curl, nscurl, osascript, python, perl or a shell with a URL or a /tmp path.
+    - The child removes the quarantine attribute or changes a file's mode to executable.
+    - The document was opened from Downloads or a mail attachment directory.
+    - The user has no Office automation history on this host.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: office-app-spawning-shell-or-interpreter
+        name: Office application spawning a shell, interpreter or download utility
+        purpose: >-
+          Return every child of Word, Excel, PowerPoint, Outlook or OneNote that is a
+          shell, interpreter or network utility, with the version-probe and error
+          reporting noise removed and nothing else summarised away.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^Microsoft (Word|Excel|PowerPoint|Outlook|OneNote)$/i
+          | FileName=/^(sh|bash|zsh|dash|osascript|python[0-9.]*|perl[0-9.]*|ruby|php|curl|nscurl|wget|mktemp|chmod|nohup|openssl|plutil|PlistBuddy|xattr|sqlite3|funzip|base64|launchctl)$/
+          | CommandLine!=/(ProductVersion|ProductName|ProductUserVisibleVersion|ProductBuildVersion|hw\.model|ioreg -d2 -c IOPlatformExpertDevice|Microsoft Error Reporting|zoteroIntegrationPipe|defaults read )/
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName children from approved enterprise add-ins"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - process
+            - command_line
+
+      - id: office-child-fetching-or-running-remote-content
+        name: Office child fetching content or running from a temporary path
+        purpose: >-
+          Isolate the children whose arguments carry the second stage: a URL, a pipe into
+          a shell, or a path under /tmp, /private/var or the user's Downloads.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^Microsoft (Word|Excel|PowerPoint|Outlook|OneNote)$/i
+          | CommandLine=/(https?:\/\/|\|\s*(ba|z)?sh\b|\/tmp\/|\/private\/var\/|\/Users\/[^\/]+\/(Downloads|Library\/Containers)\/|do shell script|base64\s+(-d|--decode|-D))/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: quarantine-or-mode-change-from-office-chain
+        name: Quarantine removed or file made executable from an Office chain
+        purpose: >-
+          Catch the preparation for the payload. Removing com.apple.quarantine or setting
+          the execute bit is what a stage-two loader needs and what document editing
+          never does.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(Microsoft (Word|Excel|PowerPoint|Outlook|OneNote)|sh|bash|zsh|osascript)$/i
+          | CommandLine=/(xattr\s+(-[a-z]*d|-[a-z]*c)[^|]*(com\.apple\.quarantine)?|chmod\s+(\+x|[0-7]*[157][0-7]*\s))/i
+          | CommandLine=/(\/tmp\/|\/private\/var\/|\/Users\/[^\/]+\/(Downloads|Library)\/)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - command_line
+
+evidence:
+  required:
+    - id: office_spawned_shell
+      name: Office application spawned a shell or utility
+      description: >-
+        Word, Excel, PowerPoint, Outlook or OneNote became the parent of a shell,
+        script interpreter or download utility outside the known version-probe and error
+        reporting patterns.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: user_execution_foothold
+
+  supporting:
+    - id: remote_content_in_arguments
+      name: Child fetched remote content or used a temporary path
+      description: >-
+        The child's arguments carry a URL, a pipe into a shell, a base64 decode or a path
+        under a temporary or download directory.
+      source: process_creation
+      field: CommandLine
+      indicates: possible_payload_retrieval
+    - id: quarantine_or_mode_change
+      name: Quarantine stripped or execute bit set
+      description: >-
+        The chain removed the quarantine attribute from a file or made it executable,
+        preparing a downloaded payload to run without a Gatekeeper prompt.
+      source: process_creation
+      field: CommandLine
+      indicates: defense_preparation
+    - id: interpreter_child
+      name: Child is a script interpreter
+      description: >-
+        The child is osascript, python, perl, ruby or php, which can run an entire stage
+        from inline text.
+      source: process_creation
+      field: FileName
+      indicates: execution_chain_progression
+    - id: office_shell_rare_for_user
+      name: No Office shell activity for this user before
+      description: >-
+        This user's Office applications have not started shells during the baseline
+        window.
+      source: baseline
+      field: UserName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: version_or_crash_probe
+      name: Office version probe or crash reporting
+      description: >-
+        The child is Office reading the OS version or hardware model, or starting
+        Microsoft Error Reporting, which the exclusions may not have caught verbatim.
+      source: process_creation
+      field: CommandLine
+      indicates: legitimate_application_component
+    - id: approved_add_in
+      name: Approved add-in shelling out
+      description: >-
+        The child is started by an approved reference-manager or enterprise add-in that
+        integrates with Office through a shell.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_application_component
+    - id: automation_user
+      name: User who automates Office
+      description: >-
+        The user maintains Office automation and has run comparable shell calls from
+        Office before.
+      source: identity_context
+      field: UserName
+      indicates: expected_developer_activity
+
+  risk_logic:
+    required:
+      - office_spawned_shell
+
+    supporting:
+      any:
+        - remote_content_in_arguments
+        - quarantine_or_mode_change
+        - interpreter_child
+        - office_shell_rare_for_user
+      all:
+        - remote_content_in_arguments
+        - quarantine_or_mode_change
+
+    contradicting:
+      any:
+        - version_or_crash_probe
+        - approved_add_in
+        - automation_user
+      all: []
+
+  verdict:
+    low_risk_when:
+      - office_spawned_shell
+      - version_or_crash_probe
+      - approved_add_in
+      - automation_user
+    suspicious_when:
+      - office_spawned_shell
+      - office_shell_rare_for_user
+    high_risk_when:
+      - office_spawned_shell
+      - remote_content_in_arguments
+      - quarantine_or_mode_change
+      - interpreter_child
+
+  false_positive:
+    - condition: Office probes the OS version or hardware model.
+      explanation: >-
+        Office starts a shell with sysctl, ioreg or sw_vers style arguments at launch.
+        The command line names product-version keys and nothing is fetched.
+    - condition: Microsoft Error Reporting runs after a crash.
+      explanation: >-
+        The error reporter is started from Office's support directory with its own path
+        as the argument.
+    - condition: A reference manager integrates with Word.
+      explanation: >-
+        Zotero and similar tools open a shell pipe from Word. The command line names the
+        integration pipe and recurs for the same users.

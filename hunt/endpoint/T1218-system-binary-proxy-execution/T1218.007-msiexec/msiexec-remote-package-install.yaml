@@ -1,7 +1,7 @@
 type: detection
 
 id: hg-win-msiexec-remote-package-install-t1218-007
-version: 1.0.0
+version: 1.1.0
 
 info:
   name: Msiexec installing a package from a remote or writable location
@@ -25,6 +25,7 @@ info:
     - https://attack.mitre.org/techniques/T1218/007
     - https://attack.mitre.org/detectionstrategies/DET0158
     - https://lolbas-project.github.io/lolbas/Binaries/Msiexec/
+    - https://raw.githubusercontent.com/elastic/detection-rules/main/rules/windows/initial_access_execution_remote_via_msiexec.toml
 
 mitre:
   tactics:
@@ -85,6 +86,7 @@ requires:
         host: ComputerName
         user: UserName
         image_name: FileName
+        image_path: ImageFileName
         command_line: CommandLine
         parent_process: ParentBaseFileName
     - source: process_creation
@@ -97,6 +99,7 @@ requires:
         host: win.system.computer
         user: win.eventdata.user
         image_name: win.eventdata.image
+        image_path: win.eventdata.image
         command_line: win.eventdata.commandLine
         parent_process: win.eventdata.parentImage
 query:
@@ -166,6 +169,30 @@ query:
           window: null
           compare: []
 
+      - id: msiexec-spawned-payload-from-writable-path
+        name: Process started by msiexec from outside the system and program directories
+        purpose: >-
+          Observe the custom action executing. A package's embedded payload runs as a
+          child of msiexec, and when that child's image lives in a user profile, temporary
+          or ProgramData directory instead of the Windows Installer cache or Program Files,
+          the install ran something the package brought with it.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^msiexec\.exe$/i
+          | ImageFileName!=/\\Windows\\(System32|SysWOW64|Installer|twain_32)\\/i
+          | ImageFileName!=/\\Program Files( \(x86\))?\\/i
+        filters:
+          include: []
+          exclude:
+            - "SHA256HashData of signed vendor custom-action helpers seen across the estate"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
   - platform: wazuh
     language: wazuh-rules
     ruleset:
@@ -197,6 +224,29 @@ query:
         limitations:
           - Derived from the CQL filter chain; the aggregation in the original case
             is not represented.
+
+      - id: msiexec-spawned-payload-from-writable-path
+        covers: msiexec-spawned-payload-from-writable-path
+        name: Process started by msiexec from outside the system and program directories
+        purpose: >-
+          Observe the custom action executing: a child of msiexec whose image lives
+          outside the Windows Installer cache, the system directories and Program Files.
+        rule: |
+          <rule id="100993" level="10">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.parentImage" type="pcre2">(?i)\\msiexec\.exe$</field>
+            <field name="win.eventdata.image" type="pcre2" negate="yes">(?i)\\Windows\\(System32|SysWOW64|Installer|twain_32)\\</field>
+            <field name="win.eventdata.image" type="pcre2" negate="yes">(?i)\\Program Files( \(x86\))?\\</field>
+            <description>Process started by msiexec from outside the system and program directories</description>
+            <mitre><id>T1218.007</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - The 60d baseline in the CQL case is not represented; every such child is
+            reported.
 
     not_portable:
       - case: msiexec-remote-package
@@ -244,6 +294,15 @@ evidence:
       source: baseline
       field: CommandLine
       indicates: unusual_activity_for_host
+    - id: custom_action_payload
+      name: Package ran a payload from a writable path
+      description: >-
+        msiexec became the parent of a process whose image sits in a user profile,
+        temporary or ProgramData directory, which is the package's embedded custom action
+        executing rather than a file being installed.
+      source: process_creation
+      field: image_path
+      indicates: execution_chain_progression
 
   contradicting:
     - id: distribution_agent_parent
@@ -280,6 +339,7 @@ evidence:
         - silent_install
         - delivery_parent
         - unseen_package
+        - custom_action_payload
       all:
         - silent_install
         - delivery_parent
@@ -304,6 +364,7 @@ evidence:
       - untrusted_package_source
       - silent_install
       - delivery_parent
+      - custom_action_payload
 
   false_positive:
     - condition: A software distribution agent installs an MSI silently on every managed host.
