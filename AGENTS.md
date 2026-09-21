@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 Operating instructions for an agent working in this repository.
 

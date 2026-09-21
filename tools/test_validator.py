@@ -139,6 +139,27 @@ def m_foreign_platform(d):
     d["query"][0]["platform"] = "splunk"
 
 
+def _cql_case(d, cid):
+    return next(c for b in d["query"] if b["platform"] != "wazuh" for c in b["cases"]
+                if c["id"] == cid)
+
+
+def m_declared_field_never_returned(d):
+    # the corpus's original failure: a field is declared, filtered on, and then
+    # aggregated away, so the agent is asked to reason over telemetry the query
+    # never hands back. Declared on the network source, which only an aggregating
+    # case reads — a raw case would return the whole event and legitimately pass.
+    d["requires"]["logs"][2]["fields"].append("SourceProcessId")
+
+
+def m_field_collected_from_the_wrong_events(d):
+    # naming a declared field in a collect() over events that never carry it
+    # returns nothing; it must not count as returning the field
+    d["requires"]["logs"][2]["fields"].append("SourceProcessId")
+    c = _cql_case(d, "dll-write-then-rundll32-execute")
+    c["query"] = c["query"].replace("collect([", "collect([SourceProcessId, ", 1)
+
+
 CASES = [
     ("L1", "unknown top-level key rejected", m_unknown_key, None),
     ("L1", "missing required key rejected", m_missing_version, None),
@@ -165,6 +186,8 @@ CASES = [
     ("L4", "query ignoring every declared event type", m_query_ignores_event_types, None),
     ("L4", "baseline required without a window", m_baseline_missing_window, None),
     ("L4", "baseline required without comparators", m_baseline_missing_compare, None),
+    ("L4", "declared field that no query returns", m_declared_field_never_returned, None),
+    ("L4", "declared field only named in a collect() over the wrong events", m_field_collected_from_the_wrong_events, None),
 ]
 
 
@@ -182,6 +205,7 @@ def main() -> int:
         V.check_mitre(base, atk, rep)
         V.check_evidence(base, rep)
         V.check_query(base, rep)
+        V.check_query_emits_declared(base, rep)
         V.check_convention(base, GOOD, rep)
     failures = []
     if rep.errors:
@@ -196,6 +220,7 @@ def main() -> int:
             V.check_mitre(doc, atk, r)
             V.check_evidence(doc, r)
             V.check_query(doc, r)
+            V.check_query_emits_declared(doc, r)
             V.check_convention(doc, GOOD, r)
         caught = [e for e in r.errors if e.startswith("[%s]" % layer)]
         if caught:

@@ -51,7 +51,7 @@ techniques/T1218-system-binary-proxy-execution/
 schema/detection.schema.json     the structural contract
 tools/attack_extract.py          the only sanctioned source of MITRE facts
 tools/validate.py                five-layer contract enforcement
-tools/test_validator.py          25 injected defects, asserts each is caught
+tools/test_validator.py          27 injected defects, asserts each is caught
 tools/coverage.py                what is done, what is left, what is blocked
 tools/track_sources.py           triages upstream Splunk and Elastic rules
 ```
@@ -73,10 +73,10 @@ python3 tools/test_validator.py
 | L1 structure | schema conformance; unknown keys are errors |
 | L2 mitre | every id exists, and the relationships a file asserts are the ones MITRE publishes |
 | L3 evidence | referential integrity between evidence, risk logic and verdict; every field declared |
-| L4 query | CQL cases carry CQL only — no SPL, KQL, EQL, SQL or Sigma; declared event types actually used; Wazuh blocks well-formed and id-allocated |
+| L4 query | CQL cases carry CQL only — no SPL, KQL, EQL, SQL or Sigma; declared event types actually used; every declared field reaches a result row; Wazuh blocks well-formed and id-allocated |
 | L5 convention | directory encodes the technique; ids unique and correctly suffixed |
 
-`test_validator.py` injects 25 known defects and asserts the right layer catches each. That
+`test_validator.py` injects 27 known defects and asserts the right layer catches each. That
 matters more than it sounds: when the validator once produced a *false* positive, the
 mutation tests are what made narrowing the rule distinguishable from disabling it.
 
@@ -121,27 +121,20 @@ Two other honest limits, stated in the files themselves:
 
 A case returns **raw events** by default: filter the stream down to the behaviour and stop.
 The agent receives every field on every matching event and does its own counting, grouping
-and pivoting. That is the whole point of an agentic consumer — a pre-computed row is a
-summary someone else chose, and nothing recovers what it dropped.
+and pivoting — a pre-computed row is a summary someone else chose, and nothing recovers what
+it dropped.
 
-The corpus did not start this way. All 1028 CQL cases once ended in `groupBy()` keyed on
-some subset of `ComputerName`, `UserName`, `ParentBaseFileName` and `FileName`, preserving
-detail only through `collect([...], limit=3..5)`. Every one of the 289 templates declared
-`aid` in `requires.logs` and no query returned it. 774 cases are now raw, where that
-question no longer arises.
+Of 1028 CQL cases, **781 return raw events** and 247 still end in `groupBy`; no `sort()`
+remains. The 247 are 152 joins (a `case { ... }` block whose two tagged streams only meet on
+one row because of the `groupBy`), 65 that still end in a count threshold such as
+`| hosts >= 20`, and 82 that end at the `groupBy` itself. Most of those 82 lost their
+threshold or join condition when the last two lines of every `groupBy ... sort` query were
+removed, so they return every grouped row and leave the condition to the agent.
 
-254 cases still aggregate, because in those the aggregation *is* the hypothesis:
-
-- **159 joins.** A `case { ... }` block tags two event streams and `groupBy` on a shared
-  key puts them on one row, so a trailing line can demand both:
-  `| enumerated=/.+/ and controlled=/.+/`. Without the `groupBy` those fields never appear
-  together on one event and the query returns nothing.
-- **179 threshold lines.** "At breadth" and "at machine rate" are stated as
-  `| hosts >= 20`, `| connections >= 6`, `| distinct_categories >= 3`. The count exists
-  only because of the `groupBy`.
-
-Where aggregation survives, every field `requires.logs` declares must still reach the row.
-See [intent.md](intent.md) for the measurements and the tradeoff.
+Where a case aggregates, every field `requires.logs` declares must still reach the row, and
+L4 enforces it — crediting a field only to a case whose event types actually carry it.
+19 templates declare a log source that no case queries at all; those are reported as
+warnings, because closing them means writing a query. See [intent.md](intent.md).
 
 ## Status
 

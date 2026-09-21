@@ -73,16 +73,24 @@ threat"* — was exactly this, correctly observed.
 
 ### What was done
 
-| | before | after |
-|---|---:|---:|
-| CQL cases ending in `groupBy` | 1028 | 254 |
-| Cases returning raw events | 0 | **774** |
-| Files: all-raw / mixed / all-aggregated | 0 / 0 / 289 | 137 / 138 / 14 |
-| `groupBy` blocks removed | — | 774 |
-| `sort()` lines removed | — | 594 |
+| | original | first pass | now |
+|---|---:|---:|---:|
+| CQL cases ending in `groupBy` | 1028 | 254 | **247** |
+| Cases returning raw events | 0 | 774 | **781** |
+| `sort()` calls | 722 | 128 | **0** |
+| Files: all-raw / mixed / all-aggregated | 0 / 0 / 289 | 137 / 138 / 14 | 138 / 138 / 13 |
+| `collect()` sample size | 3-5 | 3-5 | 50 |
 
 A raw case filters the event stream to the behaviour and stops. Every field on every
 matching event reaches the agent, which counts, groups and pivots for itself.
+
+The second step was blunter, and deliberately so. Every query still ending `groupBy ... sort`
+— 128 of them — lost its last two lines at the owner's direction, on the grounds that a
+`groupBy` exposes too few columns to reason from. That removed every remaining `sort`, and
+with it whatever filter preceded it: in most cases the count threshold or join condition
+that *was* the hypothesis. Those queries still aggregate but now return every grouped row
+instead of only the ones meeting the condition, so applying the condition is the agent's
+job. Seven were left with an unclosed `groupBy` and were made raw.
 
 ### A correction to what this file used to say
 
@@ -118,29 +126,33 @@ why 594 of them were removed alongside the `groupBy` they served.
 
 ### What is still open
 
-- **14 templates consist entirely of join and threshold cases**, so they return no raw
-  events anywhere. All 14 still declare fields that no query returns, `aid` among them.
-  Each needs either a raw companion case — which requires a `not_portable` entry, since L4
-  demands every CQL case carry a Wazuh rule or declare itself non-portable — or a widened
-  `collect([...])`.
+- **19 templates declare a log source no case queries.** Most declare a `file_creation`
+  source on hunts whose every case reads process events. An earlier pass claimed "100% of
+  declared telemetry" by pasting those field names into a `collect()` over process events,
+  where they can never be populated; that claim was false for these files. The validator now
+  credits a field only to a case whose event types carry it, and reports these as warnings
+  because the fix is a new query, not an edit.
+- **13 templates have no raw case at all.**
 - **471 evidence items cite the `baseline` pseudo-source**, plus 27 `derived` and 16
-  `identity_context`. Their reasoning was pinned to counts the query pre-computed. In a raw
-  case the agent has the events to derive rarity itself, which is strictly more capable,
-  but nothing in the file yet tells it that is now its job.
-- **Neither rule is enforced.** The validator does not check that a case returns raw
-  events, nor that an aggregating case carries every declared field to the row.
+  `identity_context`. Their reasoning assumed counts the query pre-computed; many of those
+  counts and the thresholds on them are gone, and nothing in the files yet tells the agent
+  that deriving them is now its job.
 
 ### Make the validator own it
 
 The repo's central claim is that the validator is the contract and the mutation tests are
-what make it trustworthy. Then these belong in the validator, not in a style guide:
+what make it trustworthy. So:
 
-> **L4 (proposed):** a case that aggregates must carry every field its `requires.logs`
-> declares into the result row — as a `groupBy` key, a `collect([...])` entry, or an
-> aggregate alias.
+> **L4 `check_query_emits_declared` (shipped):** every field declared in a
+> `crowdstrike-ngsiem` `requires.logs` stanza must reach a result row. A raw case returns
+> whole events, so it carries every field of the sources whose event types it reads; an
+> aggregating case must name the field as a `groupBy` key, `collect()` entry or alias —
+> and only gets credit if its own event types carry that field. Mutations: *"declared
+> field that no query returns"* and *"declared field only named in a collect() over the
+> wrong events"*.
 >
-> **L4 (proposed):** a template must expose at least one case that returns raw events, so
-> an aggregated finding is always resolvable to evidence.
+> **L4 (still to write):** raw-by-default — a case should not end in `groupBy` unless the
+> aggregation is a join or a threshold.
 
 Write the check first and let it fail. Fixing the corpus under a failing test is a
 migration; fixing it by hand-editing YAML is 289 chances to regress silently, which is the
