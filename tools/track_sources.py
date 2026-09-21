@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Triage upstream Splunk and Elastic detection rules against this corpus.
 
-Writes splunk_tracker.md and elk_tracker.md: one row per upstream rule, with the
+Writes tracker/splunk_tracker.md and tracker/elk_tracker.md: one row per upstream rule, with the
 routing decision and why. Both are generated artefacts — regenerate, never hand-edit.
 
     python3 tools/track_sources.py                 # fetch upstream, rewrite trackers
@@ -263,7 +263,7 @@ def main():
         title = ("Splunk detection tracker" if src == "splunk" else "Elastic (ELK) detection tracker")
         url = ("https://research.splunk.com/detections/" if src == "splunk"
                else "https://elastic.github.io/detection-rules-explorer/")
-        tally[src] = write_tracker(os.path.join(ROOT, name), title, url, rows, base)
+        tally[src] = write_tracker(os.path.join(ROOT, "tracker", name), title, url, rows, base)
         staged = [r for r in rows if r["decision"] == "staged-unmapped"]
         if staged:
             d = os.path.join(ROOT, "unclassified-threat-check")

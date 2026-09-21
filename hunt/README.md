@@ -14,7 +14,7 @@ Each category folder holds two kinds of content side by side:
 | `sigma/…` | SigmaHQ threat-hunting rules, stored unmodified | no — reference only | Detection Rule License 1.1 |
 
 Each category's `README.md` says how many of each it holds; [stats.md](../stats.md) indexes
-every technique family and [sigma_tracker.md](../sigma_tracker.md) lists every Sigma rule.
+every technique family and [sigma_tracker.md](../tracker/sigma_tracker.md) lists every Sigma rule.
 The category mapping for templates is in [CLAUDE.md](../CLAUDE.md#categories).
 
 ## Templates
@@ -28,7 +28,7 @@ by the directory and the behaviour by the filename. L5 rejects any other layout.
 
 `sigma/` folders hold the rules from
 [SigmaHQ/sigma `rules-threat-hunting/windows`](https://github.com/SigmaHQ/sigma/tree/master/rules-threat-hunting/windows),
-copied byte-for-byte from the commit recorded in [sigma_tracker.md](../sigma_tracker.md) and
+copied byte-for-byte from the commit recorded in [sigma_tracker.md](../tracker/sigma_tracker.md) and
 keeping Sigma's own path below `sigma/`. A Sigma rule is filed by the telemetry it reads —
 all of the current ones read Windows host logs, so all sit in `endpoint/sigma/`. They are
 material to author from, not templates: `validate.py` and every other tool skip `sigma/`,

@@ -74,8 +74,8 @@ tools/validate.py                five-layer contract enforcement
 tools/test_validator.py          injected defects, each must be caught
 tools/coverage.py, export_csv.py coverage: task.md and coverage.csv
 tools/stats.py                   stats.md
-tools/import_sigma.py            SigmaHQ rules into hunt/*/sigma/, sigma_tracker.md
-tools/track_sources.py           Splunk and Elastic triage: splunk_tracker.md, elk_tracker.md
+tools/import_sigma.py            SigmaHQ rules into hunt/*/sigma/, tracker/sigma_tracker.md
+tools/track_sources.py           Splunk and Elastic triage: tracker/splunk_tracker.md, tracker/elk_tracker.md
 ```
 
 ## Authority
@@ -206,9 +206,9 @@ Third-party rules are reference material for authoring, never templates:
 
 | Source | Held how | Tracker |
 |---|---|---|
-| SigmaHQ `rules-threat-hunting/windows` | stored unmodified in `hunt/<category>/sigma/`, pinned to one commit | [sigma_tracker.md](sigma_tracker.md) |
-| Splunk security content | triaged, not stored | [splunk_tracker.md](splunk_tracker.md) |
-| Elastic detection rules | triaged, not stored | [elk_tracker.md](elk_tracker.md) |
+| SigmaHQ `rules-threat-hunting/windows` | stored unmodified in `hunt/<category>/sigma/`, pinned to one commit | [sigma_tracker.md](tracker/sigma_tracker.md) |
+| Splunk security content | triaged, not stored | [splunk_tracker.md](tracker/splunk_tracker.md) |
+| Elastic detection rules | triaged, not stored | [elk_tracker.md](tracker/elk_tracker.md) |
 
 Upstream rules with no ATT&CK mapping are listed in `unclassified-threat-check/`. Turning an
 upstream rule into a template is authoring, not porting: the behaviour is rewritten as a
@@ -224,8 +224,8 @@ Never edit these by hand — rerun the tool.
 | [stats.md](stats.md) | `tools/stats.py` | what the corpus contains, and an index of every technique family by category |
 | [task.md](task.md) | `tools/coverage.py --markdown` | coverage by tactic and priority, and what is blocked |
 | [coverage.csv](coverage.csv) | `tools/export_csv.py` | the whole Enterprise matrix, one row per tactic-technique, with status |
-| [sigma_tracker.md](sigma_tracker.md), `hunt/*/sigma/`, `hunt/*/README.md` | `tools/import_sigma.py` | Sigma rules by category — Category, TTP, Rule, Description, Path |
-| [splunk_tracker.md](splunk_tracker.md), [elk_tracker.md](elk_tracker.md), `unclassified-threat-check/` | `tools/track_sources.py` | every upstream rule with its routing decision |
+| [sigma_tracker.md](tracker/sigma_tracker.md), `hunt/*/sigma/`, `hunt/*/README.md` | `tools/import_sigma.py` | Sigma rules by category — Category, TTP, Rule, Description, Path |
+| [splunk_tracker.md](tracker/splunk_tracker.md), [elk_tracker.md](tracker/elk_tracker.md), `unclassified-threat-check/` | `tools/track_sources.py` | every upstream rule with its routing decision |
 
 ## The iteration loop
 

@@ -186,7 +186,7 @@ def main() -> int:
                               (os.path.relpath(x, ROOT) for x in glob.glob(os.path.join(ROOT, "hunt", "*", "sigma", "**", "*.yml"), recursive=True)))
     rows = [["Sigma threat-hunting (stored)", sum(sig.values()), ", ".join("%s %d" % kv for kv in sig.most_common()) or "—"]]
     for name, f in (("Splunk (tracked)", "splunk_tracker.md"), ("Elastic (tracked)", "elk_tracker.md")):
-        r = tracker_routing(os.path.join(ROOT, f))
+        r = tracker_routing(os.path.join(ROOT, "tracker", f))
         if r:
             rows.append([name, sum(r.values()), "convert %d, covered %d, blocked %d, out of scope %d"
                          % (r.get("convert", 0), r.get("covered", 0), r.get("blocked-telemetry", 0),

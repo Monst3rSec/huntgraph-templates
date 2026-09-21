@@ -107,9 +107,9 @@ Two public rule sets are triaged against this corpus:
 
 | Source | Upstream | Tracker |
 |---|---|---|
-| Splunk | [research.splunk.com/detections](https://research.splunk.com/detections/) (`splunk/security_content`) | `splunk_tracker.md` |
-| Elastic | [detection-rules-explorer](https://elastic.github.io/detection-rules-explorer/) (`elastic/detection-rules`) | `elk_tracker.md` |
-| Sigma | [`rules-threat-hunting/windows`](https://github.com/SigmaHQ/sigma/tree/master/rules-threat-hunting/windows) (`SigmaHQ/sigma`) | `sigma_tracker.md` |
+| Splunk | [research.splunk.com/detections](https://research.splunk.com/detections/) (`splunk/security_content`) | `tracker/splunk_tracker.md` |
+| Elastic | [detection-rules-explorer](https://elastic.github.io/detection-rules-explorer/) (`elastic/detection-rules`) | `tracker/elk_tracker.md` |
+| Sigma | [`rules-threat-hunting/windows`](https://github.com/SigmaHQ/sigma/tree/master/rules-threat-hunting/windows) (`SigmaHQ/sigma`) | `tracker/sigma_tracker.md` |
 
 ```bash
 python3 tools/track_sources.py     # refetch upstream, rewrite both trackers
@@ -157,7 +157,7 @@ mail-gateway and ML rules all land there.
 
 Sigma rules are also **stored**, not just tracked: `python3 tools/import_sigma.py` copies
 them byte-for-byte from a pinned commit into `hunt/<category>/sigma/` and writes
-`sigma_tracker.md` (Category | TTP | Rule | Description | Path). Categories are Elastic's
+`tracker/sigma_tracker.md` (Category | TTP | Rule | Description | Path). Categories are Elastic's
 prebuilt-rule domains — cloud, containers, email, endpoint, identity, kubernetes, llm,
 network, saas, unspecified, web — and a rule is filed by the telemetry it reads, not the
 technique it maps to. All 128 current rules read Windows host logs, so all are `endpoint`.
