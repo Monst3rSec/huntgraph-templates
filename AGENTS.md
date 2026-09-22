@@ -1,17 +1,15 @@
 # AGENTS.md
 
-Operating instructions for an agent working in this repository.
+Operating rules for an agent working in this repository. `CLAUDE.md` imports this file, so
+it is the only copy. Why the repository exists is in [intent.md](intent.md); the order of
+work, phase by phase, is in [adlc.md](adlc.md).
 
 ## What this repo is
 
-293 YAML files of threat-hunting detection knowledge, consumed by the **huntgraph**
-threat-hunting agent. Each file is one hypothesis: what to query, what evidence the
-result carries, and how to reason from that evidence to a verdict.
-
-It is not an alert ruleset. Nothing here is meant to fire on its own. The consumer is
-an agent that runs the query, reads the evidence back, and decides. Every design choice
-follows from that: **the query exists to hand the agent facts, not to hand a human a
-short list.**
+YAML threat-hunting detection knowledge, consumed by the **huntgraph** threat-hunting agent.
+Each file is one hypothesis: what to query, what evidence the result carries, and how to
+reason from that evidence to a verdict. It is not an alert ruleset: **the query exists to
+hand the agent facts, not to hand a human a short list.**
 
 ## Commands
 
@@ -25,13 +23,18 @@ python3 tools/coverage.py --priority 1 --blocked
 python3 tools/coverage.py --markdown > task.md     # regenerate, never hand-edit
 python3 tools/export_csv.py -o coverage.csv        # regenerate, never hand-edit
 python3 tools/stats.py                             # stats.md, regenerate, never hand-edit
+python3 tools/track_sources.py [--source sigma]    # tracker/*_tracker.md, regenerate, never hand-edit
+python3 tools/attack_extract.py T1218.011 --json   # the only source of MITRE facts
+python3 tools/alloc_rule_ids.py --alloc <file>     # reserve a Wazuh rule-id block
+python3 tools/add_wazuh_block.py <file>            # scaffold a Wazuh block from the CQL cases
 ```
 
 On a machine with an externally-managed Python (recent macOS), create a venv rather than
 installing into the system interpreter. Nothing in the toolchain requires a global install.
 
-`task.md`, `coverage.csv` and `stats.md` are generated artefacts. Editing them by hand produces a
-file that is wrong and will be silently overwritten.
+`task.md`, `coverage.csv`, `stats.md`, `tracker/*_tracker.md` and
+`unclassified-threat-check/` are generated artefacts. Editing them by hand produces a file
+that is wrong and will be silently overwritten.
 
 ## Hard invariants
 
@@ -53,10 +56,9 @@ file that is wrong and will be silently overwritten.
 
 ## Categories
 
-Templates live at `hunt/<category>/<Txxxx-slug>[/<Txxxx.yyy-slug>]/<behaviour>.yaml`. The same
-category folder also holds `sigma/`, the upstream Sigma rules for that category — reference
-material that `validate.py` and every other tool skip (see Upstream rules by category).
-The category is one of Elastic's prebuilt-rule domains — cloud, containers, email,
+Templates live at `hunt/<category>/<Txxxx-slug>[/<Txxxx.yyy-slug>]/<behaviour>.yaml`, and
+nothing else lives under `hunt/` except `hunt/README.md`. A category folder exists only once
+it holds a template. The category is one of Elastic's prebuilt-rule domains — cloud, containers, email,
 endpoint, identity, kubernetes, llm, network, saas, unspecified, web — and L5 rejects
 anything else. It records **what the hunt is about**, not what the query reads: every
 template reads the CrowdStrike endpoint sensor, so filing by telemetry would put all of them
@@ -81,10 +83,10 @@ are keyed by id.
 
 ## Connectors
 
-| Connector | `language` | Files |
-|---|---|---:|
-| `crowdstrike-ngsiem` | `cql` | 293 |
-| Wazuh | `wazuh-rules` | 127 |
+| Connector | `language` | Carried by |
+|---|---|---|
+| `crowdstrike-ngsiem` | `cql` | every template |
+| Wazuh | `wazuh-rules` | templates whose cases port; counts are in [stats.md](stats.md) |
 
 Wazuh rule ids are allocated from `ruleset/wazuh-id-allocations.yaml`; field names come
 from `ruleset/field-map.yaml`. A CQL case with no Wazuh rule must be named in
@@ -93,29 +95,35 @@ enforces all of this at L4.
 
 ## Validator layers
 
+L1 short-circuits a file; the rest all run, so one pass reports everything wrong with it.
+
 | Layer | Catches |
 |---|---|
-| L1 structure | schema conformance; unknown keys are errors |
-| L2 mitre | ids exist, and the relationships asserted are the ones MITRE publishes |
-| L3 evidence | referential integrity between evidence, risk logic and verdict |
-| L4 query | CQL only in `cql` cases; declared event types actually used; every declared field reaches a result row; Wazuh block well-formed |
-| L5 convention | directory encodes the category and technique; ids unique and correctly suffixed |
+| L1 structure | parses; conforms to `schema/detection.schema.json`; unknown keys are errors |
+| L2 mitre | every ATT&CK id exists, and the relationships asserted are the ones MITRE publishes: technique↔tactic, sub↔parent, DET↔technique, AN↔DET, platform↔technique, data component↔analytic |
+| L3 evidence | evidence ids unique; `risk_logic` and `verdict` reference only real ids; escalation tiers include the required evidence and never cite contradicting evidence; every evidence field is declared in `requires.logs` for every connector |
+| L4 query | CQL only in `cql` cases; declared event types actually used; every declared field reaches a result row and every declared source is read; Wazuh blocks well-formed and inside their allocated id block |
+| L5 convention | directory encodes the category and technique; ids unique and end with the most specific MITRE id |
+
+`tools/test_validator.py` injects known defects into a good file and asserts the right layer
+catches each one; run it whenever the schema or the validator changes.
 
 ## Upstream rule ingestion
 
-Two public rule sets are triaged against this corpus:
+Three public rule sets are triaged against this corpus. None of them is stored here:
 
 | Source | Upstream | Tracker |
 |---|---|---|
 | Splunk | [research.splunk.com/detections](https://research.splunk.com/detections/) (`splunk/security_content`) | `tracker/splunk_tracker.md` |
 | Elastic | [detection-rules-explorer](https://elastic.github.io/detection-rules-explorer/) (`elastic/detection-rules`) | `tracker/elk_tracker.md` |
-| Sigma | [`rules-threat-hunting/windows`](https://github.com/SigmaHQ/sigma/tree/master/rules-threat-hunting/windows) (`SigmaHQ/sigma`) | `tracker/sigma_tracker.md` |
+| Sigma | [`rules-threat-hunting/windows`](https://github.com/SigmaHQ/sigma/tree/master/rules-threat-hunting/windows) (`SigmaHQ/sigma`), pinned to one commit | `tracker/sigma_tracker.md` |
 
 ```bash
-python3 tools/track_sources.py     # refetch upstream, rewrite both trackers
+python3 tools/track_sources.py                    # refetch upstream, rewrite all three trackers
+python3 tools/track_sources.py --source sigma     # one source only
 ```
 
-Both trackers are **generated artefacts** — regenerate, never hand-edit, same rule as
+All three trackers are **generated artefacts** — regenerate, never hand-edit, same rule as
 `task.md` and `coverage.csv`. Every upstream rule appears in one of them with a routing
 decision, so a rule that was considered and rejected stays rejected instead of being
 re-litigated the next time someone finds these repos.
@@ -126,13 +134,17 @@ A rule is queued as `convert` only when **both** halves hold:
   macOS, is not missing the telemetry its hypothesis would need, and carries at least one
   ATT&CK detection strategy — without one, L2 can never pass.
 - **The upstream rule reads endpoint telemetry.** Judge this from the rule's own metadata
-  (Splunk `data_source`, Elastic `index`), never from its title. A technique can be
+  (Splunk `data_source`, Elastic `index`, Sigma `logsource`), never from its title. A technique can be
   endpoint-observable while a particular rule for it reads CloudTrail; those are marked
   `non-endpoint-surface`, because this connector does not ingest them.
 
 Everything else is recorded with its reason: `covered`, `blocked-telemetry`,
 `out-of-scope`, `parent`, `skipped`, `unresolved-id`, `no-detection-strategy`,
-`non-endpoint-surface`.
+`non-endpoint-surface`, and for Sigma `blocked-logsource`. A Sigma rule states exactly what it
+reads, so it is blocked per rule, whatever its technique routes to, when its logsource is a
+module load, process access, remote thread, named pipe, file open/delete/rename/timestamp
+change, PowerShell script block or module event, or a Windows event channel — none of which
+the CrowdStrike sensor supplies here.
 
 **`convert` is a technique-level judgement, not a behaviour-level one.** The tracker asks
 whether a rule's *technique* has a template. It cannot tell you whether the *behaviour* is
@@ -153,21 +165,6 @@ Also treat `surface` as a floor, not a guarantee. It reads the upstream rule's o
 because absence of a declared source is not evidence of endpoint visibility — GitHub audit,
 mail-gateway and ML rules all land there.
 
-### Upstream rules by category
-
-Sigma rules are also **stored**, not just tracked: `python3 tools/import_sigma.py` copies
-them byte-for-byte from a pinned commit into `hunt/<category>/sigma/` and writes
-`tracker/sigma_tracker.md` (Category | TTP | Rule | Description | Path). Categories are Elastic's
-prebuilt-rule domains — cloud, containers, email, endpoint, identity, kubernetes, llm,
-network, saas, unspecified, web — and a rule is filed by the telemetry it reads, not the
-technique it maps to. All 128 current rules read Windows host logs, so all are `endpoint`.
-
-`sigma/` folders are reference material: `validate.py`, `coverage.py`, `stats.py` and the
-other tools skip them, and their files are under the Detection Rule License 1.1, not
-Apache-2.0 — keep them unmodified so the authors' attribution survives. Never edit them in
-place; rerun the import, which also regenerates every category `README.md`. Never put a
-template inside `sigma/`: it would silently go unvalidated.
-
 ### Every rule lands as a hunt template
 
 Rules may come from anywhere — Elastic, Splunk, Sigma, a vendor blog, a report, an analyst's
@@ -175,8 +172,8 @@ own idea — but they enter this repository in **one form only**: a YAML templat
 `hunt/<category>/<Txxxx-slug>/[<Txxxx.yyy-slug>/]<behaviour>.yaml` structure, validated like
 every other. Never add a rule in its upstream format (EQL, KQL, ES|QL, SPL, TOML, Sigma YAML),
 never create a new per-source folder beside the templates, and never keep a "raw" copy to
-convert later. The Sigma `sigma/` folders are the one existing exception, kept as licensed
-reference material; do not extend that pattern to another source.
+convert later. Upstream rules are read at their source and triaged by `track_sources.py`;
+there is no exception.
 
 Working a rule is create, update or reject — the CRUD of this corpus:
 
@@ -253,9 +250,9 @@ unrelated `collect()` to satisfy the check.
 
 ### Still open
 
-- **13 templates have no raw case at all**, only joins and thresholds.
-- **471 evidence items cite the `baseline` pseudo-source**, plus 27 `derived` and 16
-  `identity_context`. Their reasoning assumed counts the query used to pre-compute; many of
+- **Some templates have no raw case at all**, only joins and thresholds.
+- **Many evidence items cite the `baseline`, `derived` or `identity_context`
+  pseudo-sources.** Their reasoning assumed counts the query used to pre-compute; many of
   those counts and the thresholds on them are gone, and nothing in the files yet tells the
   agent that deriving them is now its job.
 - **Raw-by-default is not enforced.** Nothing stops a new case from ending in `groupBy`.

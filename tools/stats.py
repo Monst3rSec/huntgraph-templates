@@ -3,8 +3,8 @@
 
     python3 tools/stats.py
 
-Generated — rerun it, never hand-edit stats.md. Tactic and technique names come from
-the ATT&CK STIX bundle, like every other MITRE fact in this repo.
+Generated — rerun it, never hand-edit stats.md. Tactic and technique
+names come from the ATT&CK STIX bundle, like every other MITRE fact in this repo.
 """
 from __future__ import annotations
 
@@ -60,8 +60,14 @@ def shape(q: str) -> str:
 def tracker_routing(path: str) -> dict:
     if not os.path.exists(path):
         return {}
-    return {m.group(1): int(m.group(2))
-            for m in re.finditer(r"^\| `([a-z-]+)` \| (\d+) \|", open(path).read(), re.M)}
+    text = open(path).read()
+    out = {m.group(1): int(m.group(2))
+           for m in re.finditer(r"^\| `([a-z-]+)` \| (\d+) \|", text, re.M)}
+    m = re.search(r"(\d+) converted", text)
+    if m:
+        out["converted"] = int(m.group(1))
+    return out
+
 
 
 def main() -> int:
@@ -182,16 +188,20 @@ def main() -> int:
         out += table(["Status", "Targets"], [[k, v] for k, v in c.most_common()], {1})
 
     out.append("## Upstream rules\n")
-    sig = collections.Counter(p.split(os.sep)[1] for p in
-                              (os.path.relpath(x, ROOT) for x in glob.glob(os.path.join(ROOT, "hunt", "*", "sigma", "**", "*.yml"), recursive=True)))
-    rows = [["Sigma threat-hunting (stored)", sum(sig.values()), ", ".join("%s %d" % kv for kv in sig.most_common()) or "—"]]
-    for name, f in (("Splunk (tracked)", "splunk_tracker.md"), ("Elastic (tracked)", "elk_tracker.md")):
+    out.append("Triaged by `tools/track_sources.py`; none are stored. A rule is converted when a "
+               "template cites it in `info.references`.\n")
+    rows = []
+    for name, f in (("Splunk", "splunk_tracker.md"), ("Elastic", "elk_tracker.md"),
+                    ("Sigma threat-hunting", "sigma_tracker.md")):
         r = tracker_routing(os.path.join(ROOT, "tracker", f))
         if r:
-            rows.append([name, sum(r.values()), "convert %d, covered %d, blocked %d, out of scope %d"
-                         % (r.get("convert", 0), r.get("covered", 0), r.get("blocked-telemetry", 0),
+            converted = r.pop("converted", 0)
+            rows.append([name, sum(r.values()), converted,
+                         "convert %d, covered %d, blocked %d, out of scope %d"
+                         % (r.get("convert", 0), r.get("covered", 0),
+                            r.get("blocked-telemetry", 0) + r.get("blocked-logsource", 0),
                             r.get("out-of-scope", 0))])
-    out += table(["Source", "Rules", "Breakdown"], rows, {1})
+    out += table(["Source", "Rules", "Converted", "Routing"], rows, {1, 2})
 
     out.append("## Index\n")
     out.append("Every technique family, by category. Templates live at "
