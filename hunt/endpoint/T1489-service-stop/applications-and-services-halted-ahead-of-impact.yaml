@@ -1,0 +1,257 @@
+type: detection
+
+id: hg-win-applications-and-services-halted-ahead-of-impact-t1489
+version: 1.0.0
+
+info:
+  name: Applications and services halted ahead of impact
+  description: >-
+    Ransomware and wipers cannot encrypt or destroy a file that a running database, mail
+    store or backup agent holds open, and they would rather the endpoint agent were not
+    watching. So the step before impact is almost always a sweep that stops them:
+    taskkill /f /im against sqlservr, oracle, veeam and the security products, net stop and
+    sc stop against their services, Stop-Process and Stop-Service in a script. Any single
+    kill is routine administration. Forced kills by name aimed at data-holding and
+    protective software, or many different programs stopped from one shell in a few
+    minutes, are the shape of preparation for impact.
+  severity: high
+  author: huntgraph
+  tags:
+    - impact
+    - service-stop
+    - ransomware-precursor
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1489
+    - https://attack.mitre.org/detectionstrategies/DET0021
+    - https://raw.githubusercontent.com/SigmaHQ/sigma/2e8fd89f82d9104c1b30321a307254ddeea17de2/rules-threat-hunting/windows/process_creation/proc_creation_win_taskkill_execution.yml
+
+mitre:
+  tactics:
+    - TA0040
+  techniques:
+    - T1489
+  sub_techniques: []
+  detection_strategies:
+    - DET0021
+  analytics:
+    - AN0061
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary preparing to encrypt or destroy data may forcibly stop the databases, mail
+    stores, backup agents and security products running on a host, so that the files they
+    hold are released and nothing interrupts the impact stage.
+  attacker_behavior:
+    - Runs taskkill /f /im against database, mail, backup and security process names.
+    - Runs net stop, sc stop or Stop-Service against the corresponding services.
+    - Issues the stops in a burst from one batch file, script or remote shell.
+    - Sets the stopped services to disabled so they do not restart.
+  legitimate_behavior:
+    - Installers and updaters force-close the application they are about to replace.
+    - Administrators stop database or backup services during maintenance windows.
+    - Users kill a hung application from a command prompt.
+  risk_indicator:
+    - The stopped programs are databases, mail stores, backup agents or security products.
+    - Many distinct programs or services are stopped from one parent within minutes.
+    - The stops are issued by a script host, a remote shell or a binary in a writable path.
+    - The stops precede backup deletion or mass file modification on the same host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: process-force-killed-by-name-or-id
+        name: Process force-killed with taskkill
+        purpose: >-
+          Return every forced taskkill that names its target by image or process id. The
+          command line carries the target, so the agent can see what was stopped and group
+          the kills by parent and time itself.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^taskkill\.exe$/i
+          | CommandLine=/[\/-]f(\s|$)/i
+          | CommandLine=/[\/-](im|pid)\s/i
+        filters:
+          include: []
+          exclude:
+            - "ParentBaseFileName of installers running from the Windows or user temporary directory with a .tmp image"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: data-or-protection-software-stopped
+        name: Database, mail, backup or security software stopped by command
+        purpose: >-
+          Narrow to stops aimed at software that holds data open or protects the host,
+          whether issued as a process kill or a service stop.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(taskkill|net1?(\.exe)?\s+stop|sc(\.exe)?\s+(stop|config)|Stop-Service|Stop-Process|Set-Service)/i
+          | CommandLine=/(sql|oracle|ocssd|dbsnmp|mysqld|postgres|mongod|msexchange|veeam|backup|vss|sophos|msmpeng|windefend|sense|csfalcon|symantec|mcafee|kaspersky|bitdefender|acronis|zoolz|agntsvc|encsvc|excel|winword|outlook|thunderbird)/i
+        filters:
+          include: []
+          exclude:
+            - "Maintenance runbooks for database and backup servers covered by a change record"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: many-programs-stopped-from-one-parent
+        name: Many distinct programs or services stopped from one parent
+        purpose: >-
+          The hypothesis is a sweep, not a kill. Count the distinct stop commands issued by
+          one parent on one host in a ten-minute window and keep only the bursts.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | CommandLine=/(taskkill(\.exe)?\s.*[\/-]f\b|net1?(\.exe)?\s+stop\s|sc(\.exe)?\s+stop\s|Stop-Service|Stop-Process)/i
+          | bucket(span=10m, field=[aid, ParentBaseFileName],
+                   function=[count(field=CommandLine, distinct=true, as=distinct_stops),
+                             collect([ComputerName, UserName, FileName, CommandLine], limit=50)])
+          | distinct_stops >= 5
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: forced_stop_issued
+      name: Program or service stopped by command
+      description: >-
+        A process was killed by taskkill with the force flag, or a service was stopped with
+        net, sc or a PowerShell cmdlet.
+      source: process_creation
+      field: CommandLine
+      indicates: impact_preparation
+
+  supporting:
+    - id: data_or_protection_target
+      name: Target holds data or protects the host
+      description: >-
+        The stopped program or service is a database, mail store, backup agent or security
+        product.
+      source: process_creation
+      field: CommandLine
+      indicates: defence_impairment_attempt
+    - id: stop_burst
+      name: Many stops from one parent
+      description: >-
+        Five or more distinct stop commands came from the same parent on the host within ten
+        minutes.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: impact_sequence_in_progress
+    - id: scripted_or_remote_parent
+      name: Issued from a script host or remote shell
+      description: >-
+        The stops were issued by cmd running a batch file, PowerShell, a WMI or WinRM
+        provider host, or a binary in a user-writable directory.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: abnormal_execution_chain
+    - id: stops_unseen_on_host
+      name: Stop pattern not seen before on the host
+      description: >-
+        This host has not issued these stop commands during the baseline window.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: installer_closing_its_application
+      name: Installer closing the application it updates
+      description: >-
+        An installer or updater, running from its temporary extraction directory, killed
+        the application it was about to replace.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: legitimate_software_installation
+    - id: maintenance_window
+      name: Recorded maintenance
+      description: >-
+        A change record covers stopping these services on this host at this time.
+      source: change_management
+      field: ComputerName
+      indicates: approved_change_window
+
+  risk_logic:
+    required:
+      - forced_stop_issued
+
+    supporting:
+      any:
+        - data_or_protection_target
+        - stop_burst
+        - scripted_or_remote_parent
+        - stops_unseen_on_host
+      all:
+        - data_or_protection_target
+        - stop_burst
+
+    contradicting:
+      any:
+        - installer_closing_its_application
+        - maintenance_window
+      all: []
+
+  verdict:
+    low_risk_when:
+      - forced_stop_issued
+      - installer_closing_its_application
+      - maintenance_window
+    suspicious_when:
+      - forced_stop_issued
+      - data_or_protection_target
+    high_risk_when:
+      - forced_stop_issued
+      - data_or_protection_target
+      - stop_burst
+      - scripted_or_remote_parent
+
+  false_positive:
+    - condition: An installer force-closes the application it updates.
+      explanation: >-
+        Setup programs extracted to a temporary directory kill the running copy of their
+        product by name. It is one target, matching the product being installed, not a
+        sweep across unrelated software.
+    - condition: A database administrator stops SQL Server for maintenance.
+      explanation: >-
+        The service stop matches the data-target evidence, but it is interactive, limited to
+        the database services and covered by a change record.

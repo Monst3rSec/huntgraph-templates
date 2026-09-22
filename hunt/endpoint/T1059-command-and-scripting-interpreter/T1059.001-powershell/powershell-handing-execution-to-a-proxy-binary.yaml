@@ -1,0 +1,267 @@
+type: detection
+
+id: hg-win-powershell-handing-execution-to-a-proxy-binary-t1059-001
+version: 1.0.0
+
+info:
+  name: PowerShell handing execution to a proxy binary
+  description: >-
+    PowerShell is where much of an intrusion's logic runs, but the step that does the damage
+    is often handed to another program: mshta for a remote HTA, rundll32 or regsvr32 for a
+    DLL, certutil or bitsadmin for a download, wscript for a script file, schtasks or wmic
+    to push execution somewhere else. Administrators script PowerShell every day, yet their
+    scripts rarely start these particular binaries, so a PowerShell parent is the lineage
+    that connects a script to the proxy it used. The hunt returns those children and lets
+    the command line show what was proxied.
+  severity: medium
+  author: huntgraph
+  tags:
+    - execution
+    - powershell
+    - proxy-execution
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1059/001
+    - https://attack.mitre.org/detectionstrategies/DET0455
+    - https://attack.mitre.org/techniques/T1059
+    - https://raw.githubusercontent.com/SigmaHQ/sigma/2e8fd89f82d9104c1b30321a307254ddeea17de2/rules-threat-hunting/windows/process_creation/proc_creation_win_powershell_susp_child_processes.yml
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1059
+  sub_techniques:
+    - T1059.001
+  detection_strategies:
+    - DET0455
+  analytics:
+    - AN1252
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary running PowerShell may start a signed Windows proxy binary as its child to
+    download, decode or execute a payload, so the operation runs under a trusted image
+    while PowerShell supplies the arguments.
+  attacker_behavior:
+    - Starts mshta, rundll32 or regsvr32 from PowerShell to run a remote or staged payload.
+    - Starts certutil or bitsadmin from PowerShell to fetch or decode a file.
+    - Starts wscript or cscript from PowerShell to run a dropped script.
+    - Starts schtasks, wmic or forfiles from PowerShell to move execution into another process tree or host.
+  legitimate_behavior:
+    - Deployment and inventory scripts call schtasks or wmic to configure or query hosts.
+    - Certificate maintenance scripts call certutil to inspect or verify stores.
+    - Software installers wrapped in PowerShell register DLLs with regsvr32.
+  risk_indicator:
+    - The child command line points at a URL or at a file in a user-writable directory.
+    - The child connects to an address outside the estate.
+    - The PowerShell-and-child pair has not been seen on the host or in the estate before.
+    - PowerShell itself was started by a document, browser or script host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: powershell-started-a-proxy-binary
+        name: Proxy binary started by PowerShell
+        purpose: >-
+          Return every start of a proxy-capable Windows binary whose parent is PowerShell.
+          The child's command line is the proxied operation, so each row can be read on its
+          own.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(powershell|pwsh|powershell_ise)\.exe$/i
+          | FileName=/^(bash|sh|bitsadmin|certutil|cscript|wscript|forfiles|hh|mshta|regsvr32|rundll32|schtasks|scrcons|scriptrunner|wmic)\.exe$/i
+        filters:
+          include: []
+          exclude:
+            - "certutil started with -verifystore by certificate maintenance scripts"
+            - "wmic started with read-only inventory classes (qfe, os, computersystem, csproduct, diskdrive)"
+            - "CommandLine under the Amazon WorkSpaces configuration scripts directory"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: proxy-child-aimed-at-a-remote-or-writable-payload
+        name: PowerShell-started proxy binary given a URL or a writable-path payload
+        purpose: >-
+          Narrow to children whose arguments name a URL or a file under a user profile,
+          temporary or public directory, which is where a proxied payload comes from.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(powershell|pwsh|powershell_ise)\.exe$/i
+          | FileName=/^(bitsadmin|certutil|cscript|wscript|hh|mshta|regsvr32|rundll32)\.exe$/i
+          | CommandLine=/(https?\s*:?\s*(\[:\])?\/\/|\\\\[^\\\s]+\\|\\(AppData|Temp|ProgramData|Users\\Public|Downloads)\\)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: proxy-child-reached-outside
+        name: PowerShell-started proxy binary connected outside the estate
+        purpose: >-
+          Join the child to its own outbound connections, so a proxy that fetched or
+          beaconed is shown with the address it reached.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | ParentBaseFileName=/^(powershell|pwsh|powershell_ise)\.exe$/i
+                | FileName=/^(bitsadmin|certutil|cscript|wscript|hh|mshta|regsvr32|rundll32)\.exe$/i
+                | proxy_pid := TargetProcessId ;
+              #event_simpleName=NetworkConnectIP4
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/ ;
+            }
+          | groupBy([aid, ContextProcessId],
+                    function=[collect([ComputerName, UserName, FileName, CommandLine, ParentBaseFileName,
+                                       TargetProcessId, RemoteAddressIP4, RemotePort]),
+                              count(as=events)])
+          | proxy_pid = ContextProcessId
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: powershell_proxy_child
+      name: Proxy binary started by PowerShell
+      description: >-
+        PowerShell was the parent of mshta, rundll32, regsvr32, certutil, bitsadmin, a
+        script host, schtasks, wmic or another proxy-capable Windows binary.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: signed_binary_proxy_execution
+
+  supporting:
+    - id: remote_or_writable_payload
+      name: Child aimed at a URL or writable-path file
+      description: >-
+        The child's command line names a URL, a UNC path or a file in a user profile,
+        temporary, public or download directory.
+      source: process_creation
+      field: CommandLine
+      indicates: payload_staged_in_writable_path
+    - id: child_external_connection
+      name: Child connected outside the estate
+      description: >-
+        The proxy binary PowerShell started made an outbound connection to a public
+        address.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: external_payload_retrieval
+    - id: pair_unseen
+      name: Parent-child pair not seen before
+      description: >-
+        This PowerShell-to-binary pair, with this command line shape, has not occurred on
+        the host or in the estate during the baseline window.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: managed_script_run
+      name: Run by the management platform
+      description: >-
+        The PowerShell parent was run by the configuration-management or deployment agent
+        and the same child appears across the managed estate.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_automation
+    - id: read_only_maintenance_call
+      name: Read-only maintenance command
+      description: >-
+        The child performed a read-only query, such as certutil verifying a store or wmic
+        reading an inventory class.
+      source: process_creation
+      field: CommandLine
+      indicates: expected_administrative_activity
+
+  risk_logic:
+    required:
+      - powershell_proxy_child
+
+    supporting:
+      any:
+        - remote_or_writable_payload
+        - child_external_connection
+        - pair_unseen
+      all:
+        - remote_or_writable_payload
+        - child_external_connection
+
+    contradicting:
+      any:
+        - managed_script_run
+        - read_only_maintenance_call
+      all: []
+
+  verdict:
+    low_risk_when:
+      - powershell_proxy_child
+      - managed_script_run
+      - read_only_maintenance_call
+    suspicious_when:
+      - powershell_proxy_child
+      - pair_unseen
+    high_risk_when:
+      - powershell_proxy_child
+      - remote_or_writable_payload
+      - child_external_connection
+      - pair_unseen
+
+  false_positive:
+    - condition: A deployment script registers a DLL or creates a task.
+      explanation: >-
+        Installer wrappers call regsvr32 and schtasks with paths under Program Files. The
+        same command runs across many managed hosts and the parent chain leads to the
+        deployment agent.
+    - condition: A certificate script calls certutil.
+      explanation: >-
+        certutil -verifystore and -viewstore are read-only and make no outbound connection;
+        a download or decode flag is what separates abuse from maintenance.

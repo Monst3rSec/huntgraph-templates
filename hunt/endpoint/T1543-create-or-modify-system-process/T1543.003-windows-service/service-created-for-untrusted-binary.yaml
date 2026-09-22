@@ -1,7 +1,7 @@
 type: detection
 
 id: hg-win-service-created-for-untrusted-binary-t1543-003
-version: 1.0.0
+version: 1.1.0
 
 info:
   name: Windows service created for an untrusted binary
@@ -25,6 +25,7 @@ info:
     - https://attack.mitre.org/techniques/T1543/003
     - https://attack.mitre.org/detectionstrategies/DET0552
     - https://attack.mitre.org/techniques/T1543
+    - https://raw.githubusercontent.com/SigmaHQ/sigma/2e8fd89f82d9104c1b30321a307254ddeea17de2/rules-threat-hunting/windows/registry/registry_set/registry_set_service_image_path_user_controlled_folder.yml
 
 mitre:
   tactics:
@@ -57,6 +58,7 @@ hypothesis:
     - Creates a service whose image path is an executable in a temporary or user-writable directory.
     - Points a service directly at an interpreter with an encoded or obfuscated argument.
     - Reconfigures an existing service's binary path rather than creating a new one.
+    - Writes the service's ImagePath value directly in the registry or through the service control API, leaving no sc.exe command line.
     - Names the service after a Windows or vendor component to survive a review of the service list.
   legitimate_behavior:
     - Installers create services for the products they deploy.
@@ -119,6 +121,28 @@ requires:
         host: win.system.computer
         file_path: win.eventdata.targetFilename
         writer_process_id: win.eventdata.processId
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegSystemConfigValueUpdate
+        - RegGenericValueUpdate
+        - AsepValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+    - source: registry
+      connector: wazuh
+      event_types:
+        - sysmon_event_13
+      fields:
+        agent_id: agent.id
+        host: win.system.computer
+        registry_path: win.eventdata.targetObject
+        registry_value: win.eventdata.targetObject
+        registry_data: win.eventdata.details
 
 query:
   - platform: crowdstrike
@@ -202,6 +226,30 @@ query:
           window: null
           compare: []
 
+      - id: service-image-path-written-to-a-writable-directory
+        name: Service ImagePath value set to a user-writable directory
+        purpose: >-
+          Read the service definition where it is stored. A service created or repointed
+          through the service control API or a direct registry write has no sc.exe command
+          line, but its ImagePath value still lands under the Services key, and a value
+          pointing into ProgramData or a user profile is the same untrusted binary.
+        query: |
+          #event_simpleName=/^(RegSystemConfigValueUpdate|RegGenericValueUpdate|AsepValueUpdate)$/
+          | RegObjectName=/\\ControlSet\d*\\Services\\[^\\]+$/i
+          | RegValueName=/^ImagePath$/i
+          | RegStringValue=/(:\\ProgramData\\|\\AppData\\(Local|Roaming)\\|\\Users\\Public\\|\\Windows\\Temp\\)/i
+        filters:
+          include: []
+          exclude:
+            - "Security and update agents that install services under ProgramData (Defender platform, Zoom sharing, Malwarebytes installer)"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
   - platform: wazuh
     language: wazuh-rules
     ruleset:
@@ -231,6 +279,28 @@ query:
         limitations:
           - Derived from the CQL filter chain; the aggregation in the original case
             is not represented.
+
+      - id: service-image-path-written-to-a-writable-directory
+        covers: service-image-path-written-to-a-writable-directory
+        name: Service ImagePath value set to a user-writable directory
+        purpose: >-
+          Report a service's ImagePath being set to a program under ProgramData, a user
+          profile, Users\Public or the Windows temporary directory.
+        rule: |
+          <rule id="101137" level="10">
+            <if_group>sysmon_event_13</if_group>
+            <field name="win.eventdata.targetObject" type="pcre2">(?i)\\ControlSet\d*\\Services\\[^\\]+\\ImagePath$</field>
+            <field name="win.eventdata.details" type="pcre2">(?i)(:\\ProgramData\\|\\AppData\\(Local|Roaming)\\|\\Users\\Public\\|\\Windows\\Temp\\)</field>
+            <description>Service ImagePath value set to a user-writable directory</description>
+            <mitre><id>T1543.003</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - The 60d baseline in the CQL case is not represented, and neither are the
+            vendor exclusions; every such write is reported.
 
     not_portable:
       - case: service-image-writable-path
@@ -292,6 +362,15 @@ evidence:
       source: process_creation
       field: command_line
       indicates: deliberate_evasion
+    - id: image_path_written_without_command
+      name: Service ImagePath written to a writable directory
+      description: >-
+        The Services registry key recorded an ImagePath pointing into ProgramData, a user
+        profile or a temporary directory, whether or not an sc.exe or PowerShell command
+        line accompanied it.
+      source: registry
+      field: registry_data
+      indicates: persistence_established
 
   contradicting:
     - id: installer_service
@@ -328,6 +407,7 @@ evidence:
         - image_recently_written
         - script_host_creator
         - existing_service_repointed
+        - image_path_written_without_command
       all:
         - interpreter_service
         - script_host_creator

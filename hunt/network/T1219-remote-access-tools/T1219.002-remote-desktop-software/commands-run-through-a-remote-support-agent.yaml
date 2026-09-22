@@ -1,0 +1,302 @@
+type: detection
+
+id: hg-win-commands-run-through-a-remote-support-agent-t1219-002
+version: 1.0.0
+
+info:
+  name: Commands run through a remote support agent
+  description: >-
+    Remote support and RMM agents do more than share a screen. ScreenConnect, Action1,
+    AnyViewer, Ammyy Admin and their peers can run a command or push a package on the
+    endpoint from the operator's console, and the agent service becomes the parent of
+    whatever runs. That is the channel ransomware operators use once they have installed
+    or hijacked an agent: no new implant, no new service, just a trusted support tool
+    starting cmd and PowerShell. Whether or not the agent itself is sanctioned, the
+    commands it runs are the part to read, and this hunt returns them.
+  severity: high
+  author: huntgraph
+  tags:
+    - command-and-control
+    - remote-access
+    - rmm
+    - hands-on-keyboard
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1219/002
+    - https://attack.mitre.org/detectionstrategies/DET0259
+    - https://attack.mitre.org/techniques/T1219
+    - https://raw.githubusercontent.com/SigmaHQ/sigma/2e8fd89f82d9104c1b30321a307254ddeea17de2/rules-threat-hunting/windows/process_creation/proc_creation_win_remote_access_tools_screenconnect_child_proc.yml
+    - https://raw.githubusercontent.com/SigmaHQ/sigma/2e8fd89f82d9104c1b30321a307254ddeea17de2/rules-threat-hunting/windows/process_creation/proc_creation_win_remote_access_tools_action1_code_exec_and_remote_sessions.yml
+    - https://raw.githubusercontent.com/SigmaHQ/sigma/2e8fd89f82d9104c1b30321a307254ddeea17de2/rules-threat-hunting/windows/process_creation/proc_creation_win_remote_access_tools_anyviewer_shell_exec.yml
+    - https://raw.githubusercontent.com/SigmaHQ/sigma/2e8fd89f82d9104c1b30321a307254ddeea17de2/rules-threat-hunting/windows/process_creation/proc_creation_win_remote_access_tools_ammyy_admin_execution.yml
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1219
+  sub_techniques:
+    - T1219.002
+  detection_strategies:
+    - DET0259
+  analytics:
+    - AN0714
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary controlling a remote support or RMM agent on a host may use the agent's
+    command or package feature to run shells, scripts and tools there, so the agent service
+    is the parent of hands-on-keyboard activity.
+  attacker_behavior:
+    - Runs cmd or PowerShell commands through the ScreenConnect client service's command feature.
+    - Pushes a script or package through Action1 and runs it from the agent's package directory.
+    - Opens a shell through AnyViewer's service component.
+    - Starts the Ammyy Admin agent through rundll32 to take a session.
+    - Uses the agent to run discovery, credential access or defence-impairment commands.
+  legitimate_behavior:
+    - Help-desk staff run diagnostic commands through the sanctioned support tool.
+    - The RMM platform deploys patches and scripts to the managed estate.
+    - Support sessions start helper processes for file transfer and screen capture.
+  risk_indicator:
+    - The agent starts discovery, credential or defence-impairment commands.
+    - The agent product is not the one the organisation uses.
+    - The commands run outside the help desk's working hours or against a server.
+    - The agent's command runs connect to an address outside the estate.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - TargetProcessId
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextProcessId
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: process-started-by-a-support-agent-service
+        name: Process started by a remote support agent's service
+        purpose: >-
+          Return every child of the agent components that execute console commands. Each
+          row is something run on the host from the operator's side of the tool.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(ScreenConnect\.ClientService|ScreenConnect\.WindowsClient|action1_agent|action1_remote|AVCore|AnyDesk|TeamViewer_Service|TeamViewer|rutserv|SRService|Splashtop-streamer|ateraagent|AgentPackageRunCommand|AgentPackageRunCommandInteractive|NinjaRMMAgent|ninjarmmagpatcher|client32|dwagsvc|meshagent|rustdesk|ToDesk_Service)\.exe$/i
+        filters:
+          include: []
+          exclude:
+            - "The organisation's sanctioned support product, where the help desk has a record of the session"
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: agent-command-wrapper-executed
+        name: Shell running an agent's command or package wrapper
+        purpose: >-
+          Catch the wrapper files RMM agents write for a console command, which identify
+          the product even when the shell's parent is not the agent itself.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^(cmd|powershell|pwsh)\.exe$/i
+          | CommandLine=/(\\Action1\\scripts\\Run_(Command|PowerShell)_|\\ScreenConnect\\\d[\d.]*\\[0-9a-f-]+run\.(cmd|ps1)|\\Temp\\ScreenConnect\\|\\AteraAgent\\Packages\\)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: agent-delivered-package-or-session-helper
+        name: Agent-delivered package or remote-session helper started
+        purpose: >-
+          Surface the other two ways an agent acts on the host: running a package it
+          downloaded, and starting the helper that opens a live session.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              ImageFileName=/\\Windows\\Action1\\package_downloads\\/i ;
+              FileName=/^agent1_remote\.exe$/i ;
+              FileName=/^rundll32\.exe$/i | CommandLine=/AMMYY\\aa_nts\.dll"?\s*,\s*run/i ;
+            }
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 30d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: agent-run-command-reached-outside
+        name: Command run by a support agent connected outside the estate
+        purpose: >-
+          Join an agent-started process to its own outbound connections, which shows a
+          command fetching a tool or sending data rather than inspecting the host.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|NetworkConnectIP4)$/
+          | case {
+              #event_simpleName=ProcessRollup2
+                | ParentBaseFileName=/^(ScreenConnect\.ClientService|action1_agent|AVCore|AnyDesk|TeamViewer_Service|rutserv|SRService|ateraagent|NinjaRMMAgent|client32|meshagent|rustdesk)\.exe$/i
+                | agent_child_pid := TargetProcessId ;
+              #event_simpleName=NetworkConnectIP4
+                | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/ ;
+            }
+          | groupBy([aid, ContextProcessId],
+                    function=[collect([ComputerName, UserName, FileName, ImageFileName, CommandLine,
+                                       ParentBaseFileName, TargetProcessId, RemoteAddressIP4, RemotePort]),
+                              count(as=events)])
+          | agent_child_pid = ContextProcessId
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: agent_started_process
+      name: Process started through a support agent
+      description: >-
+        A remote support or RMM agent component was the parent of a process, or a shell ran
+        one of the agent's command or package wrapper files.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: remote_operator_activity
+
+  supporting:
+    - id: operator_tradecraft_command
+      name: Discovery, credential or impairment command
+      description: >-
+        The agent-started command performs account or network discovery, credential access,
+        log clearing, backup deletion or security-tool tampering.
+      source: process_creation
+      field: CommandLine
+      indicates: hands_on_keyboard_activity
+    - id: agent_command_egress
+      name: Agent-started command connected outside
+      description: >-
+        The process the agent started connected to a public address, which is a tool being
+        fetched or data being sent.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: external_payload_retrieval
+    - id: agent_product_unsanctioned
+      name: Agent product not sanctioned
+      description: >-
+        The agent that ran the command is not the remote support product the organisation
+        licenses and manages.
+      source: asset_inventory
+      field: ParentBaseFileName
+      indicates: unexpected_software_presence
+    - id: agent_activity_unseen
+      name: Agent command activity unusual for the host
+      description: >-
+        The agent has not run commands on this host during the baseline window, or not this
+        command.
+      source: baseline
+      field: CommandLine
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: recorded_support_session
+      name: Help-desk session on record
+      description: >-
+        A help-desk ticket or session log covers a technician working on this host at this
+        time through the sanctioned tool.
+      source: change_management
+      field: ComputerName
+      indicates: legitimate_administrative_action
+    - id: rmm_patch_wave
+      name: Estate-wide RMM job
+      description: >-
+        The same package or command ran through the agent across a large group of hosts
+        within a short window, as a scheduled RMM job does.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - agent_started_process
+
+    supporting:
+      any:
+        - operator_tradecraft_command
+        - agent_command_egress
+        - agent_product_unsanctioned
+        - agent_activity_unseen
+      all:
+        - operator_tradecraft_command
+        - agent_product_unsanctioned
+
+    contradicting:
+      any:
+        - recorded_support_session
+        - rmm_patch_wave
+      all: []
+
+  verdict:
+    low_risk_when:
+      - agent_started_process
+      - recorded_support_session
+      - rmm_patch_wave
+    suspicious_when:
+      - agent_started_process
+      - agent_activity_unseen
+    high_risk_when:
+      - agent_started_process
+      - operator_tradecraft_command
+      - agent_product_unsanctioned
+      - agent_command_egress
+
+  false_positive:
+    - condition: A technician runs diagnostics through the sanctioned support tool.
+      explanation: >-
+        ipconfig, ping or a log collection run through the licensed product during a ticket
+        produces the required evidence. The session is on record and the commands are
+        diagnostic, not credential or impairment tradecraft.
+    - condition: The RMM platform runs its nightly patch script.
+      explanation: >-
+        The same wrapper runs on every managed host within minutes, which the estate-wide
+        view shows as a deployment wave rather than a single host.

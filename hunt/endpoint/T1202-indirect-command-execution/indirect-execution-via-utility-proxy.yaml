@@ -1,7 +1,7 @@
 type: detection
 
 id: hg-win-indirect-execution-via-utility-proxy-t1202
-version: 1.0.0
+version: 1.1.0
 
 info:
   name: Command executed indirectly through a utility proxy
@@ -26,6 +26,11 @@ info:
     - https://attack.mitre.org/techniques/T1202
     - https://attack.mitre.org/detectionstrategies/DET0200
     - https://lolbas-project.github.io/lolbas/Binaries/Forfiles/
+    - https://raw.githubusercontent.com/SigmaHQ/sigma/2e8fd89f82d9104c1b30321a307254ddeea17de2/rules-threat-hunting/windows/process_creation/proc_creation_win_wsl_arbitrary_command_execution.yml
+    - https://raw.githubusercontent.com/SigmaHQ/sigma/2e8fd89f82d9104c1b30321a307254ddeea17de2/rules-threat-hunting/windows/process_creation/proc_creation_win_diskshadow_script_mode.yml
+    - https://raw.githubusercontent.com/SigmaHQ/sigma/2e8fd89f82d9104c1b30321a307254ddeea17de2/rules-threat-hunting/windows/process_creation/proc_creation_win_diskshadow_child_process.yml
+    - https://raw.githubusercontent.com/SigmaHQ/sigma/2e8fd89f82d9104c1b30321a307254ddeea17de2/rules-threat-hunting/windows/process_creation/proc_creation_win_explorer_child_of_shell_process.yml
+    - https://raw.githubusercontent.com/SigmaHQ/sigma/2e8fd89f82d9104c1b30321a307254ddeea17de2/rules-threat-hunting/windows/process_creation/proc_creation_win_extexport_execution.yml
 
 mitre:
   tactics:
@@ -56,6 +61,10 @@ hypothesis:
     - Launches a payload through pcalua so the compatibility assistant becomes the parent.
     - Starts a process through conhost or explorer so the originating shell drops out of the tree.
     - Chains the proxy to a script interpreter or a payload staged in a writable directory.
+    - Runs a command through wsl.exe, as root or in the system distribution, so it executes inside the Linux subsystem.
+    - Feeds diskshadow a script file with /s whose exec lines start a payload.
+    - Relaunches explorer.exe from a shell with a payload path so explorer becomes the payload's parent.
+    - Runs Extexport.exe against a folder holding a planted DLL, which it loads.
   legitimate_behavior:
     - Administrators use forfiles in maintenance scripts to act on files older than a threshold.
     - The compatibility assistant genuinely launches older applications through pcalua.
@@ -150,6 +159,91 @@ query:
           window: null
           compare: []
 
+      - id: wsl-running-a-command
+        name: WSL asked to execute a command directly
+        purpose: >-
+          Return wsl.exe invocations that execute a command, pick root or the system
+          distribution, or reach the Windows drive from inside Linux, which moves the work
+          into a subsystem that Windows process telemetry sees only as wsl.exe.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^wsl\.exe$/i
+          | CommandLine=/(\s-e\s|\s--exec\b|\s--system\b|\s--shell-type\s|\/mnt\/c|\s(-u|--user)\s+root\b|--debug-shell)/i
+        filters:
+          include: []
+          exclude:
+            - "cmd parent running wsl -d <distribution> -e kill during developer tooling shutdown"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - user
+            - command_line
+
+      - id: diskshadow-script-or-child
+        name: Diskshadow run with a script file or starting a process
+        purpose: >-
+          Diskshadow's exec directive runs any program listed in a script passed with /s.
+          Return the script-mode invocations and whatever diskshadow started, apart from
+          the error reporter.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              FileName=/^diskshadow\.exe$/i | CommandLine=/[\/-]s\s/i ;
+              ParentBaseFileName=/^diskshadow\.exe$/i | FileName!=/^WerFault\.exe$/i ;
+            }
+        filters:
+          include: []
+          exclude:
+            - "Backup scripts run by the approved backup product on file and database servers"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: explorer-relaunched-from-a-shell
+        name: Explorer started by a shell with an argument
+        purpose: >-
+          A shell that starts explorer.exe with a path hands the launch of that path to
+          explorer, so the payload's parent is explorer rather than the shell.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^(cmd|powershell|pwsh)\.exe$/i
+          | FileName=/^explorer\.exe$/i
+          | CommandLine=/explorer(\.exe)?"?\s+\S/i
+        filters:
+          include: []
+          exclude:
+            - "Explorer opened on a folder path by logon or mapping scripts"
+        baseline:
+          required: true
+          window: 45d
+          compare:
+            - host
+            - parent_process
+            - command_line
+
+      - id: extexport-executed
+        name: Extexport.exe executed
+        purpose: >-
+          Extexport.exe loads mozcrt19.dll, mozsqlite3.dll or sqlite3.dll from the folder it
+          is pointed at. It has no ordinary use outside Internet Explorer's own import
+          feature, so every run is returned with the folder it was given.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^extexport\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
 evidence:
   required:
     - id: proxy_utility_execution
@@ -180,6 +274,15 @@ evidence:
       source: process_creation
       field: ImageFileName
       indicates: untrusted_execution_location
+    - id: proxy_given_a_script_or_folder
+      name: Proxy handed a script file, a folder or a privileged subsystem
+      description: >-
+        The proxy was given a diskshadow script with /s, a folder for Extexport to load a
+        DLL from, or a wsl command to run as root or in the system distribution, so what
+        executes is decided by content the command line only points at.
+      source: process_creation
+      field: CommandLine
+      indicates: trusted_binary_proxy_execution
     - id: delivery_grandparent
       name: Delivery-style process above the proxy
       description: >-
@@ -231,6 +334,7 @@ evidence:
       any:
         - interpreter_child
         - writable_target
+        - proxy_given_a_script_or_folder
         - delivery_grandparent
         - rare_for_host
       all:

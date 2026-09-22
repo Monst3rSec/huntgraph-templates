@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Triage upstream Splunk and Elastic detection rules against this corpus.
+"""Triage upstream Splunk, Elastic and Sigma detection rules against this corpus.
 
-Writes tracker/splunk_tracker.md and tracker/elk_tracker.md: one row per upstream rule, with the
-routing decision and why. Both are generated artefacts — regenerate, never hand-edit.
+Writes tracker/splunk_tracker.md, tracker/elk_tracker.md and tracker/sigma_tracker.md: one row
+per upstream rule, with the routing decision and why. All are generated artefacts — regenerate,
+never hand-edit.
 
-    python3 tools/track_sources.py                 # fetch upstream, rewrite trackers
-    python3 tools/track_sources.py --inventory X   # reuse a cached inventory json
+    python3 tools/track_sources.py                   # fetch upstream, rewrite all trackers
+    python3 tools/track_sources.py --source sigma    # one source only
+    python3 tools/track_sources.py --inventory X     # reuse a cached inventory json
+
+Sigma is read from one pinned commit of SigmaHQ/sigma, so its tracker only changes when SIGMA_REF
+is moved deliberately.
 
 A rule is only queued for conversion when its technique is a leaf this repo does not
 cover, is observable on Windows/Linux/macOS, is not missing the telemetry the hypothesis
@@ -23,6 +28,10 @@ import validate as V  # noqa: E402
 
 SPLUNK = "https://raw.githubusercontent.com/splunk/security_content/develop/"
 ELASTIC = "https://raw.githubusercontent.com/elastic/detection-rules/main/"
+SIGMA_REF = "2e8fd89f82d9104c1b30321a307254ddeea17de2"
+SIGMA_DIR = "rules-threat-hunting/windows"
+SIGMA = "https://raw.githubusercontent.com/SigmaHQ/sigma/%s/" % SIGMA_REF
+SOURCES = ("splunk", "elastic", "sigma")
 ENDPOINT = {"Windows", "Linux", "macOS"}
 
 REASON = {
@@ -36,6 +45,7 @@ REASON = {
     "no-detection-strategy":"ATT&CK publishes no detection strategy, so L2 cannot pass",
     "unresolved-id":        "technique id not in the ATT&CK release this repo pins",
     "non-endpoint-surface": "upstream rule does not read endpoint telemetry (cloud, SaaS, network, mail, or it declares no data source at all)",
+    "blocked-logsource":    "the rule's own log source is one the CrowdStrike sensor does not supply (module load, process access, remote thread, named pipe, file open/delete/rename/timestamp, PowerShell script block, Windows event channel)",
     "fetch-error":          "upstream file could not be read",
 }
 ENDPOINT_SRC = re.compile(
@@ -48,7 +58,10 @@ CLOUD_SRC = re.compile(
 
 def surface(rule):
     """endpoint / cloud / mixed, from the upstream rule's own data sources."""
-    blob = " ".join(rule.get("src") or []) + " " + (rule.get("name") or "")
+    # a Sigma logsource names its product outright; a host product is endpoint telemetry
+    if rule.get("type") == "sigma" and set(rule.get("src") or []) & {"windows", "linux", "macos"}:
+        return "endpoint"
+    blob =" ".join(rule.get("src") or []) + " " + (rule.get("name") or "")
     e, c = bool(ENDPOINT_SRC.search(blob)), bool(CLOUD_SRC.search(blob))
     if e and not c:
         return "endpoint"
@@ -57,6 +70,16 @@ def surface(rule):
     if e and c:
         return "mixed"
     return "unknown"
+
+
+# Sigma logsources whose events this deployment does not collect. A Sigma rule declares
+# exactly what it reads, so unlike Splunk and Elastic this can be decided per rule rather
+# than per technique: a DLL-load rule is blocked even when its technique is covered.
+SIGMA_BLOCKED_CATEGORY = {
+    "image_load", "process_access", "create_remote_thread", "pipe_created",
+    "file_access", "file_delete", "file_change", "file_rename",
+    "ps_script", "ps_module", "ps_classic_start",
+}
 
 
 PRIORITY = ["convert", "non-endpoint-surface", "no-detection-strategy", "unresolved-id", "blocked-telemetry",
@@ -110,6 +133,32 @@ def fetch_inventory():
     with cf.ThreadPoolExecutor(16) as ex:
         inv["elastic"] = list(ex.map(ef, el))
     return inv
+
+
+def fetch_sigma():
+    listing = json.loads(get("https://api.github.com/repos/SigmaHQ/sigma/git/trees/%s?recursive=1"
+                             % SIGMA_REF))
+    if listing.get("truncated"):
+        sys.exit("SigmaHQ tree listing was truncated; cannot trust it to be complete")
+    paths = sorted(x["path"] for x in listing["tree"]
+                   if x["path"].startswith(SIGMA_DIR + "/") and x["path"].endswith(".yml"))
+
+    def gf(p):
+        try:
+            d = yaml.safe_load(get(SIGMA + p)) or {}
+            ls = d.get("logsource") or {}
+            tags = [str(t).lower() for t in d.get("tags") or []]
+            return {"path": p, "name": d.get("title"),
+                    "tech": sorted({t[len("attack."):].upper() for t in tags
+                                    if re.match(r"attack\.t\d{4}", t)}),
+                    "type": "sigma",
+                    "src": [v for v in (ls.get("product"), ls.get("category"), ls.get("service")) if v],
+                    "category": ls.get("category"), "service": ls.get("service")}
+        except Exception as exc:
+            return {"path": p, "error": str(exc)[:60]}
+
+    with cf.ThreadPoolExecutor(16) as ex:
+        return list(ex.map(gf, paths))
 
 
 def load_context():
@@ -172,6 +221,11 @@ def classifier(covered, info, atk):
 def decide(rule, classify):
     if rule.get("error"):
         return "fetch-error", []
+    # a Sigma rule reading a Windows event channel (service) or a Sysmon category this
+    # sensor lacks is blocked whatever its technique routes to
+    if rule.get("type") == "sigma" and (rule.get("service")
+                                        or rule.get("category") in SIGMA_BLOCKED_CATEGORY):
+        return "blocked-logsource", rule.get("tech") or []
     tech = rule.get("tech") or []
     if not tech:
         return "staged-unmapped", []
@@ -205,7 +259,7 @@ def write_tracker(path, title, source_url, rows, base_url):
     out.append("## Routing\n")
     out.append("| Decision | Rules | Why |")
     out.append("|---|---:|---|")
-    for d in PRIORITY + ["staged-unmapped", "fetch-error"]:
+    for d in PRIORITY + ["blocked-logsource", "staged-unmapped", "fetch-error"]:
         if counts.get(d):
             out.append("| `%s` | %d | %s |" % (d, counts[d], REASON.get(d, "")))
     out.append("")
@@ -219,7 +273,8 @@ def write_tracker(path, title, source_url, rows, base_url):
                 (r.get("name") or r["path"])[:70], ", ".join(r.get("tech") or []) or "—",
                 os.path.basename(r["template"]), r["template"], base_url + r["path"]))
         out.append("")
-    order = ["convert", "staged-unmapped"] + [d for d in PRIORITY if d != "convert"] + ["fetch-error"]
+    order = (["convert", "staged-unmapped"] + [d for d in PRIORITY if d != "convert"]
+             + ["blocked-logsource", "fetch-error"])
     for d in order:
         sel = [r for r in rows if r["decision"] == d]
         if not sel:
@@ -246,12 +301,30 @@ def write_tracker(path, title, source_url, rows, base_url):
     return counts
 
 
+TRACKERS = {
+    "splunk": (SPLUNK, "splunk_tracker.md", "Splunk detection tracker",
+               "https://research.splunk.com/detections/"),
+    "elastic": (ELASTIC, "elk_tracker.md", "Elastic (ELK) detection tracker",
+                "https://elastic.github.io/detection-rules-explorer/"),
+    "sigma": (SIGMA, "sigma_tracker.md", "Sigma threat-hunting rule tracker",
+              "[SigmaHQ/sigma `%s`](https://github.com/SigmaHQ/sigma/tree/%s/%s) at commit `%s`"
+              % (SIGMA_DIR, SIGMA_REF, SIGMA_DIR, SIGMA_REF[:7])),
+}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--inventory")
+    ap.add_argument("--source", action="append", choices=SOURCES,
+                    help="only these sources (repeatable); default all")
     a = ap.parse_args()
-    inv = json.load(open(a.inventory)) if a.inventory and os.path.exists(a.inventory) else fetch_inventory()
-    if a.inventory and not os.path.exists(a.inventory):
+    wanted = a.source or list(SOURCES)
+    inv = json.load(open(a.inventory)) if a.inventory and os.path.exists(a.inventory) else {}
+    if not ({"splunk", "elastic"} & set(wanted)) <= inv.keys():
+        inv.update(fetch_inventory())
+    if "sigma" in wanted and "sigma" not in inv:
+        inv["sigma"] = fetch_sigma()
+    if a.inventory:
         json.dump(inv, open(a.inventory, "w"))
 
     covered, info = load_context()
@@ -266,18 +339,16 @@ def main():
             origin[ref.rstrip("/")] = os.path.relpath(p, ROOT)
 
     tally = {}
-    for src, base in (("splunk", SPLUNK), ("elastic", ELASTIC)):
+    for src in wanted:
+        base, name, title, url = TRACKERS[src]
         rows = []
         for r in inv[src]:
             dec, drivers = decide(r, classify)
             rows.append({**r, "decision": dec, "drivers": drivers,
                          "template": origin.get((base + r["path"]).rstrip("/"))})
-        name = "splunk_tracker.md" if src == "splunk" else "elk_tracker.md"
-        title = ("Splunk detection tracker" if src == "splunk" else "Elastic (ELK) detection tracker")
-        url = ("https://research.splunk.com/detections/" if src == "splunk"
-               else "https://elastic.github.io/detection-rules-explorer/")
         tally[src] = write_tracker(os.path.join(ROOT, "tracker", name), title, url, rows, base)
-        staged = [r for r in rows if r["decision"] == "staged-unmapped"]
+        # a converted rule needs no staging, even though it carries no ATT&CK mapping upstream
+        staged = [r for r in rows if r["decision"] == "staged-unmapped" and not r.get("template")]
         if staged:
             d = os.path.join(ROOT, "unclassified-threat-check")
             os.makedirs(d, exist_ok=True)

@@ -1,0 +1,298 @@
+type: detection
+
+id: hg-win-clickonce-deployment-ran-an-unfamiliar-application-t1127-002
+version: 1.0.0
+
+info:
+  name: ClickOnce deployment ran an unfamiliar application
+  description: >-
+    ClickOnce installs and starts a .NET application from a web page or a file share with a
+    single click, and it does so through dfsvc.exe, a Microsoft-signed service that runs as
+    the user and needs no administrative rights. An adversary who sends a link to an
+    .application or .appref-ms file therefore gets code running as a child of a trusted
+    binary, cached under the user's profile, and updated from a server they control. Most
+    estates run a handful of known ClickOnce applications or none at all, so an application
+    the deployment service has not started before, or a deployment service reaching a
+    destination outside the estate, is the thing to look at.
+  severity: medium
+  author: huntgraph
+  tags:
+    - execution
+    - stealth
+    - proxy-execution
+    - clickonce
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1127/002
+    - https://attack.mitre.org/detectionstrategies/DET0191
+    - https://attack.mitre.org/techniques/T1127
+    - https://raw.githubusercontent.com/SigmaHQ/sigma/2e8fd89f82d9104c1b30321a307254ddeea17de2/rules-threat-hunting/windows/process_creation/proc_creation_win_dfsvc_child_processes.yml
+    - https://raw.githubusercontent.com/SigmaHQ/sigma/2e8fd89f82d9104c1b30321a307254ddeea17de2/rules-threat-hunting/windows/network_connection/net_connection_win_dfsvc_non_local_ip.yml
+    - https://raw.githubusercontent.com/SigmaHQ/sigma/2e8fd89f82d9104c1b30321a307254ddeea17de2/rules-threat-hunting/windows/network_connection/net_connection_win_dfsvc_uncommon_ports.yml
+
+mitre:
+  tactics:
+    - TA0002
+    - TA0005
+  techniques:
+    - T1127
+  sub_techniques:
+    - T1127.002
+  detection_strategies:
+    - DET0191
+  analytics:
+    - AN0550
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary may deliver a ClickOnce application through a link or a file share so
+    that dfsvc.exe downloads it into the user's deployment cache and starts it, giving the
+    payload a signed Microsoft parent and a self-updating channel without an installer or
+    administrative rights.
+  attacker_behavior:
+    - Sends a link to an .application manifest or an .appref-ms shortcut hosted on attacker infrastructure.
+    - Relies on dfsvc.exe to fetch the application and start it from AppData\Local\Apps\2.0.
+    - Opens the deployment through rundll32 and dfshim.dll so no browser prompt is involved.
+    - Uses the ClickOnce update check as a recurring fetch from the same server.
+  legitimate_behavior:
+    - Line-of-business .NET tools are published internally as ClickOnce applications.
+    - Some vendor utilities and trading or reporting clients are distributed through ClickOnce.
+    - A ClickOnce application checks its deployment server for updates each time it starts.
+  risk_indicator:
+    - The application started by dfsvc.exe has not been seen on the host or in the estate before.
+    - dfsvc.exe connects to an address outside the estate or on a port other than 80 and 443.
+    - The deployment was opened by rundll32 with dfshim.dll from a mail client or browser download.
+    - The application image lives in the per-user deployment cache rather than Program Files.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+        - SHA256HashData
+    - source: network_connection
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        - aid
+        - ComputerName
+        - ContextBaseFileName
+        - RemoteAddressIP4
+        - RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: application-started-by-the-deployment-service
+        name: Process started by dfsvc.exe
+        purpose: >-
+          Return every process the ClickOnce deployment service launches. dfsvc.exe starts
+          nothing but ClickOnce applications, so each row names an application, its cached
+          image path and hash, and the user it ran as.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^dfsvc\.exe$/i
+        filters:
+          include: []
+          exclude:
+            - "SHA256HashData of ClickOnce applications the estate publishes or approves"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - process
+            - organization
+
+      - id: process-run-from-the-deployment-cache
+        name: Process run from the ClickOnce per-user cache
+        purpose: >-
+          Catch an application running out of AppData\Local\Apps\2.0 whatever started it,
+          including a relaunch from its Start-menu shortcut after the first deployment.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/\\AppData\\Local\\Apps\\2\.0\\/i
+        filters:
+          include: []
+          exclude:
+            - "SHA256HashData of ClickOnce applications the estate publishes or approves"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: deployment-opened-through-dfshim
+        name: ClickOnce deployment opened through rundll32 and dfshim.dll
+        purpose: >-
+          Surface the activation step. Opening an .application or .appref-ms file runs
+          rundll32 with dfshim.dll, and the command line carries the manifest URL or path,
+          which is where the deployment came from.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^rundll32\.exe$/i
+          | CommandLine=/dfshim(\.dll)?\s*,\s*(ShOpenVerbApplication|ShOpenVerbShortcut|ShArpMaintain)/i
+        filters:
+          include: []
+          exclude:
+            - "Manifest URLs on the estate's own ClickOnce publishing servers"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: deployment-service-reached-an-outside-address
+        name: dfsvc.exe connected to an address outside the estate
+        purpose: >-
+          Return the deployment service's outbound connections to public addresses. Each row
+          carries the port, so a fetch or update check over anything but 80 and 443 is
+          visible without a second query.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | ContextBaseFileName=/^dfsvc\.exe$/i
+          | RemoteAddressIP4!=/^(10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/
+        filters:
+          include: []
+          exclude:
+            - "RemoteAddressIP4 of approved vendor and internal publishing servers"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - remote_address
+            - organization
+
+evidence:
+  required:
+    - id: clickonce_application_ran
+      name: ClickOnce application started
+      description: >-
+        A process was started by dfsvc.exe or from the ClickOnce per-user deployment cache,
+        so an application was deployed through ClickOnce and executed.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: proxy_execution
+
+  supporting:
+    - id: activated_through_dfshim
+      name: Deployment opened through dfshim.dll
+      description: >-
+        rundll32 opened the deployment through dfshim.dll with a manifest URL or path,
+        which is what clicking a delivered .application or .appref-ms file does.
+      source: process_creation
+      field: CommandLine
+      indicates: user_execution_foothold
+    - id: fetched_from_outside
+      name: Deployment service contacted a public address
+      description: >-
+        dfsvc.exe connected to an address outside the estate, so the application or its
+        update came from a server the organisation does not run.
+      source: network_connection
+      field: RemoteAddressIP4
+      indicates: external_payload_retrieval
+    - id: uncommon_deployment_port
+      name: Deployment fetched on an unusual port
+      description: >-
+        dfsvc.exe connected on a port other than 80 or 443, which ClickOnce publishing
+        servers do not normally use.
+      source: network_connection
+      field: RemotePort
+      indicates: suspicious_network_behavior
+    - id: application_unseen
+      name: Application not seen before
+      description: >-
+        The application's hash or cached path has not appeared on this host or elsewhere in
+        the estate during the baseline window.
+      source: baseline
+      field: SHA256HashData
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: published_line_of_business_app
+      name: Estate-published ClickOnce application
+      description: >-
+        The application is one the organisation publishes or approves, with a known hash and
+        a deployment URL on an internal or approved vendor server.
+      source: asset_inventory
+      field: SHA256HashData
+      indicates: legitimate_application_component
+    - id: estate_wide_rollout
+      name: Same application across many hosts
+      description: >-
+        The same application started from the deployment cache across a group of hosts
+        within a short window, which is a planned rollout.
+      source: baseline
+      field: ComputerName
+      indicates: software_deployment_wave
+
+  risk_logic:
+    required:
+      - clickonce_application_ran
+
+    supporting:
+      any:
+        - activated_through_dfshim
+        - fetched_from_outside
+        - uncommon_deployment_port
+        - application_unseen
+      all:
+        - fetched_from_outside
+        - application_unseen
+
+    contradicting:
+      any:
+        - published_line_of_business_app
+        - estate_wide_rollout
+      all: []
+
+  verdict:
+    low_risk_when:
+      - clickonce_application_ran
+      - published_line_of_business_app
+      - estate_wide_rollout
+    suspicious_when:
+      - clickonce_application_ran
+      - application_unseen
+    high_risk_when:
+      - clickonce_application_ran
+      - application_unseen
+      - fetched_from_outside
+      - activated_through_dfshim
+
+  false_positive:
+    - condition: An internal .NET tool is published and updated through ClickOnce.
+      explanation: >-
+        Its application starts from the deployment cache as a child of dfsvc.exe on every
+        host that uses it. The hash and deployment server are known, and the application
+        appears across many hosts rather than one.
+    - condition: A vendor client distributed through ClickOnce checks for updates.
+      explanation: >-
+        The update check makes dfsvc.exe contact the vendor's publishing server on 443. The
+        destination is stable across the estate and the application is on the approved list.

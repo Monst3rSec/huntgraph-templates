@@ -46,9 +46,6 @@ from attack_extract import Attack, attack_id, load_bundle  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCHEMA_PATH = os.path.join(ROOT, "schema", "detection.schema.json")
 HUNT_DIR = os.path.join(ROOT, "hunt")
-# Upstream rule sets stored beside the templates, e.g. hunt/endpoint/sigma/. They are
-# third-party material, not templates, so nothing walks into them.
-UPSTREAM_SOURCES = {"sigma"}
 
 # Rule ids are allocated to templates in blocks of this size. Wazuh ids must be
 # globally unique, so a template may only use ids inside the block it owns.
@@ -619,7 +616,7 @@ def check_wazuh_block(doc, block, cql_case_ids: set, rep: Report) -> None:
 # Elastic's prebuilt-rule domains. A template is filed by what the hunt is about:
 # traffic on the wire and host-to-host movement under network, accounts and
 # authentication under identity, and so on; anything that happens on the host is
-# endpoint. See "Categories" in CLAUDE.md.
+# endpoint. See "Categories" in AGENTS.md.
 CATEGORIES = ("cloud", "containers", "email", "endpoint", "identity", "kubernetes",
               "llm", "network", "saas", "unspecified", "web")
 
@@ -704,7 +701,6 @@ def collect(paths: list[str]) -> list[str]:
             found.append(root)
             continue
         for dirpath, dirs, files in os.walk(root):
-            dirs[:] = [d for d in dirs if d not in UPSTREAM_SOURCES]
             for f in sorted(files):
                 if f.endswith((".yaml", ".yml")):
                     found.append(os.path.join(dirpath, f))

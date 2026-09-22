@@ -1,7 +1,7 @@
 type: detection
 
 id: hg-win-scheduled-task-created-for-untrusted-payload-t1053-005
-version: 1.0.0
+version: 1.1.0
 
 info:
   name: Scheduled task created to run an untrusted payload
@@ -25,6 +25,7 @@ info:
     - https://attack.mitre.org/techniques/T1053/005
     - https://attack.mitre.org/detectionstrategies/DET0441
     - https://attack.mitre.org/techniques/T1053
+    - https://raw.githubusercontent.com/SigmaHQ/sigma/2e8fd89f82d9104c1b30321a307254ddeea17de2/rules-threat-hunting/windows/registry/registry_event/registry_event_scheduled_task_creation.yml
 
 mitre:
   tactics:
@@ -59,6 +60,7 @@ hypothesis:
     - Requests SYSTEM through the highest run level or an explicit system account.
     - Triggers the task at logon, at startup or on a short repeating interval.
     - Registers the task on a remote host as part of lateral movement.
+    - Registers the task through the Task Scheduler COM interface from its own code, so no schtasks or PowerShell command line exists.
   legitimate_behavior:
     - Installed software registers update and maintenance tasks during setup.
     - Management platforms deploy scheduled jobs across the estate.
@@ -97,6 +99,17 @@ requires:
         - ComputerName
         - TargetFileName
         - ContextProcessId
+    - source: registry
+      event_types:
+        - RegKeyCreate
+        - RegGenericValueUpdate
+        - AsepValueUpdate
+      fields:
+        - aid
+        - ComputerName
+        - RegObjectName
+        - RegValueName
+        - RegStringValue
 
 query:
   - platform: crowdstrike
@@ -169,6 +182,28 @@ query:
             - user
             - organization
 
+      - id: task-registered-in-the-task-cache
+        name: Task registration written to the TaskCache registry keys
+        purpose: >-
+          Every task, however it was created, is recorded under Schedule\TaskCache\Tree by
+          name and under TaskCache\Tasks by GUID. Returning those writes catches tasks
+          registered through the COM interface from a program's own code, which leave no
+          schtasks or PowerShell command line for the other cases to match.
+        query: |
+          #event_simpleName=/^(RegKeyCreate|RegGenericValueUpdate|AsepValueUpdate)$/
+          | RegObjectName=/\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\(Tree|Tasks)\\/i
+        filters:
+          include: []
+          exclude:
+            - "Task names under \\Microsoft\\Windows\\ written during Windows servicing"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
       - id: task-payload-written
         name: Program written to a user-writable path
         purpose: >-
@@ -222,6 +257,15 @@ evidence:
       source: file_creation
       field: TargetFileName
       indicates: payload_staging
+    - id: task_cache_registration_without_command
+      name: Task registered with no creating command line
+      description: >-
+        A new task appeared under the TaskCache registry keys on the host with no matching
+        schtasks or scheduled-task cmdlet invocation, so a program registered it through the
+        Task Scheduler interface directly.
+      source: registry
+      field: RegObjectName
+      indicates: persistence_established
     - id: rare_task
       name: Task rare across the estate
       description: >-
@@ -266,6 +310,7 @@ evidence:
         - elevated_run_level
         - script_host_creator
         - action_recently_written
+        - task_cache_registration_without_command
         - rare_task
       all:
         - elevated_run_level

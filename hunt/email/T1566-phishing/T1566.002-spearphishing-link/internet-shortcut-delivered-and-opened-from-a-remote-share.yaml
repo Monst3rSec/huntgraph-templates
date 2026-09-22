@@ -1,7 +1,7 @@
 type: detection
 
 id: hg-win-internet-shortcut-delivered-and-opened-from-a-remote-share-t1566-002
-version: 1.0.0
+version: 1.1.0
 
 info:
   name: Internet shortcut delivered and opened against a remote share
@@ -28,6 +28,8 @@ info:
     - https://attack.mitre.org/techniques/T1566
     - https://raw.githubusercontent.com/elastic/detection-rules/main/rules/windows/execution_downloaded_url_file.toml
     - https://raw.githubusercontent.com/elastic/detection-rules/main/rules/windows/execution_downloaded_shortcut_files.toml
+    - https://raw.githubusercontent.com/SigmaHQ/sigma/2e8fd89f82d9104c1b30321a307254ddeea17de2/rules-threat-hunting/windows/process_creation/proc_creation_win_webdav_process_execution.yml
+    - https://raw.githubusercontent.com/SigmaHQ/sigma/2e8fd89f82d9104c1b30321a307254ddeea17de2/rules-threat-hunting/windows/file/file_event/file_event_win_webdav_tmpfile_creation.yml
 
 mitre:
   tactics:
@@ -57,6 +59,7 @@ hypothesis:
     - Sets the shortcut target to a WebDAV path (\\host@SSL\...) or a file:// URL on the internet.
     - Uses a search-ms URI so Explorer displays the remote share as if it were a local folder.
     - Places a script, HTA, LNK or executable on the share for the user to open.
+    - Lets the WebDAV redirector copy the script to its local cache when the user opens it, then runs it from the share.
   legitimate_behavior:
     - Intranet portals and SharePoint libraries are opened through WebDAV.
     - Users keep .url shortcuts to internal applications on the desktop.
@@ -86,6 +89,15 @@ requires:
         - ImageFileName
         - CommandLine
         - ParentBaseFileName
+    - source: file_creation
+      event_types:
+        - NewScriptWritten
+        - PeFileWritten
+      fields:
+        - aid
+        - ComputerName
+        - TargetFileName
+        - ContextProcessId
 
 query:
   - platform: crowdstrike
@@ -176,6 +188,47 @@ query:
           window: null
           compare: []
 
+      - id: program-image-on-a-webdav-share
+        name: Process whose image is on a WebDAV share
+        purpose: >-
+          Return every process whose own image path is a WebDAV location. Whatever the
+          command line looked like, the program that ran was fetched from a web server
+          through the redirector.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/^\\\\[^\\]+(@SSL|@\d+)?\\DavWWWRoot\\|^\\\\[^\\]+@(SSL|\d+)\\/i
+        filters:
+          include: []
+          exclude:
+            - "Internal SharePoint or WebDAV servers that publish approved tools"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
+      - id: webdav-redirector-cached-a-script
+        name: Script or executable written to the WebDAV redirector's cache
+        purpose: >-
+          Opening a file from a WebDAV share makes the redirector copy it under
+          AppData\Local\Temp\TfsStore\Tfs_DAV. A script, shortcut or executable
+          landing there is content the user opened from a remote web share.
+        query: |
+          #event_simpleName=/^(NewScriptWritten|PeFileWritten)$/
+          | TargetFileName=/\\AppData\\Local\\Temp\\TfsStore\\Tfs_DAV\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
 evidence:
   required:
     - id: shortcut_opened_against_remote_target
@@ -228,6 +281,14 @@ evidence:
       source: baseline
       field: UserName
       indicates: unusual_activity_for_host
+    - id: webdav_content_cached
+      name: Remote script cached by the WebDAV redirector
+      description: >-
+        A script, shortcut or executable was written into the WebDAV redirector's local
+        cache, which happens when a user opens that file from a web share.
+      source: file_creation
+      field: TargetFileName
+      indicates: remote_content_executed
 
   contradicting:
     - id: intranet_webdav
@@ -265,6 +326,7 @@ evidence:
         - interpreter_on_remote_path
         - explorer_parent
         - share_new_for_user
+        - webdav_content_cached
       all:
         - external_webdav_host
         - interpreter_on_remote_path

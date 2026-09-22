@@ -35,7 +35,6 @@ from attack_extract import Attack, attack_id, load_bundle  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TECHNIQUES_DIR = os.path.join(ROOT, "hunt")
-UPSTREAM_SOURCES = {"sigma"}   # third-party rules stored beside the templates
 
 PRIORITY_1 = [
     "execution",
@@ -107,7 +106,6 @@ def corpus_coverage() -> dict[str, list[str]]:
     if not os.path.isdir(TECHNIQUES_DIR):
         return covered
     for dirpath, dirs, files in os.walk(TECHNIQUES_DIR):
-        dirs[:] = [d for d in dirs if d not in UPSTREAM_SOURCES]
         for f in sorted(files):
             if not f.endswith((".yaml", ".yml")):
                 continue
@@ -137,7 +135,6 @@ def wazuh_coverage() -> dict[str, dict]:
     if not os.path.isdir(TECHNIQUES_DIR):
         return out
     for dirpath, dirs, files in os.walk(TECHNIQUES_DIR):
-        dirs[:] = [d for d in dirs if d not in UPSTREAM_SOURCES]
         for f in sorted(files):
             if not f.endswith((".yaml", ".yml")):
                 continue

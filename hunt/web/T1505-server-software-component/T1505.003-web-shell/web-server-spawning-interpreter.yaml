@@ -1,7 +1,7 @@
 type: detection
 
 id: hg-win-web-server-spawning-interpreter-t1505-003
-version: 1.0.0
+version: 1.1.0
 
 info:
   name: Web server process spawning a command interpreter
@@ -24,6 +24,7 @@ info:
     - https://attack.mitre.org/techniques/T1505/003
     - https://attack.mitre.org/detectionstrategies/DET0394
     - https://attack.mitre.org/techniques/T1505
+    - https://raw.githubusercontent.com/SigmaHQ/sigma/2e8fd89f82d9104c1b30321a307254ddeea17de2/rules-threat-hunting/windows/process_creation/proc_creation_win_susp_execution_path_webserver.yml
 
 mitre:
   tactics:
@@ -56,6 +57,7 @@ hypothesis:
     - Runs discovery, credential access or lateral movement commands through the shell.
     - Uses the web server's service account, which often has more privilege than expected.
     - Writes further tooling into the web root for later use.
+    - Runs an executable placed in the web root, so the tool starts from a directory the web server serves.
   legitimate_behavior:
     - Some applications legitimately shell out for image processing, PDF generation or archiving.
     - Deployment and health-check scripts may be invoked by the application server.
@@ -84,6 +86,7 @@ requires:
         host: ComputerName
         user: UserName
         image_name: FileName
+        image_path: ImageFileName
         command_line: CommandLine
         parent_process: ParentBaseFileName
     - source: process_creation
@@ -96,6 +99,7 @@ requires:
         host: win.system.computer
         user: win.eventdata.user
         image_name: win.eventdata.image
+        image_path: win.eventdata.image
         command_line: win.eventdata.commandLine
         parent_process: win.eventdata.parentImage
     - source: file_creation
@@ -182,6 +186,27 @@ query:
             - host
             - path
 
+      - id: process-run-from-the-web-root
+        name: Process started from a web-accessible directory
+        purpose: >-
+          Return every process whose image sits under a web root. Web applications are
+          served from these directories, not executed from them, so a program running from
+          wwwroot, htdocs or wmpub is usually a tool an operator uploaded through the shell.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ImageFileName=/\\(wwwroot|wmpub|htdocs)\\/i
+        filters:
+          include: []
+          exclude:
+            - "Images under bin\\, Tools\\ or SMSComponent\\ started by services.exe, which are application services installed beside the site"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - path
+            - organization
+
   - platform: wazuh
     language: wazuh-rules
     ruleset:
@@ -212,6 +237,28 @@ query:
         limitations:
           - Derived from the CQL filter chain; the aggregation in the original case
             is not represented.
+
+      - id: process-run-from-the-web-root
+        covers: process-run-from-the-web-root
+        name: Process started from a web-accessible directory
+        purpose: >-
+          Report every process whose image lives under a web root, where site content is
+          served from rather than executed.
+        rule: |
+          <rule id="101121" level="10">
+            <if_group>sysmon_event1</if_group>
+            <field name="win.eventdata.image" type="pcre2">(?i)\\(wwwroot|wmpub|htdocs)\\</field>
+            <description>Process started from a web-accessible directory</description>
+            <mitre><id>T1505.003</id></mitre>
+          </rule>
+        correlation:
+          frequency: null
+          timeframe: null
+          same_field: null
+        limitations:
+          - The 60d baseline in the CQL case is not represented, and neither is the
+            exclusion for application services installed beside the site; every such
+            process is reported.
 
     not_portable:
       - case: web-worker-spawns-shell
@@ -252,6 +299,14 @@ evidence:
       source: file_creation
       field: file_path
       indicates: web_shell_staging
+    - id: executable_in_web_root
+      name: Program executed from the web root
+      description: >-
+        A process started from an image under wwwroot, htdocs or wmpub, which is tooling
+        placed where the web server serves content rather than where software is installed.
+      source: process_creation
+      field: image_path
+      indicates: web_shell_execution
     - id: general_purpose_shell
       name: Child is a general-purpose shell
       description: >-
@@ -303,6 +358,7 @@ evidence:
       any:
         - discovery_commands
         - script_in_web_root
+        - executable_in_web_root
         - general_purpose_shell
         - new_for_server
       all:

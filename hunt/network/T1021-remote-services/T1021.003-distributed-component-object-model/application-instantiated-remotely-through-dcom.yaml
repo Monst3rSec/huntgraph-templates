@@ -1,0 +1,301 @@
+type: detection
+
+id: hg-win-application-instantiated-remotely-through-dcom-t1021-003
+version: 1.0.0
+
+info:
+  name: Application instantiated remotely through DCOM
+  description: >-
+    DCOM lets a caller on one host create a COM object on another and drive it. Office
+    applications, MMC and a few shell objects expose methods that run commands, so an
+    adversary with credentials can instantiate Excel.Application, Outlook.Application or
+    MMC20.Application on a target and execute through it without copying a file or creating
+    a service. On the target the object's server is started by the DCOM launcher inside
+    svchost, not by a user, which is the tell: Word, Excel or MMC with svchost as their
+    parent is a COM activation, and on a workstation that nobody is automating it is
+    usually someone else's.
+  severity: high
+  author: huntgraph
+  tags:
+    - lateral-movement
+    - dcom
+    - remote-execution
+    - windows
+  references:
+    - https://attack.mitre.org/techniques/T1021/003
+    - https://attack.mitre.org/detectionstrategies/DET0285
+    - https://attack.mitre.org/techniques/T1021
+    - https://raw.githubusercontent.com/SigmaHQ/sigma/2e8fd89f82d9104c1b30321a307254ddeea17de2/rules-threat-hunting/windows/process_creation/proc_creation_win_office_svchost_parent.yml
+
+mitre:
+  tactics:
+    - TA0008
+  techniques:
+    - T1021
+  sub_techniques:
+    - T1021.003
+  detection_strategies:
+    - DET0285
+  analytics:
+    - AN0791
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+    - Logon Session Creation
+
+hypothesis:
+  statement: >-
+    An adversary holding valid credentials may instantiate an Office application or MMC on
+    a remote host through DCOM and call its methods to run commands there, so the object's
+    server starts under the DCOM launcher and becomes the parent of the adversary's
+    process.
+  attacker_behavior:
+    - Instantiates Excel.Application, Word.Application or Outlook.Application on a remote host and runs a macro or shell command through it.
+    - Instantiates MMC20.Application and calls ExecuteShellCommand to start cmd or PowerShell.
+    - Uses ShellWindows or ShellBrowserWindow to run a command in the context of a remote explorer.
+    - Authenticates to the target over the network immediately before the object is created.
+  legitimate_behavior:
+    - Reporting and finance tools automate Excel or Word on a server through COM.
+    - Document conversion services instantiate Office applications unattended.
+    - Administrators open MMC snap-ins that connect to remote computers.
+  risk_indicator:
+    - An Office application or MMC is started by svchost on a workstation that runs no automation.
+    - The COM-started application spawns a shell, script host or LOLBin.
+    - A network logon from another workstation precedes the activation for the same account.
+    - The account is an administrator whose normal work does not include this host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      event_types:
+        - ProcessRollup2
+        - SyntheticProcessRollup2
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - FileName
+        - ImageFileName
+        - CommandLine
+        - ParentBaseFileName
+    - source: authentication
+      event_types:
+        - UserLogon
+      fields:
+        - aid
+        - ComputerName
+        - UserName
+        - LogonType
+        - RemoteAddressIP4
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: office-started-by-the-dcom-launcher
+        name: Office application started by svchost
+        purpose: >-
+          Return every Office application whose parent is svchost. A user opening a
+          document starts Office from explorer, a mail client or a browser; svchost as the
+          parent means the DCOM launcher activated it as a COM server.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^svchost\.exe$/i
+          | FileName=/^(winword|excel|powerpnt|outlook|msaccess|mspub|visio|onenote|eqnedt32)\.exe$/i
+        filters:
+          include: []
+          exclude:
+            - "ComputerName of servers that run approved Office automation or document conversion"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: mmc-started-for-automation
+        name: MMC started as an embedded COM server
+        purpose: >-
+          Surface MMC20.Application activation. MMC started with -Embedding is a COM server
+          rather than a console a person opened, and it is the object most often used to
+          run a shell command remotely.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | FileName=/^mmc\.exe$/i
+          | CommandLine=/[-\/]Embedding/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - user
+            - organization
+
+      - id: com-server-spawned-a-shell
+        name: Shell or script host started by MMC or a COM-hosted explorer
+        purpose: >-
+          Observe the command executing. ExecuteShellCommand and ShellExecute make MMC or
+          the explorer hosting ShellWindows the parent of whatever the caller ran.
+        query: |
+          #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+          | ParentBaseFileName=/^mmc\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin)\.exe$/i
+        filters:
+          include: []
+          exclude:
+            - "Management consoles that launch scripted helpers, identified by CommandLine"
+        baseline:
+          required: true
+          window: 60d
+          compare:
+            - host
+            - command_line
+            - organization
+
+      - id: network-logon-then-com-activation
+        name: Network logon and COM activation for the same account on one host
+        purpose: >-
+          Join the remote authentication to the activation. A DCOM call arrives as a
+          network logon for the caller's account and the object's server runs as that
+          account, so both halves on one host under one name tie the process to a remote
+          source address.
+        query: |
+          #event_simpleName=/^(UserLogon|ProcessRollup2|SyntheticProcessRollup2)$/
+          | case {
+              #event_simpleName=UserLogon
+                | LogonType=3
+                | logon_source := RemoteAddressIP4 ;
+              #event_simpleName=/^(ProcessRollup2|SyntheticProcessRollup2)$/
+                | ParentBaseFileName=/^svchost\.exe$/i
+                | FileName=/^(winword|excel|powerpnt|outlook|msaccess|mspub|visio|mmc)\.exe$/i
+                | com_server := FileName ;
+            }
+          | groupBy([aid, UserName],
+                    function=[collect([ComputerName, logon_source, RemoteAddressIP4, LogonType, com_server,
+                                       ImageFileName, CommandLine, ParentBaseFileName], limit=50),
+                              count(as=events)])
+          | logon_source=/.+/ and com_server=/.+/
+        filters:
+          include: []
+          exclude:
+            - "UserName of service accounts that run approved Office automation"
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: com_activated_application
+      name: Office application or MMC started as a COM server
+      description: >-
+        An Office application was started by svchost, or MMC was started with -Embedding,
+        so the process exists because a COM client activated it rather than because a user
+        opened it.
+      source: process_creation
+      field: ParentBaseFileName
+      indicates: remote_execution_channel
+
+  supporting:
+    - id: com_server_child_shell
+      name: COM server started a shell
+      description: >-
+        The COM-activated MMC or explorer became the parent of a shell, script host or
+        LOLBin, which is a command being run through the object.
+      source: process_creation
+      field: FileName
+      indicates: execution_chain_progression
+    - id: preceding_network_logon
+      name: Network logon for the same account
+      description: >-
+        A network logon for the account the COM server runs as arrived on the host from
+        another address, identifying where the activation came from.
+      source: authentication
+      field: RemoteAddressIP4
+      indicates: lateral_movement_attempt
+    - id: activation_unseen_on_host
+      name: COM activation not seen before on this host
+      description: >-
+        This host has not started this application through the DCOM launcher during the
+        baseline window, so there is no automation that would explain it.
+      source: baseline
+      field: ComputerName
+      indicates: unusual_activity_for_host
+
+  contradicting:
+    - id: automation_server_role
+      name: Host runs approved Office automation
+      description: >-
+        The host is a reporting, conversion or batch server that is recorded as running
+        Office automation through COM.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_infrastructure_role
+    - id: automation_service_account
+      name: Activation by an automation service account
+      description: >-
+        The COM server runs as a service account that exists to drive Office automation and
+        does so on a schedule.
+      source: identity_context
+      field: UserName
+      indicates: routine_automation
+
+  risk_logic:
+    required:
+      - com_activated_application
+
+    supporting:
+      any:
+        - com_server_child_shell
+        - preceding_network_logon
+        - activation_unseen_on_host
+      all:
+        - preceding_network_logon
+        - com_server_child_shell
+
+    contradicting:
+      any:
+        - automation_server_role
+        - automation_service_account
+      all: []
+
+  verdict:
+    low_risk_when:
+      - com_activated_application
+      - automation_server_role
+      - automation_service_account
+    suspicious_when:
+      - com_activated_application
+      - activation_unseen_on_host
+    high_risk_when:
+      - com_activated_application
+      - preceding_network_logon
+      - com_server_child_shell
+      - activation_unseen_on_host
+
+  false_positive:
+    - condition: A reporting server automates Excel through COM.
+      explanation: >-
+        The server starts Excel under svchost many times a day as the same service account.
+        The host role and account are known and the activation is routine in the baseline.
+    - condition: A user embeds an Office object in another application.
+      explanation: >-
+        Embedding a chart or document can start an Office server through COM on the user's
+        own workstation. There is no network logon from another host and no shell child.
+    - condition: An administrator opens an MMC snap-in against a remote computer.
+      explanation: >-
+        The console runs on the administrator's host, not the target, and is started from
+        explorer or a shell rather than with -Embedding.

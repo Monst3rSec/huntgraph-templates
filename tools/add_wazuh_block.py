@@ -305,7 +305,6 @@ def main() -> int:
     if not paths:
         paths = []
         for dp, dirs, fs in os.walk(os.path.join(ROOT, "hunt")):
-            dirs[:] = [d for d in dirs if d != "sigma"]
             paths += [os.path.join(dp, f) for f in fs if f.endswith(".yaml")]
         paths.sort()
 
