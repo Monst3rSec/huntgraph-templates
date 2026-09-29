@@ -18,3 +18,8 @@ family belongs in which category is in [AGENTS.md](../AGENTS.md#categories), and
 Upstream rules (Splunk, Elastic, Sigma) are never stored here. They are triaged at their
 source by `tools/track_sources.py` into [tracker/](../tracker/), and a rule enters `hunt/`
 only by being rewritten as a template.
+
+`hunt/keyword/` is the one exception to the layout above: generated tool-keyword sweeps
+from [mthcht/ThreatHunting-Keywords](https://github.com/mthcht/ThreatHunting-Keywords),
+filed by tool name rather than technique and deliberately outside the validated corpus.
+See [hunt/keyword/README.md](keyword/README.md).
