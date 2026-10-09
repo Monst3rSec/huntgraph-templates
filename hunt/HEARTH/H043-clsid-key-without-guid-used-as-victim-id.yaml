@@ -1,0 +1,257 @@
+# Converted from THORCollective/HEARTH Flames/H043.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h043-clsid-key-without-guid-used-as-victim-id-t1112
+version: 1.0.0
+
+info:
+  name: Non-GUID key under HKCU Classes CLSID used to store a victim identifier
+  description: >-
+    Every legitimate entry under a CLSID key is a GUID in curly brackets; that is what
+    the key is for. FamousSparrow's SparrowDoor backdoor writes a key literally named ID
+    under HKCU\Software\Classes\CLSID and keeps the victim's unique identifier in it, so
+    each command-and-control session can be tied to the same host. A child of CLSID that
+    is not a braced GUID is therefore wrong by construction. HEARTH calls it a Run key;
+    it is not one, and it starts nothing. The hunt returns registry writes and commands
+    that touch such a key.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-impairment
+    - registry
+    - famoussparrow
+    - sparrowdoor
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H043.md
+    - https://attack.mitre.org/techniques/T1112
+    - https://attack.mitre.org/detectionstrategies/DET0280
+    - https://www.welivesecurity.com/en/eset-research/you-will-always-remember-this-as-the-day-you-finally-caught-famoussparrow/
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1112
+  sub_techniques: []
+  detection_strategies:
+    - DET0280
+  analytics:
+    - AN0781
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Windows Registry Key Modification
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    Adversaries are modifying the Windows Registry under HKCU\Software\Classes\CLSID\ID
+    to store unique victim identifiers used for tracking command-and-control
+    communications, deviating from the standard CLSID format that requires GUIDs in curly
+    brackets.
+  attacker_behavior:
+    - Creates a key named ID directly under the per-user CLSID key on first run.
+    - Writes a generated identifier as that key's value and reads it on every later start.
+    - Performs the write from the backdoor's own process, often a side-loaded DLL in a signed host.
+    - Leaves the key in place across reinstalls so the identifier persists.
+  legitimate_behavior:
+    - Software registers COM classes under CLSID using braced GUID key names.
+    - Installers and per-user application updates create and remove such keys in volume.
+    - Poorly written software occasionally writes a stray non-GUID key there.
+  risk_indicator:
+    - A key directly under CLSID has a name that is not a braced GUID.
+    - The key is under the per-user hive, not the machine hive.
+    - The writing process runs from a user-writable path or is a signed binary loading an unsigned DLL.
+    - The value written is a short opaque string and not a class registration.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: non-guid-key-under-user-clsid
+        name: Value written to a per-user CLSID child that is not a GUID
+        purpose: >-
+          Return registry writes whose key sits directly under a user hive's Classes
+          CLSID and does not begin with an opening brace. Whether the sensor reports
+          writes under this key depends on its registry coverage; confirm in the tenant.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\Classes\\CLSID\\[^{\\]/i
+          | RegObjectName=/\\REGISTRY\\USER\\S-1-5-21-[^\\]+(\\Software\\Classes|_Classes)\\CLSID\\[^{\\]/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: clsid-id-key-written
+        name: Value written to the CLSID\ID key
+        purpose: >-
+          Return writes to the exact key SparrowDoor uses, in either the user or machine
+          hive.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\Classes\\CLSID\\ID(\\|$)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: command-touching-non-guid-clsid-key
+        name: Command that reads or writes a non-GUID CLSID key
+        purpose: >-
+          Return reg.exe and PowerShell commands naming a CLSID child that is not a
+          braced GUID, which covers operator testing and scripted installs of the key.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(reg|powershell|pwsh|cmd)\.exe$/i
+          | CommandLine=/\\Classes\\CLSID\\[A-Za-z0-9_]/i
+          | CommandLine!=/\\Classes\\CLSID\\\{/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: malformed_clsid_key
+      name: CLSID child key that is not a GUID
+      description: >-
+        A registry write targets a key directly under Classes\CLSID whose name is not a
+        GUID in curly brackets.
+      source: registry
+      field: registry_path
+      indicates: registry_used_for_implant_state
+
+  supporting:
+    - id: opaque_identifier_value
+      name: Value is a short opaque identifier
+      description: >-
+        The string written is a short hexadecimal or random-looking token, not a class
+        name, a path or a server registration.
+      source: registry
+      field: registry_data
+      indicates: victim_identifier_stored
+    - id: value_name_default_or_id
+      name: Value name is default or identifier-like
+      description: >-
+        The value written is the key's default value or carries a name such as ID,
+        with none of the subkeys a COM registration has.
+      source: registry
+      field: registry_value
+      indicates: non_com_registry_usage
+    - id: registry_tool_command
+      name: Key touched from the command line
+      description: >-
+        A reg.exe or PowerShell command names the same non-GUID key.
+      source: process_creation
+      field: command_line
+      indicates: manual_or_scripted_registry_change
+
+  contradicting:
+    - id: known_software_stray_key
+      name: Key is written by known software fleet-wide
+      description: >-
+        Earlier activity shows the same key name written on many hosts by the same
+        installed product.
+      source: baseline
+      field: RegObjectName
+      indicates: established_software_behaviour
+    - id: software_deployment_window
+      name: Write falls inside a software deployment
+      description: >-
+        A change record covers an installation on the host at the time of the write.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_software_deployment
+
+  risk_logic:
+    required:
+      - malformed_clsid_key
+
+    supporting:
+      any:
+        - opaque_identifier_value
+        - value_name_default_or_id
+        - registry_tool_command
+      all:
+        - opaque_identifier_value
+        - value_name_default_or_id
+
+    contradicting:
+      any:
+        - known_software_stray_key
+        - software_deployment_window
+      all: []
+
+  verdict:
+    low_risk_when:
+      - malformed_clsid_key
+      - known_software_stray_key
+    suspicious_when:
+      - malformed_clsid_key
+      - value_name_default_or_id
+    high_risk_when:
+      - malformed_clsid_key
+      - value_name_default_or_id
+      - opaque_identifier_value
+
+  false_positive:
+    - condition: Badly behaved software writes a non-GUID key under CLSID.
+      explanation: >-
+        A handful of products do. The key name is the same on every host with the
+        product and its writer is the product's own signed binary.
+    - condition: An administrator queries the key while investigating.
+      explanation: >-
+        The command case matches reads as well as writes. A reg query from an
+        administrative console during an investigation is the hunt being run by hand.
+    - condition: The sensor does not report this key.
+      explanation: >-
+        Registry coverage is selective. No results from the two registry cases means
+        either no such write or no visibility; the command case is the only one that
+        does not depend on it.

@@ -1,0 +1,257 @@
+# Converted from THORCollective/HEARTH Flames/H050.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h050-dcsync-replication-tooling-t1003-006
+version: 1.0.0
+
+info:
+  name: AD password hashes obtained through a DCSync operation
+  description: >-
+    DCSync asks a domain controller to replicate account secrets, as another domain
+    controller would, using the directory replication rights of a compromised account.
+    HEARTH's indicators are on the domain controller: security event 4662 with access
+    mask 0x100 and the replication GUIDs, raised for an account that is not a computer.
+    That event channel is not collected here. What the sensor does see is the request
+    being made, when the tool runs on a managed host: Mimikatz, the DSInternals module
+    or Impacket's secretsdump named on a command line. A DCSync launched from a machine
+    with no sensor leaves nothing in this hunt.
+  severity: critical
+  author: huntgraph
+  tags:
+    - hearth
+    - credential-access
+    - active-directory
+    - dcsync
+    - secretsdump
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H050.md
+    - https://attack.mitre.org/techniques/T1003
+    - https://attack.mitre.org/techniques/T1003/006
+    - https://attack.mitre.org/detectionstrategies/DET0594
+
+# The analytic for T1003.006 lists Active Directory object access and network traffic
+# content, neither of which this hunt reads. No analytic is declared, so data_sources and
+# data_components describe the hunt, not an ATT&CK mapping.
+mitre:
+  tactics:
+    - TA0006
+  techniques:
+    - T1003
+  sub_techniques:
+    - T1003.006
+  detection_strategies:
+    - DET0594
+  analytics: []
+  platforms:
+    - Windows
+  data_sources:
+    - CrowdStrike:Endpoint
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary successfully obtained Active Directory password hashes by abusing
+    directory replication permissions through a DCSync operation.
+  attacker_behavior:
+    - Runs Mimikatz lsadump::dcsync for krbtgt, an administrator or every account.
+    - Uses the DSInternals Get-ADReplAccount cmdlet from PowerShell.
+    - Runs Impacket secretsdump with the just-dc options against a domain controller.
+    - Grants an account the replication rights beforehand with a directory ACL change.
+    - Forges tickets or logs on with the recovered hashes afterwards.
+  legitimate_behavior:
+    - Domain controllers replicate with each other continuously.
+    - Azure AD Connect and password-audit tools replicate secrets under a dedicated service account.
+    - Security teams run DSInternals for sanctioned password-quality audits.
+  risk_indicator:
+    - A replication tool is named on the command line of a workstation or member server.
+    - The target is krbtgt or all users.
+    - The account is not a domain controller or a synchronisation service account.
+    - Replication rights were added to an account shortly before.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: replication-tool-command
+        name: Command line naming a directory replication tool
+        purpose: >-
+          Return processes whose command line carries the DCSync verbs of Mimikatz,
+          DSInternals or Impacket. The terms are distinctive literals, so one pattern on
+          one field is enough.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/lsadump::dcsync|Get-ADReplAccount|Invoke-DCSync|secretsdump|-just-dc(-ntlm|-user)?\b|DRSGetNCChanges|drsuapi/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: replication-of-krbtgt-or-all-accounts
+        name: Replication request for krbtgt or every account
+        purpose: >-
+          Narrow to requests whose target is the ticket-granting account or the whole
+          directory, the two that amount to domain compromise.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/dcsync|Get-ADReplAccount|secretsdump|-just-dc/i
+          | CommandLine=/krbtgt|\/all\b|-All\b|\/csv\b|-NamingContext\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: replication-rights-granted
+        name: Directory replication rights granted to an account
+        purpose: >-
+          Return commands that add the replication extended rights to an account, the
+          preparation step that makes DCSync possible for a non-administrator.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/DS-Replication-Get-Changes|Replicating Directory Changes|1131f6a[ad]-9c07-11d1-f79f-00c04fc2dcd2|89e95b76-444d-4c62-991a-0facbeda640c|Add-(Domain)?ObjectAcl.*DCSync|-Rights\s+DCSync/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: dcsync_tool_command
+      name: Directory replication tool invoked
+      description: >-
+        A process command line names a DCSync function of Mimikatz, DSInternals or
+        Impacket, showing replication of account secrets was requested from this host.
+      source: process_creation
+      field: command_line
+      indicates: directory_secret_replication_requested
+
+  supporting:
+    - id: high_value_target
+      name: Target is krbtgt or all accounts
+      description: >-
+        The command line names krbtgt or asks for every account in the domain.
+      source: process_creation
+      field: command_line
+      indicates: domain_wide_credential_theft
+    - id: non_controller_host
+      name: Request issued from a workstation or member server
+      description: >-
+        The host on the event is not a domain controller or a directory synchronisation
+        server.
+      source: process_creation
+      field: host
+      indicates: replication_from_unexpected_host
+    - id: non_service_account
+      name: Account is not a replication service account
+      description: >-
+        The user is a person's account or an unrelated service account, not a domain
+        controller or the synchronisation service.
+      source: process_creation
+      field: user
+      indicates: replication_rights_abused
+    - id: offensive_tool_parent
+      name: Started from a shell, script or remote session
+      description: >-
+        The parent is an interactive shell, a script host or a remote-management
+        process.
+      source: process_creation
+      field: parent_process
+      indicates: operator_driven_execution
+
+  contradicting:
+    - id: sanctioned_password_audit
+      name: Run is a sanctioned password audit
+      description: >-
+        A change record covers the host, account and time for a password-quality audit
+        or an authorised penetration test.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_security_testing
+    - id: directory_sync_server
+      name: Host is a directory synchronisation server
+      description: >-
+        Asset records class the host as an Azure AD Connect or identity synchronisation
+        server that replicates secrets by design.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_directory_replication
+
+  risk_logic:
+    required:
+      - dcsync_tool_command
+
+    supporting:
+      any:
+        - high_value_target
+        - non_controller_host
+        - non_service_account
+        - offensive_tool_parent
+      all:
+        - high_value_target
+        - non_controller_host
+
+    contradicting:
+      any:
+        - sanctioned_password_audit
+        - directory_sync_server
+      all: []
+
+  verdict:
+    low_risk_when:
+      - dcsync_tool_command
+      - sanctioned_password_audit
+    suspicious_when:
+      - dcsync_tool_command
+      - non_controller_host
+    high_risk_when:
+      - dcsync_tool_command
+      - non_controller_host
+      - high_value_target
+
+  false_positive:
+    - condition: The security team audits password quality with DSInternals.
+      explanation: >-
+        The cmdlet and the request are identical. It is scheduled, run by a named
+        auditor from an administrative host, and recorded.
+    - condition: A penetration test includes DCSync.
+      explanation: >-
+        Testers use the same tools. The engagement record and the tester's host and
+        account are the only distinction.
+    - condition: An administrator reviews or documents replication rights.
+      explanation: >-
+        The third case matches the names of the replication rights, so a script that
+        reports who holds them appears. It reads ACLs and does not grant them.

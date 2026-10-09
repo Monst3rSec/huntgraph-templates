@@ -1,0 +1,355 @@
+# Converted from THORCollective/HEARTH Flames/H097.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+# Holds the macOS half of H097. The Windows half, a pasted PowerShell command, is
+# the behaviour H024 (Run dialog) and H088 (Windows Terminal) already hunt.
+type: detection
+
+id: hg-mac-hearth-h097-clickfix-terminal-paste-on-macos-t1204-004
+version: 1.0.0
+
+info:
+  name: ClickFix lure leading to a pasted command in the macOS Terminal
+  description: >-
+    Odyssey Stealer is delivered through ClickFix pages that pose as Microsoft Teams,
+    Homebrew or Ledger Live and tell the visitor to open Terminal and paste a command. The
+    page and the clipboard are not visible to the sensor. On macOS the pasted line is run
+    by the login shell, and each part of a pipeline is its own process: curl appears with
+    the URL, base64 with only its decode flag, and the interpreter at the end of the pipe
+    with no arguments at all. The hunt returns those pieces and the agent joins them on
+    the parent process id. It also returns what the stealer does next: lifting the
+    quarantine attribute from a file in a scratch directory, asking for the login password
+    in a dialog it draws itself, and checking the answer with dscl. On Windows the same
+    lure ends in a pasted PowerShell command, which H024 and H088 cover.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - execution
+    - clickfix
+    - user-execution
+    - odyssey-stealer
+    - infostealer
+    - macos
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H097.md
+    - https://attack.mitre.org/techniques/T1204
+    - https://attack.mitre.org/techniques/T1204/004
+    - https://attack.mitre.org/detectionstrategies/DET0340
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1204
+  sub_techniques:
+    - T1204.004
+  detection_strategies:
+    - DET0340
+  analytics:
+    - AN0964
+  platforms:
+    - macOS
+  data_sources:
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary is using ClickFix lure pages impersonating legitimate software (Microsoft
+    Teams, Homebrew, Ledger Live) to social-engineer users into executing malicious
+    commands that deploy the Odyssey infostealer for credential and session token theft.
+  attacker_behavior:
+    - Shows a fake error or install page that copies a command to the clipboard.
+    - Has the user paste a line that pipes curl output, or a decoded Base64 string, into a shell or osascript.
+    - Removes the quarantine attribute from a downloaded file and runs it from a scratch directory.
+    - Draws a password dialog with osascript and validates the answer with dscl.
+    - Collects browser, keychain and wallet data and posts an archive to its server.
+  legitimate_behavior:
+    - Developers paste one-line installers for Homebrew, rustup, nvm and similar tools.
+    - Shell scripts call curl against APIs and read the response from standard output.
+    - Management agents run osascript to show notices to the user.
+  risk_indicator:
+    - curl writes to standard output under a shell and a bare interpreter starts under the same shell.
+    - base64 runs in decode mode beside a bare bash, sh or osascript.
+    - The quarantine attribute is removed from a file under /tmp or a hidden directory.
+    - osascript asks for a password with a hidden answer field.
+    - dscl is asked to check a password and nothing else.
+    - The user is not technical staff and seldom opens Terminal.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: silent-fetch-to-standard-output-under-shell
+        name: curl fetching a URL to standard output under a shell
+        purpose: >-
+          Return curl and wget started by a shell with a URL and no output file, the shape
+          of both 'curl URL | bash' and 'bash -c "$(curl URL)"'. The pipe and the
+          substitution are done by the parent shell and are not on curl's command line, so
+          the agent looks for an interpreter under the same parent process id in the next
+          case. Scripts that call web APIs match as well; this is the widest case in the
+          file. Homebrew's own installer URL is left out.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=/^(curl|wget)$/
+          | ParentBaseFileName=/^(zsh|bash|sh)$/
+          | CommandLine=/https?:\/\//i
+          | CommandLine!=/\s(-o|-O|--output|--remote-name)\b/
+          | CommandLine!=/raw\.githubusercontent\.com\/Homebrew\//i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: bare-interpreter-under-shell
+        name: Interpreter started with no arguments by a shell
+        purpose: >-
+          Return bash, sh, zsh and osascript started by a shell with nothing after the
+          program name. That is the receiving end of a pipe: the script arrives on
+          standard input and never reaches a command line. A user who types bash to open a
+          sub-shell matches too. A pasted 'bash -c "$(curl URL)"' is not returned here;
+          its command line holds the downloaded script, and the fetch case shows the URL.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=/^(bash|sh|zsh|osascript)$/
+          | ParentBaseFileName=/^(zsh|bash|sh)$/
+          | CommandLine=/^\S+$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: base64-decode-step-under-shell
+        name: base64 decoding under a shell
+        purpose: >-
+          Return base64 run in decode mode by a shell, the middle of 'echo STRING | base64
+          -D | bash'. The encoded string belongs to echo, a shell built-in, and is not
+          recorded.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=base64
+          | ParentBaseFileName=/^(zsh|bash|sh)$/
+          | CommandLine=/\s(-d|-D|--decode)\b/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: quarantine-attribute-removed-in-scratch-directory
+        name: Quarantine attribute removed from a file in a scratch or hidden directory
+        purpose: >-
+          Return xattr clearing attributes, or deleting com.apple.quarantine, on a path
+          under /tmp, /var/folders, /Users/Shared, Downloads or a dot-directory in a home
+          folder, the step that lets a downloaded binary run without a Gatekeeper prompt.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=xattr
+          | CommandLine=/\s-[a-z]*c[a-z]*\s|com\.apple\.quarantine/
+          | CommandLine=/\/(private\/)?tmp\/|\/var\/folders\/|\/Users\/Shared\/|\/Users\/[^\/\s]+\/(Downloads|\.[^\/\s]+)\//
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: osascript-password-dialog
+        name: osascript drawing a password dialog
+        purpose: >-
+          Return osascript commands that show a dialog with a hidden answer field or ask
+          for a password in the name of System Settings. A script fed to osascript on
+          standard input shows no text here and appears in the bare-interpreter case
+          instead.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=osascript
+          | CommandLine=/hidden answer|display dialog.*(password|System (Preferences|Settings))/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: dscl-password-check
+        name: dscl used to check a password
+        purpose: >-
+          Return dscl run with -authonly, which tests a user name and password and does
+          nothing else. Stealers loop on it until the user types the right password.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=dscl
+          | CommandLine=/-authonly\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: pasted_fetch_or_decode_command
+      name: Fetch or decode step run by a shell
+      description: >-
+        curl fetched a URL to standard output, or base64 ran in decode mode, as a child of
+        a shell.
+      source: process_creation
+      field: command_line
+      indicates: pasted_command_execution
+
+  supporting:
+    - id: interpreter_fed_by_pipe
+      name: Bare interpreter under the same shell
+      description: >-
+        A bash, sh, zsh or osascript process with no arguments has the same parent process
+        id as the fetch or decode step and starts within the same second or two. The agent
+        derives this from the returned events.
+      source: process_creation
+      field: parent_process_id
+      indicates: fetched_content_executed
+    - id: quarantine_removed
+      name: Quarantine attribute removed from a downloaded file
+      description: >-
+        xattr cleared the quarantine attribute on a file in a scratch or hidden directory.
+      source: process_creation
+      field: command_line
+      indicates: gatekeeper_prompt_avoided
+    - id: password_dialog_shown
+      name: Password requested through an osascript dialog
+      description: >-
+        osascript displayed a dialog with a hidden answer field.
+      source: process_creation
+      field: command_line
+      indicates: credential_prompt_spoofing
+    - id: password_checked_with_dscl
+      name: Password validated with dscl
+      description: >-
+        dscl -authonly ran on the host, often several times in a row.
+      source: process_creation
+      field: image_name
+      indicates: credential_validation
+    - id: non_technical_user
+      name: User seldom uses Terminal
+      description: >-
+        The account belongs to a non-technical role with no history of shell sessions on
+        the host.
+      source: process_creation
+      field: user
+      indicates: activity_outside_user_role
+
+  contradicting:
+    - id: technical_staff_account
+      name: Account belongs to technical staff
+      description: >-
+        The user is a developer, administrator or support engineer who works in a terminal
+        routinely.
+      source: identity_context
+      field: UserName
+      indicates: routine_administration
+    - id: vendor_installer_command
+      name: URL is a vendor's published installer
+      description: >-
+        The URL matches the one-line installer a vendor documents for software approved on
+        the host.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_software_installation
+    - id: management_agent_dialog
+      name: Dialog comes from a management agent
+      description: >-
+        The osascript or dscl process descends from the organisation's device management
+        agent.
+      source: asset_inventory
+      field: ComputerName
+      indicates: managed_device_workflow
+
+  risk_logic:
+    required:
+      - pasted_fetch_or_decode_command
+
+    supporting:
+      any:
+        - interpreter_fed_by_pipe
+        - quarantine_removed
+        - password_dialog_shown
+        - password_checked_with_dscl
+        - non_technical_user
+      all:
+        - interpreter_fed_by_pipe
+        - password_dialog_shown
+
+    contradicting:
+      any:
+        - technical_staff_account
+        - vendor_installer_command
+        - management_agent_dialog
+      all: []
+
+  verdict:
+    low_risk_when:
+      - pasted_fetch_or_decode_command
+      - technical_staff_account
+      - vendor_installer_command
+    suspicious_when:
+      - pasted_fetch_or_decode_command
+      - interpreter_fed_by_pipe
+    high_risk_when:
+      - pasted_fetch_or_decode_command
+      - interpreter_fed_by_pipe
+      - password_dialog_shown
+
+  false_positive:
+    - condition: Developers paste one-line installers.
+      explanation: >-
+        rustup, nvm, Oh My Zsh and many others document curl piped to a shell. The account
+        is technical and the URL is the vendor's.
+    - condition: Scripts that query web APIs.
+      explanation: >-
+        A script that reads a JSON response from curl has the same fetch shape. No bare
+        interpreter follows under the same parent, and the script recurs.
+    - condition: Device management prompts.
+      explanation: >-
+        Enrolment and compliance tools show osascript dialogs and call dscl. They run
+        under the management agent, not under a user's shell.

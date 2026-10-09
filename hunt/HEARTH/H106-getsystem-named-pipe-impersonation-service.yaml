@@ -1,0 +1,265 @@
+# Converted from THORCollective/HEARTH Flames/H106.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h106-getsystem-named-pipe-impersonation-service-t1134-001
+version: 1.0.0
+
+info:
+  name: GetSystem named-pipe impersonation through a short-lived service
+  description: >-
+    Meterpreter's getsystem and the Cobalt Strike command of the same name turn a local
+    administrator into SYSTEM by creating a named pipe, registering a service whose
+    command writes to that pipe, and impersonating the service when it connects. Pipe
+    creation, the impersonation API calls and the service-install event are not collected
+    here. The service's command is: the Service Control Manager starts cmd.exe with 'echo
+    <random> > \\.\pipe\<random>', or rundll32 with a dropped DLL and a /p: argument, and
+    that process is recorded like any other. The hunt returns those commands. Escalation
+    that duplicates a token without starting a process, and the potato family of exploits,
+    leave nothing in this telemetry.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - privilege-escalation
+    - getsystem
+    - named-pipe-impersonation
+    - meterpreter
+    - cobalt-strike
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H106.md
+    - https://attack.mitre.org/techniques/T1134
+    - https://attack.mitre.org/techniques/T1134/001
+    - https://attack.mitre.org/detectionstrategies/DET0482
+
+mitre:
+  tactics:
+    - TA0004
+    - TA0005
+  techniques:
+    - T1134
+  sub_techniques:
+    - T1134.001
+  detection_strategies:
+    - DET0482
+  analytics:
+    - AN1324
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary is using named pipe impersonation or token manipulation techniques such
+    as Meterpreter's GetSystem command to escalate privileges from a local administrator
+    context to NT AUTHORITY\SYSTEM on a compromised Windows host.
+  attacker_behavior:
+    - Creates a named pipe with a random name from an elevated process.
+    - Registers a service with a random name whose command echoes a string into the pipe.
+    - Starts the service, impersonates the SYSTEM client that connects, and deletes the service.
+    - Uses a dropped DLL run by rundll32 as the pipe client when the echo form is blocked.
+    - Continues as SYSTEM to dump credentials or tamper with security tools.
+  legitimate_behavior:
+    - Almost no software redirects a cmd.exe echo into a named pipe.
+    - A few installers and test harnesses signal a helper through a pipe from a script.
+    - Red-team exercises run the same frameworks on agreed hosts.
+  risk_indicator:
+    - cmd.exe started by services.exe echoes a short random string into a pipe.
+    - The pipe name and the echoed string are the same random letters.
+    - "rundll32 started by services.exe loads a DLL from a temporary path with a /p: argument."
+    - A process owned by the same parent as the pipe creator starts running as SYSTEM straight after.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: cmd-echo-into-named-pipe
+        name: cmd.exe echoing into a named pipe
+        purpose: >-
+          Return cmd.exe commands that redirect an echo into \\.\pipe\, whatever started
+          them. When the parent is services.exe this is the service the GetSystem pipe
+          technique registers; the parent is on each event. The service itself lives for
+          milliseconds and its creation is not seen when it is registered through the
+          service API.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^cmd\.exe$/i
+          | CommandLine=/echo\s+\S+\s*>\s*\\\\\.\\pipe\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: service-started-rundll32-with-pipe-argument
+        name: rundll32 started by the Service Control Manager with a pipe argument
+        purpose: >-
+          Return rundll32 started by services.exe with an export named a and a /p:
+          argument, the DLL form of the same technique. Windows services hosted in
+          rundll32 do not use that argument.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^rundll32\.exe$/i
+          | ParentBaseFileName=/^services\.exe$/i
+          | CommandLine=/,a\s+\/p:/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: service-created-with-pipe-command
+        name: Service created from a command line that writes to a pipe
+        purpose: >-
+          Return sc.exe, PowerShell and cmd.exe commands that create or reconfigure a
+          service whose command names \\.\pipe\, the manual form of the technique. A
+          framework that registers the service through API calls is seen only in the first
+          two cases.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(sc|powershell|pwsh|cmd)\.exe$/i
+          | CommandLine=/\\\\\.\\pipe\\/i
+          | CommandLine=/\b(create|config)\b|New-Service|binpath/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: pipe_write_command
+      name: Command that connects to a named pipe on behalf of a service
+      description: >-
+        A cmd.exe echo redirected into \\.\pipe\, a rundll32 pipe-client DLL, or a service
+        definition holding either.
+      source: process_creation
+      field: command_line
+      indicates: named_pipe_impersonation_setup
+
+  supporting:
+    - id: started_by_service_control_manager
+      name: Process was started by services.exe
+      description: >-
+        The parent of the pipe-writing process is services.exe, so it ran as a service.
+      source: process_creation
+      field: parent_process
+      indicates: service_used_as_pipe_client
+    - id: ran_as_system
+      name: Pipe client ran as SYSTEM
+      description: >-
+        The user on the event is SYSTEM, the identity the technique impersonates.
+      source: process_creation
+      field: user
+      indicates: system_token_offered_to_pipe
+    - id: random_matching_names
+      name: Echoed string and pipe name are the same random letters
+      description: >-
+        The string echoed and the pipe name are identical short random strings, the form
+        the frameworks generate. The agent reads this from the command line.
+      source: process_creation
+      field: command_line
+      indicates: framework_generated_names
+    - id: followed_by_system_activity
+      name: Credential or security-tool activity follows on the host
+      description: >-
+        Other returned or correlated events show SYSTEM-level commands on the same host
+        within minutes, which the agent derives.
+      source: process_creation
+      field: process_id
+      indicates: escalation_put_to_use
+
+  contradicting:
+    - id: authorised_security_test
+      name: Host is in scope of an authorised test
+      description: >-
+        Change records show a red-team or penetration test using these frameworks on the
+        host at the time.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_testing
+    - id: known_product_pipe_helper
+      name: Command belongs to an installed product
+      description: >-
+        Earlier activity shows the same command, with a fixed pipe name, from an installed
+        product on this host.
+      source: baseline
+      field: CommandLine
+      indicates: established_application_behaviour
+
+  risk_logic:
+    required:
+      - pipe_write_command
+
+    supporting:
+      any:
+        - started_by_service_control_manager
+        - ran_as_system
+        - random_matching_names
+        - followed_by_system_activity
+      all:
+        - started_by_service_control_manager
+        - random_matching_names
+
+    contradicting:
+      any:
+        - authorised_security_test
+        - known_product_pipe_helper
+      all: []
+
+  verdict:
+    low_risk_when:
+      - pipe_write_command
+      - known_product_pipe_helper
+    suspicious_when:
+      - pipe_write_command
+      - random_matching_names
+    high_risk_when:
+      - pipe_write_command
+      - started_by_service_control_manager
+      - random_matching_names
+
+  false_positive:
+    - condition: Authorised red-team activity.
+      explanation: >-
+        The frameworks that do this are the ones testers use. Scope and timing are in the
+        engagement record.
+    - condition: Scripts that signal a helper through a pipe.
+      explanation: >-
+        Rare, but some test harnesses write to a fixed, descriptive pipe name from a batch
+        file. The name is not random and the parent is not services.exe.

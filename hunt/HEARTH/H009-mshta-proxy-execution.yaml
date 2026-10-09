@@ -1,0 +1,293 @@
+# Converted from THORCollective/HEARTH Flames/H009.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h009-mshta-proxy-execution-t1218-005
+version: 1.0.0
+
+info:
+  name: Mshta executing HTA files or inline script
+  description: >-
+    mshta.exe runs Microsoft HTML Applications, stand-alone programs that use Internet
+    Explorer's script engines outside the browser and its security zones. It is signed by
+    Microsoft and present on every Windows host, and it will run an .hta from disk, an
+    .hta from a URL, or JavaScript and VBScript passed on the command line. The hunt
+    returns mshta runs that take a remote or inline script, mshta runs of HTA files in
+    writable locations, the processes mshta starts, and the external connections it
+    makes.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - stealth
+    - proxy-execution
+    - mshta
+    - lolbin
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H009.md
+    - https://attack.mitre.org/techniques/T1218
+    - https://attack.mitre.org/techniques/T1218/005
+    - https://attack.mitre.org/detectionstrategies/DET0506
+    - https://redcanary.com/threat-detection-report/techniques/mshta/
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1218
+  sub_techniques:
+    - T1218.005
+  detection_strategies:
+    - DET0506
+  analytics:
+    - AN1397
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    Attackers may exploit mshta.exe, a trusted Windows utility, to execute malicious .hta
+    files as well as JavaScript or VBScript indirectly, using its signed status to run
+    code outside the browser's controls and evade detection.
+  attacker_behavior:
+    - Passes a URL to mshta.exe so the HTA is fetched and run without touching disk first.
+    - Supplies javascript or vbscript inline on the command line to bootstrap a second stage.
+    - Delivers an .hta attachment or download that the user opens from Downloads or Temp.
+    - Has mshta spawn PowerShell, cmd or another proxy binary to continue the chain.
+    - Renames mshta.exe or launches it from an Office or browser parent.
+  legitimate_behavior:
+    - A few legacy line-of-business and vendor support tools are packaged as HTA files.
+    - Old installers and device utilities use mshta for a setup dialog.
+    - Internal help-desk tools written as HTAs run from a fixed share or install path.
+  risk_indicator:
+    - The command line holds an http or https URL, or a javascript or vbscript scheme.
+    - The HTA path is under a user profile, a temporary directory or an archive extraction folder.
+    - mshta is the parent of an interpreter or of another proxy-execution binary.
+    - mshta connects to an external address.
+    - The parent is an Office application, a mail client, a browser or a script host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: mshta-remote-or-inline-script
+        name: mshta given a URL or an inline script
+        purpose: >-
+          Return mshta runs whose argument is a remote location or script text, the two
+          forms that need no HTA file on disk.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^mshta\.exe$/i
+          | CommandLine=/https?:\/\/|\\\\[^\s"\\]+\\|(javascript|vbscript|about)\s*:|GetObject\s*\(|script(let)?\s*:/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: mshta-hta-from-writable-path
+        name: mshta running an HTA from a user-writable location
+        purpose: >-
+          Return mshta runs of files under user profiles, temporary and public
+          directories, where delivered HTAs land and installed ones do not.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^mshta\.exe$/i
+          | CommandLine=/\\(Users\\[^\\]+\\(Downloads|Desktop|Documents|AppData)|Users\\Public|Windows\\Temp|ProgramData|Temp)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: mshta-spawned-process
+        name: Interpreter or proxy binary spawned by mshta
+        purpose: >-
+          Return what mshta started, which shows the script's next step and survives any
+          obfuscation of the mshta command line itself.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^mshta\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh|wscript|cscript|rundll32|regsvr32|certutil|bitsadmin|curl|schtasks|msiexec|wmic)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: mshta-external-connection
+        name: mshta connecting to an external address
+        purpose: >-
+          Return outbound connections made by mshta to public addresses, confirming a
+          remote HTA or a second stage was actually requested.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | ContextBaseFileName=/^mshta\.exe$/i
+          | !cidr(RemoteAddressIP4, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: mshta_execution
+      name: mshta.exe executed script content
+      description: >-
+        A process event shows mshta.exe run with a URL, an inline script scheme or an
+        HTA file path, or shows mshta as the parent of another process.
+      source: process_creation
+      field: command_line
+      indicates: proxy_execution_through_mshta
+
+  supporting:
+    - id: mshta_child_interpreter
+      name: mshta spawned an interpreter or proxy binary
+      description: >-
+        A process whose parent is mshta.exe is a shell, script host, download utility or
+        another signed proxy-execution binary.
+      source: process_creation
+      field: parent_process
+      indicates: staged_execution_chain
+    - id: mshta_external_address
+      name: mshta reached a public address
+      description: >-
+        A network connection attributed to mshta.exe goes to an address outside the
+        private ranges.
+      source: network_connection
+      field: remote_address
+      indicates: remote_payload_retrieval
+    - id: mshta_network_process
+      name: Connection attributed to the mshta process
+      description: >-
+        The connecting process name is mshta.exe and its process id matches the process
+        event, tying the connection to the specific invocation.
+      source: network_connection
+      field: process_name
+      indicates: script_initiated_network_activity
+    - id: delivery_user_context
+      name: Run by an ordinary user after opening content
+      description: >-
+        The user is a standard interactive account and the parent is a mail client,
+        browser, archive utility or Office application.
+      source: process_creation
+      field: user
+      indicates: user_triggered_delivery
+
+  contradicting:
+    - id: known_hta_application
+      name: HTA is an inventoried internal or vendor application
+      description: >-
+        The HTA path and host match a line-of-business or vendor tool recorded in the
+        software inventory.
+      source: asset_inventory
+      field: ComputerName
+      indicates: sanctioned_legacy_application
+    - id: hta_seen_fleet_wide
+      name: Same HTA runs routinely across many hosts
+      description: >-
+        Earlier activity shows the identical command line on many hosts over a long
+        period, as an installed tool would produce.
+      source: baseline
+      field: CommandLine
+      indicates: established_software_behaviour
+
+  risk_logic:
+    required:
+      - mshta_execution
+
+    supporting:
+      any:
+        - mshta_child_interpreter
+        - mshta_external_address
+        - mshta_network_process
+        - delivery_user_context
+      all:
+        - mshta_child_interpreter
+        - mshta_external_address
+
+    contradicting:
+      any:
+        - known_hta_application
+        - hta_seen_fleet_wide
+      all: []
+
+  verdict:
+    low_risk_when:
+      - mshta_execution
+      - known_hta_application
+      - hta_seen_fleet_wide
+    suspicious_when:
+      - mshta_execution
+      - delivery_user_context
+    high_risk_when:
+      - mshta_execution
+      - delivery_user_context
+      - mshta_child_interpreter
+      - mshta_external_address
+
+  false_positive:
+    - condition: A legacy internal tool is written as an HTA.
+      explanation: >-
+        Help-desk and line-of-business HTAs still exist. They run from a fixed share or
+        install path with a stable command line on many hosts, and do not spawn shells or
+        reach public addresses.
+    - condition: An old installer or device utility uses mshta for its dialog.
+      explanation: >-
+        The parent is the vendor's setup program and the script is a short inline dialog
+        call. It appears only around installation.
+    - condition: mshta contacts Microsoft or a proxy during normal rendering.
+      explanation: >-
+        An HTA that loads web content makes connections of its own. One connection from a
+        known application is not retrieval of a payload; an unknown HTA followed by a
+        child interpreter is.

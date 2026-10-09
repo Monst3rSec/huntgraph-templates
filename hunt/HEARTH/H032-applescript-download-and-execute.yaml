@@ -1,0 +1,283 @@
+# Converted from THORCollective/HEARTH Flames/H032.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-mac-hearth-h032-applescript-download-and-execute-t1059-002
+version: 1.0.0
+
+info:
+  name: AppleScript downloading and executing a payload
+  description: >-
+    AppleScript can run any shell command through do shell script, so a few lines are
+    enough to fetch a payload with curl and start it. In the BlueNoroff intrusion the
+    script first calls a genuine Zoom address, so the earliest traffic is to a trusted
+    domain, and only then pulls the payload from the attacker's server. A network control
+    that judges by destination reputation sees nothing wrong. The process record is not
+    fooled: osascript carrying a download command, or osascript as the parent of curl
+    writing an executable, is the same whatever domain is involved.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - execution
+    - applescript
+    - ingress-tool-transfer
+    - bluenoroff
+    - macos
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H032.md
+    - https://attack.mitre.org/techniques/T1059
+    - https://attack.mitre.org/techniques/T1059/002
+    - https://attack.mitre.org/detectionstrategies/DET0414
+    - https://www.huntress.com/blog/inside-bluenoroff-web3-intrusion-analysis
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1059
+  sub_techniques:
+    - T1059.002
+  detection_strategies:
+    - DET0414
+  analytics:
+    - AN1164
+  platforms:
+    - macOS
+  data_sources:
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    Threat actors are using AppleScript to download and execute malicious payloads,
+    bypassing network detections by using legitimate websites like Zoom as command and
+    control infrastructure.
+  attacker_behavior:
+    - Runs osascript with an inline do shell script that calls curl against a remote URL.
+    - Contacts a trusted domain first so the script's opening traffic looks routine.
+    - Writes the downloaded file to /tmp, /Users/Shared or a hidden directory and marks it executable.
+    - Pipes the download straight into a shell or interpreter without writing a file.
+    - Runs the script with administrator privileges after prompting for the password.
+  legitimate_behavior:
+    - Management agents use osascript with do shell script for maintenance tasks.
+    - Users automate downloads of their own files with AppleScript.
+    - Installers call osascript to request elevation for a setup step.
+  risk_indicator:
+    - An osascript command line combines do shell script with curl or a pipe to a shell.
+    - curl started by an AppleScript host writes into a temporary, shared or hidden directory.
+    - The downloaded file is made executable or run in the same command.
+    - The script asks for administrator privileges.
+    - A trusted conferencing domain appears in the same command as an unrelated host.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: osascript-inline-shell-download
+        name: osascript running an inline shell download
+        purpose: >-
+          Return osascript invocations whose own command line holds do shell script
+          together with a download tool or a URL. The image name is an exact match and
+          runs first.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=osascript
+          | CommandLine=/do shell script/i
+          | CommandLine=/\b(curl|wget|nscurl)\b|https?:\/\//i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: applescript-host-curl-to-scratch-path
+        name: curl started by an AppleScript host writing to a scratch path
+        purpose: >-
+          Return curl runs whose parent is an AppleScript host and whose output goes to a
+          temporary, shared or hidden location, the download half of the chain.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=/^(curl|wget|nscurl)$/
+          | ParentBaseFileName=/^(osascript|Script Editor|applet|sh|bash|zsh)$/
+          | CommandLine=/\s(-o|-O|--output)\s*\S*(\/tmp\/|\/var\/folders\/|\/Users\/Shared\/|\/\.[^\/\s]+)/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: osascript-download-piped-to-interpreter
+        name: AppleScript chain piping a download into an interpreter
+        purpose: >-
+          Return shells started by an AppleScript host whose command pipes fetched
+          content into a shell, osascript or another interpreter, the fileless variant.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | ParentBaseFileName=/^(osascript|Script Editor|applet)$/
+          | CommandLine=/(curl|wget)\s[^|;]*\|\s*(ba|z)?sh\b|(curl|wget)\s[^|;]*\|\s*(osascript|python3?|perl|ruby)\b|chmod\s+\+x\s+\S+\s*(;|&&)/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: osascript-administrator-privileges
+        name: AppleScript shell command run with administrator privileges
+        purpose: >-
+          Return inline scripts that ask for elevation for a shell command, which is how
+          the downloaded payload is installed as root.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=osascript
+          | CommandLine=/with administrator privileges/i
+          | CommandLine=/do shell script/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: applescript_download_command
+      name: AppleScript issuing a download
+      description: >-
+        An osascript command line, or the command of a process started by an AppleScript
+        host, fetches remote content with curl or a similar tool.
+      source: process_creation
+      field: command_line
+      indicates: script_driven_payload_retrieval
+
+  supporting:
+    - id: payload_written_and_run
+      name: Download written to a scratch path or piped to an interpreter
+      description: >-
+        The command line writes the fetched file to a temporary, shared or hidden
+        directory, marks it executable, or pipes it into a shell.
+      source: process_creation
+      field: command_line
+      indicates: download_and_execute
+    - id: applescript_host_parent
+      name: Download tool parented by an AppleScript host
+      description: >-
+        The parent of curl or the shell is osascript, Script Editor or a compiled
+        applet, not a terminal or a package manager.
+      source: process_creation
+      field: parent_process
+      indicates: script_initiated_chain
+    - id: elevation_requested
+      name: Script requested administrator privileges
+      description: >-
+        The inline script runs its shell command with administrator privileges, after a
+        password prompt shown to the user.
+      source: process_creation
+      field: command_line
+      indicates: privilege_escalation_through_user_prompt
+    - id: ordinary_user_session
+      name: Run in an ordinary user's session
+      description: >-
+        The user is a standard account without an engineering or administration role.
+      source: process_creation
+      field: user
+      indicates: activity_outside_user_role
+
+  contradicting:
+    - id: management_agent_script
+      name: Script belongs to the management agent
+      description: >-
+        The parent chain leads to the host's device-management agent, which is recorded
+        as running AppleScript maintenance tasks.
+      source: asset_inventory
+      field: ComputerName
+      indicates: managed_tooling_activity
+    - id: recurring_user_automation
+      name: Same script runs regularly on this host
+      description: >-
+        Earlier activity shows the identical osascript command line on this host over a
+        long period.
+      source: baseline
+      field: CommandLine
+      indicates: established_user_automation
+
+  risk_logic:
+    required:
+      - applescript_download_command
+
+    supporting:
+      any:
+        - payload_written_and_run
+        - applescript_host_parent
+        - elevation_requested
+        - ordinary_user_session
+      all:
+        - payload_written_and_run
+        - applescript_host_parent
+
+    contradicting:
+      any:
+        - management_agent_script
+        - recurring_user_automation
+      all: []
+
+  verdict:
+    low_risk_when:
+      - applescript_download_command
+      - management_agent_script
+      - recurring_user_automation
+    suspicious_when:
+      - applescript_download_command
+      - applescript_host_parent
+    high_risk_when:
+      - applescript_download_command
+      - applescript_host_parent
+      - payload_written_and_run
+      - elevation_requested
+
+  false_positive:
+    - condition: Device-management tools run AppleScript maintenance.
+      explanation: >-
+        Agents wrap shell commands in osascript, sometimes with a download. The parent
+        chain is the agent, the URL is the organisation's or the vendor's, and it repeats
+        across the fleet.
+    - condition: Installers ask for elevation through osascript.
+      explanation: >-
+        Setup scripts use with administrator privileges for a copy or permission change.
+        The parent is the installer and no remote fetch is involved.
+    - condition: A user's own automation downloads files.
+      explanation: >-
+        Personal scripts fetch reports or media on a schedule. They save to the user's
+        folders, not scratch paths, and do not execute what they fetch.

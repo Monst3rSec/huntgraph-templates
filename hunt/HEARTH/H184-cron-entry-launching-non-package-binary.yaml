@@ -1,0 +1,273 @@
+# Converted from THORCollective/HEARTH Flames/H184.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-lin-hearth-h184-cron-entry-launching-non-package-binary-t1053-003
+version: 1.0.0
+
+info:
+  name: Cron entry added or changed to launch a binary from outside the package tree
+  description: >-
+    VerdantBamboo keeps BRICKSTORM and AGENTPSD on edge appliances through cron
+    (Volexity, June 2026): a line in /etc/crontab that starts a disguised host monitor
+    once a month, a file in /etc/cron.d that runs a staging script and is removed
+    afterwards, and on a pfSense firewall an edited /etc/rc.d/cron. Most of the devices
+    named carry no sensor, the BSD ones cannot, and this connector does not ingest their
+    logs; there the hunt does not apply. It applies where the same tradecraft lands on a
+    Linux storage or application server that does carry one. The sensor does not report
+    writes to cron files as file events, so the hunt reads the commands that write and
+    remove them and what cron then starts.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - persistence
+    - cron
+    - brickstorm
+    - agentpsd
+    - verdantbamboo
+    - edge-appliance
+    - linux
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H184.md
+    - https://attack.mitre.org/techniques/T1053
+    - https://attack.mitre.org/techniques/T1053/003
+    - https://attack.mitre.org/detectionstrategies/DET0290
+
+mitre:
+  tactics:
+    - TA0002
+    - TA0003
+    - TA0004
+  techniques:
+    - T1053
+  sub_techniques:
+    - T1053.003
+  detection_strategies:
+    - DET0290
+  analytics:
+    - AN0805
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    Adversaries (VerdantBamboo) persist on edge and network appliances by adding or
+    modifying cron entries (/etc/crontab, /etc/cron.d/*) to launch BRICKSTORM or
+    AGENTPSD; hunt cron file creation and modification and cron-spawned execs from
+    non-package binary paths on appliances.
+  attacker_behavior:
+    - Appends a line to /etc/crontab through a misconfigured sudo tee.
+    - Creates a file in /etc/cron.d that runs a script from a service account's home directory.
+    - Removes the cron.d file once the job has run.
+    - Names the backdoor after the appliance vendor's own monitoring client.
+    - Edits an rc script so the backdoor starts at boot.
+  legitimate_behavior:
+    - Package managers and configuration management install cron files.
+    - Administrators add maintenance jobs with crontab or by editing /etc/cron.d.
+    - Vendor agents run jobs from /opt and /usr/local.
+  risk_indicator:
+    - A cron file is written by tee, a redirect or cp from a shell, not by a package manager.
+    - The job's command is under /home, /tmp, /dev/shm or an unfamiliar /usr/local directory.
+    - The cron file is removed within minutes of being written.
+    - The writing shell belongs to a service account.
+    - The host is a storage or network appliance whose crontab is otherwise static.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: cron-file-written-by-command
+        name: Command writing to a cron or rc file
+        purpose: >-
+          Return redirects, tee, sed -i, copy, move and install commands whose target is
+          /etc/crontab, a cron directory, a user spool or /etc/rc.d. An edit made in an
+          editor shows only the editor starting, with no content, and a write made by a
+          program directly is not seen.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | CommandLine=/(>>?\s*|\btee\b(\s+-a)?\s+|\bsed\b[^|;&]*\s-i\S*\s[^|;&]*|\b(cp|mv|install|ln|dd)\b[^|;&]*\s)\/(etc\/crontab|etc\/cron\.(d|daily|hourly|weekly|monthly)\/|var\/spool\/cron\/|etc\/rc\.d\/)/
+          | ParentBaseFileName!=/^(dpkg|rpm|yum|dnf|apt|apt-get|zypper)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: cron-file-removed-by-command
+        name: Command removing a file from a cron directory
+        purpose: >-
+          Return rm, unlink and shred against a cron directory or spool. The agent pairs
+          a removal with a write of the same path from the first case; a short gap
+          between the two is the create-then-delete pattern the report describes.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ImageFileName=/\/(rm|unlink|shred)$/
+          | CommandLine=/\/etc\/cron\.(d|daily|hourly|weekly|monthly)\/\S+|\/var\/spool\/cron\/\S+/
+          | ParentBaseFileName!=/^(dpkg|rpm|yum|dnf|apt|apt-get|zypper)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: cron-job-running-from-non-package-path
+        name: Cron starting a command from a home, temporary or local directory
+        purpose: >-
+          Return what cron starts when the command sits under /home, /root, /tmp,
+          /var/tmp, /dev/shm, /usr/local or /opt. A backdoor placed in /usr/sbin under a
+          plausible name, as on the pfSense device, cannot be told from a packaged
+          binary by path and is not matched.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ParentBaseFileName=/^(cron|crond|anacron)$/
+          | CommandLine=/(^|[\s"'=])\/(home|root|tmp|var\/tmp|dev\/shm|usr\/local|opt)\/\S+/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: cron_entry_changed_by_command
+      name: Cron or rc file written from a shell
+      description: >-
+        A command writes to /etc/crontab, a cron directory, a user spool or an rc
+        script, and its parent is not a package manager.
+      source: process_creation
+      field: command_line
+      indicates: cron_persistence_installed
+
+  supporting:
+    - id: job_runs_non_package_binary
+      name: Cron starts a binary outside the package tree
+      description: >-
+        A child of cron runs a command under a home, temporary or local directory.
+      source: process_creation
+      field: parent_process
+      indicates: scheduled_backdoor_execution
+    - id: entry_removed_after_run
+      name: Cron file removed shortly after it was written
+      description: >-
+        A removal of the same path follows the write within minutes, which the agent
+        derives by pairing the returned events.
+      source: process_creation
+      field: image_path
+      indicates: anti_forensic_cleanup
+    - id: written_by_service_account
+      name: Writer is a service account
+      description: >-
+        The user on the writing command is an application or appliance service account.
+      source: process_creation
+      field: user
+      indicates: compromised_service_account
+    - id: write_through_sudo_tee
+      name: Write goes through sudo and tee
+      description: >-
+        The writing process is tee whose parent is sudo, the privilege path the report
+        describes, which the agent reads from the parent on the event.
+      source: process_creation
+      field: parent_process_id
+      indicates: sudo_misconfiguration_abuse
+
+  contradicting:
+    - id: configuration_management_job
+      name: Cron file matches configuration management
+      description: >-
+        The file and its content are what Ansible, Chef or Puppet is recorded to deploy
+        on this host.
+      source: change_management
+      field: ComputerName
+      indicates: managed_scheduled_job
+    - id: vendor_agent_job
+      name: Job belongs to an installed vendor agent
+      description: >-
+        The command path belongs to a product installed on the host and listed in
+        inventory.
+      source: asset_inventory
+      field: ComputerName
+      indicates: vendor_maintenance_job
+
+  risk_logic:
+    required:
+      - cron_entry_changed_by_command
+
+    supporting:
+      any:
+        - job_runs_non_package_binary
+        - entry_removed_after_run
+        - written_by_service_account
+        - write_through_sudo_tee
+      all:
+        - job_runs_non_package_binary
+        - written_by_service_account
+
+    contradicting:
+      any:
+        - configuration_management_job
+        - vendor_agent_job
+      all: []
+
+  verdict:
+    low_risk_when:
+      - cron_entry_changed_by_command
+      - configuration_management_job
+      - vendor_agent_job
+    suspicious_when:
+      - cron_entry_changed_by_command
+      - job_runs_non_package_binary
+    high_risk_when:
+      - cron_entry_changed_by_command
+      - job_runs_non_package_binary
+      - written_by_service_account
+      - entry_removed_after_run
+
+  false_positive:
+    - condition: Administrators add cron jobs.
+      explanation: >-
+        They do, with crontab -e or a file in cron.d, under their own account and with a
+        change record.
+    - condition: Vendor agents run from /opt and /usr/local.
+      explanation: >-
+        Monitoring and backup agents schedule themselves there. The path belongs to an
+        installed product.
+    - condition: Installers clean up their own cron files.
+      explanation: >-
+        An uninstall removes its cron.d file. The parent is the package manager or the
+        vendor's script.

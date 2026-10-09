@@ -1,0 +1,345 @@
+# Converted from THORCollective/HEARTH Flames/H117.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h117-files-gathered-into-local-staging-directory-t1074-001
+version: 1.0.0
+
+info:
+  name: Files gathered into a local staging directory before archiving
+  description: >-
+    Before data leaves a host it is usually pulled together in one place. In the
+    Bumblebee-to-Akira intrusion reconnaissance output and collected files were put
+    under ProgramData and then sent out with FileZilla over SFTP. ProgramData,
+    Windows\Temp, PerfLogs, the Recycle Bin folder and the Public profile are favoured
+    because any account can write there and few people look. The sensor does not report
+    documents being written, so a process that gathers files in its own code is not seen
+    doing it. What is seen is the copy issued as a command, the archiver run against the
+    staging path, and the archive file written there. HEARTH's count of files from
+    disparate sources is left to the agent, which reads source paths off the returned
+    commands.
+  severity: medium
+  author: huntgraph
+  tags:
+    - hearth
+    - collection
+    - data-staging
+    - exfiltration-prep
+    - archive
+    - akira
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H117.md
+    - https://attack.mitre.org/techniques/T1074
+    - https://attack.mitre.org/techniques/T1074/001
+    - https://attack.mitre.org/detectionstrategies/DET0261
+    - https://thedfirreport.com/2025/11/04/from-bing-search-to-ransomware-bumblebee-and-adaptixc2-deliver-akira-2/
+
+mitre:
+  tactics:
+    - TA0009
+  techniques:
+    - T1074
+  sub_techniques:
+    - T1074.001
+  detection_strategies:
+    - DET0261
+  analytics:
+    - AN0724
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary is aggregating collected data into a central staging directory on a
+    compromised host, such as ProgramData, Temp, or Recycle Bin, before compressing and
+    exfiltrating it, indicated by a process writing numerous files from disparate source
+    locations into a single directory.
+  attacker_behavior:
+    - Copies documents from user profiles and mapped shares into one folder under ProgramData or Temp.
+    - Selects by extension, taking office documents, mail stores, databases and spreadsheets.
+    - Runs 7-Zip or WinRAR against the folder, often with a password.
+    - Writes the archive into the same folder and deletes the loose copies.
+    - Starts a transfer tool against the archive soon afterwards.
+  legitimate_behavior:
+    - Installers unpack into ProgramData and Temp and copy files from there.
+    - Backup and migration scripts copy user data with robocopy.
+    - Support staff collect logs into a Temp folder and zip them for a vendor.
+  risk_indicator:
+    - The destination is a staging directory and the sources are user documents or shares.
+    - The command selects document, mail or database extensions.
+    - An archive is written in the staging directory by a process that does not normally archive.
+    - The copy and the archive share a parent shell that a remote tool started.
+    - Several unrelated source directories feed one destination within a short time.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ZipFileWritten
+        - SevenZipFileWritten
+        - RarFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: copy-command-into-staging-directory
+        name: Copy command whose arguments name a staging directory
+        purpose: >-
+          Return copy and move commands that name ProgramData, Windows\Temp, PerfLogs,
+          the Recycle Bin folder or the Public profile. Source and destination are both
+          on the command line; the agent groups by destination and counts distinct
+          sources. A per-user Temp folder is left out because installers fill it
+          constantly.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(xcopy|robocopy|cmd|powershell|pwsh)\.exe$/i
+          | CommandLine=/\\(ProgramData|Windows\\Temp|PerfLogs|\$Recycle\.Bin|Users\\Public)\\/i
+          | CommandLine=/\b(copy|xcopy|robocopy|move|Copy-Item|Move-Item|cpi|cp|mv)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: collection-by-sensitive-extension
+        name: Copy or search command selecting document, mail or database extensions
+        purpose: >-
+          Return commands that select files by the extensions collected before
+          exfiltration, whatever the destination.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(xcopy|robocopy|cmd|powershell|pwsh|forfiles|where)\.exe$/i
+          | CommandLine=/\*\.(docx?|xlsx?|pptx?|pdf|pst|ost|csv|sql|mdb|accdb|bak|kdbx)\b/i
+          | CommandLine=/\b(copy|xcopy|robocopy|move|Copy-Item|Move-Item|Get-ChildItem|gci|dir|forfiles|where)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: archiver-run-against-staging-directory
+        name: Archiver run with a staging directory in its arguments
+        purpose: >-
+          Return 7-Zip, WinRAR and tar runs that read from or write to a staging
+          directory. A renamed archiver is missed here and caught by the archive-written
+          cases.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(7z|7za|7zr|7zg|rar|winrar|tar|zip)\.exe$/i
+          | CommandLine=/\\(ProgramData|Windows\\Temp|PerfLogs|\$Recycle\.Bin|Users\\Public)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: zip-written-in-staging-directory
+        name: ZIP archive written in a staging directory
+        purpose: >-
+          Return ZIP files created under a staging directory, with the writing process
+          id. Product folders under ProgramData that write archives routinely are
+          excluded.
+        query: |
+          #event_simpleName=ZipFileWritten
+          | TargetFileName=/\\(ProgramData|Windows\\Temp|PerfLogs|\$Recycle\.Bin|Users\\Public)\\/i
+          | TargetFileName!=/\\ProgramData\\(Microsoft|Package Cache|chocolatey|Packages|USOShared|NVIDIA[^\\]*|Adobe|Dell|Lenovo|HP)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: sevenzip-written-in-staging-directory
+        name: 7-Zip archive written in a staging directory
+        purpose: >-
+          Return 7z files created under a staging directory, with the writing process
+          id.
+        query: |
+          #event_simpleName=SevenZipFileWritten
+          | TargetFileName=/\\(ProgramData|Windows\\Temp|PerfLogs|\$Recycle\.Bin|Users\\Public)\\/i
+          | TargetFileName!=/\\ProgramData\\(Microsoft|Package Cache|chocolatey|Packages)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: rar-written-in-staging-directory
+        name: RAR archive written in a staging directory
+        purpose: >-
+          Return RAR files created under a staging directory, with the writing process
+          id.
+        query: |
+          #event_simpleName=RarFileWritten
+          | TargetFileName=/\\(ProgramData|Windows\\Temp|PerfLogs|\$Recycle\.Bin|Users\\Public)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: staging_directory_collection_command
+      name: Copy or archive command aimed at a staging directory
+      description: >-
+        A copy, move or archiver command names a staging directory, or selects files by
+        document, mail or database extension.
+      source: process_creation
+      field: command_line
+      indicates: local_data_staging
+
+  supporting:
+    - id: archive_written_in_staging_directory
+      name: Archive created in the staging directory
+      description: >-
+        A ZIP, 7z or RAR file was written under ProgramData, Windows\Temp, PerfLogs, the
+        Recycle Bin folder or the Public profile.
+      source: file_creation
+      field: file_path
+      indicates: collection_packaged_for_transfer
+    - id: archive_writer_links_to_copy
+      name: Archive writer is the process that copied
+      description: >-
+        The writing process id on the archive event is the process, or a child of the
+        shell, that issued the copy. The agent matches the ids across the two event
+        types.
+      source: file_creation
+      field: writer_process_id
+      indicates: single_collection_chain
+    - id: many_sources_one_destination
+      name: Several source directories feed one destination
+      description: >-
+        Commands on one host name different source paths and the same destination within
+        a short period. The agent derives this from the returned command lines.
+      source: process_creation
+      field: command_line
+      indicates: aggregation_from_disparate_sources
+    - id: unexpected_parent
+      name: Issued by a shell that an unusual parent started
+      description: >-
+        The parent is a remote access tool, a script host or a process in a
+        user-writable path, not an installer or a management agent.
+      source: process_creation
+      field: parent_process
+      indicates: operator_driven_collection
+    - id: ordinary_user_account
+      name: Run under an ordinary user or a service account with no such duty
+      description: >-
+        The account does not run backup, migration or packaging jobs.
+      source: process_creation
+      field: user
+      indicates: activity_outside_user_role
+
+  contradicting:
+    - id: installer_or_updater_activity
+      name: Copy is part of a software installation
+      description: >-
+        The parent is an installer or updater and the files copied are the product's
+        own.
+      source: baseline
+      field: ParentBaseFileName
+      indicates: software_installation
+    - id: scheduled_backup_job
+      name: Host runs a known backup or migration job
+      description: >-
+        Asset records show a backup, profile migration or log collection job that issues
+        this command.
+      source: asset_inventory
+      field: ComputerName
+      indicates: routine_data_movement
+
+  risk_logic:
+    required:
+      - staging_directory_collection_command
+
+    supporting:
+      any:
+        - archive_written_in_staging_directory
+        - archive_writer_links_to_copy
+        - many_sources_one_destination
+        - unexpected_parent
+        - ordinary_user_account
+      all:
+        - archive_written_in_staging_directory
+        - many_sources_one_destination
+
+    contradicting:
+      any:
+        - installer_or_updater_activity
+        - scheduled_backup_job
+      all: []
+
+  verdict:
+    low_risk_when:
+      - staging_directory_collection_command
+      - installer_or_updater_activity
+    suspicious_when:
+      - staging_directory_collection_command
+      - many_sources_one_destination
+    high_risk_when:
+      - staging_directory_collection_command
+      - many_sources_one_destination
+      - archive_written_in_staging_directory
+      - unexpected_parent
+
+  false_positive:
+    - condition: Installers copying from ProgramData or Windows\Temp.
+      explanation: >-
+        Setup programs stage their payload there. The parent is the installer and the
+        files are binaries, not documents.
+    - condition: Support staff zipping logs for a vendor.
+      explanation: >-
+        The archive holds log files from one product folder and the account belongs to
+        IT.
+    - condition: Profile migration and backup scripts.
+      explanation: >-
+        Robocopy jobs copy whole profiles on a schedule. They repeat and write to a
+        backup share, not to a local staging folder.

@@ -1,0 +1,271 @@
+# Converted from THORCollective/HEARTH Flames/H010.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h010-network-share-data-collection-t1039
+version: 1.0.0
+
+info:
+  name: Network shares searched and harvested for files of interest
+  description: >-
+    File servers and host-shared directories hold the documents, exports and credentials
+    an adversary wants, and every authenticated user can list most of them. Collection
+    starts with finding the shares and continues with reading or copying what is on
+    them. Security event 5140 is not collected here; the hunt uses the SMB client events
+    the sensor reports on the accessing host, and the commands that enumerate shares and
+    copy from UNC paths.
+  severity: medium
+  author: huntgraph
+  tags:
+    - hearth
+    - collection
+    - network-share
+    - smb
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H010.md
+    - https://attack.mitre.org/techniques/T1039
+    - https://attack.mitre.org/detectionstrategies/DET0410
+    - https://research.splunk.com/endpoint/4dc3951f-b3f8-4f46-b412-76a483f72277/
+
+mitre:
+  tactics:
+    - TA0009
+  techniques:
+    - T1039
+  sub_techniques: []
+  detection_strategies:
+    - DET0410
+  analytics:
+    - AN1145
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+  data_components:
+    - Network Share Access
+
+hypothesis:
+  statement: >-
+    Adversaries may search for network shares on compromised systems to locate files of
+    interest, and gather sensitive data from shared network drives reachable from the
+    current system before exfiltrating it.
+  attacker_behavior:
+    - Lists shares on file servers and peers with net view, net share or PowerShell SMB cmdlets.
+    - Maps a discovered share with net use and walks its directories.
+    - Copies whole directory trees from a UNC path with robocopy, xcopy or Copy-Item.
+    - Opens files whose names suggest passwords, keys, configuration or backups.
+    - Stages the copied data locally in a temporary directory for archiving.
+  legitimate_behavior:
+    - Users open documents on departmental shares throughout the day.
+    - Logon scripts map drives with net use.
+    - Backup, synchronisation and migration jobs copy share contents with robocopy.
+  risk_indicator:
+    - Share enumeration is issued from a shell by an account that does not administer file servers.
+    - A recursive copy from a UNC path targets a local temporary or user-writable directory.
+    - Files with credential, key or backup names are opened on shares the user does not normally use.
+    - One account touches many different shares or servers in a short span.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: network_share_access
+      connector: crowdstrike-ngsiem
+      event_types:
+        - SmbFileOpen
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        share_name: ShareName
+        file_path: TargetFileName
+        remote_address: RemoteAddressIP4
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: share-enumeration-command
+        name: Command listing shares on a remote host
+        purpose: >-
+          Return net view against a named host, net share and the PowerShell SMB
+          enumeration cmdlets, the step that finds shares before any file is read.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(net1?|powershell|pwsh)\.exe$/i
+          | CommandLine=/\bview\s+(\/all\s+)?\\\\|\bview\s+\/all\b|\bshare\s*$|Get-SmbShare|Get-SmbMapping|Invoke-ShareFinder|Find-InterestingFile|Get-WmiObject\s+.*Win32_Share/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: bulk-copy-from-unc-path
+        name: Recursive copy from a UNC path
+        purpose: >-
+          Return copy utilities reading from a remote share with a recursion switch, the
+          command that turns browsing into collection.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(robocopy|xcopy|cmd|powershell|pwsh)\.exe$/i
+          | CommandLine=/\\\\[^\s"\\]+\\[^\s"\\]+/
+          | CommandLine=/\brobocopy\b.*\s\/(e|s|mir)\b|\bxcopy\b.*\s\/[a-z]*[es]\b|\bCopy-Item\b.*-Recurse|\bcopy\s+\/[yz]/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: sensitive-file-opened-on-share
+        name: File with a sensitive name opened over SMB
+        purpose: >-
+          Return SMB file opens whose name suggests credentials, keys, configuration or
+          backups. Matching on the name keeps the result small enough to return raw over
+          a long window, which every file open on every share would not be.
+        query: |
+          #event_simpleName=SmbFileOpen
+          | UserName!=/\$$/
+          | ShareName!=/^(SYSVOL|NETLOGON|IPC\$|print\$)$/i
+          | TargetFileName=/passw|credential|secret|\.kdbx?$|\.pfx$|\.p12$|\.pem$|\.ppk$|id_rsa|unattend\.xml|web\.config$|\.rdp$|\.ovpn$|\.bak$|\.vmdk$|ntds\.dit/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: share_discovery_or_copy_command
+      name: Command that enumerates or copies from network shares
+      description: >-
+        A process command line lists the shares of a remote host or recursively copies
+        from a UNC path.
+      source: process_creation
+      field: command_line
+      indicates: network_share_collection_candidate
+
+  supporting:
+    - id: sensitive_share_file
+      name: Sensitive-named file opened on a share
+      description: >-
+        An SMB file-open event names a file whose name indicates passwords, private
+        keys, configuration secrets or backups.
+      source: network_share_access
+      field: file_path
+      indicates: targeted_file_access
+    - id: share_breadth
+      name: Many shares touched by one account
+      description: >-
+        The returned SMB events for one account span several share names or servers,
+        which the agent derives by counting distinct shares per user.
+      source: network_share_access
+      field: share_name
+      indicates: share_sweeping
+    - id: non_file_admin_user
+      name: Account does not administer file servers
+      description: >-
+        The user issuing the enumeration or copy is a standard user or a service account
+        with no file-server role.
+      source: process_creation
+      field: user
+      indicates: activity_outside_user_role
+    - id: shell_or_script_parent
+      name: Copy or enumeration issued from a script or unexpected parent
+      description: >-
+        The parent is a script host, Office application or remote-management process,
+        not Explorer, a logon script or a scheduler.
+      source: process_creation
+      field: parent_process
+      indicates: abnormal_execution_chain
+
+  contradicting:
+    - id: scheduled_copy_job
+      name: Copy is a scheduled backup or migration job
+      description: >-
+        A change record or job definition covers the host, account, source share and
+        time of the recursive copy.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_data_movement
+    - id: routine_share_use
+      name: Account routinely uses these shares
+      description: >-
+        Earlier activity shows the same account opening files on the same shares as part
+        of its normal work.
+      source: baseline
+      field: UserName
+      indicates: expected_share_access
+
+  risk_logic:
+    required:
+      - share_discovery_or_copy_command
+
+    supporting:
+      any:
+        - sensitive_share_file
+        - share_breadth
+        - non_file_admin_user
+        - shell_or_script_parent
+      all:
+        - sensitive_share_file
+        - share_breadth
+
+    contradicting:
+      any:
+        - scheduled_copy_job
+        - routine_share_use
+      all: []
+
+  verdict:
+    low_risk_when:
+      - share_discovery_or_copy_command
+      - scheduled_copy_job
+      - routine_share_use
+    suspicious_when:
+      - share_discovery_or_copy_command
+      - non_file_admin_user
+    high_risk_when:
+      - share_discovery_or_copy_command
+      - non_file_admin_user
+      - sensitive_share_file
+      - share_breadth
+
+  false_positive:
+    - condition: Backup, synchronisation and migration jobs use robocopy.
+      explanation: >-
+        These are the heaviest users of recursive copies from UNC paths. They run under a
+        service account on a schedule, between the same source and destination each
+        time.
+    - condition: Logon scripts and administrators list and map shares.
+      explanation: >-
+        net use and net view at logon are fleet-wide and identical. Enumeration by an
+        ordinary user from an interactive shell, against servers they do not use, is not.
+    - condition: Staff open files with sensitive-sounding names as part of their job.
+      explanation: >-
+        Administrators open configuration and key files on shares they manage. The
+        account's role and its history on that share decide whether the access is
+        expected.

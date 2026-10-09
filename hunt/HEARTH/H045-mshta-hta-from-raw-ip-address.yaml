@@ -1,0 +1,294 @@
+# Converted from THORCollective/HEARTH Flames/H045.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h045-mshta-hta-from-raw-ip-address-t1218-005
+version: 1.0.0
+
+info:
+  name: mshta fetching an HTA from a hardcoded IP address
+  description: >-
+    The Silent Skimmer operators, after exploiting a web server, run mshta.exe against a
+    URL of the form http://IP/PORT.hta. The HTA holds a Base64-encoded PowerShell reverse
+    shell that connects back to the same address on the port named in the file. A URL
+    made of an IP literal and a numeric file name is not how any product ships an HTA.
+    H009 covers mshta abuse in general; this template is the narrow form: the IP-literal
+    URL, the encoded PowerShell child, and mshta running under a web or database server
+    process.
+  severity: critical
+  author: huntgraph
+  tags:
+    - hearth
+    - stealth
+    - execution
+    - mshta
+    - reverse-shell
+    - silent-skimmer
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H045.md
+    - https://attack.mitre.org/techniques/T1218
+    - https://attack.mitre.org/techniques/T1218/005
+    - https://attack.mitre.org/detectionstrategies/DET0506
+    - https://unit42.paloaltonetworks.com/silent-skimmer-latest-campaign/
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1218
+  sub_techniques:
+    - T1218.005
+  detection_strategies:
+    - DET0506
+  analytics:
+    - AN1397
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    Threat actors are using mshta.exe to download and execute HTA scripts from hardcoded
+    IP addresses, in the form http://IP/PORT.hta, which contain Base64-encoded PowerShell
+    reverse shell commands to establish persistent command-and-control connections.
+  attacker_behavior:
+    - Runs mshta.exe with an http URL whose host is an IP literal and whose file is a number with an .hta extension.
+    - Issues the command from a web server worker or database process after exploiting it.
+    - Has the HTA start PowerShell with an encoded command that opens a TCP client.
+    - Connects the shell back to the same IP address on the port named in the file.
+    - Repeats the command with different port numbers to open further sessions.
+  legitimate_behavior:
+    - Legacy internal HTA tools are opened from file shares or named intranet servers.
+    - Old installers call mshta with an inline script and no URL.
+    - Testing and red-team tools reproduce the pattern on designated hosts.
+  risk_indicator:
+    - The mshta URL host is a raw public IP address.
+    - The parent is w3wp, sqlservr, a Java or PHP worker, or cmd started by one.
+    - mshta is the parent of PowerShell with an encoded command.
+    - PowerShell or mshta connects to the same address on a high port.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: mshta-url-with-ip-literal
+        name: mshta given a URL whose host is an IP address
+        purpose: >-
+          Return mshta runs whose argument is an http or https URL with an IP literal as
+          host. The image name is an exact match and runs first.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^mshta\.exe$/i
+          | CommandLine=/https?:\/\/(\d{1,3}\.){3}\d{1,3}(:\d{1,5})?\//i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: mshta-under-server-process
+        name: mshta started from a web or database server process tree
+        purpose: >-
+          Return mshta runs whose parent is a server worker or a shell such workers
+          start, which is where post-exploitation commands come from.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^mshta\.exe$/i
+          | ParentBaseFileName=/^(w3wp|sqlservr|httpd|nginx|php-cgi|php|tomcat\d*|java|javaw|node|cmd|powershell|pwsh)\.exe$/i
+          | CommandLine=/https?:\/\//i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: mshta-spawned-encoded-powershell
+        name: Encoded PowerShell started by mshta
+        purpose: >-
+          Return PowerShell whose parent is mshta and whose command line is encoded or
+          builds a socket, the reverse shell the HTA carries.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^mshta\.exe$/i
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/\s-e(nc|ncodedcommand)?\s+[A-Za-z0-9+\/=]{40,}|FromBase64String|Net\.Sockets\.TCPClient|-w(in|indowstyle)?\s+h(id|idden)?\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: mshta-or-child-high-port-connection
+        name: mshta or PowerShell connecting to a public address on a high port
+        purpose: >-
+          Return connections from the two processes in the chain to public addresses on
+          ports above 1023 other than common web alternates, where the shell connects
+          back.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | ContextBaseFileName=/^(mshta|powershell|pwsh)\.exe$/i
+          | RemotePort>1023
+          | !in(field="RemotePort", values=[8080, 8443, 3128, 5985, 5986])
+          | !cidr(RemoteAddressIP4, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: mshta_ip_literal_url
+      name: mshta run against an IP-literal URL
+      description: >-
+        An mshta.exe command line holds an http or https URL whose host is an IP
+        address, or mshta is started from a server process with a remote URL.
+      source: process_creation
+      field: command_line
+      indicates: remote_hta_execution_from_raw_address
+
+  supporting:
+    - id: server_process_parent
+      name: Parent is a server worker process
+      description: >-
+        The parent of mshta is a web, application or database server process, or a shell
+        that such a process started.
+      source: process_creation
+      field: parent_process
+      indicates: post_exploitation_activity
+    - id: encoded_powershell_child
+      name: mshta started encoded PowerShell
+      description: >-
+        A PowerShell process with mshta as parent carries an encoded command or builds a
+        TCP client.
+      source: process_creation
+      field: command_line
+      indicates: reverse_shell_payload
+    - id: callback_high_port
+      name: Connection back on a high port
+      description: >-
+        mshta or PowerShell connects to a public address on a port above 1023.
+      source: network_connection
+      field: remote_port
+      indicates: reverse_shell_connection
+    - id: callback_same_address
+      name: Connection goes to the address in the URL
+      description: >-
+        The remote address of the connection is the IP address that appeared in the
+        mshta URL.
+      source: network_connection
+      field: remote_address
+      indicates: single_host_delivery_and_control
+
+  contradicting:
+    - id: sanctioned_test_host
+      name: Host is a designated testing endpoint
+      description: >-
+        Asset records list the host as a detection-validation, red-team or
+        malware-analysis system.
+      source: asset_inventory
+      field: ComputerName
+      indicates: authorised_security_testing
+    - id: approved_exercise_window
+      name: Run falls inside an approved exercise
+      description: >-
+        A recorded exercise covers the host and time and names this technique.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_security_testing
+
+  risk_logic:
+    required:
+      - mshta_ip_literal_url
+
+    supporting:
+      any:
+        - server_process_parent
+        - encoded_powershell_child
+        - callback_high_port
+        - callback_same_address
+      all:
+        - encoded_powershell_child
+        - callback_same_address
+
+    contradicting:
+      any:
+        - sanctioned_test_host
+        - approved_exercise_window
+      all: []
+
+  verdict:
+    low_risk_when:
+      - mshta_ip_literal_url
+      - sanctioned_test_host
+      - approved_exercise_window
+    suspicious_when:
+      - mshta_ip_literal_url
+      - server_process_parent
+    high_risk_when:
+      - mshta_ip_literal_url
+      - server_process_parent
+      - encoded_powershell_child
+      - callback_same_address
+
+  false_positive:
+    - condition: A red-team or validation tool runs the pattern.
+      explanation: >-
+        Remote HTA execution from an IP address is a stock test. It runs on designated
+        hosts inside recorded exercises.
+    - condition: An internal tool is served from an intranet IP address.
+      explanation: >-
+        Rare, but a legacy HTA can be linked by private address. The address is internal
+        and the same link is used across a department.
+    - condition: PowerShell connects out on a high port for another reason.
+      explanation: >-
+        The network case returns every such connection by PowerShell. It carries weight
+        only when the process is a child of mshta or the address matches the URL.

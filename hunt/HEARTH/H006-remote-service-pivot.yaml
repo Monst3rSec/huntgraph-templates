@@ -1,0 +1,334 @@
+# Converted from THORCollective/HEARTH Flames/H006.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-any-hearth-h006-remote-service-pivot-t1021-001
+version: 1.0.0
+
+info:
+  name: Pivot from a compromised host through RDP, SMB admin shares or SSH
+  description: >-
+    After the first host falls, an adversary moves to others through the remote access
+    features the estate already runs: Remote Desktop, SMB administrative shares, SSH and
+    WinRM. Each is ordinary administration, usually with valid credentials, so no single
+    event is malicious. HEARTH states the hypothesis for remote services as a whole; this
+    template keeps that scope and gives each protocol its own case, returning the logon,
+    the connection or the command so the agent can trace which account went from which
+    host to which.
+  severity: medium
+  author: huntgraph
+  tags:
+    - hearth
+    - lateral-movement
+    - rdp
+    - smb
+    - ssh
+    - remote-services
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H006.md
+    - https://attack.mitre.org/techniques/T1021
+    - https://attack.mitre.org/techniques/T1021/001
+    - https://attack.mitre.org/techniques/T1021/002
+    - https://attack.mitre.org/techniques/T1021/004
+    - https://attack.mitre.org/detectionstrategies/DET0327
+    - https://attack.mitre.org/detectionstrategies/DET0530
+    - https://attack.mitre.org/detectionstrategies/DET0596
+    - https://www.ultimatewindowssecurity.com/securitylog/encyclopedia/event.aspx?eventid=4624
+
+mitre:
+  tactics:
+    - TA0008
+  techniques:
+    - T1021
+  sub_techniques:
+    - T1021.001
+    - T1021.002
+    - T1021.004
+  detection_strategies:
+    - DET0327
+    - DET0530
+    - DET0596
+  analytics:
+    - AN0931
+    - AN1468
+    - AN1638
+    - AN1639
+  platforms:
+    - Windows
+    - Linux
+    - macOS
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+    - auditd:EXECVE
+    - macos:osquery
+  data_components:
+    - Logon Session Creation
+    - Network Connection Creation
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    After compromising an initial asset, an adversary may attempt to pivot to additional
+    resources within the victim network by abusing legitimate remote access features
+    already enabled there, such as RDP, SMB administrative shares and SSH, with valid
+    credentials.
+  attacker_behavior:
+    - Logs on to further Windows hosts over RDP from the first compromised workstation.
+    - Maps ADMIN$ or C$ on a peer with net use and copies tooling across.
+    - Starts ssh, scp or sftp towards internal hosts found during discovery.
+    - Reaches RDP or WinRM ports with a tool other than the standard client.
+    - Reuses one compromised account across many hosts in a short span.
+  legitimate_behavior:
+    - Administrators and help-desk staff use RDP and admin shares from jump hosts.
+    - Deployment, backup and monitoring systems connect to many hosts over SMB, WinRM and SSH.
+    - Developers and operators open SSH sessions to servers they own.
+  risk_indicator:
+    - The source is a user workstation, not a jump host or management server.
+    - The account has not used remote services to these destinations before.
+    - One source reaches many internal hosts in sequence.
+    - The connecting process is a script host, an unsigned binary or a tunnelling tool.
+    - The activity follows discovery commands on the same source host.
+
+requires:
+  platforms:
+    - windows
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: logon_session
+      connector: crowdstrike-ngsiem
+      event_types:
+        - UserLogon
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        logon_type: LogonType
+        remote_address: RemoteAddressIP4
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: rdp-logon-from-internal-peer
+        name: Remote-interactive logon arriving from an internal address
+        purpose: >-
+          Return each RDP logon whose source is inside the network, the destination-side
+          record of a pivot. Read on the host that was logged on to, it names the account
+          and the source address.
+        query: |
+          #event_simpleName=UserLogon
+          | LogonType=10
+          | cidr(RemoteAddressIP4, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: admin-share-command
+        name: Command addressing an administrative share on another host
+        purpose: >-
+          Return commands that name ADMIN$, IPC$ or a drive share on a remote host, the
+          source-side record of SMB movement.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/\\\\[^\s"\\]+\\(ADMIN|IPC|[A-Z])\$/i
+          | CommandLine=/\b(net1?(\.exe)?\s+use|copy|xcopy|robocopy|move|Copy-Item|New-PSDrive|sc(\.exe)?\s|schtasks|wmic)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: ssh-client-onward-hop
+        name: SSH client started towards another host
+        purpose: >-
+          Return ssh, scp and sftp client runs on Linux and macOS, leaving out the
+          automation parents that account for most of them.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=/^(Lin|Mac)$/
+          | ImageFileName=/\/(ssh|scp|sftp)$/
+          | ParentBaseFileName!=/^(git|git-remote-ssh|rsync|ansible.*|sshpass|code|launchd)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: remote-admin-port-from-unusual-process
+        name: RDP or WinRM port reached by a non-standard process
+        purpose: >-
+          Return internal connections to 3389, 5985 and 5986 made by anything other than
+          the built-in clients, which is what tunnelling and offensive tooling look like
+          on the wire. SMB on 445 is left to the command case because its volume over a
+          long window is too large to return raw.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | in(field="RemotePort", values=[3389, 5985, 5986])
+          | cidr(RemoteAddressIP4, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"])
+          | ContextBaseFileName!=/^(mstsc|msrdc|svchost|wsmprovhost|winrshost|System)(\.exe)?$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: remote_service_session
+      name: Remote service used between internal hosts
+      description: >-
+        A remote-interactive logon from an internal address, an admin-share command, an
+        SSH client run or a connection to a remote-administration port shows one internal
+        host reaching another through a remote service.
+      source: process_creation
+      field: command_line
+      indicates: lateral_movement_candidate
+
+  supporting:
+    - id: rdp_logon_source
+      name: RDP logon source is a workstation or unexpected host
+      description: >-
+        The remote address on the logon event belongs to a user workstation or a server
+        with no administrative role, not a jump host.
+      source: logon_session
+      field: remote_address
+      indicates: pivot_from_non_admin_host
+    - id: account_new_to_destination
+      name: Account not previously seen on the destination
+      description: >-
+        The user on the logon has no earlier remote logons to this host in the returned
+        window, or belongs to a population that does not administer servers.
+      source: logon_session
+      field: user
+      indicates: credential_reuse_across_hosts
+    - id: nonstandard_client_process
+      name: Remote-administration port reached by an unusual process
+      description: >-
+        The process that opened the connection is a script host, an unsigned binary or a
+        tunnelling tool, not the operating system's own client.
+      source: network_connection
+      field: process_name
+      indicates: tooling_driven_remote_access
+    - id: fan_out_destinations
+      name: One source reaching many internal destinations
+      description: >-
+        The same host and process connect to a run of different internal addresses,
+        which the agent derives by counting distinct remote addresses in the results.
+      source: network_connection
+      field: remote_address
+      indicates: sequential_host_to_host_movement
+    - id: interactive_parent_shell
+      name: Remote command issued from a script or unexpected parent
+      description: >-
+        The parent of the share or SSH command is a script host, Office application or
+        service process, not an administrator's interactive shell.
+      source: process_creation
+      field: parent_process
+      indicates: abnormal_execution_chain
+
+  contradicting:
+    - id: designated_admin_source
+      name: Source is a jump host or management server
+      description: >-
+        Asset records list the source as a privileged access workstation, jump host,
+        deployment server or monitoring system.
+      source: asset_inventory
+      field: ComputerName
+      indicates: sanctioned_remote_administration
+    - id: established_access_pattern
+      name: Account routinely reaches these hosts
+      description: >-
+        Earlier activity shows the same account using the same remote service to the same
+        destinations on a regular basis.
+      source: baseline
+      field: UserName
+      indicates: routine_administration
+
+  risk_logic:
+    required:
+      - remote_service_session
+
+    supporting:
+      any:
+        - rdp_logon_source
+        - account_new_to_destination
+        - nonstandard_client_process
+        - fan_out_destinations
+        - interactive_parent_shell
+      all:
+        - account_new_to_destination
+        - fan_out_destinations
+
+    contradicting:
+      any:
+        - designated_admin_source
+        - established_access_pattern
+      all: []
+
+  verdict:
+    low_risk_when:
+      - remote_service_session
+      - designated_admin_source
+      - established_access_pattern
+    suspicious_when:
+      - remote_service_session
+      - account_new_to_destination
+    high_risk_when:
+      - remote_service_session
+      - account_new_to_destination
+      - fan_out_destinations
+      - nonstandard_client_process
+
+  false_positive:
+    - condition: Administrators work from jump hosts.
+      explanation: >-
+        Their sessions are the same events with the same logon type. They originate from
+        a small set of known hosts under administrative accounts and recur day after day.
+    - condition: Deployment, backup and monitoring systems reach every host.
+      explanation: >-
+        These produce the widest fan-out in the estate. The source is a known server, the
+        account is a service account, and the pattern repeats on a schedule.
+    - condition: Developers use SSH and Git over SSH all day.
+      explanation: >-
+        Interactive SSH from an engineering workstation to systems the user owns is
+        routine. It is the unfamiliar pairing of source, account and destination that
+        matters, not the presence of the client.

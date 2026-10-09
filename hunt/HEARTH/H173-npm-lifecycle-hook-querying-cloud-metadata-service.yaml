@@ -1,0 +1,363 @@
+# Converted from THORCollective/HEARTH Flames/H173.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-any-hearth-h173-npm-lifecycle-hook-querying-cloud-metadata-service-t1195-001
+version: 1.0.0
+
+info:
+  name: npm lifecycle hook querying the cloud metadata service and fetching a Bun runtime
+  description: >-
+    The typosquatted npm packages Microsoft reported in May 2026 steal secrets the
+    moment they are installed. A preinstall or postinstall script asks the instance
+    metadata service for workload credentials, reads ~/.aws/credentials, ~/.npmrc and
+    Vault tokens, and in its second generation downloads the Bun runtime so the payload
+    runs outside Node. Cloud SDKs do query the metadata service, but from long-running
+    application processes, not from a script npm started seconds ago. The sensor records
+    the connection with the process that made it, so the hunt returns metadata-service
+    connections from node and bun, the commands package managers start that name
+    credential stores or the Bun release path, and Bun binaries written under
+    node_modules or a temporary directory. The registry side, the HTTP header on the
+    exfiltration request and the daemonised process's environment are not visible.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - initial-access
+    - supply-chain
+    - npm
+    - typosquatting
+    - cloud-metadata
+    - bun-runtime
+    - ci-cd
+    - credential-access
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H173.md
+    - https://attack.mitre.org/techniques/T1195
+    - https://attack.mitre.org/techniques/T1195/001
+    - https://attack.mitre.org/detectionstrategies/DET0009
+
+mitre:
+  tactics:
+    - TA0001
+  techniques:
+    - T1195
+  sub_techniques:
+    - T1195.001
+  detection_strategies:
+    - DET0009
+  analytics:
+    - AN0021
+    - AN0022
+    - AN0023
+  platforms:
+    - Windows
+    - Linux
+    - macOS
+  data_sources:
+    - WinEventLog:Sysmon
+    - auditd:SYSCALL
+    - NSM:Flow
+    - macos:endpointsecurity
+  data_components:
+    - Process Creation
+    - File Creation
+    - Network Traffic Flow
+
+hypothesis:
+  statement: >-
+    An npm install on a developer workstation or CI/CD runner is executing a
+    typosquatted package's preinstall or postinstall lifecycle hook that immediately
+    queries the AWS Instance Metadata Service (169.254.169.254 or 169.254.170.2), reads
+    cloud credential files (~/.aws/credentials, ~/.npmrc, HashiCorp Vault environment
+    variables), spawns a detached process with __DAEMONIZED=1 in the environment, drops
+    payload.bin inside node_modules, or downloads a Bun runtime from
+    github.com/oven-sh/bun/releases/download, exfiltrating collected secrets to attacker
+    infrastructure.
+  attacker_behavior:
+    - Publishes a package whose name is one character away from a popular one.
+    - Runs a preinstall or postinstall script when the package is installed.
+    - Requests workload credentials from the instance or container metadata service.
+    - Reads AWS, npm and Vault credentials from files and environment variables.
+    - Downloads the Bun runtime from GitHub and runs the payload under it.
+    - Posts the collected secrets to a free-hosting domain.
+  legitimate_behavior:
+    - Applications built on a cloud SDK query the metadata service when they start.
+    - Projects that depend on Bun install its binary through npm.
+    - Native modules compile or download prebuilt binaries in an install script.
+  risk_indicator:
+    - node or bun connects to the metadata address during a package install.
+    - The connecting process descends from npm, yarn or pnpm rather than an application server.
+    - A child of the package manager names a credential file, a token endpoint or the Bun release path.
+    - A bun binary appears under node_modules or a temporary directory in a project that does not use Bun.
+    - The host resolves the reported exfiltration domain.
+
+requires:
+  platforms:
+    - windows
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NewExecutableWritten
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: metadata-service-connection-from-node-or-bun
+        name: Connection to the instance metadata service from node or bun
+        purpose: >-
+          Return connections to the two metadata addresses made by a JavaScript runtime,
+          with the process id on each event. Application servers written in Node match
+          by design; the agent follows the process id into process events and keeps the
+          connections whose process descends from a package manager and is minutes old.
+          On a workstation outside a cloud the connection attempt fails but is still
+          recorded.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | RemoteAddressIP4=/^169\.254\.(169\.254|170\.2)$/
+          | ContextBaseFileName=/^(node|nodejs|bun)(\.exe)?$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: credential-or-runtime-fetch-under-package-manager
+        name: Package manager child naming credential stores, the metadata address or the Bun release path
+        purpose: >-
+          Return processes started by node, npm, yarn, pnpm or bun whose command line
+          names the metadata address, a cloud or npm credential file, a Vault token, the
+          npm token endpoint or the Bun release path. A script that reads the files with
+          Node's own file API starts no process and is not seen here; the metadata
+          connection in the first case is what remains. The __DAEMONIZED marker is an
+          environment variable and shows only when it is written inline on a shell
+          command.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | ParentBaseFileName=/^(node|nodejs|npm|npx|yarn|pnpm|bun)(\.exe|\.cmd)?$/i
+          | CommandLine=/169\.254\.(169\.254|170\.2)|\.aws[\/\\]credentials|[\/\\]\.npmrc\b|VAULT_(AUTH_)?TOKEN|\/-\/npm\/v1\/tokens|oven-sh\/bun\/releases|__DAEMONIZED=/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: bun-runtime-written-on-posix-host
+        name: Bun binary written under node_modules or a temporary directory on Linux or macOS
+        purpose: >-
+          Return a bun executable written under node_modules, /tmp, /var/tmp or
+          /dev/shm. Projects that depend on Bun produce the same write; the project's
+          lock file settles it. payload.bin is not an executable format the sensor
+          reports and is not hunted.
+        query: |
+          #event_simpleName=NewExecutableWritten
+          | TargetFileName=/\/(node_modules|tmp|var\/tmp|dev\/shm)\/(.*\/)?bun$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: bun-runtime-written-on-windows-host
+        name: bun.exe written under node_modules or a temporary directory on Windows
+        purpose: >-
+          The Windows form of the previous case.
+        query: |
+          #event_simpleName=PeFileWritten
+          | TargetFileName=/\\(node_modules|Temp)\\(.*\\)?bun\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: reported-exfiltration-domain-resolved
+        name: DNS request for the reported exfiltration host
+        purpose: >-
+          Return requests for the first-generation collection host, with the requester.
+          The parent domain is shared free hosting, so only the reported name is
+          matched.
+        query: |
+          #event_simpleName=DnsRequest
+          | DomainName=/^aab\.sportsontheweb\.net$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: metadata_query_from_install_script
+      name: JavaScript runtime contacts the metadata service
+      description: >-
+        node or bun connects to 169.254.169.254 or 169.254.170.2, and the agent
+        establishes from the process id that the process was started by a package
+        install.
+      source: network_connection
+      field: remote_address
+      indicates: workload_credential_theft
+
+  supporting:
+    - id: connecting_process_is_runtime
+      name: Connecting process is node or bun
+      description: >-
+        The process named on the connection is a JavaScript runtime, not an application
+        server binary.
+      source: network_connection
+      field: process_name
+      indicates: script_driven_metadata_access
+    - id: credential_store_named
+      name: Package manager child names a credential store
+      description: >-
+        A child of the package manager names an AWS, npm or Vault credential source on
+        its command line.
+      source: process_creation
+      field: command_line
+      indicates: secret_harvesting
+    - id: child_of_package_manager
+      name: Process descends from a package manager
+      description: >-
+        The parent of the process is npm, yarn, pnpm, node or bun during an install.
+      source: process_creation
+      field: parent_process
+      indicates: lifecycle_hook_execution
+    - id: bun_runtime_dropped
+      name: Bun runtime written at install time
+      description: >-
+        A bun binary is written under node_modules or a temporary directory.
+      source: file_creation
+      field: file_path
+      indicates: alternate_runtime_staged
+    - id: exfiltration_host_resolved
+      name: Reported collection host resolved
+      description: >-
+        A process on the host resolves aab.sportsontheweb.net.
+      source: dns_request
+      field: query_name
+      indicates: secret_exfiltration
+
+  contradicting:
+    - id: long_running_cloud_application
+      name: Process is a deployed application
+      description: >-
+        The connecting process is a service that has run for hours on a cloud instance
+        and is listed as a deployed application.
+      source: asset_inventory
+      field: ComputerName
+      indicates: cloud_sdk_credential_refresh
+    - id: bun_is_declared_dependency
+      name: Project declares Bun as a dependency
+      description: >-
+        The project's manifest or lock file lists bun, and the binary came from the
+        registry.
+      source: derived
+      field: TargetFileName
+      indicates: expected_dependency_install
+
+  risk_logic:
+    required:
+      - metadata_query_from_install_script
+
+    supporting:
+      any:
+        - connecting_process_is_runtime
+        - credential_store_named
+        - child_of_package_manager
+        - bun_runtime_dropped
+        - exfiltration_host_resolved
+      all:
+        - child_of_package_manager
+        - credential_store_named
+
+    contradicting:
+      any:
+        - long_running_cloud_application
+        - bun_is_declared_dependency
+      all: []
+
+  verdict:
+    low_risk_when:
+      - metadata_query_from_install_script
+      - long_running_cloud_application
+      - bun_is_declared_dependency
+    suspicious_when:
+      - metadata_query_from_install_script
+      - child_of_package_manager
+    high_risk_when:
+      - metadata_query_from_install_script
+      - child_of_package_manager
+      - credential_store_named
+      - bun_runtime_dropped
+
+  false_positive:
+    - condition: A Node application on a cloud instance refreshes its credentials.
+      explanation: >-
+        The process is a long-lived server, not a child of an install, and it repeats on
+        the SDK's refresh interval.
+    - condition: A build step uses the AWS CLI or SDK.
+      explanation: >-
+        Deploy scripts run from npm do query the metadata service. They are named in the
+        pipeline definition and run after install, not during it.
+    - condition: A project uses Bun.
+      explanation: >-
+        The binary is written by the bun package's own install script and the manifest
+        lists it.

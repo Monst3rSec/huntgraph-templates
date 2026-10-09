@@ -1,0 +1,293 @@
+# Converted from THORCollective/HEARTH Flames/H072.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h072-archive-extraction-writing-to-startup-folder-t1547-001
+version: 1.0.0
+
+info:
+  name: WinRAR extraction writing a payload into the Startup folder
+  description: >-
+    CVE-2025-8088 is a path traversal in WinRAR: a crafted archive, opened from a
+    phishing attachment, writes a file outside the folder the user chose, and the
+    attackers aim it at the Startup folder. The payload then runs at the next logon with
+    no further action, and the user saw only an ordinary archive open. It has been used
+    for ransomware and credential theft, and is fixed in WinRAR 7.13. An archiver has no
+    business writing into Startup whatever its version, so the hunt returns executables
+    and scripts written there, with the writer named, and processes later started from
+    that folder.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - persistence
+    - startup-folder
+    - winrar
+    - cve-2025-8088
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H072.md
+    - https://attack.mitre.org/techniques/T1547
+    - https://attack.mitre.org/techniques/T1547/001
+    - https://attack.mitre.org/detectionstrategies/DET0365
+    - https://research.checkpoint.com/2026/2nd-february-threat-intelligence-report/
+
+mitre:
+  tactics:
+    - TA0003
+  techniques:
+    - T1547
+  sub_techniques:
+    - T1547.001
+  detection_strategies:
+    - DET0365
+  analytics:
+    - AN1032
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:Microsoft-Windows-Shell-Core
+  data_components:
+    - File Creation
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary is weaponizing WinRAR archive extraction to write malware into the
+    Windows Startup folder, targeting users who open phishing attachments, to achieve
+    persistence and automatic execution.
+  attacker_behavior:
+    - Sends an archive whose entries carry traversal paths or alternate data streams aimed at the Startup folder.
+    - Relies on the user opening or extracting it with a vulnerable WinRAR.
+    - Drops an executable, script or shortcut into the per-user or all-users Startup folder.
+    - Lets the next logon run the payload under the user's account.
+    - Uses the same archive to drop a DLL into a second writable location for the payload to load.
+  legitimate_behavior:
+    - Installers and some applications place a launcher in Startup.
+    - Users and administrators copy a script or shortcut there by hand.
+    - Deployment tools add logon helpers to the all-users Startup folder.
+  risk_indicator:
+    - The process that wrote the Startup file is an archiver.
+    - The file is an executable or script and not a shortcut to an installed application.
+    - The archiver was started by a mail client or a browser.
+    - The file runs at the next logon and connects out or starts an interpreter.
+    - The host runs a WinRAR version older than 7.13.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+        - NewScriptWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        file_hash: SHA256HashData
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: startup-file-written-by-archiver
+        name: Executable or script written to a Startup folder by an archiver
+        purpose: >-
+          Return the exact outcome of the exploit: an archiver process writing code into
+          Startup. The writer test is an anchored match and runs before the path test.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewScriptWritten)$/
+          | ContextBaseFileName=/^(winrar|rar|unrar|7z|7zg|7zfm|peazip|bandizip|explorer)\.exe$/i
+          | TargetFileName=/\\Start Menu\\Programs\\Startup\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: startup-file-written-any-writer
+        name: Executable or script written to a Startup folder
+        purpose: >-
+          Return every executable and script that lands in a Startup folder, whoever
+          wrote it, so a different archiver or a follow-on dropper is not missed.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewScriptWritten)$/
+          | TargetFileName=/\\Start Menu\\Programs\\Startup\\[^\\]+$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: process-started-from-startup-folder
+        name: Process started from a Startup folder
+        purpose: >-
+          Return processes whose image is in a Startup folder, and interpreters given a
+          script there, which is the payload running at logon.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ImageFileName=/\\Start Menu\\Programs\\Startup\\[^\\]+$/i
+            or CommandLine=/\\Start Menu\\Programs\\Startup\\[^"']+\.(vbs|vbe|js|jse|bat|cmd|ps1|hta|wsf)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: archiver-opened-from-mail-or-browser
+        name: WinRAR started by a mail client or browser
+        purpose: >-
+          Return WinRAR runs whose parent is a mail client or browser, the opening of a
+          delivered archive, so the agent can tie a Startup write to its delivery.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(winrar|rar|unrar)\.exe$/i
+          | ParentBaseFileName=/^(outlook|olk|thunderbird|chrome|msedge|firefox|brave|opera|explorer)\.exe$/i
+          | CommandLine=/\\(Downloads|INetCache|Content\.Outlook|AppData\\Local\\Temp)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: startup_folder_code_file
+      name: Executable or script written to a Startup folder
+      description: >-
+        A file-write event records a PE file or script in the per-user or all-users
+        Startup folder.
+      source: file_creation
+      field: file_path
+      indicates: logon_autostart_persistence
+
+  supporting:
+    - id: archiver_was_writer
+      name: Writer is an archiver
+      description: >-
+        The process that wrote the Startup file is WinRAR or another archive utility,
+        which never targets that folder in normal extraction.
+      source: file_creation
+      field: writer_process_name
+      indicates: path_traversal_during_extraction
+    - id: delivered_archive_opened
+      name: Archive opened from mail or a download
+      description: >-
+        WinRAR was started by a mail client or browser on an archive under Downloads or
+        an attachment cache.
+      source: process_creation
+      field: parent_process
+      indicates: phishing_delivery
+    - id: startup_payload_executed
+      name: Payload ran from the Startup folder
+      description: >-
+        A process image or script path under the Startup folder appears in a process
+        event after the write.
+      source: process_creation
+      field: image_path
+      indicates: persistence_triggered
+    - id: rare_payload_hash
+      name: Written file hash is rare
+      description: >-
+        The hash of the written file appears on one or few hosts and has no reputation.
+      source: file_creation
+      field: file_hash
+      indicates: unknown_binary
+
+  contradicting:
+    - id: installed_application_launcher
+      name: File belongs to an installed application
+      description: >-
+        The file name and hash match a launcher that software inventoried for the host
+        places in Startup.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_installer_behaviour
+    - id: startup_item_fleet_wide
+      name: Same Startup item exists across the fleet
+      description: >-
+        Earlier activity shows the identical file written to Startup on many hosts by a
+        deployment tool.
+      source: baseline
+      field: TargetFileName
+      indicates: established_software_behaviour
+
+  risk_logic:
+    required:
+      - startup_folder_code_file
+
+    supporting:
+      any:
+        - archiver_was_writer
+        - delivered_archive_opened
+        - startup_payload_executed
+        - rare_payload_hash
+      all:
+        - archiver_was_writer
+        - delivered_archive_opened
+
+    contradicting:
+      any:
+        - installed_application_launcher
+        - startup_item_fleet_wide
+      all: []
+
+  verdict:
+    low_risk_when:
+      - startup_folder_code_file
+      - installed_application_launcher
+      - startup_item_fleet_wide
+    suspicious_when:
+      - startup_folder_code_file
+      - rare_payload_hash
+    high_risk_when:
+      - startup_folder_code_file
+      - rare_payload_hash
+      - archiver_was_writer
+
+  false_positive:
+    - condition: An application installs a Startup launcher.
+      explanation: >-
+        Chat clients, updaters and utilities do this. The writer is the product's
+        installer, and the same file appears wherever the product is installed.
+    - condition: A user extracts or copies a file into Startup on purpose.
+      explanation: >-
+        Explorer is in the writer list because drag-and-drop from an archive goes
+        through it. A deliberate copy by a technical user is one file they can account
+        for.
+    - condition: The payload is a shortcut.
+      explanation: >-
+        Shortcut files are not PE files or scripts and do not appear in the file cases.
+        A .lnk dropped by the exploit shows only when the process it points to starts at
+        logon.

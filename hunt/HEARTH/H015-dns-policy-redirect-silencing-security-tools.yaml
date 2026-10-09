@@ -1,0 +1,277 @@
+# Converted from THORCollective/HEARTH Flames/H015.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h015-dns-policy-redirect-silencing-security-tools-t1685
+version: 1.0.0
+
+info:
+  name: DNS name-resolution policy redirecting security tool traffic to a false server
+  description: >-
+    The Windows Name Resolution Policy Table lets an administrator send queries for a
+    chosen namespace to a chosen DNS server. Pointed at a server that does not answer,
+    a rule for a security vendor's cloud domain stops the agent on that host from
+    reaching its console: no telemetry, no detections, no response actions, while the
+    agent keeps running and looks healthy. With local administrator rights it is one
+    PowerShell call, Add-DnsClientNrptRule, which writes values under the Dnscache
+    DnsPolicyConfig registry key. The hunt returns both the command and the registry
+    write.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-impairment
+    - dns
+    - registry
+    - edr
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H015.md
+    - https://attack.mitre.org/techniques/T1685
+    - https://attack.mitre.org/techniques/T1112
+    - https://attack.mitre.org/detectionstrategies/DET0497
+    - https://attack.mitre.org/detectionstrategies/DET0280
+    - https://cloudbrothers.info/edr-silencers-exploring-methods-block-edr-communication-part-1/
+
+# HEARTH pitches this at T1685 and none of its sub-techniques (event log, cloud log, tool
+# UI, audit log, log clearing) describes cutting an agent off from its console, so the
+# parent is kept as upstream wrote it.
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1685
+    - T1112
+  sub_techniques: []
+  detection_strategies:
+    - DET0497
+    - DET0280
+  analytics:
+    - AN1369
+    - AN0781
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    Adversaries are redirecting DNS queries to an inappropriate or false DNS server IP
+    through name-resolution policy rules, blocking legitimate communications between
+    security agents and their management consoles and so compromising the security
+    infrastructure.
+  attacker_behavior:
+    - Runs Add-DnsClientNrptRule with a security vendor's namespace and an unreachable or loopback name server.
+    - Writes the DnsPolicyConfig values directly with reg add or Set-ItemProperty to avoid the cmdlet.
+    - Targets namespaces such as endpoint.security.microsoft.com or another agent's cloud domain.
+    - Restarts the DNS client or clears its cache so the rule takes effect at once.
+  legitimate_behavior:
+    - Group Policy deploys NRPT rules for DirectAccess, Always On VPN and DNSSEC.
+    - Network administrators add split-DNS rules for internal namespaces.
+    - VPN clients add and remove rules as the tunnel connects and disconnects.
+  risk_indicator:
+    - The rule's namespace is a security or telemetry vendor domain.
+    - The name server given is loopback, unroutable or an address outside the estate.
+    - The rule is created locally by a shell, not by the Group Policy client or a VPN service.
+    - The host's security agent stops reporting soon afterwards.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: nrpt-rule-command
+        name: Command that adds or edits a name-resolution policy rule
+        purpose: >-
+          Return each command that creates an NRPT rule through the cmdlet or by writing
+          the registry key, with the namespace and name server on the command line.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/Add-DnsClientNrptRule|Set-DnsClientNrptRule|DnsPolicyConfig/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: nrpt-registry-value-written
+        name: Value written under a DnsPolicyConfig key
+        purpose: >-
+          Return the registry writes that make up a rule, which are present however the
+          rule was created and carry the namespace and the server in their data.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\(Services\\Dnscache\\Parameters|Policies\\Microsoft\\Windows NT\\DNSClient)\\DnsPolicyConfig\\/i
+          | RegValueName=/^(Name|GenericDNSServers|ConfigOptions|DirectAccessDNSServers)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: security-vendor-namespace-in-rule
+        name: Policy rule naming a security vendor namespace
+        purpose: >-
+          Narrow the command case to rules whose namespace belongs to a security or
+          telemetry product, the form that silences an agent.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/Add-DnsClientNrptRule|Set-DnsClientNrptRule|DnsPolicyConfig/i
+          | CommandLine=/security\.microsoft\.com|\.atp\.azure\.com|crowdstrike|cloudsink\.net|sentinelone|cbdefense|carbonblack|paloaltonetworks|trendmicro|sophos|cylance|elastic-cloud|defender|\.wdcp\.microsoft\.com/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: nrpt_rule_creation
+      name: Name-resolution policy rule created or changed
+      description: >-
+        A command line calls the NRPT cmdlets or writes a DnsPolicyConfig key, creating a
+        rule that redirects a DNS namespace.
+      source: process_creation
+      field: command_line
+      indicates: dns_resolution_policy_modified
+
+  supporting:
+    - id: security_namespace_targeted
+      name: Rule namespace is a security vendor domain
+      description: >-
+        The Name value written under the policy key is the cloud domain of a security or
+        telemetry product.
+      source: registry
+      field: registry_data
+      indicates: security_agent_communication_blocked
+    - id: policy_key_written
+      name: DnsPolicyConfig registry key written
+      description: >-
+        A registry value update lands under the Dnscache or policy DnsPolicyConfig key,
+        confirming the rule reached the configuration the DNS client reads.
+      source: registry
+      field: registry_path
+      indicates: persistent_dns_redirection
+    - id: local_shell_origin
+      name: Rule created from a local shell
+      description: >-
+        The parent of the creating process is an interactive shell, script host or remote
+        session, not the Group Policy client or a VPN service.
+      source: process_creation
+      field: parent_process
+      indicates: manual_policy_tampering
+    - id: unprivileged_role_creator
+      name: Creator is not a network administrator
+      description: >-
+        The user on the event has local administrator rights but no network or endpoint
+        engineering role.
+      source: process_creation
+      field: user
+      indicates: activity_outside_user_role
+
+  contradicting:
+    - id: group_policy_nrpt
+      name: Rule is delivered by Group Policy or a VPN client
+      description: >-
+        A change record or policy definition covers the namespace and server, as for
+        DirectAccess, Always On VPN or split DNS.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_network_configuration
+    - id: rule_present_fleet_wide
+      name: Same rule exists across the fleet
+      description: >-
+        Earlier activity shows the same namespace and server written on many hosts, as a
+        managed rule would be.
+      source: baseline
+      field: RegStringValue
+      indicates: established_configuration
+
+  risk_logic:
+    required:
+      - nrpt_rule_creation
+
+    supporting:
+      any:
+        - security_namespace_targeted
+        - policy_key_written
+        - local_shell_origin
+        - unprivileged_role_creator
+      all:
+        - security_namespace_targeted
+        - local_shell_origin
+
+    contradicting:
+      any:
+        - group_policy_nrpt
+        - rule_present_fleet_wide
+      all: []
+
+  verdict:
+    low_risk_when:
+      - nrpt_rule_creation
+      - group_policy_nrpt
+      - rule_present_fleet_wide
+    suspicious_when:
+      - nrpt_rule_creation
+      - local_shell_origin
+    high_risk_when:
+      - nrpt_rule_creation
+      - local_shell_origin
+      - security_namespace_targeted
+
+  false_positive:
+    - condition: Group Policy or a VPN client manages NRPT rules.
+      explanation: >-
+        DirectAccess, Always On VPN and DNSSEC all write DnsPolicyConfig values. The
+        writer is the Group Policy client or the VPN service, the namespaces are
+        internal, and the rule is the same on every host in scope.
+    - condition: A network engineer adds a split-DNS rule by hand.
+      explanation: >-
+        The command is the same cmdlet. The namespace is an internal zone and the server
+        is one of the estate's own resolvers.
+    - condition: A security team tests agent resilience.
+      explanation: >-
+        Blocking an agent's cloud domain is a known test. It happens on a designated
+        host inside a recorded exercise and is reverted afterwards.

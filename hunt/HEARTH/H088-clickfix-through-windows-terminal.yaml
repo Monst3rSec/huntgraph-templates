@@ -1,0 +1,371 @@
+# Converted from THORCollective/HEARTH Flames/H088.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+# Also holds H089 (hex-encoded ClickFix commands in Windows Terminal deploying Lumma
+# Stealer). It differs from H088 in payload and encoding, and not in the process chain
+# the sensor records; the hex-encoded form has its own case below.
+type: detection
+
+id: hg-win-hearth-h088-clickfix-through-windows-terminal-t1204-004
+version: 1.0.0
+
+info:
+  name: ClickFix lure executed through Windows Terminal
+  description: >-
+    ClickFix pages have moved from the Run dialog to Windows Terminal: the visitor is
+    told to press Win+X, open Terminal and paste. The Run dialog cuts a command off at
+    260 characters and leaves an entry in RunMRU; Terminal does neither, and its process
+    tree is one defenders watch less. Velvet Tempest uses the route to bring in loaders
+    ahead of ransomware, compiling .NET code with csc.exe at run time and keeping a
+    Python runtime in ProgramData, and the same route delivers Lumma Stealer through
+    hex-encoded commands. H024 covers the Run dialog, where Explorer is the parent. Here
+    Terminal starts a shell and the pasted command runs under that shell, one step
+    below Terminal, so the hunt returns the shells Terminal starts and the fetch or
+    decode commands shells start, and the agent joins the two on process id.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - execution
+    - clickfix
+    - windows-terminal
+    - user-execution
+    - velvet-tempest
+    - lumma-stealer
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H088.md
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H089.md
+    - https://attack.mitre.org/techniques/T1204
+    - https://attack.mitre.org/techniques/T1204/004
+    - https://attack.mitre.org/detectionstrategies/DET0340
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1204
+  sub_techniques:
+    - T1204.004
+  detection_strategies:
+    - DET0340
+  analytics:
+    - AN0962
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary is using ClickFix social engineering through the Windows Terminal
+    application, including hex-encoded commands, targeting enterprise endpoints, to
+    deploy commodity loaders, backdoors and information stealers for ransomware
+    pre-positioning and credential theft.
+  attacker_behavior:
+    - Instructs the visitor to open Windows Terminal from the Win+X menu and paste a command.
+    - Supplies a command that decodes a hex or Base64 string and runs the result.
+    - Fetches the next stage with PowerShell, curl, mshta or finger.exe from the Terminal session.
+    - Compiles a .NET loader on the host with csc.exe from a temporary directory.
+    - Leaves a Python runtime in ProgramData that a scheduled task starts.
+  legitimate_behavior:
+    - Developers and administrators work in Windows Terminal all day.
+    - Vendor one-line installers are pasted into Terminal.
+    - Build tools and PowerShell itself start csc.exe to compile helper assemblies.
+  risk_indicator:
+    - A shell under Windows Terminal runs a decode-and-execute or fetch-and-execute command.
+    - The command contains a long hex string or a fake verification phrase.
+    - csc.exe compiles source from Temp or ProgramData under that shell.
+    - python.exe appears under ProgramData with a scheduled-task parent.
+    - The user is not technical staff and seldom opens a terminal.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: shell-started-by-windows-terminal
+        name: Shell started by Windows Terminal
+        purpose: >-
+          Return every shell Windows Terminal starts, with its process id. A pasted
+          command does not run as a child of Terminal; it runs inside, or as a child
+          of, the shell in the tab. This case gives the agent the set of shell process
+          ids that belong to a Terminal session, to match against the parent process id
+          on the events the next case returns. A shell that Terminal starts with
+          arguments of its own, from a profile or a wt.exe command line, shows them
+          here.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(WindowsTerminal|wt)\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: fetch-or-decode-command-under-shell
+        name: Fetch or decode-and-run command started by a shell
+        purpose: >-
+          Return processes whose parent is PowerShell or cmd and whose own command line
+          downloads, decodes or executes remote content. The parent's process id is on
+          each event; the agent keeps the events whose parent is a shell returned by
+          the first case. A pasted line that uses only PowerShell's built-in cmdlets
+          runs inside the existing shell and starts no process, so it is not seen here;
+          it appears once it starts a second interpreter or a utility, which the
+          reported chains do.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(powershell|pwsh|cmd)\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd|mshta|curl|finger|msiexec|rundll32|wscript|cscript|certutil|bitsadmin)\.exe$/i
+          | CommandLine=/https?:\/\/|\bIEX\b|Invoke-Expression|DownloadString|Invoke-WebRequest|Invoke-RestMethod|\b(iwr|irm)\b|FromBase64String|\s-e(nc|ncodedcommand)?\s+[A-Za-z0-9+\/=]{40,}|@[A-Za-z0-9.-]+\s*\|/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: hex-decoded-command-execution
+        name: Command line that decodes a hex string and executes it
+        purpose: >-
+          Return interpreter commands carrying a long run of hex together with a
+          conversion call, the encoding H089 reports, whatever started them.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh|cmd)\.exe$/i
+          | CommandLine=/([0-9a-f]{2}[\s,-]?){40,}/i
+          | CommandLine=/ToInt32\(|ToByte\(|\[char\]|-split\s|FromHexString|\[Convert\]::|-join\b|GetString\(/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: csc-compiling-from-temporary-directory
+        name: csc.exe compiling source from a temporary or ProgramData directory
+        purpose: >-
+          Return run-time compilation whose inputs or outputs sit in Temp or ProgramData
+          and whose parent is not PowerShell's own cmdline compiler path or a build
+          tool.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(csc|vbc)\.exe$/i
+          | CommandLine=/\\(AppData\\Local\\Temp|Windows\\Temp|ProgramData|Users\\Public)\\[^"\s]*\.(cs|vb|cmdline|txt)\b|\/out:\S*\\(Temp|ProgramData|Public)\\/i
+          | ParentBaseFileName!=/^(msbuild|devenv|dotnet|VBCSCompiler|aspnet_compiler|w3wp)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: python-runtime-in-programdata
+        name: Python interpreter running from ProgramData
+        purpose: >-
+          Return python.exe and pythonw.exe whose image is under ProgramData, the
+          persistence component reported for this activity.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^python\d*w?\.exe$/i
+          | ImageFileName=/\\ProgramData\\/i
+          | ImageFileName!=/\\ProgramData\\(anaconda3|miniconda3|chocolatey|Microsoft\\VisualStudio)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: executable-compiled-into-temp
+        name: Executable written by csc.exe
+        purpose: >-
+          Return assemblies the compiler produced, with their path, so the agent can
+          follow what was built into what ran.
+        query: |
+          #event_simpleName=PeFileWritten
+          | ContextBaseFileName=/^(csc|vbc)\.exe$/i
+          | TargetFileName=/\\(AppData\\Local\\Temp|Windows\\Temp|ProgramData|Users\\Public)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: terminal_pasted_command
+      name: Fetch or decode command run in a Windows Terminal session
+      description: >-
+        A process started by a shell carries a command line that downloads, decodes or
+        executes remote or encoded content, and its parent process id is that of a shell
+        Windows Terminal started.
+      source: process_creation
+      field: command_line
+      indicates: pasted_command_execution
+
+  supporting:
+    - id: terminal_parent_chain
+      name: Shell was started by Windows Terminal
+      description: >-
+        The shell's parent process is WindowsTerminal.exe, consistent with a terminal
+        the user was told to open. The agent establishes this for a fetch or decode
+        command by matching its parent process id to the process id of a shell the
+        first case returned.
+      source: process_creation
+      field: parent_process
+      indicates: user_initiated_execution
+    - id: runtime_compilation
+      name: .NET code compiled on the host from a scratch directory
+      description: >-
+        csc.exe compiled source from Temp or ProgramData and wrote an assembly there.
+      source: file_creation
+      field: file_path
+      indicates: loader_built_at_run_time
+    - id: compiler_wrote_assembly
+      name: Assembly writer is the compiler
+      description: >-
+        The process named on the file-write event is csc.exe or vbc.exe.
+      source: file_creation
+      field: writer_process_name
+      indicates: on_host_compilation
+    - id: programdata_python_runtime
+      name: Python runtime under ProgramData
+      description: >-
+        A Python interpreter runs from a ProgramData path that no installed product
+        accounts for.
+      source: process_creation
+      field: image_path
+      indicates: portable_interpreter_persistence
+    - id: non_technical_user
+      name: User seldom uses a terminal
+      description: >-
+        The account belongs to a non-technical role with no history of terminal
+        sessions.
+      source: process_creation
+      field: user
+      indicates: activity_outside_user_role
+    - id: chain_under_one_shell
+      name: Fetch, compile and run share one shell
+      description: >-
+        The download, the compilation and the payload start under the same parent
+        process id, which the agent derives from the returned events.
+      source: process_creation
+      field: parent_process_id
+      indicates: single_pasted_command_chain
+
+  contradicting:
+    - id: technical_staff_account
+      name: Account belongs to technical staff
+      description: >-
+        The user is a developer, administrator or support engineer who works in a
+        terminal routinely.
+      source: identity_context
+      field: UserName
+      indicates: routine_administration
+    - id: vendor_installer_command
+      name: Command is a documented vendor installer
+      description: >-
+        The URL and command match a vendor's published one-line installer for software
+        approved on the host.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_software_installation
+
+  risk_logic:
+    required:
+      - terminal_pasted_command
+
+    supporting:
+      any:
+        - terminal_parent_chain
+        - runtime_compilation
+        - compiler_wrote_assembly
+        - programdata_python_runtime
+        - non_technical_user
+        - chain_under_one_shell
+      all:
+        - terminal_parent_chain
+        - non_technical_user
+
+    contradicting:
+      any:
+        - technical_staff_account
+        - vendor_installer_command
+      all: []
+
+  verdict:
+    low_risk_when:
+      - terminal_pasted_command
+      - technical_staff_account
+      - vendor_installer_command
+    suspicious_when:
+      - terminal_pasted_command
+      - non_technical_user
+    high_risk_when:
+      - terminal_pasted_command
+      - non_technical_user
+      - runtime_compilation
+
+  false_positive:
+    - condition: Developers paste installer one-liners into Terminal.
+      explanation: >-
+        Package managers and tools document exactly this. The account is technical and
+        the URL is the vendor's.
+    - condition: PowerShell compiles helper code with csc.exe.
+      explanation: >-
+        Add-Type and some modules start csc.exe with a .cmdline file in Temp. It happens
+        constantly on administrative hosts; it matters when it sits under a pasted fetch
+        command.
+    - condition: Profiles and startup commands configured in Terminal.
+      explanation: >-
+        A Terminal profile can start a shell with arguments. Those repeat unchanged on
+        the same host and point at local scripts.

@@ -1,0 +1,305 @@
+# Converted from THORCollective/HEARTH Flames/H047.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h047-powershell-download-from-discord-cdn-t1105
+version: 1.0.0
+
+info:
+  name: PowerShell downloading executables from the Discord CDN
+  description: >-
+    Any file attached to a Discord message gets a public URL on Discord's content
+    network, served over TLS from a domain most organisations allow. That makes it free
+    hosting for malware, and in the reported Bumblebee and AdaptixC2 intrusion that ended
+    in Akira ransomware, PowerShell's Invoke-WebRequest pulled encrypted DLL and EXE
+    payloads from those URLs. The Discord client fetches media from the same domain, but
+    PowerShell does not, and nobody distributes software as a Discord attachment. The
+    hunt returns the download commands and the DNS requests that non-Discord processes
+    make for the CDN.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - command-and-control
+    - ingress-tool-transfer
+    - powershell
+    - discord
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H047.md
+    - https://attack.mitre.org/techniques/T1105
+    - https://attack.mitre.org/detectionstrategies/DET0060
+    - https://thedfirreport.com/2025/08/05/from-bing-search-to-ransomware-bumblebee-and-adaptixc2-deliver-akira/
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1105
+  sub_techniques: []
+  detection_strategies:
+    - DET0060
+  analytics:
+    - AN0165
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    Threat actors are using PowerShell's Invoke-WebRequest cmdlet to download encrypted
+    payloads from Discord CDN URLs ending in .dll or .exe, to evade network detection and
+    transfer malware to compromised Windows hosts.
+  attacker_behavior:
+    - Uploads a payload as a Discord attachment and takes its CDN link.
+    - Runs Invoke-WebRequest or a web client against cdn.discordapp.com with an output file.
+    - Saves the file as a DLL or EXE under a user profile, ProgramData or Temp.
+    - Decrypts and runs it with rundll32, regsvr32 or a direct start.
+    - Issues the command from a loader, a script host or a remote session.
+  legitimate_behavior:
+    - The Discord desktop client and browsers load media and updates from the CDN.
+    - Bots and integrations written by developers fetch attachments through the API.
+    - Users download files others shared with them in a channel.
+  risk_indicator:
+    - A script interpreter or system utility, not Discord or a browser, requests the CDN.
+    - The URL path ends in an executable extension.
+    - The destination path is user-writable and the file is run soon after.
+    - The host has no Discord client installed.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: discord-cdn-url-in-command
+        name: Command line holding a Discord CDN attachment URL
+        purpose: >-
+          Return any process whose command line names the Discord CDN or media domain.
+          The domain is a fixed literal, so the match is cheap and nothing else contains
+          it; the Discord client and browsers are dropped.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/(cdn|media)\.discordapp\.(com|net)\/attachments\//i
+          | FileName!=/^(Discord|DiscordPTB|DiscordCanary|chrome|msedge|firefox|brave|opera)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: discord-cdn-executable-download
+        name: Download of a DLL or EXE from the Discord CDN
+        purpose: >-
+          Narrow to URLs whose path ends in an executable extension, the form HEARTH
+          names.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/(cdn|media)\.discordapp\.(com|net)\/attachments\/[^\s"']+\.(dll|exe|scr|msi|ps1|bat|bin|dat)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: non-client-discord-cdn-dns
+        name: Discord CDN resolved by a script interpreter or system utility
+        purpose: >-
+          Return DNS requests for the CDN made by interpreters and transfer utilities,
+          which catches a download whose URL was built at run time and never appeared on
+          a command line.
+        query: |
+          #event_simpleName=DnsRequest
+          | DomainName=/^(cdn|media)\.discordapp\.(com|net)$/i
+          | ContextBaseFileName=/^(powershell|pwsh|cmd|curl|certutil|bitsadmin|mshta|wscript|cscript|rundll32|regsvr32|msiexec|python\d*w?)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: executable-written-by-powershell
+        name: Executable written by PowerShell into a user-writable directory
+        purpose: >-
+          Return PE files PowerShell saved under user profiles, ProgramData and Temp, so
+          the agent can match one to the host and time of a CDN request.
+        query: |
+          #event_simpleName=PeFileWritten
+          | ContextBaseFileName=/^(powershell|pwsh)\.exe$/i
+          | TargetFileName=/\\(Users\\[^\\]+\\(AppData|Downloads|Desktop|Documents)|Users\\Public|ProgramData|Windows\\Temp)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: discord_cdn_download_command
+      name: Non-client process fetching from the Discord CDN
+      description: >-
+        A process other than the Discord client or a browser names a Discord CDN
+        attachment URL on its command line, or resolves the CDN domain.
+      source: process_creation
+      field: command_line
+      indicates: tool_transfer_from_abused_cdn
+
+  supporting:
+    - id: executable_extension_in_url
+      name: URL path ends in an executable extension
+      description: >-
+        The attachment URL on the command line ends in .dll, .exe or another executable
+        or script extension.
+      source: process_creation
+      field: command_line
+      indicates: executable_payload_retrieval
+    - id: interpreter_resolved_cdn
+      name: Interpreter resolved the CDN domain
+      description: >-
+        A DNS request for the CDN is attributed to PowerShell, a script host or a
+        transfer utility.
+      source: dns_request
+      field: process_name
+      indicates: non_client_cdn_access
+    - id: cdn_domain_requested
+      name: Discord CDN domain requested from the host
+      description: >-
+        The host issued a DNS request for cdn.discordapp.com or its media domain.
+      source: dns_request
+      field: query_name
+      indicates: cdn_contacted
+    - id: payload_file_written
+      name: Executable written by PowerShell
+      description: >-
+        A PE file was written by PowerShell into a user-writable directory around the
+        time of the request.
+      source: file_creation
+      field: file_path
+      indicates: payload_saved_to_disk
+    - id: loader_parent_process
+      name: Download issued by a loader or script host
+      description: >-
+        The parent of the downloading process is a script host, an Office application,
+        an unknown binary or a remote session.
+      source: process_creation
+      field: parent_process
+      indicates: abnormal_execution_chain
+
+  contradicting:
+    - id: discord_bot_developer
+      name: User develops Discord integrations
+      description: >-
+        Identity records place the user in a role that builds or operates Discord bots
+        and integrations.
+      source: identity_context
+      field: UserName
+      indicates: expected_development_activity
+    - id: recurring_integration_job
+      name: Same request recurs as a scheduled job
+      description: >-
+        Earlier activity shows the same command line on this host at regular intervals.
+      source: baseline
+      field: CommandLine
+      indicates: established_automation
+
+  risk_logic:
+    required:
+      - discord_cdn_download_command
+
+    supporting:
+      any:
+        - executable_extension_in_url
+        - interpreter_resolved_cdn
+        - cdn_domain_requested
+        - payload_file_written
+        - loader_parent_process
+      all:
+        - executable_extension_in_url
+        - payload_file_written
+
+    contradicting:
+      any:
+        - discord_bot_developer
+        - recurring_integration_job
+      all: []
+
+  verdict:
+    low_risk_when:
+      - discord_cdn_download_command
+      - discord_bot_developer
+      - recurring_integration_job
+    suspicious_when:
+      - discord_cdn_download_command
+      - interpreter_resolved_cdn
+    high_risk_when:
+      - discord_cdn_download_command
+      - interpreter_resolved_cdn
+      - executable_extension_in_url
+      - payload_file_written
+
+  false_positive:
+    - condition: A developer's bot or script fetches attachments.
+      explanation: >-
+        Integrations pull images and logs from the CDN with scripts. The files are
+        media or text, the user is a developer, and the job repeats.
+    - condition: A user pastes a shared link into PowerShell or curl.
+      explanation: >-
+        Technically minded users do download shared files this way. It is one request,
+        for a document or archive, from an interactive console.
+    - condition: PowerShell writes executables for unrelated reasons.
+      explanation: >-
+        Installers and updaters driven by PowerShell write PE files constantly. The file
+        case is context for a CDN hit on the same host, not a finding alone.

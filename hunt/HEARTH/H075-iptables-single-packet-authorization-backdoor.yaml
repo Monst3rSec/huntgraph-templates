@@ -1,0 +1,254 @@
+# Converted from THORCollective/HEARTH Flames/H075.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-lin-hearth-h075-iptables-single-packet-authorization-backdoor-t1205-001
+version: 1.0.0
+
+info:
+  name: iptables rules implementing a single-packet port-knocking backdoor
+  description: >-
+    UNC6201 leaves a door on compromised Linux appliances that a port scan cannot find.
+    An iptables rule watches packets to port 443 for a magic hex string; a match adds
+    the sender to a recent-list, and a second rule redirects that sender's traffic to a
+    hidden backdoor port for five minutes. Nothing listens visibly and nothing answers
+    without the knock. Most of the targeted appliances carry no sensor, so this hunt
+    applies only where the technique is used on a Linux host that does. There the rules
+    have to be installed with a command, and string matching combined with the recent
+    module and a redirect is a combination ordinary firewall management does not use.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - persistence
+    - port-knocking
+    - iptables
+    - traffic-signaling
+    - unc6201
+    - linux
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H075.md
+    - https://attack.mitre.org/techniques/T1205
+    - https://attack.mitre.org/techniques/T1205/001
+    - https://attack.mitre.org/detectionstrategies/DET0302
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0005
+  techniques:
+    - T1205
+  sub_techniques:
+    - T1205.001
+  detection_strategies:
+    - DET0302
+  analytics:
+    - AN0843
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary is deploying iptables-based Single Packet Authorization on compromised
+    Linux appliances to create port-knocking backdoors, targeting network infrastructure,
+    to maintain persistent covert access that is invisible to standard port scanning.
+  attacker_behavior:
+    - Adds an iptables rule with the string module and a hex pattern on an open port such as 443.
+    - Uses the recent module to record the source of a matching packet under a named list.
+    - Adds a NAT rule that redirects listed sources to a backdoor port for a short time window.
+    - Persists the rules through a start-up script, cron entry or saved ruleset.
+    - Runs the backdoor listener bound to loopback or a high port that no rule otherwise exposes.
+  legitimate_behavior:
+    - Administrators run knockd or fwknop as a deliberate hardening measure.
+    - Firewall management tools and container runtimes add NAT and redirect rules.
+    - Rate-limiting rules use the recent module without string matching.
+  risk_indicator:
+    - One rule set combines string or hex-string matching, the recent module and a redirect or DNAT.
+    - The rule is added by a shell under a web, appliance or service account.
+    - The time window on the recent match is a few minutes.
+    - No knock daemon or change record accounts for the rule.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: iptables-string-match-rule
+        name: iptables or nftables rule matching packet content
+        purpose: >-
+          Return firewall commands that match on a string or hex pattern in the packet,
+          the knock detector. The image test is anchored on the file name and runs first.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ImageFileName=/\/(iptables|ip6tables|iptables-legacy|iptables-nft|xtables-multi|xtables-legacy-multi|xtables-nft-multi|nft)$/
+          | CommandLine=/-m\s+string\b|--hex-string\b|--string\b|@th,\d+,\d+|\bpayload\b.*\braw\b/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: iptables-recent-list-with-redirect
+        name: iptables rule using a recent-list together with a redirect
+        purpose: >-
+          Return rules that set or check a recent-list and rules that redirect or DNAT,
+          the two halves that open the hidden port to a source that knocked.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ImageFileName=/\/(iptables|ip6tables|iptables-legacy|iptables-nft|xtables-multi|xtables-legacy-multi|xtables-nft-multi)$/
+          | CommandLine=/-m\s+recent\b/
+          | CommandLine=/--(set|rcheck|update)\b.*--name\b|--name\b.*--(set|rcheck|update)\b|-j\s+(REDIRECT|DNAT)\b|--seconds\s+\d+/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: firewall-rule-added-by-service-account-shell
+        name: NAT redirect added from a shell under a service process
+        purpose: >-
+          Return redirect and DNAT rules whose parent is a web server, an interpreter or
+          a shell that is not a firewall manager, which is how an implant on an appliance
+          installs them.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ImageFileName=/\/(iptables|ip6tables|iptables-legacy|iptables-nft|xtables-multi|xtables-legacy-multi|xtables-nft-multi|nft)$/
+          | CommandLine=/-j\s+(REDIRECT|DNAT)\b|\bredirect\s+to\b|\bdnat\s+to\b/
+          | ParentBaseFileName!=/^(firewalld|ufw|dockerd|containerd|kube-proxy|kubelet|libvirtd|NetworkManager|systemd|netfilter-persistent|iptables-restore|fail2ban-server|podman|cni|flanneld|calico-node|tailscaled)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: knock_detection_rule
+      name: Firewall rule that reacts to packet content
+      description: >-
+        An iptables or nftables command matches on a string or hex pattern, or pairs the
+        recent module with a redirect.
+      source: process_creation
+      field: command_line
+      indicates: port_knocking_backdoor_installed
+
+  supporting:
+    - id: redirect_to_hidden_port
+      name: Listed sources redirected to another port
+      description: >-
+        A rule on the host redirects or DNATs traffic from sources on the recent-list to
+        a port that is not otherwise exposed.
+      source: process_creation
+      field: command_line
+      indicates: covert_service_exposure
+    - id: installed_by_service_shell
+      name: Rule added from a service account's shell
+      description: >-
+        The parent of the firewall command is a web server, an interpreter or a shell
+        that descends from one, not a firewall management daemon.
+      source: process_creation
+      field: parent_process
+      indicates: post_exploitation_activity
+    - id: rule_added_by_unexpected_account
+      name: Rule added under an unexpected account context
+      description: >-
+        The command runs as root from a session that belongs to an application account,
+        or at a time with no administrative logon.
+      source: process_creation
+      field: user
+      indicates: unauthorised_firewall_change
+
+  contradicting:
+    - id: deliberate_knock_daemon
+      name: Host runs a sanctioned knock or SPA service
+      description: >-
+        Asset records show knockd or fwknop deployed on the host as a hardening control.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_access_control
+    - id: firewall_change_record
+      name: Rule matches a recorded firewall change
+      description: >-
+        A change record covers the host, the rule and the time.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_network_configuration
+
+  risk_logic:
+    required:
+      - knock_detection_rule
+
+    supporting:
+      any:
+        - redirect_to_hidden_port
+        - installed_by_service_shell
+        - rule_added_by_unexpected_account
+      all:
+        - redirect_to_hidden_port
+        - installed_by_service_shell
+
+    contradicting:
+      any:
+        - deliberate_knock_daemon
+        - firewall_change_record
+      all: []
+
+  verdict:
+    low_risk_when:
+      - knock_detection_rule
+      - deliberate_knock_daemon
+      - firewall_change_record
+    suspicious_when:
+      - knock_detection_rule
+      - redirect_to_hidden_port
+    high_risk_when:
+      - knock_detection_rule
+      - redirect_to_hidden_port
+      - installed_by_service_shell
+
+  false_positive:
+    - condition: An administrator deploys port knocking on purpose.
+      explanation: >-
+        knockd and fwknop install similar rules. They are a documented control on named
+        hosts with a daemon running.
+    - condition: String matching is used for content filtering.
+      explanation: >-
+        Some hosts block requests by string, for example to drop a known bad pattern.
+        Those rules end in DROP or REJECT, not a recent-list and a redirect.
+    - condition: Container and firewall tooling adds redirects.
+      explanation: >-
+        Docker, Kubernetes and firewalld add DNAT rules constantly. The common managers
+        are excluded by parent; rules restored from a saved file at boot arrive through
+        iptables-restore and show no command line.

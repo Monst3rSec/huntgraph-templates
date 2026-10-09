@@ -1,0 +1,293 @@
+# Converted from THORCollective/HEARTH Flames/H053.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+# Also holds H111 (Advanced IP Scanner, SoftPerfect Network Scanner or nmap run after
+# compromise). The scanner case already matches them by image name. A scanner run under
+# another name is seen only through the database-port case.
+type: detection
+
+id: hg-any-hearth-h053-automated-network-and-database-scanning-t1046
+version: 1.1.0
+
+info:
+  name: Automated scanning of network services and databases at machine speed
+  description: >-
+    In the espionage campaign Anthropic reported, an AI agent ran the reconnaissance
+    itself: it scanned infrastructure and enumerated databases at thousands of requests a
+    second across some thirty targets, with little human direction. Whether an AI drives
+    the tooling is not visible in telemetry; the speed and breadth are, and so are the
+    tools. HEARTH's hypothesis is a rate. This template returns the events that make it
+    up on a managed host: scanner invocations, and connections to database ports from
+    processes that are not database clients, leaving the agent to count destinations per
+    source and per minute.
+  severity: medium
+  author: huntgraph
+  tags:
+    - hearth
+    - discovery
+    - network-scan
+    - database-enumeration
+    - ai-assisted-intrusion
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H053.md
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H111.md
+    - https://attack.mitre.org/techniques/T1046
+    - https://attack.mitre.org/detectionstrategies/DET0376
+    - https://www.anthropic.com/news/disrupting-AI-espionage
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1046
+  sub_techniques: []
+  detection_strategies:
+    - DET0376
+  analytics:
+    - AN1057
+    - AN1058
+    - AN1059
+  platforms:
+    - Windows
+    - Linux
+    - macOS
+  data_sources:
+    - WinEventLog:Sysmon
+    - auditd:SYSCALL
+    - macos:osquery
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    Adversaries are using AI-powered tools to autonomously scan network infrastructure
+    and enumerate high-value databases, executing thousands of reconnaissance requests
+    per second against target systems and significantly accelerating the discovery phase
+    of cyber espionage operations.
+  attacker_behavior:
+    - Runs nmap, masscan, naabu or similar scanners with wide target ranges and high rates.
+    - Probes database ports across a subnet from a script or agent process.
+    - Follows discovery at once with database client commands that list schemas and tables.
+    - Issues many short, varied commands in quick succession from one parent, faster than a person types.
+    - Works from a foothold host that has no administrative role.
+  legitimate_behavior:
+    - Vulnerability scanners and asset-discovery tools sweep the network on a schedule.
+    - Database administrators connect to many servers from management hosts.
+    - Monitoring systems poll database and service ports continuously.
+  risk_indicator:
+    - A scanner runs on a host that is not a designated scanning system.
+    - One process connects to database ports on many internal addresses within seconds.
+    - The connecting process is a script interpreter or an unknown binary.
+    - Schema-enumeration queries follow the connections.
+    - Command volume from one parent exceeds what a person could type.
+
+requires:
+  platforms:
+    - windows
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: network-scanner-executed
+        name: Network scanner executed
+        purpose: >-
+          Return runs of common port and service scanners by image name, on any
+          platform, with their targets and rate options on the command line.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | ImageFileName=/[\\\/](nmap|masscan|zmap|naabu|rustscan|unicornscan|nbtscan|fscan|netscan|advanced_port_scanner|advanced_ip_scanner|angry ip scanner|ipscan|httpx|nuclei)[^\\\/]*$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: database-port-connection-from-non-client
+        name: Database port reached by a script interpreter or unknown process
+        purpose: >-
+          Return internal connections to database ports made by interpreters, shells
+          and scanners. Port and CIDR tests run first; known database clients and
+          servers are not in the process list, so their steady traffic is not returned.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | in(field="RemotePort", values=[1433, 1521, 3306, 5432, 27017, 6379, 9200, 5984, 9042, 50000])
+          | cidr(RemoteAddressIP4, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"])
+          | ContextBaseFileName=/^(python[0-9.]*w?(\.exe)?|node(\.exe)?|ruby|perl|php|powershell\.exe|pwsh(\.exe)?|cmd\.exe|bash|sh|zsh|curl(\.exe)?|nc|ncat(\.exe)?|nmap(\.exe)?|masscan|naabu|java(\.exe)?|go|claude|codex)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: schema-enumeration-command
+        name: Database client command that enumerates schemas or tables
+        purpose: >-
+          Return command-line database clients asked to list databases, tables or
+          users, the step that turns a found port into a map of what is worth taking.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | CommandLine=/\b(sqlcmd|osql|mysql|psql|mongosh?|redis-cli|sqlplus|bcp|Invoke-Sqlcmd)\b/i
+          | CommandLine=/information_schema|sys\.(databases|tables|objects)|show\s+(databases|tables|dbs)|\\l\b|\\dt\b|pg_catalog|listDatabases|getCollectionNames|all_tables|master\.\.sysdatabases|\bKEYS\s+\*/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: service_scanning_activity
+      name: Network service scanning from a managed host
+      description: >-
+        A scanner was executed, or a non-client process connected to database ports on
+        internal addresses.
+      source: network_connection
+      field: remote_port
+      indicates: network_service_discovery
+
+  supporting:
+    - id: destination_breadth
+      name: One process reaches many internal addresses
+      description: >-
+        The returned connections for one process span many distinct remote addresses
+        within seconds, which the agent derives by counting destinations per process and
+        minute.
+      source: network_connection
+      field: remote_address
+      indicates: machine_rate_scanning
+    - id: non_client_process
+      name: Connecting process is not a database client
+      description: >-
+        The process that opened the connections is a script interpreter, a shell or a
+        scanner.
+      source: network_connection
+      field: process_name
+      indicates: tooling_driven_enumeration
+    - id: scanner_command
+      name: Scanner invoked with wide ranges or high rate
+      description: >-
+        A scanner command line names a subnet or address list and a rate, timing or
+        thread option.
+      source: process_creation
+      field: command_line
+      indicates: deliberate_broad_scan
+    - id: enumeration_followup
+      name: Schema enumeration follows the scan
+      description: >-
+        A database client on the same host lists databases, tables or users shortly
+        after the connections.
+      source: process_creation
+      field: command_line
+      indicates: high_value_data_mapping
+    - id: machine_speed_commands
+      name: Commands issued faster than a person types
+      description: >-
+        Many distinct commands share one parent process id within seconds, which the
+        agent derives from the returned events.
+      source: process_creation
+      field: parent_process_id
+      indicates: automated_operator
+
+  contradicting:
+    - id: designated_scanner_host
+      name: Host is a designated scanning or monitoring system
+      description: >-
+        Asset records list the host as a vulnerability scanner, asset-discovery node or
+        monitoring server.
+      source: asset_inventory
+      field: ComputerName
+      indicates: sanctioned_scanning
+    - id: scheduled_scan_window
+      name: Activity falls inside a scheduled scan or test
+      description: >-
+        A change record covers the source host and time for a scan or an authorised
+        penetration test.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_security_testing
+
+  risk_logic:
+    required:
+      - service_scanning_activity
+
+    supporting:
+      any:
+        - destination_breadth
+        - non_client_process
+        - scanner_command
+        - enumeration_followup
+        - machine_speed_commands
+      all:
+        - destination_breadth
+        - enumeration_followup
+
+    contradicting:
+      any:
+        - designated_scanner_host
+        - scheduled_scan_window
+      all: []
+
+  verdict:
+    low_risk_when:
+      - service_scanning_activity
+      - designated_scanner_host
+      - scheduled_scan_window
+    suspicious_when:
+      - service_scanning_activity
+      - destination_breadth
+    high_risk_when:
+      - service_scanning_activity
+      - destination_breadth
+      - enumeration_followup
+      - machine_speed_commands
+
+  false_positive:
+    - condition: Vulnerability and asset scanners sweep the network.
+      explanation: >-
+        They are the largest source of scanning. The source hosts are known, the scans
+        are scheduled, and no schema enumeration follows.
+    - condition: Applications and scripts connect to their own databases.
+      explanation: >-
+        A Python or Node service talking to one database server repeats the same
+        destination all day. Scanning shows many destinations, each touched once.
+    - condition: Administrators list schemas during maintenance.
+      explanation: >-
+        Database administrators run the same catalogue queries from management hosts
+        under their own accounts, against servers they own.

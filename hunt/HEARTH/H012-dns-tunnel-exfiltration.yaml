@@ -1,0 +1,323 @@
+# Converted from THORCollective/HEARTH Flames/H012.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-any-hearth-h012-dns-tunnel-exfiltration-t1048-003
+version: 1.0.0
+
+info:
+  name: Data exfiltrated through DNS tunnelling on port 53
+  description: >-
+    DNS leaves almost every network and is seldom inspected, so an adversary can carry
+    data out inside the query names themselves: each query to a domain they control holds
+    a chunk of encoded data as a long subdomain label, and the answers can carry
+    instructions back. The sensor records each DNS request with the name asked for and
+    the process that asked, which is enough to see the encoded labels, the record types
+    tunnels prefer, the tools that build them, and processes that talk to a resolver
+    outside the estate directly.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - exfiltration
+    - dns
+    - tunneling
+    - command-and-control
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H012.md
+    - https://attack.mitre.org/techniques/T1048
+    - https://attack.mitre.org/techniques/T1048/003
+    - https://attack.mitre.org/techniques/T1071
+    - https://attack.mitre.org/techniques/T1071/004
+    - https://attack.mitre.org/detectionstrategies/DET0149
+    - https://attack.mitre.org/detectionstrategies/DET0400
+    - https://brightsec.com/blog/dns-tunneling/
+    - https://www.socinvestigation.com/threat-hunting-using-dns-logs-soc-incident-response-procedure/
+
+mitre:
+  tactics:
+    - TA0010
+    - TA0011
+  techniques:
+    - T1048
+    - T1071
+  sub_techniques:
+    - T1048.003
+    - T1071.004
+  detection_strategies:
+    - DET0149
+    - DET0400
+  analytics:
+    - AN0423
+    - AN0424
+    - AN1121
+    - AN1122
+  platforms:
+    - Windows
+    - Linux
+    - macOS
+  data_sources:
+    - NSM:Flow
+    - WinEventLog:Sysmon
+    - auditd:SYSCALL
+  data_components:
+    - Network Traffic Content
+    - Network Connection Creation
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary is utilizing DNS tunneling to exfiltrate data through DNS port 53,
+    encoding the data into the names of queries sent to a domain they control because DNS
+    is an unmonitored channel that passes through firewalls.
+  attacker_behavior:
+    - Encodes stolen data as long base32 or hex subdomain labels under one attacker-owned domain.
+    - Issues TXT, NULL or CNAME queries, whose answers hold more data than an address record.
+    - Runs a tunnelling tool such as iodine, dnscat2 or dns2tcp, or a script that loops nslookup.
+    - Sends queries straight to an external resolver, bypassing the estate's DNS servers.
+    - Keeps a steady stream of unique names going to one parent domain for the length of the transfer.
+  legitimate_behavior:
+    - Security products and content networks encode lookups in long labels for reputation checks.
+    - Mail servers and administrators issue TXT queries for SPF, DKIM and domain verification.
+    - Some VPN and captive-portal products tunnel over DNS by design.
+    - Diagnostic tools query public resolvers directly.
+  risk_indicator:
+    - A query label is forty or more characters of encoded-looking text.
+    - Many unique names fall under one rarely seen parent domain from one process.
+    - The requesting process is a script host, an unsigned binary or a tool with no reason to resolve names.
+    - A non-DNS process connects to port 53 on a public address.
+    - The host recently archived or staged data.
+
+requires:
+  platforms:
+    - windows
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        query_type: RequestType
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: long-encoded-query-label
+        name: DNS query carrying a long encoded label
+        purpose: >-
+          Return each request whose name holds a single label of 45 or more
+          encoding-alphabet characters. One pattern on one field keeps the scan cheap,
+          and well-known providers that use long labels are dropped before results are
+          returned.
+        query: |
+          #event_simpleName=DnsRequest
+          | DomainName=/(^|\.)[a-z0-9_=\-]{45,}\./i
+          | DomainName!=/\.(amazonaws\.com|cloudfront\.net|akadns\.net|akamaiedge\.net|azure\.com|windows\.net|googleusercontent\.com|sophosxl\.net|mcafee\.com|in-addr\.arpa|ip6\.arpa)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: bulk-record-type-query
+        name: TXT or NULL query with a long leading label
+        purpose: >-
+          Return queries for the record types tunnels use to move the most data per
+          answer, limited to names with a long first label so routine SPF and
+          verification lookups are not returned.
+        query: |
+          #event_simpleName=DnsRequest
+          | in(field="RequestType", values=[10, 16])
+          | DomainName=/^[a-z0-9_=\-]{24,}\./i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: dns-tunnel-tool-execution
+        name: DNS tunnelling tool or scripted lookup executed
+        purpose: >-
+          Return runs of the known tunnelling tools and of nslookup or dig asked for TXT
+          records, which is how a tunnel is built without custom code.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | CommandLine=/\b(iodined?|dnscat2?|dns2tcpc?|dnsexfiltrator|dnsteal|Invoke-DNSExfiltrator)\b|\b(nslookup|dig|Resolve-DnsName)\b.*\b(-q(uerytype)?=|-type[=\s]|\s)txt\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: direct-external-resolver-connection
+        name: Non-DNS process connecting to port 53 on a public address
+        purpose: >-
+          Return connections to port 53 outside the private ranges made by anything other
+          than the operating system's resolver, which is how a tunnel avoids the estate's
+          own DNS servers and their logging.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | RemotePort=53
+          | !cidr(RemoteAddressIP4, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"])
+          | ContextBaseFileName!=/^(svchost\.exe|dns\.exe|systemd-resolved|dnsmasq|named|unbound|mDNSResponder|chrome(\.exe)?|msedge\.exe|firefox(\.exe)?)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: encoded_dns_query
+      name: DNS query name carrying encoded data
+      description: >-
+        A DNS request holds a label of dozens of base32, base64 or hex characters,
+        longer than any hostname a person or ordinary software would form.
+      source: dns_request
+      field: query_name
+      indicates: data_carried_in_dns_query_names
+
+  supporting:
+    - id: tunnel_record_type
+      name: Query uses a bulk-capable record type
+      description: >-
+        The request type is TXT or NULL, which let the answer return far more data than
+        an address record.
+      source: dns_request
+      field: query_type
+      indicates: dns_tunnel_record_usage
+    - id: unusual_requesting_process
+      name: Requests come from an unexpected process
+      description: >-
+        The process issuing the queries is a script host, a tunnelling tool or an
+        unsigned binary, not a browser or the system resolver service.
+      source: dns_request
+      field: process_name
+      indicates: non_browser_dns_activity
+    - id: tunnel_tool_command
+      name: Tunnelling tool or scripted TXT lookup on the command line
+      description: >-
+        A process command line names a DNS tunnelling tool, or loops a lookup utility
+        over TXT queries.
+      source: process_creation
+      field: command_line
+      indicates: dns_tunnel_tooling
+    - id: external_resolver_direct
+      name: Port 53 reached on a public address by a non-DNS process
+      description: >-
+        A connection to port 53 goes to an address outside the private ranges from a
+        process other than the resolver, bypassing internal DNS.
+      source: network_connection
+      field: remote_address
+      indicates: resolver_bypass
+
+  contradicting:
+    - id: known_long_label_service
+      name: Parent domain belongs to a known service that encodes lookups
+      description: >-
+        The parent domain is a security vendor, content network or telemetry service
+        seen across the fleet for a long period.
+      source: baseline
+      field: DomainName
+      indicates: established_software_behaviour
+    - id: sanctioned_dns_tooling
+      name: Host runs a sanctioned DNS-based product or test
+      description: >-
+        Asset records list the host as a DNS server, a security test system or one
+        running an approved product that tunnels over DNS.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_dns_usage
+
+  risk_logic:
+    required:
+      - encoded_dns_query
+
+    supporting:
+      any:
+        - tunnel_record_type
+        - unusual_requesting_process
+        - tunnel_tool_command
+        - external_resolver_direct
+      all:
+        - unusual_requesting_process
+        - tunnel_record_type
+
+    contradicting:
+      any:
+        - known_long_label_service
+        - sanctioned_dns_tooling
+      all: []
+
+  verdict:
+    low_risk_when:
+      - encoded_dns_query
+      - known_long_label_service
+      - sanctioned_dns_tooling
+    suspicious_when:
+      - encoded_dns_query
+      - unusual_requesting_process
+    high_risk_when:
+      - encoded_dns_query
+      - unusual_requesting_process
+      - tunnel_record_type
+      - external_resolver_direct
+
+  false_positive:
+    - condition: A security product performs reputation lookups over DNS.
+      explanation: >-
+        Anti-malware and web-filtering agents encode file hashes and URLs in long labels
+        under the vendor's domain. The requesting process is the agent, the parent domain
+        is the vendor's, and every host with the product does the same.
+    - condition: Mail and identity systems issue TXT queries.
+      explanation: >-
+        SPF, DKIM, DMARC and domain-verification lookups are TXT queries with short,
+        readable first labels. The long-label test on the bulk-record case leaves them
+        out; any that remain come from mail servers.
+    - condition: A diagnostic tool queries a public resolver.
+      explanation: >-
+        An administrator testing resolution with dig or nslookup against a public
+        resolver produces a few connections to port 53. A tunnel produces a sustained
+        stream from one process to one address.

@@ -1,0 +1,256 @@
+# Converted from THORCollective/HEARTH Flames/H055.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h055-gootloader-powershell-host-reconnaissance-t1082
+version: 1.0.0
+
+info:
+  name: Gootloader second-stage PowerShell host reconnaissance
+  description: >-
+    Within about twenty minutes of a Gootloader JavaScript file being run, its PowerShell
+    stage profiles the host: operating system details through Get-CimInstance
+    Win32_OperatingSystem, the window title of every running process through
+    ConvertTo-Csv, environment variables shorter than 99 characters, the desktop's file
+    names through the Shell.Application COM object, and the mounted drives. Window titles
+    are the unusual part, because they leak open documents and sometimes credentials.
+    The result goes to the operator, and for Vanilla Tempest it precedes Kerberoasting,
+    WinRM movement and ransomware. Script block logging is not collected here, so the
+    hunt sees these terms only where they reach a process command line, and returns
+    PowerShell started by the script host that runs Gootloader.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - discovery
+    - gootloader
+    - powershell
+    - system-information
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H055.md
+    - https://attack.mitre.org/techniques/T1082
+    - https://attack.mitre.org/detectionstrategies/DET0525
+    - https://www.huntress.com/blog/gootloader-threat-detection-woff2-obfuscation
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1082
+  sub_techniques: []
+  detection_strategies:
+    - DET0525
+  analytics:
+    - AN1452
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    Threat actors are using PowerShell's Get-CimInstance cmdlet to query
+    Win32_OperatingSystem and ConvertTo-Csv to extract MainWindowTitle properties from
+    running processes, together with short environment variables, desktop file
+    inventories through the Shell.Application COM object and mounted drive information,
+    to perform comprehensive host reconnaissance within 20 minutes of Gootloader
+    JavaScript execution.
+  attacker_behavior:
+    - Runs a .js file from a downloaded zip with wscript, which sets a scheduled task and starts PowerShell.
+    - Queries Win32_OperatingSystem and lists processes with their main window titles.
+    - Filters environment variables to those under 99 characters.
+    - Enumerates the desktop through Shell.Application and lists drives.
+    - Sends the collected profile to a compromised WordPress site and waits for tasking.
+  legitimate_behavior:
+    - Inventory and support scripts query Win32_OperatingSystem.
+    - Administrators list processes with window titles when troubleshooting.
+    - Logon scripts read environment variables and drives.
+  risk_indicator:
+    - PowerShell is a child of wscript or cscript running a .js file from a user profile.
+    - One command line combines operating system, window title and drive queries.
+    - The command line references Shell.Application or MainWindowTitle.
+    - The PowerShell process makes an outbound web connection soon after.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: window-title-and-os-reconnaissance
+        name: PowerShell command line with the reconnaissance terms
+        purpose: >-
+          Return PowerShell runs whose command line carries the distinctive terms of the
+          profile: window titles, the Shell.Application object, or the operating system
+          class together with CSV conversion.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/MainWindowTitle|Shell\.Application|Win32_OperatingSystem.*ConvertTo-Csv|ConvertTo-Csv.*Win32_OperatingSystem|\.Length\s+-lt\s+99\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: script-host-spawned-powershell
+        name: PowerShell started by a script host running JavaScript
+        purpose: >-
+          Return PowerShell whose parent is wscript or cscript, the launch arrangement
+          of the Gootloader stage, whatever its command line contains.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(wscript|cscript)\.exe$/i
+          | FileName=/^(powershell|pwsh)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: javascript-run-from-user-profile
+        name: Script host running a .js file from a user profile
+        purpose: >-
+          Return the first stage: wscript or cscript given a JavaScript file under a
+          user profile or a temporary directory, where the unzipped lure sits.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(wscript|cscript)\.exe$/i
+          | CommandLine=/\\(Users\\[^\\]+\\(Downloads|Desktop|Documents|AppData)|Windows\\Temp|Temp)\\[^"]*\.jse?\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: host_profile_command
+      name: PowerShell collecting a host profile
+      description: >-
+        A PowerShell command line queries operating system details, window titles,
+        desktop contents or drives, or PowerShell runs as the child of a script host.
+      source: process_creation
+      field: command_line
+      indicates: system_information_discovery
+
+  supporting:
+    - id: script_host_parent
+      name: PowerShell parented by wscript or cscript
+      description: >-
+        The parent of PowerShell is a Windows script host, which is how the JavaScript
+        loader hands over to its second stage.
+      source: process_creation
+      field: parent_process
+      indicates: loader_to_second_stage_chain
+    - id: window_title_collection
+      name: Window titles or desktop contents collected
+      description: >-
+        The command line references MainWindowTitle or Shell.Application, collection
+        that support scripts rarely perform.
+      source: process_creation
+      field: command_line
+      indicates: sensitive_context_harvesting
+    - id: lure_script_user
+      name: Ordinary user ran a downloaded script
+      description: >-
+        The user is a standard account and a JavaScript file from a download location
+        ran in the same session.
+      source: process_creation
+      field: user
+      indicates: user_executed_lure
+
+  contradicting:
+    - id: inventory_script_origin
+      name: Query belongs to an inventory or support script
+      description: >-
+        The parent chain leads to a management agent or logon script that is recorded as
+        collecting operating system details.
+      source: asset_inventory
+      field: ComputerName
+      indicates: managed_inventory_collection
+    - id: command_common_fleet_wide
+      name: Same command recurs across the fleet
+      description: >-
+        Earlier activity shows the identical command line on many hosts on a schedule.
+      source: baseline
+      field: CommandLine
+      indicates: established_software_behaviour
+
+  risk_logic:
+    required:
+      - host_profile_command
+
+    supporting:
+      any:
+        - script_host_parent
+        - window_title_collection
+        - lure_script_user
+      all:
+        - script_host_parent
+        - window_title_collection
+
+    contradicting:
+      any:
+        - inventory_script_origin
+        - command_common_fleet_wide
+      all: []
+
+  verdict:
+    low_risk_when:
+      - host_profile_command
+      - inventory_script_origin
+      - command_common_fleet_wide
+    suspicious_when:
+      - host_profile_command
+      - script_host_parent
+    high_risk_when:
+      - host_profile_command
+      - script_host_parent
+      - window_title_collection
+
+  false_positive:
+    - condition: Inventory and logon scripts query the operating system.
+      explanation: >-
+        Win32_OperatingSystem is one of the most queried classes. Those scripts run
+        fleet-wide from a management agent and do not collect window titles.
+    - condition: Legacy logon scripts in VBScript or JScript start PowerShell.
+      explanation: >-
+        Some estates still chain wscript to PowerShell at logon. The script path is on a
+        domain share, not a user's Downloads folder.
+    - condition: The reconnaissance runs inside the script and not on a command line.
+      explanation: >-
+        Gootloader often passes its code by stdin or an encoded block. The first case
+        then finds nothing, and the second and third are what remains; a miss on the
+        first does not clear a host.

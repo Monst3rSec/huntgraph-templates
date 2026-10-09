@@ -1,0 +1,285 @@
+# Converted from THORCollective/HEARTH Flames/H013.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+# Also holds H098 (AI-generated PowerShell backdoors, Hive0163 Slopoly). Who or what
+# wrote the script is not observable, and the behaviour is this file's.
+type: detection
+
+id: hg-win-hearth-h013-suspicious-powershell-script-execution-t1059-001
+version: 1.1.0
+
+info:
+  name: Unauthorised or suspicious PowerShell script execution
+  description: >-
+    PowerShell gives an adversary a downloader, a .NET runtime and full access to system
+    configuration on every Windows host. HEARTH points at script block logging, event
+    4104, as the richest record; that channel is not collected here, so the hunt works
+    from what the sensor does report, the PowerShell process and its command line. That
+    still shows download methods, execution-policy and profile switches, scripts run from
+    writable locations and attempts to switch off PowerShell's own logging. Script
+    content that never appears on a command line is out of reach.
+  severity: medium
+  author: huntgraph
+  tags:
+    - hearth
+    - execution
+    - powershell
+    - script-execution
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H013.md
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H098.md
+    - https://attack.mitre.org/techniques/T1059
+    - https://attack.mitre.org/techniques/T1059/001
+    - https://attack.mitre.org/detectionstrategies/DET0455
+    - https://techcommunity.microsoft.com/blog/microsoftsentinelblog/the-power-of-data-collection-rules-monitoring-powershell-usage/4236527
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1059
+  sub_techniques:
+    - T1059.001
+  detection_strategies:
+    - DET0455
+  analytics:
+    - AN1252
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    Attackers utilize PowerShell on Windows systems to execute malicious commands,
+    download additional payloads and manipulate system configuration, so the execution of
+    unauthorized or suspicious PowerShell scripts may indicate an adversary attempting to
+    compromise the system.
+  attacker_behavior:
+    - Calls DownloadFile, DownloadString or Invoke-WebRequest to bring a payload onto the host.
+    - Starts PowerShell with the execution policy bypassed, no profile and a hidden window.
+    - Runs a .ps1 from Downloads, Temp, ProgramData or Public.
+    - Disables script block logging or patches AMSI before running the real script.
+    - Launches PowerShell from an Office application, a script host or a scheduled task.
+  legitimate_behavior:
+    - Administrators and management agents run signed scripts from fixed paths.
+    - Software installers use PowerShell with the execution policy bypassed to run setup scripts.
+    - Developers download modules and packages with Invoke-WebRequest.
+  risk_indicator:
+    - The command line combines a download method with immediate execution.
+    - The script path is user-writable and the script is not seen on other hosts.
+    - The command line references AMSI or script block logging settings.
+    - The parent is a document application, a script host or a web server worker.
+    - The run falls outside the user's working hours or under a non-administrative account.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: powershell-download-method
+        name: PowerShell command line using a download method
+        purpose: >-
+          Return PowerShell runs that fetch remote content, with the URL and the
+          destination left on the command line for the agent to read.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh|powershell_ise)\.exe$/i
+          | CommandLine=/DownloadFile|DownloadString|DownloadData|Net\.WebClient|Invoke-WebRequest|Invoke-RestMethod|\b(iwr|irm|curl|wget)\s|Start-BitsTransfer|Net\.Sockets/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: script-from-writable-path
+        name: PowerShell running a script file from a user-writable location
+        purpose: >-
+          Return script-file executions from the directories where delivered and staged
+          scripts sit, leaving out scripts under Program Files and the Windows directory.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/\\(Users\\[^\\]+\\(Downloads|Desktop|AppData\\Local\\Temp|AppData\\Roaming)|Users\\Public|Windows\\Temp|ProgramData|PerfLogs)\\[^"']*\.ps(1|m1|d1)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: policy-bypass-hidden-launch
+        name: PowerShell started with policy bypass and a concealed window
+        purpose: >-
+          Return launches that both bypass the execution policy and hide the window or
+          skip the profile, the switch combination loaders use and interactive
+          administration does not.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/-e(x|xe|xec|xecutionpolicy)?\s+(bypass|unrestricted)/i
+          | CommandLine=/-w(in|indowstyle)?\s+h(id|idden)?\b|-nop(rofile)?\b|-noni(nteractive)?\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: powershell-logging-or-amsi-tamper
+        name: Command line that disables PowerShell logging or AMSI
+        purpose: >-
+          Return commands that turn off the visibility HEARTH relies on, which is itself
+          evidence that the script that follows is one the author wants unseen.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/amsiInitFailed|AmsiScanBuffer|amsiUtils|EnableScriptBlockLogging|ScriptBlockLogging\b.*\b0\b|System\.Management\.Automation\.Tracing|-version\s+2\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: suspicious_powershell_command
+      name: PowerShell command line with a suspicious trait
+      description: >-
+        A PowerShell process command line shows a download method, a script in a
+        writable path, a concealed policy-bypass launch or tampering with logging.
+      source: process_creation
+      field: command_line
+      indicates: suspicious_powershell_execution
+
+  supporting:
+    - id: download_and_execute
+      name: Download combined with immediate execution
+      description: >-
+        The same command line both fetches remote content and runs it, through IEX, a
+        pipe to the interpreter or a start of the downloaded file.
+      source: process_creation
+      field: command_line
+      indicates: payload_retrieval_and_execution
+    - id: unexpected_powershell_parent
+      name: PowerShell launched by an unexpected parent
+      description: >-
+        The parent is an Office application, a script host, a web server worker or a
+        scheduled-task host, not an administrator's console or a management agent.
+      source: process_creation
+      field: parent_process
+      indicates: abnormal_execution_chain
+    - id: non_admin_powershell_user
+      name: Run by an account that does not normally script
+      description: >-
+        The user is a standard account with no administrative or development role, or
+        the run is outside the account's usual hours.
+      source: process_creation
+      field: user
+      indicates: activity_outside_user_role
+    - id: visibility_tampering
+      name: Logging or AMSI disabled on the command line
+      description: >-
+        The command line references AMSI internals, script block logging settings or the
+        version 2 engine, which removes PowerShell's own inspection.
+      source: process_creation
+      field: command_line
+      indicates: defence_evasion_before_execution
+
+  contradicting:
+    - id: managed_script_deployment
+      name: Script is deployed by management tooling
+      description: >-
+        The host is in scope of a management or deployment system whose recorded job
+        matches the script and time.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_administration
+    - id: script_common_across_fleet
+      name: Same command line is routine across the fleet
+      description: >-
+        Earlier activity shows the identical command line on many hosts over a long
+        period under the same parent.
+      source: baseline
+      field: CommandLine
+      indicates: established_software_behaviour
+
+  risk_logic:
+    required:
+      - suspicious_powershell_command
+
+    supporting:
+      any:
+        - download_and_execute
+        - unexpected_powershell_parent
+        - non_admin_powershell_user
+        - visibility_tampering
+      all:
+        - download_and_execute
+        - unexpected_powershell_parent
+
+    contradicting:
+      any:
+        - managed_script_deployment
+        - script_common_across_fleet
+      all: []
+
+  verdict:
+    low_risk_when:
+      - suspicious_powershell_command
+      - managed_script_deployment
+      - script_common_across_fleet
+    suspicious_when:
+      - suspicious_powershell_command
+      - unexpected_powershell_parent
+    high_risk_when:
+      - suspicious_powershell_command
+      - unexpected_powershell_parent
+      - download_and_execute
+      - visibility_tampering
+
+  false_positive:
+    - condition: Management agents and installers bypass the execution policy.
+      explanation: >-
+        Deployment tools routinely pass -ExecutionPolicy Bypass -NoProfile to run their
+        own scripts. The parent is the agent's service and the same line appears across
+        the fleet.
+    - condition: Developers and administrators download modules and tools.
+      explanation: >-
+        Invoke-WebRequest against package repositories and vendor sites is everyday
+        work. The destination host and the absence of immediate execution separate it
+        from a download cradle.
+    - condition: Security tooling tests AMSI.
+      explanation: >-
+        Validation and red-team tools reference AMSI internals deliberately. They run on
+        known test hosts inside recorded exercises.

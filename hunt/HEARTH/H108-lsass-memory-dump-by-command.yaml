@@ -1,0 +1,279 @@
+# Converted from THORCollective/HEARTH Flames/H108.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h108-lsass-memory-dump-by-command-t1003-001
+version: 1.0.0
+
+info:
+  name: LSASS memory dumped with comsvcs, procdump or a named dumping tool
+  description: >-
+    Dumping LSASS gave the ActiveMQ-to-LockBit operators the domain administrator
+    credentials they then used over RDP. HEARTH's main signal is the handle opened to
+    lsass.exe and its access mask, which is a Process Access event; this deployment does
+    not collect it, and nothing here stands in for it. What is collected is the dump
+    issued as a command: rundll32 calling the MiniDump export of comsvcs.dll, procdump
+    taking a full dump, another dumping utility pointed at lsass, and Mimikatz modules
+    named on a command line. A tool that opens LSASS through API calls in its own code, or
+    a dump taken from Task Manager, leaves no command and is not seen.
+  severity: critical
+  author: huntgraph
+  tags:
+    - hearth
+    - credential-access
+    - lsass
+    - comsvcs
+    - procdump
+    - mimikatz
+    - credential-dumping
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H108.md
+    - https://attack.mitre.org/techniques/T1003
+    - https://attack.mitre.org/techniques/T1003/001
+    - https://attack.mitre.org/detectionstrategies/DET0363
+
+mitre:
+  tactics:
+    - TA0006
+  techniques:
+    - T1003
+  sub_techniques:
+    - T1003.001
+  detection_strategies:
+    - DET0363
+  analytics:
+    - AN1030
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary is dumping credentials from the LSASS process memory using tools such as
+    Mimikatz, procdump, comsvcs.dll MiniDump, or direct API calls to access cached domain
+    credentials for lateral movement.
+  attacker_behavior:
+    - Runs rundll32 with comsvcs.dll MiniDump and the LSASS process id.
+    - Runs procdump with a full-dump switch against lsass.exe by name or by process id.
+    - Uses another signed dumping utility pointed at LSASS.
+    - Runs Mimikatz with sekurlsa modules, or loads it into PowerShell.
+    - Copies the dump off the host to extract credentials elsewhere.
+  legitimate_behavior:
+    - Support engineers take process dumps with procdump for crash analysis.
+    - Windows Error Reporting dumps crashed processes on its own.
+    - Security products and authorised testers exercise these commands in detection tests.
+  risk_indicator:
+    - comsvcs.dll MiniDump is called at all; it has no routine use.
+    - The dump target is lsass.exe or the process id LSASS holds on that host.
+    - The output path is a temporary or public directory.
+    - The command runs under a web server, a remote-access tool or a script host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: comsvcs-minidump-through-rundll32
+        name: rundll32 calling comsvcs.dll MiniDump
+        purpose: >-
+          Return rundll32 commands that name comsvcs and its MiniDump export, by name or
+          by ordinal 24. The target process id and the output path are on the command
+          line.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^rundll32\.exe$/i
+          | CommandLine=/comsvcs/i
+          | CommandLine=/MiniDump|#\+?0*24\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: procdump-full-dump
+        name: procdump taking a full process dump
+        purpose: >-
+          Return procdump runs with a full or mini-plus dump switch. The target is given
+          by name or by process id; when it is a number, the agent checks it against the
+          process id LSASS holds on that host. A renamed procdump is not matched by this
+          case and is caught by the next one only if lsass is named.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^procdump(64|64a)?\.exe$/i
+          | CommandLine=/\s[-\/]m[amp]\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: dump-command-naming-lsass
+        name: Dump command that names lsass
+        purpose: >-
+          Return any command line that names lsass together with a dump verb, switch or
+          .dmp output, whatever the image is called. This covers renamed procdump and
+          other dumping utilities.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/lsass/i
+          | CommandLine=/dump|\.dmp\b|\s[-\/]m[amp]\b|fullmemdmp/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: mimikatz-module-on-command-line
+        name: Mimikatz credential module on a command line
+        purpose: >-
+          Return command lines carrying Mimikatz module syntax for LSASS credentials.
+          Mimikatz run interactively takes its commands at its own prompt and shows only
+          the image name.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/sekurlsa::|lsadump::|privilege::debug|Invoke-Mimikatz/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: lsass_dump_command
+      name: Command that dumps LSASS memory
+      description: >-
+        A command line calls comsvcs MiniDump, runs procdump with a full-dump switch,
+        names lsass with a dump verb, or carries a Mimikatz credential module.
+      source: process_creation
+      field: command_line
+      indicates: lsass_memory_dump
+
+  supporting:
+    - id: target_is_lsass
+      name: Dump target is LSASS
+      description: >-
+        The command names lsass.exe, or the numeric target equals the process id LSASS
+        holds on the host, which the agent confirms.
+      source: process_creation
+      field: command_line
+      indicates: credential_store_targeted
+    - id: output_in_scratch_path
+      name: Dump written to a temporary or public path
+      description: >-
+        The output path on the command line is under Temp, ProgramData, Public or a web
+        root.
+      source: process_creation
+      field: command_line
+      indicates: dump_staged_for_collection
+    - id: unusual_parent
+      name: Parent is not an administrator's shell
+      description: >-
+        The parent is a web or application server, a remote-access tool, a script host or
+        an Office program.
+      source: process_creation
+      field: parent_process
+      indicates: dump_run_from_intrusion_chain
+    - id: renamed_dump_tool
+      name: Dumping tool runs under another name
+      description: >-
+        The command has procdump's switches but the image name is something else.
+      source: process_creation
+      field: image_name
+      indicates: tool_masquerading
+
+  contradicting:
+    - id: authorised_security_test
+      name: Host is in scope of an authorised test
+      description: >-
+        Change records show a penetration test or detection-validation run on the host at
+        the time.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_testing
+    - id: support_dump_of_other_process
+      name: procdump target is another process
+      description: >-
+        The procdump target is an application under support investigation, not LSASS.
+      source: asset_inventory
+      field: ComputerName
+      indicates: crash_analysis
+
+  risk_logic:
+    required:
+      - lsass_dump_command
+
+    supporting:
+      any:
+        - target_is_lsass
+        - output_in_scratch_path
+        - unusual_parent
+        - renamed_dump_tool
+      all:
+        - target_is_lsass
+        - unusual_parent
+
+    contradicting:
+      any:
+        - authorised_security_test
+        - support_dump_of_other_process
+      all: []
+
+  verdict:
+    low_risk_when:
+      - lsass_dump_command
+      - support_dump_of_other_process
+    suspicious_when:
+      - lsass_dump_command
+      - target_is_lsass
+    high_risk_when:
+      - lsass_dump_command
+      - target_is_lsass
+      - unusual_parent
+
+  false_positive:
+    - condition: procdump used for crash analysis.
+      explanation: >-
+        Support staff dump hung applications with the same switches. The target is the
+        application, not LSASS.
+    - condition: Security product self-tests and attack simulation.
+      explanation: >-
+        Breach-simulation tools run these exact commands. They are scheduled and come from
+        the simulation agent.

@@ -1,0 +1,290 @@
+# Converted from THORCollective/HEARTH Flames/H030.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+# Also holds H131 (Launch Daemon masquerading as an Apple or Google service, Sapphire
+# Sleet). It differs from H030 only in the name borrowed; a case for those prefixes is
+# below.
+type: detection
+
+id: hg-mac-hearth-h030-launchdaemon-impersonating-messaging-service-t1543-004
+version: 1.1.0
+
+info:
+  name: LaunchDaemon named after a messaging service running a binary from a non-standard path
+  description: >-
+    A property list in /Library/LaunchDaemons makes launchd start a program as root at
+    every boot. BlueNoroff installs one whose label borrows the name of a familiar
+    application, such as Telegram2, while its program path points at a binary that is not
+    part of any application bundle. The name survives a glance at the daemon list; the
+    path does not. The sensor does not report plist writes as such, so the hunt reads the
+    commands that create and load daemons, and the processes launchd starts from
+    locations where daemons do not belong.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - persistence
+    - launch-daemon
+    - masquerading
+    - bluenoroff
+    - macos
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H030.md
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H131.md
+    - https://attack.mitre.org/techniques/T1543
+    - https://attack.mitre.org/techniques/T1543/004
+    - https://attack.mitre.org/detectionstrategies/DET0401
+    - https://www.huntress.com/blog/inside-bluenoroff-web3-intrusion-analysis
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1543
+  sub_techniques:
+    - T1543.004
+  detection_strategies:
+    - DET0401
+  analytics:
+    - AN1126
+  platforms:
+    - macOS
+  data_sources:
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    Threat actors are establishing persistence on macOS systems using LaunchDaemons that
+    impersonate legitimate messaging services, such as Telegram2, but execute malicious
+    binaries from non-standard locations.
+  attacker_behavior:
+    - Writes a plist into /Library/LaunchDaemons with a label that imitates a messaging application.
+    - Points ProgramArguments at a binary under /Library, /Users/Shared, a hidden directory or a temporary path.
+    - Loads the daemon with launchctl load or bootstrap so it starts without a reboot.
+    - Sets RunAtLoad and KeepAlive so the binary restarts whenever it exits.
+    - Obtains the administrator password through a dialog to gain the rights to install it.
+  legitimate_behavior:
+    - Vendor installers add daemons whose programs live inside their application bundle or support directory.
+    - Device-management tooling installs and loads daemons across the fleet.
+    - Developers load test daemons on their own machines.
+  risk_indicator:
+    - The daemon label uses a consumer messaging name that installs no daemon of its own.
+    - The program launchd starts is outside /Applications, /System, /usr and vendor support directories.
+    - The plist is created by a shell, osascript or curl-fed script and not by an installer package.
+    - The binary is unsigned, ad-hoc signed or newly written.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: launchdaemon-plist-created-or-loaded
+        name: Command that creates or loads a LaunchDaemon plist
+        purpose: >-
+          Return commands that name a plist under /Library/LaunchDaemons together with a
+          write or a launchctl load, leaving out the installer and management parents
+          that do this legitimately.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | CommandLine=/\/Library\/LaunchDaemons\/[^\s"']+\.plist/
+          | FileName=/^(launchctl|cp|mv|tee|sh|bash|zsh|plutil|defaults|osascript|curl|chown|chmod|install|ditto|PlistBuddy)$/
+          | ParentBaseFileName!=/^(installd|package_script_service|jamf|JamfDaemon|munki.*|managedsoftwareupdate|kandji.*|softwareupdated|system_installd)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: messaging-named-daemon-plist
+        name: LaunchDaemon plist named after a messaging application
+        purpose: >-
+          Return any command naming a daemon plist whose file name borrows a messaging or
+          conferencing product, the impersonation HEARTH describes.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | CommandLine=/\/Library\/Launch(Daemons|Agents)\/[^\s"'\/]*(telegram|whatsapp|signal|slack|discord|zoom|skype|wechat|teams|messenger)[^\s"'\/]*\.plist/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: launchd-started-binary-from-odd-path
+        name: launchd starting a root process from a non-standard location
+        purpose: >-
+          Return processes launchd starts from shared, temporary or hidden directories.
+          The image path is tested with anchored prefixes, which keeps the scan cheap
+          over a long window.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | ParentBaseFileName=launchd
+          | ImageFileName=/^\/(Users\/Shared|private\/tmp|tmp|private\/var\/tmp|var\/tmp|Library\/[^\/]+$|Users\/[^\/]+\/\.[^\/]+\/|Library\/\.[^\/]+\/)/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: vendor-prefixed-daemon-plist-from-non-installer
+        name: com.apple or com.google daemon plist under /Library/LaunchDaemons outside an installer
+        purpose: >-
+          Return commands that name a com.apple or com.google plist under
+          /Library/LaunchDaemons and whose parent is not an installer or updater.
+          Apple's own daemons live under /System/Library/LaunchDaemons, so a com.apple
+          label here is borrowed; Google's are installed by its updater. The signing
+          status of the daemon's program is not on the event and is not claimed.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | CommandLine=/\/Library\/LaunchDaemons\/com\.(apple|google)\.[^\s"'\/]*\.plist/
+          | CommandLine!=/\/System\/Library\/LaunchDaemons\//
+          | ParentBaseFileName!=/^(installd|system_installd|package_script_service|softwareupdated|GoogleSoftwareUpdate.*|GoogleUpdater|ksinstall|launchd)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: launchdaemon_install_command
+      name: LaunchDaemon created or loaded from the command line
+      description: >-
+        A process command line writes, copies or loads a plist under
+        /Library/LaunchDaemons, registering a program for launchd to start as root.
+      source: process_creation
+      field: command_line
+      indicates: launch_daemon_persistence_candidate
+
+  supporting:
+    - id: messaging_name_impersonation
+      name: Daemon named after a messaging application
+      description: >-
+        The plist name on the command line borrows a messaging or conferencing product
+        name, sometimes with a digit or suffix added.
+      source: process_creation
+      field: command_line
+      indicates: service_name_masquerading
+    - id: daemon_binary_odd_path
+      name: launchd started a binary from a non-standard location
+      description: >-
+        A process whose parent is launchd has an image path under a shared, temporary or
+        hidden directory, or directly in /Library.
+      source: process_creation
+      field: image_path
+      indicates: persistence_payload_outside_application_bundle
+    - id: non_installer_origin
+      name: Daemon installed by a shell or script
+      description: >-
+        The parent of the creating command is a shell, osascript or a download tool, not
+        the system installer or a management agent.
+      source: process_creation
+      field: parent_process
+      indicates: manual_persistence_installation
+    - id: vendor_prefix_impersonation
+      name: Daemon label borrows an Apple or Google prefix
+      description: >-
+        The plist named on the command line carries a com.apple or com.google label, is
+        under /Library/LaunchDaemons, and was not placed by an installer or updater.
+      source: process_creation
+      field: command_line
+      indicates: trusted_vendor_name_borrowed
+
+  contradicting:
+    - id: vendor_package_install
+      name: Daemon belongs to an installed vendor package
+      description: >-
+        The plist label and program path match software inventoried for the host, and
+        the install lines up with a package installation.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_installer_behaviour
+    - id: daemon_present_fleet_wide
+      name: Same daemon exists across the fleet
+      description: >-
+        Earlier activity shows the same plist and program path on many macOS hosts, as a
+        managed deployment would produce.
+      source: baseline
+      field: CommandLine
+      indicates: established_software_behaviour
+
+  risk_logic:
+    required:
+      - launchdaemon_install_command
+
+    supporting:
+      any:
+        - messaging_name_impersonation
+        - daemon_binary_odd_path
+        - non_installer_origin
+        - vendor_prefix_impersonation
+      all:
+        - messaging_name_impersonation
+        - daemon_binary_odd_path
+
+    contradicting:
+      any:
+        - vendor_package_install
+        - daemon_present_fleet_wide
+      all: []
+
+  verdict:
+    low_risk_when:
+      - launchdaemon_install_command
+      - vendor_package_install
+      - daemon_present_fleet_wide
+    suspicious_when:
+      - launchdaemon_install_command
+      - non_installer_origin
+    high_risk_when:
+      - launchdaemon_install_command
+      - non_installer_origin
+      - daemon_binary_odd_path
+
+  false_positive:
+    - condition: A vendor's install script loads its daemon.
+      explanation: >-
+        Post-install scripts call launchctl on plists they just placed. The parent is
+        the installer, and the program path is inside the vendor's bundle or support
+        directory.
+    - condition: Conferencing products install real daemons.
+      explanation: >-
+        Zoom and Teams ship launch daemons, so the name case matches them. Their labels
+        and program paths are the vendor's own and identical on every host.
+    - condition: Developers test their own daemons.
+      explanation: >-
+        A developer loading a daemon from a build directory looks the same on one
+        machine. The host's role and the developer's ownership of the binary settle it.

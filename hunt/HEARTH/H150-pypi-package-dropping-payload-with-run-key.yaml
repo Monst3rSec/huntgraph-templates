@@ -1,0 +1,383 @@
+# Converted from THORCollective/HEARTH Flames/H150.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h150-pypi-package-dropping-payload-with-run-key-t1195-002
+version: 1.0.0
+
+info:
+  name: Python package that drops an executable into the user profile and adds a Run key
+  description: >-
+    OceanLotus published three packages to PyPI, colorinal, termncolor and uuid32-utils,
+    that run on import. A native DLL shipped inside the package is loaded into the
+    Python process, drops a second stage into %LOCALAPPDATA%\vcpacket\, registers it
+    under the HKCU Run value pkt-update and talks to its operators through the Zulip
+    chat API. The DLL load inside python.exe is a Module Load event and is not claimed.
+    The rest of the chain is visible: Python writing a PE file into the user profile
+    outside any package directory, Python starting it, the Run value, and a name request
+    for Zulip from a process that is not a browser or the Zulip client. The package
+    names are searched for, and the first two cases do not depend on them.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - initial-access
+    - supply-chain
+    - pypi
+    - python
+    - oceanlotus
+    - apt32
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H150.md
+    - https://attack.mitre.org/techniques/T1195
+    - https://attack.mitre.org/techniques/T1195/002
+    - https://attack.mitre.org/detectionstrategies/DET0309
+
+mitre:
+  tactics:
+    - TA0001
+  techniques:
+    - T1195
+  sub_techniques:
+    - T1195.002
+  detection_strategies:
+    - DET0309
+  analytics:
+    - AN0862
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - Windows Registry Key Modification
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    Threat actors deliver Python supply-chain malware through PyPI packages (colorinal,
+    termncolor, uuid32-utils) that load an attacker-controlled native DLL on import,
+    drop a payload to %LOCALAPPDATA%\vcpacket\ and persist through an HKCU Run key.
+  attacker_behavior:
+    - Publishes a package whose import runs code and loads a bundled native DLL.
+    - Drops a second-stage executable into a new directory under the user's local application data.
+    - Starts the dropped executable from the Python process.
+    - Adds an HKCU Run value so the executable starts at every logon.
+    - Uses a team-chat service's REST API as its command channel.
+  legitimate_behavior:
+    - pip writes compiled extensions and launcher executables into site-packages and Scripts.
+    - Packaged Python applications unpack helpers into their own directories.
+    - Teams that use Zulip resolve its hosts from the client and from browsers.
+  risk_indicator:
+    - python.exe writes a PE file under AppData outside any package or environment directory.
+    - python.exe starts an executable from AppData that is not part of a Python distribution.
+    - A Run value named pkt-update, or one pointing into vcpacket, is written.
+    - A process that is not a browser or the Zulip client resolves zulipchat.com.
+    - One of the named packages appears on a command line.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: executable-written-by-python-outside-package-directories
+        name: PE file written by Python into the user profile outside package directories
+        purpose: >-
+          Return PE files a Python interpreter writes under AppData when the path is not
+          a package, environment, launcher or tool-cache directory. pip installs write
+          many PE files and all of them land in the excluded directories. Frozen
+          applications that unpack into Temp are left in and show as a known product's
+          files.
+        query: |
+          #event_simpleName=PeFileWritten
+          | ContextBaseFileName=/^pythonw?[0-9.]*\.exe$/i
+          | TargetFileName=/\\Users\\[^\\]+\\AppData\\(Local|Roaming)\\/i
+          | TargetFileName!=/\\(site-packages|dist-packages|Scripts|Lib|DLLs|libs|envs|pkgs|pip|pipx|uv|pypoetry|Programs\\Python|_MEI\d+)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: python-starting-executable-from-appdata
+        name: Python starting an executable from AppData that is not a Python tool
+        purpose: >-
+          Return children of a Python interpreter whose image is under AppData and is
+          neither an interpreter nor a launcher in a Scripts or package directory. The
+          dropped second stage appears here when the importing process starts it; once
+          the Run key takes over, its parent is Explorer and it is not returned.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^pythonw?[0-9.]*\.exe$/i
+          | ImageFileName=/\\AppData\\(Local|Roaming)\\/i
+          | FileName!=/^(python|pythonw|py|pip|conda|uv|poetry|git|node)[0-9.]*\.exe$/i
+          | ImageFileName!=/\\(site-packages|Scripts|Programs\\Python|pipx|uv|envs)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: run-value-named-pkt-update
+        name: Run value named pkt-update written
+        purpose: >-
+          Return writes of the Run value name the campaign uses. Exact and cheap, and
+          gone as soon as the name changes.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\CurrentVersion\\Run\\?$/i
+          | RegValueName=/^pkt-update$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: run-value-pointing-into-vcpacket
+        name: Run value whose data points into the vcpacket directory
+        purpose: >-
+          Return Run values, under any name, whose data names the vcpacket directory or
+          the vcpktsvr executable.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\CurrentVersion\\Run\\?$/i
+          | RegStringValue=/\\vcpacket\\|vcpktsvr/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: zulip-api-requested-by-non-client-process
+        name: Zulip host requested by a process that is not a browser or the Zulip client
+        purpose: >-
+          Return name requests for zulipchat.com from anything but browsers and the
+          Zulip desktop client. Where the organisation runs Zulip bots or integrations
+          they appear under their interpreter and are told apart by host. The API calls
+          themselves are inside TLS and not visible.
+        query: |
+          #event_simpleName=DnsRequest
+          | DomainName=/(^|\.)zulipchat\.com$/i
+          | ContextBaseFileName!=/^(chrome|msedge|firefox|brave|opera|zulip|msedgewebview2)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: named-package-on-command-line
+        name: Command line naming one of the reported packages
+        purpose: >-
+          Return commands that name colorinal, termncolor or uuid32-utils: an install,
+          an import run with -c, or a requirements check. A package pulled in as a
+          dependency of another is never named on a command line and is not seen here.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/\b(colorinal|termncolor|uuid32-utils)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: payload_written_by_python
+      name: Python wrote an executable outside package directories
+      description: >-
+        A PE file is written under AppData, outside site-packages, Scripts and
+        environment directories, and the file-write event places it in a directory no
+        installed product owns.
+      source: file_creation
+      field: file_path
+      indicates: dropper_payload_staged
+
+  supporting:
+    - id: writer_is_python_interpreter
+      name: Writer is a Python interpreter
+      description: >-
+        The process named on the file-write event is python.exe or pythonw.exe.
+      source: file_creation
+      field: writer_process_name
+      indicates: package_code_dropping_files
+    - id: python_started_dropped_executable
+      name: Python started an executable from AppData
+      description: >-
+        A process whose parent is a Python interpreter runs from AppData and is not part
+        of a Python distribution.
+      source: process_creation
+      field: image_path
+      indicates: second_stage_execution
+    - id: run_value_added
+      name: Run value added for the dropped executable
+      description: >-
+        A value is written under a CurrentVersion\Run key with the name pkt-update, or
+        under any name by the same process id that wrote the executable.
+      source: registry
+      field: registry_value
+      indicates: logon_persistence
+    - id: run_value_targets_dropped_path
+      name: Run value data points at the dropped path
+      description: >-
+        The Run value's data is the path of the executable Python wrote.
+      source: registry
+      field: registry_data
+      indicates: persistence_for_dropped_payload
+    - id: chat_api_lookup
+      name: Zulip host resolved by an unexpected process
+      description: >-
+        A name request for zulipchat.com comes from a process that is not a browser or
+        the Zulip client.
+      source: dns_request
+      field: query_name
+      indicates: chat_service_command_channel
+    - id: chat_api_requester_is_dropped_binary
+      name: Requester is the dropped executable
+      description: >-
+        The requesting process on the name request is the executable Python wrote or
+        started.
+      source: dns_request
+      field: process_name
+      indicates: payload_beaconing
+    - id: reported_package_named
+      name: A reported package is named on a command line
+      description: >-
+        A command on the host names colorinal, termncolor or uuid32-utils.
+      source: process_creation
+      field: command_line
+      indicates: known_malicious_package
+
+  contradicting:
+    - id: known_python_application
+      name: Files belong to a known Python application
+      description: >-
+        Asset records identify the directory and executable as part of a packaged Python
+        product installed on the host.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_software_installation
+    - id: zulip_integration_host
+      name: Host runs an approved Zulip integration
+      description: >-
+        The host is registered as running a Zulip bot or integration.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_chat_integration
+
+  risk_logic:
+    required:
+      - payload_written_by_python
+
+    supporting:
+      any:
+        - writer_is_python_interpreter
+        - python_started_dropped_executable
+        - run_value_added
+        - run_value_targets_dropped_path
+        - chat_api_lookup
+        - chat_api_requester_is_dropped_binary
+        - reported_package_named
+      all:
+        - python_started_dropped_executable
+        - run_value_added
+
+    contradicting:
+      any:
+        - known_python_application
+        - zulip_integration_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - payload_written_by_python
+      - known_python_application
+    suspicious_when:
+      - payload_written_by_python
+      - python_started_dropped_executable
+    high_risk_when:
+      - payload_written_by_python
+      - python_started_dropped_executable
+      - run_value_added
+
+  false_positive:
+    - condition: Frozen Python applications and self-updaters.
+      explanation: >-
+        A packaged application run under python.exe may download its own update into
+        AppData. The directory carries the product's name and the same files appear on
+        every host with it installed.
+    - condition: Packages that fetch a helper binary on first use.
+      explanation: >-
+        Browser-automation and media packages download a driver or codec into a cache
+        directory. The path is the package's documented cache and no Run value follows.
+    - condition: Zulip bots written in Python.
+      explanation: >-
+        They resolve zulipchat.com from python.exe by design, on hosts set up for the
+        purpose.

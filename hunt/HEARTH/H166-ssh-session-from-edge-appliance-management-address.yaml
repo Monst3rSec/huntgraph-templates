@@ -1,0 +1,258 @@
+# Converted from THORCollective/HEARTH Flames/H166.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-lin-hearth-h166-ssh-session-from-edge-appliance-management-address-t1021-004
+version: 1.0.0
+
+info:
+  name: SSH session to a Linux host from an edge appliance management address
+  description: >-
+    In the F5 and Confluence intrusion Microsoft reported in May 2026, the actor logged
+    in over SSH from a compromised F5 BIG-IP to internal Linux servers and worked from
+    that one session: Confluence credentials, NTLM relay tooling and the move into
+    Active Directory all came from it. A BIG-IP is administered to, not from, so an SSH
+    logon whose source is its management address has almost no legitimate explanation.
+    The appliance carries no sensor and its outbound connection is not seen. The target
+    host does carry one, so the hunt returns the SSH logons Linux hosts accept from
+    private addresses, for the agent to compare with the appliance management inventory,
+    and the staging commands the report lists: shared memory and /tmp made
+    world-writable and payloads fetched or decoded into them.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - lateral-movement
+    - ssh
+    - edge-appliance
+    - f5-big-ip
+    - linux
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H166.md
+    - https://attack.mitre.org/techniques/T1021
+    - https://attack.mitre.org/techniques/T1021/004
+    - https://attack.mitre.org/detectionstrategies/DET0596
+
+mitre:
+  tactics:
+    - TA0008
+  techniques:
+    - T1021
+  sub_techniques:
+    - T1021.004
+  detection_strategies:
+    - DET0596
+  analytics:
+    - AN1638
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:EXECVE
+    - linux:syslog
+  data_components:
+    - Process Creation
+    - Logon Session Creation
+
+hypothesis:
+  statement: >-
+    A privileged SSH session to an internal Linux host (Confluence, Tomcat, an SSH
+    bastion or any domain-joined Linux server) is originating from the management IP of
+    an F5 BIG-IP edge appliance, a path that almost never exists in normal operations
+    and was the pivot point in the Microsoft-reported F5 and Confluence intrusion.
+  attacker_behavior:
+    - Compromises an internet-facing edge appliance that carries no endpoint sensor.
+    - Logs in over SSH from the appliance to internal Linux servers with harvested credentials.
+    - Makes /dev/shm or /tmp world-writable and stages tooling there.
+    - Fetches payloads with curl or wget from a staging server on port 8888.
+    - Decodes Base64 payloads into shared memory and runs them from the session.
+  legitimate_behavior:
+    - Lifecycle automation and backup jobs connect to the appliance, not from it.
+    - A small number of monitoring probes on an appliance open SSH health checks to pool members.
+    - Administrators stage files in /tmp during ordinary maintenance.
+  risk_indicator:
+    - The source address of an accepted SSH logon is an appliance management interface.
+    - The account is root or a service account with sudo rights.
+    - chmod 777 on /dev/shm or /tmp follows the logon on the same host.
+    - A download or decode into /dev/shm follows within the session.
+    - No change record or health-monitor configuration accounts for the session.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: logon_session
+      connector: crowdstrike-ngsiem
+      event_types:
+        - UserLogon
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        logon_type: LogonType
+        remote_address: RemoteAddressIP4
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: ssh-logon-from-private-address
+        name: Linux logon accepted from a private address
+        purpose: >-
+          Return logons on Linux hosts whose source is a private address, with the
+          account and the source on each event. The sensor does not know which addresses
+          belong to edge appliances; the agent keeps the events whose source is in the
+          appliance management inventory. Replace the three private ranges with the
+          appliance management subnets before a long-window run, or the case returns
+          every internal SSH logon. The appliance itself has no sensor, so its outbound
+          connection is never seen and only the target side is hunted.
+        query: |
+          #event_simpleName=UserLogon
+          | event_platform=Lin
+          | cidr(RemoteAddressIP4, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: world-writable-staging-directory
+        name: Shared memory or /tmp made world-writable, or a payload fetched into it
+        purpose: >-
+          Return the staging commands Microsoft published for this intrusion: chmod 777
+          on /dev/shm or /tmp, curl or wget writing into either, a fetch from a host on
+          port 8888, and a Base64 decode redirected into either. A redirect belongs to
+          the shell, so the decode form is seen only when the whole line was passed to a
+          shell as an argument; typed at an interactive prompt, base64 shows as a bare
+          process with no destination. The agent keeps the events that follow a logon
+          from the first case on the same host.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | CommandLine=/chmod\s+(-R\s+)?(0?777|a\+rwx|ugo\+rwx)\s+\/(dev\/shm|tmp)\b|\b(curl|wget)\b[^|;]*\s(-o|-O|--output|--output-document)\s*\/(dev\/shm|tmp)\/|\b(curl|wget)\b[^|;]*https?:\/\/[^\s\/]+:8888\b|base64\s+(-d|--decode)[^|;]*>\s*\/(dev\/shm|tmp)\//
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: ssh_logon_from_appliance_address
+      name: SSH logon whose source is an appliance management address
+      description: >-
+        A Linux host accepted a logon whose remote address is the management interface
+        of an edge appliance, which the agent establishes by comparing the address on
+        the returned event with the appliance inventory.
+      source: logon_session
+      field: remote_address
+      indicates: lateral_movement_from_edge_appliance
+
+  supporting:
+    - id: privileged_session_account
+      name: Session account is root or a privileged service account
+      description: >-
+        The logon is for root or an account with sudo rights on the target.
+      source: logon_session
+      field: user
+      indicates: privileged_remote_session
+    - id: staging_in_shared_memory
+      name: Tooling staged in /dev/shm or /tmp
+      description: >-
+        A command on the same host makes /dev/shm or /tmp world-writable or writes a
+        downloaded or decoded file into it.
+      source: process_creation
+      field: command_line
+      indicates: payload_staging
+    - id: staging_follows_logon
+      name: Staging follows the logon on the same host
+      description: >-
+        The staging command starts after the logon and on the same host, which the agent
+        derives by ordering the returned events.
+      source: process_creation
+      field: host
+      indicates: hands_on_keyboard_session
+
+  contradicting:
+    - id: appliance_health_monitor
+      name: Appliance is configured to probe the host over SSH
+      description: >-
+        The appliance configuration holds an SSH health monitor or a scripted check
+        against this host and account.
+      source: asset_inventory
+      field: ComputerName
+      indicates: configured_health_check
+    - id: session_change_record
+      name: Session matches a recorded maintenance window
+      description: >-
+        A change record covers the appliance, the target host and the time.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_maintenance
+
+  risk_logic:
+    required:
+      - ssh_logon_from_appliance_address
+
+    supporting:
+      any:
+        - privileged_session_account
+        - staging_in_shared_memory
+        - staging_follows_logon
+      all:
+        - privileged_session_account
+        - staging_in_shared_memory
+
+    contradicting:
+      any:
+        - appliance_health_monitor
+        - session_change_record
+      all: []
+
+  verdict:
+    low_risk_when:
+      - ssh_logon_from_appliance_address
+      - appliance_health_monitor
+      - session_change_record
+    suspicious_when:
+      - ssh_logon_from_appliance_address
+      - privileged_session_account
+    high_risk_when:
+      - ssh_logon_from_appliance_address
+      - privileged_session_account
+      - staging_in_shared_memory
+
+  false_positive:
+    - condition: An appliance runs an SSH health monitor against pool members.
+      explanation: >-
+        Some load balancer configurations log in to check a service. The account is a
+        dedicated low-privilege one, the logons repeat at a fixed interval and nothing
+        is staged afterwards.
+    - condition: An administrator makes /tmp writable during troubleshooting.
+      explanation: >-
+        It happens on a host under maintenance, from a jump host address and under a
+        named administrator.
+    - condition: Address reuse on the management network.
+      explanation: >-
+        A decommissioned appliance's address may have been given to a jump host. The
+        inventory date settles it.

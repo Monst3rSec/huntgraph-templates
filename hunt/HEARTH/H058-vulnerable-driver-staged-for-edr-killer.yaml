@@ -1,0 +1,285 @@
+# Converted from THORCollective/HEARTH Flames/H058.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h058-vulnerable-driver-staged-for-edr-killer-t1068
+version: 1.0.0
+
+info:
+  name: Vulnerable driver staged and registered to load an EDR-killer driver
+  description: >-
+    EDR killers packed with the Shanya service bring a legitimate but vulnerable driver,
+    ThrottleStop.sys or rwdrv.sys from TechPowerUp, and use its kernel write primitive
+    to load an unsigned driver of their own, hlpdrv.sys, which terminates security
+    product processes. Akira, Medusa, Qilin and Crytox affiliates run it shortly before
+    encryption. The driver load itself is a module-load event this deployment does not
+    collect. The steps around it are visible: the driver files being written to disk,
+    and the kernel service being created and started from the command line. The hunt
+    returns those, and does not claim to see the load.
+  severity: critical
+  author: huntgraph
+  tags:
+    - hearth
+    - privilege-escalation
+    - byovd
+    - edr-killer
+    - ransomware
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H058.md
+    - https://attack.mitre.org/techniques/T1068
+    - https://attack.mitre.org/detectionstrategies/DET0514
+    - https://news.sophos.com/en-us/2025/12/06/inside-shanya-a-packer-as-a-service-fueling-modern-attacks/
+
+mitre:
+  tactics:
+    - TA0004
+  techniques:
+    - T1068
+  sub_techniques: []
+  detection_strategies:
+    - DET0514
+  analytics:
+    - AN1419
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    Threat actors are loading legitimate vulnerable drivers such as ThrottleStop.sys and
+    rwdrv.sys from TechPowerUp to gain kernel-level write access, enabling the subsequent
+    loading and execution of unsigned malicious kernel drivers like hlpdrv.sys that
+    terminate security product processes and services.
+  attacker_behavior:
+    - Drops the vulnerable driver and the malicious driver into Temp, ProgramData or a user profile.
+    - Creates a kernel service for each with sc create type= kernel, or through the registry.
+    - Starts the services, uses the first driver to disable signature enforcement, then loads the second.
+    - Kills security product processes and stops their services from kernel mode.
+    - Proceeds to shadow-copy deletion and encryption within minutes.
+  legitimate_behavior:
+    - ThrottleStop and other TechPowerUp utilities install their drivers on enthusiast and engineering machines.
+    - Hardware vendors' tools register kernel services during installation.
+    - Driver developers create and start test kernel services.
+  risk_indicator:
+    - A driver file is written to a temporary or user-writable directory instead of System32\drivers.
+    - A kernel service is created with a binary path in such a directory.
+    - The driver names appear on a server or an ordinary business workstation.
+    - Security product processes stop reporting soon afterwards.
+    - The writing process is an unknown executable or a script host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        file_hash: SHA256HashData
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: named-driver-file-written
+        name: ThrottleStop, rwdrv or hlpdrv driver file written
+        purpose: >-
+          Return the three driver files as they are written, by name. The names are
+          anchored at the end of the path, so the match is cheap and exact.
+        query: |
+          #event_simpleName=PeFileWritten
+          | TargetFileName=/\\(ThrottleStop|rwdrv|hlpdrv)\.sys$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: driver-file-written-to-writable-path
+        name: Any driver file written to a temporary or user-writable directory
+        purpose: >-
+          Return .sys files written outside the driver store, which catches the same
+          technique under different driver names.
+        query: |
+          #event_simpleName=PeFileWritten
+          | TargetFileName=/\.sys$/i
+          | TargetFileName=/\\(Users\\[^\\]+\\(AppData|Downloads|Desktop|Documents)|Users\\Public|ProgramData|Windows\\Temp|PerfLogs|Temp)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: kernel-service-created-from-command-line
+        name: Kernel driver service created or started from the command line
+        purpose: >-
+          Return sc and PowerShell commands that register a kernel-type service, with
+          the binary path on the command line for the agent to read.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(sc|powershell|pwsh|cmd|reg)\.exe$/i
+          | CommandLine=/type=?\s*(kernel|filesys)\b|New-Service\b.*\.sys\b|\\Services\\[^\\\s]+.*\bImagePath\b.*\.sys\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: command-naming-the-drivers
+        name: Command line naming one of the drivers
+        purpose: >-
+          Return any process whose command line names the three drivers, covering
+          service creation, copies and deletions.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/\b(ThrottleStop|rwdrv|hlpdrv)(\.sys)?\b/i
+          | FileName!=/^ThrottleStop\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: driver_staged_on_disk
+      name: Driver file staged on disk
+      description: >-
+        A PE-written event records ThrottleStop.sys, rwdrv.sys or hlpdrv.sys, or another
+        driver file landing in a temporary or user-writable directory.
+      source: file_creation
+      field: file_path
+      indicates: kernel_driver_staged_for_loading
+
+  supporting:
+    - id: kernel_service_registered
+      name: Kernel service created for the driver
+      description: >-
+        A command line registers or starts a kernel-type service whose binary path is
+        the staged driver.
+      source: process_creation
+      field: command_line
+      indicates: driver_prepared_to_load
+    - id: unknown_driver_writer
+      name: Driver written by an unknown or script process
+      description: >-
+        The process that wrote the driver is not an installer or a vendor utility but an
+        executable in a writable path, a script host or a shell.
+      source: file_creation
+      field: writer_process_name
+      indicates: dropper_activity
+    - id: driver_hash_reputation
+      name: Driver hash is a known vulnerable or unknown driver
+      description: >-
+        The file hash matches a published vulnerable-driver list or has no reputation at
+        all.
+      source: threat_intel
+      field: SHA256HashData
+      indicates: vulnerable_or_malicious_driver
+    - id: service_created_by_non_installer
+      name: Service created from a shell or script
+      description: >-
+        The parent of the service-creating command is an interactive shell, a script or
+        an unknown executable, not an installer.
+      source: process_creation
+      field: parent_process
+      indicates: manual_driver_installation
+
+  contradicting:
+    - id: hardware_utility_installed
+      name: Host legitimately runs the hardware utility
+      description: >-
+        Software inventory shows ThrottleStop or another TechPowerUp tool on an
+        engineering or enthusiast machine, with the driver in the tool's own directory.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_hardware_tooling
+    - id: driver_development_host
+      name: Host is a driver development or test machine
+      description: >-
+        Asset records class the host as a driver development or test system.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_development_activity
+
+  risk_logic:
+    required:
+      - driver_staged_on_disk
+
+    supporting:
+      any:
+        - kernel_service_registered
+        - unknown_driver_writer
+        - driver_hash_reputation
+        - service_created_by_non_installer
+      all:
+        - kernel_service_registered
+        - unknown_driver_writer
+
+    contradicting:
+      any:
+        - hardware_utility_installed
+        - driver_development_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - driver_staged_on_disk
+      - hardware_utility_installed
+    suspicious_when:
+      - driver_staged_on_disk
+      - unknown_driver_writer
+    high_risk_when:
+      - driver_staged_on_disk
+      - unknown_driver_writer
+      - kernel_service_registered
+
+  false_positive:
+    - condition: ThrottleStop is installed and used on purpose.
+      explanation: >-
+        The utility drops its driver beside itself when run. It appears on laptops of
+        engineers and enthusiasts, started by the user, with no second driver and no
+        kernel service created from a shell.
+    - condition: Hardware and virtualisation installers write drivers to Temp first.
+      explanation: >-
+        Many installers unpack .sys files to a temporary directory before installing
+        them. The writer is the signed installer and the driver is the vendor's.
+    - condition: The driver was loaded without a command line.
+      explanation: >-
+        A loader can register and start the service through API calls. The command cases
+        then find nothing, and the file write is the only trace this hunt has.

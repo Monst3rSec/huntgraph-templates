@@ -1,0 +1,256 @@
+# Converted from THORCollective/HEARTH Flames/H129.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h129-powershell-reflective-assembly-load-on-command-line-t1620
+version: 1.0.0
+
+info:
+  name: PowerShell command line loading an assembly or shellcode into memory
+  description: >-
+    Reflective loading runs a payload from memory so that no executable is written to
+    disk. The PHANTOMPULL loader in the PhantomPulse campaign decrypted an AES-256-CBC
+    payload and loaded it this way. HEARTH's evidence is script block logging, .NET
+    runtime loader events, image loads with no backing file and memory-protection API
+    calls. None of those is collected here, and a compiled loader that does this in its
+    own code is not observable at all. One form is: PowerShell given the loading code on
+    its command line, where Assembly.Load on a byte array, or the VirtualAlloc and
+    delegate calls used to run shellcode, appear as text. The hunt is limited to that. A
+    command passed with -EncodedCommand is not decoded by the query and is missed unless
+    the agent decodes it.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - stealth
+    - reflective-loading
+    - fileless
+    - powershell
+    - dotnet
+    - phantompulse
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H129.md
+    - https://attack.mitre.org/techniques/T1620
+    - https://attack.mitre.org/detectionstrategies/DET0300
+    - https://www.elastic.co/security-labs/phantom-in-the-vault
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1620
+  sub_techniques: []
+  detection_strategies:
+    - DET0300
+  analytics:
+    - AN0838
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary is reflectively loading encrypted PE payloads directly into memory on
+    Windows to avoid disk-based detection, indicated by PowerShell or .NET processes
+    calling Assembly.Load, Reflection APIs, or VirtualAlloc+CreateThread sequences
+    without corresponding DLL file writes to disk.
+  attacker_behavior:
+    - Passes PowerShell a one-line loader that downloads or decodes a byte array.
+    - Decrypts the array with AES and calls Assembly.Load on the result.
+    - Invokes the loaded assembly's entry point without writing it to disk.
+    - Allocates executable memory and runs shellcode through a delegate.
+    - Hides the window and bypasses the execution policy.
+  legitimate_behavior:
+    - Administrative modules load helper assemblies from files with Add-Type or LoadFrom.
+    - Management products run PowerShell that loads their own libraries.
+    - Security teams run offensive tooling during authorised tests.
+  risk_indicator:
+    - Assembly.Load is called on bytes that were downloaded, decoded or decrypted in the same command.
+    - VirtualAlloc, a delegate for a function pointer and a memory copy appear together.
+    - The parent is an Office application, a script host or a process in a user-writable path.
+    - The window is hidden and the profile is skipped.
+    - No assembly file is named anywhere in the command.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: powershell-assembly-load-from-bytes
+        name: PowerShell command calling Assembly.Load
+        purpose: >-
+          Return PowerShell command lines that call the in-memory Load method of the
+          reflection or application-domain classes. LoadFrom and LoadFile, which read a
+          file from disk, are not matched.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/Reflection\.Assembly\]::Load\(|\[Assembly\]::Load\(|CurrentDomain\.Load\(|Assembly\]::\(?["']Load["']\)?\(/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: powershell-decode-or-decrypt-then-load
+        name: PowerShell command that decodes or decrypts and then loads
+        purpose: >-
+          Return the narrower set where the same command line also decodes, decrypts,
+          decompresses or downloads, which is where the byte array comes from.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/::Load\(/i
+          | CommandLine=/FromBase64String|DownloadData|DownloadString|GZipStream|DeflateStream|AesManaged|RijndaelManaged|Aes\]::Create|CreateDecryptor|ReadAllBytes|-bxor/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: powershell-native-memory-execution-calls
+        name: PowerShell command naming native memory execution calls
+        purpose: >-
+          Return PowerShell command lines that name the calls used to run shellcode from
+          script: memory allocation or protection together with a delegate or thread.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/VirtualAlloc|VirtualProtect|NtAllocateVirtualMemory/i
+          | CommandLine=/GetDelegateForFunctionPointer|CreateThread|Marshal\]::Copy|QueueUserAPC|EnumSystemLocales/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: in_memory_load_command
+      name: Command line that loads code into memory
+      description: >-
+        A PowerShell command line calls Assembly.Load on a byte array or names the
+        native calls that allocate executable memory and run it.
+      source: process_creation
+      field: command_line
+      indicates: reflective_code_loading
+
+  supporting:
+    - id: payload_decoded_in_same_command
+      name: Payload decoded, decrypted or downloaded in the same command
+      description: >-
+        The command line also holds a Base64 decode, an AES decryptor, a decompression
+        stream or a download call.
+      source: process_creation
+      field: command_line
+      indicates: encrypted_payload_staging
+    - id: delivery_parent
+      name: Started by a document, script host or user-path process
+      description: >-
+        The parent is an Office application, wscript, mshta, explorer from a Run dialog
+        or an executable in a user-writable path.
+      source: process_creation
+      field: parent_process
+      indicates: loader_delivery_chain
+    - id: ordinary_user_session
+      name: Runs in an ordinary user's session
+      description: >-
+        The user is not an administrator or a management service account.
+      source: process_creation
+      field: user
+      indicates: activity_outside_user_role
+
+  contradicting:
+    - id: management_product_script
+      name: Command belongs to a management product
+      description: >-
+        The same command line recurs across the fleet from a management or monitoring
+        agent.
+      source: baseline
+      field: CommandLine
+      indicates: routine_management_activity
+    - id: authorised_security_test
+      name: Authorised security testing on the host
+      description: >-
+        A change record covers offensive testing on this host at this time.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_testing
+
+  risk_logic:
+    required:
+      - in_memory_load_command
+
+    supporting:
+      any:
+        - payload_decoded_in_same_command
+        - delivery_parent
+        - ordinary_user_session
+      all:
+        - payload_decoded_in_same_command
+        - delivery_parent
+
+    contradicting:
+      any:
+        - management_product_script
+        - authorised_security_test
+      all: []
+
+  verdict:
+    low_risk_when:
+      - in_memory_load_command
+      - management_product_script
+    suspicious_when:
+      - in_memory_load_command
+      - ordinary_user_session
+    high_risk_when:
+      - in_memory_load_command
+      - payload_decoded_in_same_command
+      - delivery_parent
+
+  false_positive:
+    - condition: Management agents that embed a helper assembly.
+      explanation: >-
+        Some products ship a Base64 assembly inside a PowerShell command. The command is
+        identical on every host and the parent is the agent.
+    - condition: Administrators using community modules.
+      explanation: >-
+        A few modules load a bundled assembly from bytes. The account is technical and
+        the module is installed.
+    - condition: Red team and purple team exercises.
+      explanation: >-
+        Authorised testing produces exactly this. It is scheduled and scoped.

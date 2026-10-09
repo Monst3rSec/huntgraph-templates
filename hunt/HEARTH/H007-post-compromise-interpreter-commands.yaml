@@ -1,0 +1,306 @@
+# Converted from THORCollective/HEARTH Flames/H007.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-any-hearth-h007-post-compromise-interpreter-commands-t1059-001
+version: 1.0.0
+
+info:
+  name: Post-compromise commands run through cmd, PowerShell or a Unix shell
+  description: >-
+    Once on a host, an adversary works through the interpreters already there. The
+    commands themselves are common: whoami, ipconfig /all, nltest /domain_trusts, net
+    group, systeminfo, route print. What marks them is who ran them, from what parent,
+    how many in a row, and whether the command was obfuscated. HEARTH states the
+    hypothesis for interpreters as a whole; this template keeps that scope and gives the
+    Windows shells, PowerShell and the Unix shells their own cases, returning each
+    command so the agent can judge rarity, succession and lineage.
+  severity: medium
+  author: huntgraph
+  tags:
+    - hearth
+    - execution
+    - command-interpreter
+    - powershell
+    - discovery-commands
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H007.md
+    - https://attack.mitre.org/techniques/T1059
+    - https://attack.mitre.org/techniques/T1059/001
+    - https://attack.mitre.org/techniques/T1059/003
+    - https://attack.mitre.org/techniques/T1059/004
+    - https://attack.mitre.org/detectionstrategies/DET0455
+    - https://attack.mitre.org/detectionstrategies/DET0202
+    - https://attack.mitre.org/detectionstrategies/DET0384
+    - https://lolbas-project.github.io/lolbas/Binaries/Cmd/
+    - https://gtfobins.github.io/gtfobins/bash/
+    - https://thedfirreport.com/
+    - https://github.com/BushidoUK/Ransomware-Tool-Matrix
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1059
+  sub_techniques:
+    - T1059.001
+    - T1059.003
+    - T1059.004
+  detection_strategies:
+    - DET0455
+    - DET0202
+    - DET0384
+  analytics:
+    - AN1252
+    - AN0578
+    - AN1081
+    - AN1082
+  platforms:
+    - Windows
+    - Linux
+    - macOS
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:Security
+    - auditd:SYSCALL
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    After compromising a host, adversaries may attempt to execute malicious commands to
+    complete additional tasks, abusing the legitimate command interpreters already
+    present such as cmd, PowerShell, bash and zsh.
+  attacker_behavior:
+    - Runs a quick succession of discovery commands such as whoami, ipconfig /all, nltest /domain_trusts and net group /domain.
+    - Launches PowerShell with an encoded or hidden-window command line to hide what it runs.
+    - Starts cmd or PowerShell from an Office application, mail client or browser after a lure is opened.
+    - Uses a Unix shell one-liner to fetch and pipe a script into the shell or open a reverse shell.
+    - Runs the commands under an account or on a host that never does administrative work.
+  legitimate_behavior:
+    - Administrators and help-desk staff run the same discovery commands when troubleshooting.
+    - Logon scripts, inventory agents and monitoring tools call them on a schedule.
+    - Deployment tools pass encoded PowerShell commands to avoid quoting problems.
+  risk_indicator:
+    - Several distinct discovery commands run on one host within minutes under one shell.
+    - The user's role gives no reason to run administrative commands.
+    - The interpreter's parent is a document, mail or browser application.
+    - The command line is encoded, concatenated or otherwise obfuscated.
+    - The command references a file created shortly before in a writable directory.
+
+requires:
+  platforms:
+    - windows
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: windows-discovery-commands-from-shell
+        name: Common discovery commands launched by cmd or PowerShell
+        purpose: >-
+          Return the discovery commands HEARTH lists when a shell is their parent. Each
+          event carries the parent process id, so the agent can group commands issued by
+          one shell and see succession.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(whoami|nltest|net1?|systeminfo|route|ipconfig)\.exe$/i
+          | ParentBaseFileName=/^(cmd|powershell|pwsh)\.exe$/i
+          | CommandLine=/whoami|domain_trusts|dclist|localgroup\s+administrators|group\s+.*\/domain|systeminfo|route(\.exe)?"?\s+print|view\s+\/all|config\s+workstation|ipconfig(\.exe)?"?\s+\/all/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: powershell-encoded-or-hidden
+        name: PowerShell started with an encoded or concealed command
+        purpose: >-
+          Return PowerShell runs whose command line hides its content, the obfuscation
+          HEARTH names as a characteristic of malicious command execution.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/\s-e(n|nc|nco|ncod|ncode|ncoded|ncodedc\w*)?\s+[A-Za-z0-9+\/=]{40,}|FromBase64String|-w(in|indowstyle)?\s+h(id|idden)?\b|\bIEX\b|Invoke-Expression|DownloadString|-bxor/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: shell-from-document-or-mail-parent
+        name: Windows shell spawned by a document, mail or browser application
+        purpose: >-
+          Return cmd and PowerShell processes whose parent is a user-facing application,
+          the lineage question HEARTH asks about PowerShell spawning from Outlook.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(cmd|powershell|pwsh)\.exe$/i
+          | ParentBaseFileName=/^(outlook|winword|excel|powerpnt|onenote|msaccess|mspub|visio|acrord32|acrobat|chrome|msedge|firefox|thunderbird)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: unix-shell-fetch-and-run
+        name: Unix shell one-liner that fetches code or opens a socket
+        purpose: >-
+          Return shell invocations on Linux and macOS that pipe a download into an
+          interpreter, decode a blob into one, or redirect a shell over a TCP socket.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=/^(Lin|Mac)$/
+          | ImageFileName=/\/(bash|sh|zsh|dash|ksh)$/
+          | CommandLine=/\s-c\s/
+          | CommandLine=/(curl|wget)\s[^|;]*\|\s*(ba|z|da)?sh\b|base64\s+(-d|--decode|-D)[^|]*\|\s*(ba|z|da)?sh\b|\/dev\/(tcp|udp)\/|\b(ba|z)?sh\s+-i\b/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: interpreter_command
+      name: Command executed through a command interpreter
+      description: >-
+        A process event shows a discovery command, an obfuscated PowerShell invocation or
+        a fetch-and-run shell one-liner, with the full command line.
+      source: process_creation
+      field: command_line
+      indicates: post_compromise_command_execution_candidate
+
+  supporting:
+    - id: commands_in_succession
+      name: Several discovery commands under one shell
+      description: >-
+        Multiple distinct commands share one parent process id within minutes, which the
+        agent derives by grouping the returned events on host and parent process id.
+      source: process_creation
+      field: parent_process_id
+      indicates: scripted_or_hands_on_reconnaissance
+    - id: user_facing_parent
+      name: Interpreter parented by a document, mail or browser application
+      description: >-
+        The parent process is an Office application, PDF reader, mail client or browser,
+        placing the interpreter directly after user-opened content.
+      source: process_creation
+      field: parent_process
+      indicates: abnormal_execution_chain
+    - id: non_admin_user
+      name: Commands run by an account with no administrative role
+      description: >-
+        The user on the events belongs to a department or role that does not run
+        administrative commands, or has never run them before.
+      source: process_creation
+      field: user
+      indicates: activity_outside_user_role
+    - id: obfuscated_command
+      name: Command line is encoded or concealed
+      description: >-
+        The command line carries an encoded command, a hidden window, string
+        concatenation or an in-memory download cradle.
+      source: process_creation
+      field: command_line
+      indicates: command_obfuscation
+
+  contradicting:
+    - id: management_tooling_origin
+      name: Commands issued by management or inventory tooling
+      description: >-
+        The shell that ran the commands descends from an inventoried management,
+        monitoring or logon-script mechanism that runs them fleet-wide.
+      source: asset_inventory
+      field: ComputerName
+      indicates: managed_tooling_activity
+    - id: commands_common_for_user
+      name: Commands are routine for this user and host
+      description: >-
+        Earlier activity shows the same account running the same commands on this host
+        regularly, as an administrator or support engineer would.
+      source: baseline
+      field: UserName
+      indicates: routine_administration
+
+  risk_logic:
+    required:
+      - interpreter_command
+
+    supporting:
+      any:
+        - commands_in_succession
+        - user_facing_parent
+        - non_admin_user
+        - obfuscated_command
+      all:
+        - commands_in_succession
+        - non_admin_user
+
+    contradicting:
+      any:
+        - management_tooling_origin
+        - commands_common_for_user
+      all: []
+
+  verdict:
+    low_risk_when:
+      - interpreter_command
+      - management_tooling_origin
+      - commands_common_for_user
+    suspicious_when:
+      - interpreter_command
+      - commands_in_succession
+    high_risk_when:
+      - interpreter_command
+      - commands_in_succession
+      - non_admin_user
+      - user_facing_parent
+
+  false_positive:
+    - condition: Support staff troubleshoot a machine.
+      explanation: >-
+        whoami, ipconfig /all and systeminfo are the first things a technician types.
+        The account is a support or administrative one and the session lines up with a
+        ticket or a remote-support connection.
+    - condition: Logon scripts and inventory agents run discovery commands.
+      explanation: >-
+        These produce identical events on every host at logon or on a timer. The shared
+        parent chain and the fleet-wide repetition identify them; published lists of
+        noisy benign binaries such as WTFBins help name the product.
+    - condition: Deployment tooling uses encoded PowerShell.
+      explanation: >-
+        Management agents encode commands to survive quoting. The parent is the agent's
+        own service and the decoded content is the same across the fleet.

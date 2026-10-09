@@ -1,0 +1,282 @@
+# Converted from THORCollective/HEARTH Flames/H123.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h123-web-shell-on-windows-web-server-t1505-003
+version: 1.0.0
+
+info:
+  name: Web shell on an IIS, Exchange or Tomcat server
+  description: >-
+    A web shell is a script in a web application's folder that runs whatever the request
+    tells it to. It needs no outbound channel and survives a password reset. In the
+    domain compromise Microsoft described, Godzilla web shells were placed on Exchange
+    and Tomcat servers after an IIS file-upload flaw was used. Godzilla encrypts its
+    traffic, and HTTP requests are not visible to the sensor in any case, so the hunt
+    reads two things: the web server's worker process starting a command interpreter or
+    a discovery utility, and a server-side script being written into a web directory. A
+    shell that does its work inside the worker process through .NET or Java calls, as
+    Godzilla can, starts no child and is seen only when its file is written or when the
+    operator runs a command.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - persistence
+    - web-shell
+    - godzilla
+    - iis
+    - exchange
+    - tomcat
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H123.md
+    - https://attack.mitre.org/techniques/T1505
+    - https://attack.mitre.org/techniques/T1505/003
+    - https://attack.mitre.org/detectionstrategies/DET0394
+    - https://www.microsoft.com/en-us/security/blog/2026/04/17/domain-compromise-predictive-shielding-shut-down-lateral-movement/
+
+mitre:
+  tactics:
+    - TA0003
+  techniques:
+    - T1505
+  sub_techniques:
+    - T1505.003
+  detection_strategies:
+    - DET0394
+  analytics:
+    - AN1108
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary has deployed a web shell on a public-facing web server (IIS, Exchange,
+    Tomcat) for persistent command execution, indicated by w3wp.exe, tomcat.exe, or
+    java.exe spawning cmd.exe, PowerShell, or other execution engines.
+  attacker_behavior:
+    - Uploads an .aspx, .ashx or .jsp file into a web-accessible folder through a vulnerable upload function.
+    - Sends commands to the file over HTTP, which the worker process runs through cmd.exe or PowerShell.
+    - Runs whoami, ipconfig, net and nltest to learn where the shell landed.
+    - Uses certutil or PowerShell from the worker to fetch further tools.
+    - Places copies on several servers so one removal does not end access.
+  legitimate_behavior:
+    - Web applications start helper programs, such as image converters and PDF renderers.
+    - ASP.NET compiles pages with csc.exe under the worker process.
+    - Deployments write new pages into the web root.
+    - Java applications such as build servers start shells as part of their work.
+  risk_indicator:
+    - The worker process starts a shell that runs discovery commands.
+    - A server-side script appears in a web directory outside a deployment.
+    - The child runs as the application pool identity or the service account.
+    - The script is written by the worker process itself, not by a deployment tool.
+    - The same child commands appear on more than one web server.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NewScriptWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: web-worker-started-execution-engine
+        name: IIS, Apache, Tomcat service or PHP worker starting a shell or utility
+        purpose: >-
+          Return command interpreters, discovery utilities and transfer tools whose
+          parent is a web server worker. The compiler children of ASP.NET are not in the
+          list.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(w3wp|httpd|nginx|tomcat\d*w?|php-cgi|php|UMWorkerProcess|coldfusion|jrun)\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh|certutil|whoami|net|net1|ipconfig|systeminfo|nltest|tasklist|quser|bitsadmin|curl|wscript|cscript|mshta|rundll32|regsvr32)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: java-started-execution-engine
+        name: java.exe starting a shell or utility
+        purpose: >-
+          Return the same children where the parent is java.exe, which is how Tomcat and
+          other servlet containers appear when not run through the service wrapper. The
+          parent's command line is not on the child event, so every Java application
+          that starts a shell is returned; build servers and management consoles are the
+          usual ones and the agent removes them by host.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^javaw?\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh|certutil|whoami|net|net1|ipconfig|systeminfo|nltest|tasklist|quser|bitsadmin|curl|wscript|cscript|mshta|rundll32|regsvr32)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: server-side-script-written-to-web-directory
+        name: Server-side script written into a web directory
+        purpose: >-
+          Return script files with a server-side extension created under IIS, Exchange
+          or Tomcat web folders, with the writing process id. This depends on the sensor
+          classing these extensions as scripts; where it does not, only the process
+          cases apply.
+        query: |
+          #event_simpleName=NewScriptWritten
+          | TargetFileName=/\\(inetpub|wwwroot|webapps|htdocs|aspnet_client|FrontEnd\\HttpProxy|ClientAccess\\(owa|ecp))\\/i
+          | TargetFileName=/\.(aspx?|ashx|asmx|cshtml|jspx?|php\d?|cfm)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: web_server_spawned_interpreter
+      name: Web server process started a command interpreter or utility
+      description: >-
+        The parent of a shell, discovery utility or transfer tool is a web server worker
+        or a Java process.
+      source: process_creation
+      field: parent_process
+      indicates: web_shell_command_execution
+
+  supporting:
+    - id: discovery_or_download_command
+      name: Child runs discovery or download commands
+      description: >-
+        The child's command line runs whoami, net, ipconfig, nltest or tasklist, or
+        fetches a file.
+      source: process_creation
+      field: command_line
+      indicates: post_exploitation_activity
+    - id: script_dropped_in_web_directory
+      name: Server-side script written into a web directory
+      description: >-
+        A file with a server-side script extension was created under a web folder on the
+        same host.
+      source: file_creation
+      field: file_path
+      indicates: web_shell_file_planted
+    - id: script_written_by_worker
+      name: Script written by the worker process
+      description: >-
+        The writing process id on the file event belongs to the web server worker, which
+        points at an upload through the application. The agent matches the id to the
+        parent process id on the child events.
+      source: file_creation
+      field: writer_process_id
+      indicates: upload_through_web_application
+    - id: application_pool_identity
+      name: Child runs as the web application identity
+      description: >-
+        The user on the child process is an application pool identity, NETWORK SERVICE
+        or the servlet container's service account.
+      source: process_creation
+      field: user
+      indicates: execution_in_web_application_context
+
+  contradicting:
+    - id: application_helper_process
+      name: Child is a known helper of the application
+      description: >-
+        The same child and command line recur on this server as part of the
+        application's normal work.
+      source: baseline
+      field: CommandLine
+      indicates: expected_application_behaviour
+    - id: deployment_in_progress
+      name: Script arrived in a deployment
+      description: >-
+        A change record covers a release to this web application at this time.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_deployment
+
+  risk_logic:
+    required:
+      - web_server_spawned_interpreter
+
+    supporting:
+      any:
+        - discovery_or_download_command
+        - script_dropped_in_web_directory
+        - script_written_by_worker
+        - application_pool_identity
+      all:
+        - discovery_or_download_command
+        - script_dropped_in_web_directory
+
+    contradicting:
+      any:
+        - application_helper_process
+        - deployment_in_progress
+      all: []
+
+  verdict:
+    low_risk_when:
+      - web_server_spawned_interpreter
+      - application_helper_process
+    suspicious_when:
+      - web_server_spawned_interpreter
+      - application_pool_identity
+    high_risk_when:
+      - web_server_spawned_interpreter
+      - application_pool_identity
+      - discovery_or_download_command
+
+  false_positive:
+    - condition: Applications that shell out by design.
+      explanation: >-
+        Some web applications call cmd.exe to run a converter or a script. The command
+        line is fixed and repeats.
+    - condition: Java build and management servers.
+      explanation: >-
+        Jenkins, application managers and schedulers start shells from java.exe
+        constantly. They are internal hosts, not public web servers.
+    - condition: Releases writing pages into the web root.
+      explanation: >-
+        A deployment writes many scripts at once from a deployment tool, not one file
+        from the worker process.

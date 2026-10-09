@@ -1,0 +1,332 @@
+# Converted from THORCollective/HEARTH Flames/H116.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h116-ntds-dit-extraction-with-built-in-tools-t1003-003
+version: 1.0.0
+
+info:
+  name: NTDS.dit extracted from a domain controller with built-in tools
+  description: >-
+    NTDS.dit holds the password hash of every account in the domain. The file is locked
+    while Active Directory runs, so it is taken through a route that reads around the
+    lock: ntdsutil's Install From Media export, a wbadmin backup that includes the file,
+    a volume shadow copy made with vssadmin, WMI or diskshadow, or an esentutl copy. In
+    the Bumblebee-to-Akira intrusion the operator used wbadmin. All of these are signed
+    Microsoft binaries already on a domain controller. The copy of NTDS.dit that lands
+    in a working directory is a data file and the sensor does not report its creation,
+    so the hunt reads the commands. Nothing on a process event says the host is a domain
+    controller; the agent settles that from asset records.
+  severity: critical
+  author: huntgraph
+  tags:
+    - hearth
+    - credential-access
+    - ntds
+    - active-directory
+    - ntdsutil
+    - wbadmin
+    - shadow-copy
+    - akira
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H116.md
+    - https://attack.mitre.org/techniques/T1003
+    - https://attack.mitre.org/techniques/T1003/003
+    - https://attack.mitre.org/detectionstrategies/DET0586
+    - https://thedfirreport.com/2025/11/04/from-bing-search-to-ransomware-bumblebee-and-adaptixc2-deliver-akira-2/
+
+mitre:
+  tactics:
+    - TA0006
+  techniques:
+    - T1003
+  sub_techniques:
+    - T1003.003
+  detection_strategies:
+    - DET0586
+  analytics:
+    - AN1611
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary is extracting the Active Directory NTDS.dit database from a domain
+    controller using built-in tools such as ntdsutil, wbadmin, vssadmin, or diskshadow
+    to obtain all domain credential hashes for offline cracking and domain-wide
+    compromise.
+  attacker_behavior:
+    - Runs ntdsutil with the IFM create command to export the database and registry hives.
+    - Runs wbadmin start backup with NTDS.dit and the SYSTEM hive in its include list.
+    - Creates a shadow copy with vssadmin, WMI or a diskshadow script and copies NTDS.dit out of it.
+    - Copies the locked file with esentutl in VSS mode.
+    - Saves the SYSTEM hive, which holds the key needed to decrypt the hashes.
+  legitimate_behavior:
+    - Administrators create IFM media with ntdsutil when promoting a new domain controller.
+    - Backup products and scheduled wbadmin jobs take system state backups.
+    - Backup agents create and delete shadow copies on every run.
+  risk_indicator:
+    - The output goes to ProgramData, a Temp directory, a user profile or an admin share on the loopback address.
+    - The command runs under a shell started by a remote execution route, not a backup service.
+    - NTDS.dit and the SYSTEM hive are named in the same command or within minutes on the same host.
+    - The account is not a backup operator and no directory maintenance is scheduled.
+    - The host is a domain controller and the command falls outside its backup schedule.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: ntdsutil-ifm-or-snapshot-command
+        name: ntdsutil run with an IFM or snapshot command
+        purpose: >-
+          Return ntdsutil runs whose arguments activate the NTDS instance, create
+          Install From Media output or work with snapshots, in full or abbreviated form.
+          ntdsutil started with no arguments and driven interactively shows nothing on
+          its command line and is not returned.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^ntdsutil\.exe$/i
+          | CommandLine=/\bifm\b|\bsnapshot\b|\bac(tivate)?\s+i(nstance)?\s+ntds|\bcreate\s+(sysvol\s+)?(full|nodefrag)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: wbadmin-backup-naming-ntds-or-system-state
+        name: wbadmin backup or recovery that names NTDS or system state
+        purpose: >-
+          Return wbadmin start commands whose arguments include the NTDS folder, the
+          registry hives or the system state, the route used in the Akira intrusion. A
+          backup target on the loopback address or under ProgramData is on the command
+          line for the agent to read.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^wbadmin\.exe$/i
+          | CommandLine=/\bstart\s+(backup|systemstatebackup|recovery|systemstaterecovery)\b/i
+          | CommandLine=/ntds|systemstate|allcritical|\\config\\(SYSTEM|SAM|SECURITY)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: shadow-copy-created-from-command-line
+        name: Shadow copy created with vssadmin, WMI or PowerShell
+        purpose: >-
+          Return commands that create a volume shadow copy. Backup agents create shadow
+          copies through the VSS API and start no such process, so what is returned is a
+          person or a script.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(vssadmin|wmic|powershell|pwsh)\.exe$/i
+          | CommandLine=/create\s+shadow|shadowcopy\s+call\s+create|Win32_ShadowCopy/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: diskshadow-run
+        name: diskshadow started
+        purpose: >-
+          Return every diskshadow run. The utility is seldom used outside backup
+          scripting, and a script passed with /s is named on the command line; the
+          script's contents are not visible.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^diskshadow\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: ntds-file-copied-or-packaged
+        name: Command that names NTDS.dit or a shadow copy device path
+        purpose: >-
+          Return copy, extraction and archive commands whose arguments name ntds.dit or
+          the HarddiskVolumeShadowCopy device, the step that takes the file out of the
+          shadow copy or the IFM folder. The image name is tested before the command
+          line.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(cmd|powershell|pwsh|xcopy|robocopy|esentutl|expand|extrac32|makecab|certutil|7z|7za|rar|tar)\.exe$/i
+          | CommandLine=/ntds\.dit|GLOBALROOT\\Device\\HarddiskVolumeShadowCopy/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: system-hive-saved
+        name: SYSTEM, SAM or SECURITY hive saved with reg.exe
+        purpose: >-
+          Return reg save and reg export commands against the hives that decrypt
+          NTDS.dit. The agent keeps those on a host and at a time that match one of the
+          other cases.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^reg\.exe$/i
+          | CommandLine=/\b(save|export)\b/i
+          | CommandLine=/\b(hklm|hkey_local_machine)\\(system|sam|security)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: ntds_extraction_command
+      name: Command that exports, backs up or copies NTDS.dit
+      description: >-
+        A process command line runs ntdsutil IFM, a wbadmin backup that includes NTDS or
+        system state, a shadow copy creation, diskshadow, or a copy that names ntds.dit
+        or a shadow copy device path.
+      source: process_creation
+      field: command_line
+      indicates: ntds_database_extraction
+
+  supporting:
+    - id: output_in_working_directory
+      name: Output written to a scratch path or loopback share
+      description: >-
+        The target named on the command line is under ProgramData, Temp, PerfLogs or a
+        user profile, or is an admin share addressed through 127.0.0.1.
+      source: process_creation
+      field: command_line
+      indicates: staging_for_exfiltration
+    - id: system_hive_taken_alongside
+      name: SYSTEM hive taken on the same host
+      description: >-
+        A reg save, or a copy naming the config folder, appears on the same host close
+        to the NTDS command. The agent matches host and time across the returned events.
+      source: process_creation
+      field: command_line
+      indicates: decryption_key_collected
+    - id: remote_execution_parent
+      name: Started by a remote execution route
+      description: >-
+        The parent is WmiPrvSE.exe, a service-started shell, the Task Scheduler host or
+        a script interpreter, not a backup service or an interactive administrator
+        console.
+      source: process_creation
+      field: parent_process
+      indicates: remote_operator_activity
+    - id: non_backup_account
+      name: Account is not a backup or directory operator
+      description: >-
+        The user on the event has no history of running these tools on this host.
+      source: process_creation
+      field: user
+      indicates: activity_outside_user_role
+
+  contradicting:
+    - id: planned_directory_maintenance
+      name: Planned domain controller promotion or backup
+      description: >-
+        A change record covers IFM media creation or a system state backup on this host
+        at this time.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_maintenance
+    - id: backup_product_schedule
+      name: Command belongs to the host's backup schedule
+      description: >-
+        The same command line recurs on this host at a fixed time under the backup
+        service account.
+      source: baseline
+      field: CommandLine
+      indicates: routine_backup
+
+  risk_logic:
+    required:
+      - ntds_extraction_command
+
+    supporting:
+      any:
+        - output_in_working_directory
+        - system_hive_taken_alongside
+        - remote_execution_parent
+        - non_backup_account
+      all:
+        - output_in_working_directory
+        - system_hive_taken_alongside
+
+    contradicting:
+      any:
+        - planned_directory_maintenance
+        - backup_product_schedule
+      all: []
+
+  verdict:
+    low_risk_when:
+      - ntds_extraction_command
+      - planned_directory_maintenance
+    suspicious_when:
+      - ntds_extraction_command
+      - non_backup_account
+    high_risk_when:
+      - ntds_extraction_command
+      - output_in_working_directory
+      - remote_execution_parent
+
+  false_positive:
+    - condition: Scheduled wbadmin system state backups.
+      explanation: >-
+        Domain controllers without a backup product often run wbadmin from a scheduled
+        task. The command, account and time repeat, and the target is a backup volume.
+    - condition: IFM media created to promote a new domain controller.
+      explanation: >-
+        This is the documented purpose of ntdsutil IFM. It is rare, planned, and
+        followed by a promotion on another server.
+    - condition: Administrators creating a shadow copy before a risky change.
+      explanation: >-
+        A shadow copy alone is not extraction. It matters when a copy naming ntds.dit
+        follows it.

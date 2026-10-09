@@ -1,0 +1,283 @@
+# Converted from THORCollective/HEARTH Flames/H048.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-mac-hearth-h048-app-bundle-running-from-private-tmp-t1036-005
+version: 1.0.0
+
+info:
+  name: Application bundle with a vendor-like name running from /private/tmp
+  description: >-
+    Cisco's AnyConnect updater on macOS downloads vpndownloader.app into a directory such
+    as /private/tmp/vpn.<suffix>/ and runs it from there. Every part of that looks like a
+    dropper: a temporary directory, a generated suffix, a compiled binary inside an app
+    bundle that is not under /Applications, and a name that borrows a vendor's. HEARTH's
+    point is that the legitimate case and the malicious one share these hallmarks, and
+    only the process's command line and network destination tell them apart. The hunt
+    returns app-bundle executables that run from temporary directories so each can be
+    checked.
+  severity: medium
+  author: huntgraph
+  tags:
+    - hearth
+    - stealth
+    - masquerading
+    - temporary-directory
+    - app-bundle
+    - macos
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H048.md
+    - https://attack.mitre.org/techniques/T1036
+    - https://attack.mitre.org/techniques/T1036/005
+    - https://attack.mitre.org/detectionstrategies/DET0347
+
+# The macOS analytic for T1036.005 lists file and process metadata, not process creation,
+# which is what this hunt reads. No analytic is declared, so data_sources and
+# data_components describe the hunt, not an ATT&CK mapping.
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1036
+  sub_techniques:
+    - T1036.005
+  detection_strategies:
+    - DET0347
+  analytics: []
+  platforms:
+    - macOS
+  data_sources:
+    - CrowdStrike:Endpoint
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    A generically named executable inside an application bundle under /private/tmp, such
+    as a vpndownloader.app in a directory with a generated suffix, may be a malicious
+    binary masquerading as a vendor's updater, and files showing these hallmarks of
+    location, file name and binary path should be reviewed for validity.
+  attacker_behavior:
+    - Drops an app bundle into /private/tmp or /var/folders under a directory with a random suffix.
+    - Names the bundle after a VPN client, updater or helper so it passes a glance at the process list.
+    - Runs the bundle's Mach-O executable directly from the temporary path.
+    - Connects to its own infrastructure and removes the bundle afterwards.
+  legitimate_behavior:
+    - Cisco AnyConnect and Secure Client run vpndownloader from /private/tmp during an update.
+    - Other vendor updaters and installers unpack a helper app to a temporary directory.
+    - App translocation runs quarantined apps from a randomised path under /private/var/folders.
+  risk_indicator:
+    - The parent is a shell, curl, osascript or a browser and not the vendor's agent.
+    - The command line carries no vendor update URL.
+    - The process connects to a domain the named vendor does not own.
+    - The binary's hash is rare or its signature is missing or ad hoc.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_path: ImageFileName
+        image_hash: SHA256HashData
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: app-bundle-executed-from-tmp
+        name: App-bundle executable running from a temporary directory
+        purpose: >-
+          Return processes whose image is a bundle executable under /private/tmp or /tmp.
+          The path is anchored at the start, so it is a prefix test and stays cheap over
+          a long window.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | ImageFileName=/^\/(private\/)?(tmp|var\/tmp)\/.*\.app\/Contents\/MacOS\//
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: vpndownloader-outside-cisco-chain
+        name: vpndownloader started by something other than the Cisco agent
+        purpose: >-
+          Return runs of a binary named vpndownloader whose parent is not the Cisco
+          agent, the borrowed name with the wrong lineage.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | ImageFileName=/\/vpndownloader[^\/]*$/
+          | ParentBaseFileName!=/^(vpnagentd|vpnagent|Cisco AnyConnect.*|Cisco Secure Client.*|vpnui|acumbrellaagent|launchd)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: vendor-named-binary-in-tmp-from-shell
+        name: Temporary-directory bundle started by a shell, download tool or script host
+        purpose: >-
+          Narrow the first case to bundles launched by a parent that an updater never
+          is.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | ImageFileName=/^\/(private\/)?(tmp|var\/tmp|var\/folders)\/.*\.app\/Contents\/MacOS\//
+          | ParentBaseFileName=/^(sh|bash|zsh|curl|osascript|python[0-9.]*|open|Terminal|Safari|Google Chrome|firefox)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: umbrella-update-host-requested
+        name: DNS request for the Cisco update distribution host
+        purpose: >-
+          Return requests for the host the legitimate updater downloads from, so the
+          agent can confirm a vpndownloader run coincided with a real update.
+        query: |
+          #event_simpleName=DnsRequest
+          | event_platform=Mac
+          | DomainName=/^disthost\.umbrella\.com$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: tmp_bundle_execution
+      name: Bundle executable run from a temporary directory
+      description: >-
+        A process image path is inside an .app bundle under /private/tmp, /tmp or
+        another temporary location.
+      source: process_creation
+      field: image_path
+      indicates: execution_from_temporary_bundle
+
+  supporting:
+    - id: unexpected_launcher
+      name: Launched by a shell, download tool or script host
+      description: >-
+        The parent is a shell, curl, osascript, a browser or the open command, not the
+        vendor agent the name implies.
+      source: process_creation
+      field: parent_process
+      indicates: lineage_inconsistent_with_name
+    - id: no_vendor_url_on_command_line
+      name: Command line lacks the vendor's update URL
+      description: >-
+        The command line of the process does not reference the vendor's distribution
+        host, which the legitimate downloader's does.
+      source: process_creation
+      field: command_line
+      indicates: name_not_backed_by_behaviour
+    - id: rare_bundle_hash
+      name: Binary hash is rare in the estate
+      description: >-
+        The hash appears on one or few hosts, where a vendor updater's appears across
+        the fleet at each release.
+      source: process_creation
+      field: image_hash
+      indicates: unknown_binary
+
+  contradicting:
+    - id: vendor_update_host_contacted
+      name: Host contacted the vendor's update distribution host
+      description: >-
+        A DNS request for the Cisco distribution host occurs on the host around the time
+        of the run.
+      source: dns_request
+      field: query_name
+      indicates: legitimate_vendor_update
+    - id: vendor_client_installed
+      name: Vendor client is installed on the host
+      description: >-
+        Software inventory shows Cisco AnyConnect or Secure Client on the host, and the
+        hash matches the vendor's release.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_updater_activity
+
+  risk_logic:
+    required:
+      - tmp_bundle_execution
+
+    supporting:
+      any:
+        - unexpected_launcher
+        - no_vendor_url_on_command_line
+        - rare_bundle_hash
+      all:
+        - unexpected_launcher
+        - rare_bundle_hash
+
+    contradicting:
+      any:
+        - vendor_update_host_contacted
+        - vendor_client_installed
+      all:
+        - vendor_update_host_contacted
+        - vendor_client_installed
+
+  verdict:
+    low_risk_when:
+      - tmp_bundle_execution
+      - vendor_update_host_contacted
+      - vendor_client_installed
+    suspicious_when:
+      - tmp_bundle_execution
+      - rare_bundle_hash
+    high_risk_when:
+      - tmp_bundle_execution
+      - rare_bundle_hash
+      - unexpected_launcher
+
+  false_positive:
+    - condition: Cisco AnyConnect or Secure Client updates itself.
+      explanation: >-
+        This is the case HEARTH was written from. The parent is the Cisco agent, the
+        command line references the Umbrella distribution host, and the same hash runs
+        fleet-wide at each release.
+    - condition: Another vendor's installer unpacks a helper app to a temporary path.
+      explanation: >-
+        Several updaters do this. The parent is the vendor's installer or the system
+        installer and the hash is common across hosts.
+    - condition: A user opens an app straight from a downloaded disk image or archive.
+      explanation: >-
+        macOS may run it from a randomised translocation path. That path is under
+        /private/var/folders and the parent is launchd, which the first two cases do not
+        match.

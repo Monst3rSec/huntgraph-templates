@@ -1,0 +1,373 @@
+# Converted from THORCollective/HEARTH Flames/H127.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h127-rclone-webdav-served-through-qemu-vm-t1048-001
+version: 1.0.0
+
+info:
+  name: rclone serving local files to a QEMU virtual machine for exfiltration
+  description: >-
+    In the STXRAT intrusion the operator ran rclone serve webdav to publish the whole C:
+    drive on a loopback port, then started a small QEMU virtual machine running Alpine
+    Linux, which read the share and sent the data out. The transfer ran for 54 hours. On
+    the host the outbound traffic belongs to the QEMU process, not to rclone, which
+    breaks process-based exfiltration rules. The hunt returns each piece: rclone's serve
+    command, matched on its arguments because the binary is often renamed; QEMU run
+    without a display or with user-mode networking; both tools being written to disk or
+    fetched; and QEMU's outbound connections. What travels inside the virtual machine,
+    and how much, is not visible; the agent reads duration from the spread of connection
+    events.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - exfiltration
+    - rclone
+    - qemu
+    - webdav
+    - virtual-machine
+    - stxrat
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H127.md
+    - https://attack.mitre.org/techniques/T1048
+    - https://attack.mitre.org/techniques/T1048/001
+    - https://attack.mitre.org/detectionstrategies/DET0503
+    - https://blog.deception.pro/blog/cpuz-trojan-stxrat-purelogs-data-exfil-april-2026
+
+mitre:
+  tactics:
+    - TA0010
+  techniques:
+    - T1048
+  sub_techniques:
+    - T1048.001
+  detection_strategies:
+    - DET0503
+  analytics:
+    - AN1389
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary is exfiltrating data using rclone tunneled through a local QEMU virtual
+    machine to obscure the true source of network traffic, indicated by rclone serving a
+    WebDAV share on localhost followed by QEMU VM network activity to external
+    destinations.
+  attacker_behavior:
+    - Downloads rclone and a QEMU build with PowerShell into ProgramData.
+    - Runs rclone serve webdav against a drive root, bound to a loopback port.
+    - Starts qemu-system with no display, user-mode networking and a small Linux disk image.
+    - Has the guest mount the WebDAV share and copy it to an outside server.
+    - Leaves both running for hours or days.
+  legitimate_behavior:
+    - Administrators use rclone for sanctioned cloud backups.
+    - Developers run QEMU for emulation and testing.
+    - Android and embedded toolchains bundle qemu-system binaries.
+  risk_indicator:
+    - rclone serves a drive root or a user profile root.
+    - QEMU runs from ProgramData or a Temp folder with no display.
+    - rclone and QEMU run on the same host at the same time.
+    - QEMU holds connections to one public address over many hours.
+    - Neither tool is installed software on the host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: rclone-serve-command
+        name: Command line carrying rclone's serve subcommand
+        purpose: >-
+          Return any process whose arguments are rclone's serve subcommand with a
+          protocol. The image name is not tested because rclone is commonly renamed; the
+          phrase is specific enough to stand alone, at the cost of an unanchored scan of
+          Windows command lines.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/\sserve\s+(webdav|http|sftp|ftp|restic|dlna|s3|nfs)\s/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: qemu-system-emulator-started
+        name: QEMU system emulator started
+        purpose: >-
+          Return every qemu-system start with its image path and arguments. The emulator
+          is rare outside developer machines.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^qemu-system-[a-z0-9_]+w?\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: headless-vm-arguments-under-another-name
+        name: Headless virtual machine arguments under another file name
+        purpose: >-
+          Return processes that carry QEMU's no-display switches together with a disk
+          image or user-mode networking, whatever the file is called.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName!=/^qemu-system-[a-z0-9_]+w?\.exe$/i
+          | CommandLine=/-nographic\b|-display\s+none\b/i
+          | CommandLine=/-(nic|netdev|net)\s+user\b|hostfwd=|\.qcow2\b|-(hda|drive|cdrom)\s/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: rclone-or-qemu-binary-written
+        name: rclone or QEMU executable written to disk
+        purpose: >-
+          Return rclone and QEMU executables being written, with path and writing
+          process. A copy saved under another name is not matched.
+        query: |
+          #event_simpleName=PeFileWritten
+          | TargetFileName=/\\(rclone|qemu-system-[^\\]*|qemu-img)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: tooling-download-host-requested-by-command-line-tool
+        name: rclone or Bitbucket download host requested by a command-line tool
+        purpose: >-
+          Return lookups of the rclone download host, and of Bitbucket's hosts, made by
+          PowerShell or a transfer utility. Browser lookups are left out.
+        query: |
+          #event_simpleName=DnsRequest
+          | ContextBaseFileName=/^(powershell|pwsh|curl|certutil|bitsadmin|wget|cmd)\.exe$/i
+          | DomainName=/^(downloads\.rclone\.org|bitbucket\.org|bbuseruploads\.s3\.amazonaws\.com)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: qemu-external-connection
+        name: QEMU connecting to a public address
+        purpose: >-
+          Return outbound connections made by the emulator process to addresses outside
+          the private ranges. With user-mode networking the guest's traffic leaves the
+          host as the emulator's own.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | ContextBaseFileName=/^qemu-system-/i
+          | !cidr(RemoteAddressIP4, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: rclone_serve_or_headless_vm
+      name: rclone serving files or a headless virtual machine started
+      description: >-
+        A command line carries rclone's serve subcommand, or a QEMU system emulator
+        starts, by name or by its no-display arguments.
+      source: process_creation
+      field: command_line
+      indicates: exfiltration_tunnel_setup
+
+  supporting:
+    - id: tool_run_from_staging_path
+      name: Tool runs from ProgramData or a Temp folder
+      description: >-
+        The image path of rclone or QEMU is under ProgramData, Temp or a user profile,
+        not an installed program folder.
+      source: process_creation
+      field: image_path
+      indicates: attacker_deployed_tooling
+    - id: tool_binary_dropped
+      name: rclone or QEMU executable written to disk
+      description: >-
+        An executable with the tool's name was written on the host.
+      source: file_creation
+      field: file_path
+      indicates: tool_delivery
+    - id: tool_download_lookup
+      name: Download host requested by a command-line tool
+      description: >-
+        PowerShell or a transfer utility requested the rclone download host or
+        Bitbucket.
+      source: dns_request
+      field: query_name
+      indicates: tool_download
+    - id: download_requesting_process
+      name: Lookup made by a scripting tool
+      description: >-
+        The process named on the lookup is PowerShell or a transfer utility.
+      source: dns_request
+      field: process_name
+      indicates: scripted_download
+    - id: vm_outbound_connection
+      name: Emulator connected to a public address
+      description: >-
+        A connection event names the QEMU process and a public destination.
+      source: network_connection
+      field: remote_address
+      indicates: exfiltration_through_virtual_machine
+    - id: sustained_vm_traffic
+      name: Emulator connections continue for hours
+      description: >-
+        Connection events from the emulator to the same address span many hours. The
+        agent derives the duration from the returned events.
+      source: network_connection
+      field: process_name
+      indicates: long_running_transfer
+    - id: both_tools_on_host
+      name: rclone and QEMU run on the same host together
+      description: >-
+        Both cases return events for the same host in the same period, which the agent
+        establishes by matching host and time.
+      source: process_creation
+      field: host
+      indicates: tunnel_pattern_complete
+
+  contradicting:
+    - id: developer_emulation_host
+      name: Host runs emulators for development
+      description: >-
+        Asset records class the host as a developer machine with an emulator toolchain.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_development_activity
+    - id: sanctioned_rclone_job
+      name: rclone job is a sanctioned backup
+      description: >-
+        The rclone command recurs on a schedule and is a copy or sync to an approved
+        remote, not a serve.
+      source: baseline
+      field: CommandLine
+      indicates: routine_backup
+
+  risk_logic:
+    required:
+      - rclone_serve_or_headless_vm
+
+    supporting:
+      any:
+        - tool_run_from_staging_path
+        - tool_binary_dropped
+        - tool_download_lookup
+        - download_requesting_process
+        - vm_outbound_connection
+        - sustained_vm_traffic
+        - both_tools_on_host
+      all:
+        - both_tools_on_host
+        - vm_outbound_connection
+
+    contradicting:
+      any:
+        - developer_emulation_host
+        - sanctioned_rclone_job
+      all: []
+
+  verdict:
+    low_risk_when:
+      - rclone_serve_or_headless_vm
+      - developer_emulation_host
+    suspicious_when:
+      - rclone_serve_or_headless_vm
+      - tool_run_from_staging_path
+    high_risk_when:
+      - rclone_serve_or_headless_vm
+      - both_tools_on_host
+      - vm_outbound_connection
+
+  false_positive:
+    - condition: Developers running QEMU.
+      explanation: >-
+        Emulator toolchains start qemu-system from an SDK folder with a display. The
+        host is a developer machine and rclone is absent.
+    - condition: rclone serve used by an administrator.
+      explanation: >-
+        Serving a folder for a one-off transfer happens. It serves a specific folder,
+        not a drive root, and no virtual machine runs beside it.
+    - condition: Another program with a serve subcommand.
+      explanation: >-
+        A few tools accept the words serve http. The image path and the rest of the
+        command line show which program it is.

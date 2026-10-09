@@ -1,0 +1,199 @@
+# Converted from THORCollective/HEARTH Flames/H136.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-mac-hearth-h136-nscreateobjectfileimagefrommemory-temporary-bundle-written-t1620
+version: 1.0.0
+
+info:
+  name: Temporary bundle written by the NSCreateObjectFileImageFromMemory loader
+  description: >-
+    NSCreateObjectFileImageFromMemory and NSLinkModule were Apple's interface for
+    loading a Mach-O bundle from a memory buffer, and malware uses them to run a payload
+    that never passed Gatekeeper or notarisation. Sapphire Sleet loaded its icloudz
+    backdoor this way. On current macOS the call is no longer purely in memory: the
+    system writes the buffer to a file named NSCreateObjectFileImageFromMemory- followed
+    by random characters under /private/var/folders and loads that. The file is a Mach-O
+    image, so its creation is an executable-written event, and the hunt is that one
+    event. The load itself, anonymous executable memory mappings and library signature
+    data are module-load and OS API telemetry this deployment does not collect, so a
+    loader that reimplements the old in-memory path and skips the temporary file is not
+    seen.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - stealth
+    - reflective-loading
+    - mach-o
+    - fileless
+    - sapphire-sleet
+    - gatekeeper-bypass
+    - macos
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H136.md
+    - https://attack.mitre.org/techniques/T1620
+    - https://attack.mitre.org/detectionstrategies/DET0300
+    - https://www.microsoft.com/en-us/security/blog/2026/04/16/dissecting-sapphire-sleets-macos-intrusion-from-lure-to-compromise/
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1620
+  sub_techniques: []
+  detection_strategies:
+    - DET0300
+  analytics: []
+  platforms:
+    - macOS
+  data_sources:
+    - CrowdStrike:Endpoint
+  data_components:
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary is reflectively loading code into memory on macOS using
+    NSCreateObjectFileImageFromMemory or custom Mach-O loaders to bypass Gatekeeper,
+    file quarantine, and notarization, indicated by temporary files matching the
+    NSCreateObjectFileImageFromMemory pattern or unsigned dylib loads from non-standard
+    paths.
+  attacker_behavior:
+    - Downloads or decrypts a Mach-O bundle into a memory buffer.
+    - Calls NSCreateObjectFileImageFromMemory and NSLinkModule on the buffer.
+    - Lets the system write the buffer to a temporary file and load it.
+    - Runs the payload inside the loader process with no file the user ever opened.
+  legitimate_behavior:
+    - A few older applications and plug-in hosts still use the deprecated interface.
+    - Security researchers and red teams test loaders on lab machines.
+  risk_indicator:
+    - The file appears on a machine that runs no software known to use the interface.
+    - The writing process is a shell, osascript, curl or an unsigned binary in a temporary path.
+    - The hash is unknown or differs on every occurrence.
+    - The write follows a download-and-execute chain on the same host.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NewExecutableWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+        file_hash: SHA256HashData
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: nscreateobjectfileimagefrommemory-temporary-file-written
+        name: NSCreateObjectFileImageFromMemory temporary file written
+        purpose: >-
+          Return executable-written events on macOS whose file name carries the prefix
+          the system gives the temporary copy, with path, hash and writing process id.
+          The literal is distinctive and is the only test. This relies on the sensor
+          reporting the temporary Mach-O bundle as an executable write.
+        query: |
+          #event_simpleName=NewExecutableWritten
+          | event_platform=Mac
+          | TargetFileName=/NSCreateObjectFileImageFromMemory-/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: memory_loader_temporary_file
+      name: Temporary file left by the in-memory bundle loader
+      description: >-
+        An executable named NSCreateObjectFileImageFromMemory- plus random characters
+        was written, which the system does when a process loads a bundle from memory.
+      source: file_creation
+      field: file_path
+      indicates: reflective_macho_loading
+
+  supporting:
+    - id: unknown_loader_process
+      name: Loader is not installed software
+      description: >-
+        The writing process id resolves to a shell, an interpreter or a binary outside
+        installed application paths. The agent looks the process up by this id; this
+        template does not return the process event.
+      source: file_creation
+      field: writer_process_id
+      indicates: untrusted_loader
+    - id: payload_hash_unknown
+      name: Payload hash is unknown or unique
+      description: >-
+        The hash on the event has no reputation, or differs on each occurrence.
+      source: file_creation
+      field: file_hash
+      indicates: unvetted_payload
+
+  contradicting:
+    - id: known_application_uses_loader
+      name: Writer is an application known to use the interface
+      description: >-
+        The same writer and hash recur across the fleet from an installed application.
+      source: baseline
+      field: SHA256HashData
+      indicates: legacy_application_behaviour
+    - id: research_or_test_host
+      name: Host is a security research or test machine
+      description: >-
+        Asset records class the host as a lab or red team machine.
+      source: asset_inventory
+      field: ComputerName
+      indicates: authorised_testing
+
+  risk_logic:
+    required:
+      - memory_loader_temporary_file
+
+    supporting:
+      any:
+        - unknown_loader_process
+        - payload_hash_unknown
+      all:
+        - unknown_loader_process
+        - payload_hash_unknown
+
+    contradicting:
+      any:
+        - known_application_uses_loader
+        - research_or_test_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - memory_loader_temporary_file
+      - known_application_uses_loader
+    suspicious_when:
+      - memory_loader_temporary_file
+      - payload_hash_unknown
+    high_risk_when:
+      - memory_loader_temporary_file
+      - payload_hash_unknown
+      - unknown_loader_process
+
+  false_positive:
+    - condition: Older software that still loads plug-ins from memory.
+      explanation: >-
+        The interface is deprecated but not removed. Such software produces the same
+        file with the same hash on every machine that runs it.
+    - condition: Loader testing on research machines.
+      explanation: >-
+        Red teams and researchers exercise this interface. The host is a lab machine.

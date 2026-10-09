@@ -1,0 +1,355 @@
+# Converted from THORCollective/HEARTH Flames/H170.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h170-gentlemen-ransomware-persistence-and-spread-fingerprint-t1486
+version: 1.0.0
+
+info:
+  name: The Gentlemen ransomware persistence and self-propagation fingerprint
+  description: >-
+    The Gentlemen is a Go encryptor that will not run without a --password argument and
+    spreads on its own when given --spread. Microsoft's May 2026 analysis lists names it
+    leaves behind that no legitimate software shares: scheduled tasks gentlemen_system,
+    UpdateSystem and UpdateUser, services DefSvc, UpdateSvc and UpdateSvc2, Run values
+    GupdateS and GupdateU, and an SMB share called share$ over C:\Temp from which other
+    hosts pull the payload. The encrypted files (.umc16h) and the ransom note are data
+    files, and the sensor reports writes of executables and scripts only, so they are
+    not hunted. The invocation, the persistence names, the share and the staging of
+    PsExec in C:\Temp are all commands, registry writes or executable writes, and those
+    are returned.
+  severity: critical
+  author: huntgraph
+  tags:
+    - hearth
+    - impact
+    - ransomware
+    - gentlemen
+    - self-propagation
+    - persistence
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H170.md
+    - https://attack.mitre.org/techniques/T1486
+    - https://attack.mitre.org/detectionstrategies/DET0215
+
+mitre:
+  tactics:
+    - TA0040
+  techniques:
+    - T1486
+  sub_techniques: []
+  detection_strategies:
+    - DET0215
+  analytics:
+    - AN0602
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    A Windows host has been encrypted by The Gentlemen ransomware (Go-based,
+    self-propagating, password-gated), identifiable by .umc16h file extensions,
+    scheduled tasks named gentlemen_system, UpdateSystem or UpdateUser, registry Run
+    values GupdateS or GupdateU, Windows services DefSvc, UpdateSvc or UpdateSvc2, a
+    README-GENTLEMEN.txt ransom note and an SMB share share$ exposing C:\Temp for
+    lateral payload staging, with the encryptor invoked by the command-line arguments
+    --password, --spread and --full, --system or --shares.
+  attacker_behavior:
+    - Starts the encryptor with --password and a scope argument such as --full or --shares.
+    - Adds --spread so the encryptor copies itself to other hosts.
+    - Registers tasks, services and Run values under fixed names for persistence.
+    - Shares C:\Temp as share$ and drops PsExec there for other hosts to pull.
+    - Disables Defender protections and deletes shadow copies before encrypting.
+    - Fires PsExec, WMIC, sc, schtasks and PowerShell remoting at the same target in succession.
+  legitimate_behavior:
+    - Command-line tools take a --password argument for their own purposes.
+    - Administrators create tasks and services with generic names such as UpdateSvc.
+    - Deployment tools stage executables in C:\Temp.
+  risk_indicator:
+    - One command line carries --password together with --spread or an encryption scope.
+    - A task, service or Run value is created under one of the reported names.
+    - A share named share$ is created over C:\Temp.
+    - Defender is disabled and shadow copies deleted on the same host shortly before.
+    - Several remote-execution tools target one host within minutes.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: password-gated-encryptor-invocation
+        name: Process started with --password and a spread or scope argument
+        purpose: >-
+          Return any process whose command line carries --password with a value and one
+          of --spread, --full, --system or --shares. The match does not depend on the
+          file name, which changes per build.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/\s--password[\s=]+\S+/i
+          | CommandLine=/\s--(spread|full|system|shares)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: reported-task-service-or-run-name-in-command
+        name: Task, service or Run value created under a reported name
+        purpose: >-
+          Return schtasks, sc, reg, WMIC and PowerShell commands that name one of the
+          reported tasks, services or Run values. The encryptor may register them
+          through API calls instead, in which case only the registry case below sees the
+          Run value and the task and service are not seen.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(schtasks|sc|reg|wmic|powershell|pwsh|cmd)\.exe$/i
+          | CommandLine=/gentlemen_system|\b(UpdateSystem|UpdateUser|DefSvc|UpdateSvc2?|GupdateS|GupdateU)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: gupdate-run-value-written
+        name: Run value GupdateS or GupdateU written
+        purpose: >-
+          Return registry writes of the two Run values, with the path and the data, so
+          the agent can read which binary they start.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegValueName=/^Gupdate[SU]$/i
+          | RegObjectName=/\\CurrentVersion\\Run$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: payload-share-created-over-temp
+        name: Share named share$ created
+        purpose: >-
+          Return net share commands that create share$, the staging share other hosts
+          pull the payload from. A share created through the API leaves no command.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(net|net1|powershell|pwsh)\.exe$/i
+          | CommandLine=/\bshare\s+"?share\$"?\s*=|New-SmbShare\b.*\bshare\$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: executable-staged-in-root-temp
+        name: Executable written into C:\Temp
+        purpose: >-
+          Return executables written directly into a Temp directory at the root of a
+          volume, where the report places the embedded PsExec and the payload copy.
+        query: |
+          #event_simpleName=PeFileWritten
+          | TargetFileName=/\\HarddiskVolume\d+\\Temp\\[^\\]+\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: defender-disabled-or-shadow-copies-deleted
+        name: Defender protections disabled or shadow copies deleted
+        purpose: >-
+          Return the pre-encryption commands the report lists. Many ransomware families
+          run the same commands; on their own they do not identify this one, and the
+          agent uses them to date the start of encryption on a host the other cases
+          name.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh|vssadmin|wmic)\.exe$/i
+          | CommandLine=/Set-MpPreference\b.*-Disable(RealtimeMonitoring|BehaviorMonitoring|IOAVProtection)|Add-MpPreference\b.*-Exclusion(Process|Path)|delete\s+shadows\b.*\/all|shadowcopy\s+delete/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: gentlemen_command_fingerprint
+      name: Command line carrying the encryptor's arguments or reported names
+      description: >-
+        A process was started with --password and a spread or scope argument, or a
+        command creates a task, service, Run value or share under one of the names the
+        report attributes to this family.
+      source: process_creation
+      field: command_line
+      indicates: ransomware_deployment
+
+  supporting:
+    - id: run_value_registered
+      name: GupdateS or GupdateU Run value present
+      description: >-
+        A Run key holds a value named GupdateS or GupdateU.
+      source: registry
+      field: registry_value
+      indicates: ransomware_persistence
+    - id: run_value_target_path
+      name: Run value points at a staged binary
+      description: >-
+        The data of the Run value is a path under Temp, ProgramData or a user profile.
+      source: registry
+      field: registry_data
+      indicates: persistence_to_staged_payload
+    - id: payload_staged_in_temp
+      name: Executable written into C:\Temp
+      description: >-
+        PsExec or an unknown executable was written into the directory the share
+        exposes.
+      source: file_creation
+      field: file_path
+      indicates: lateral_payload_staging
+    - id: recovery_inhibited_first
+      name: Defender disabled and shadow copies deleted beforehand
+      description: >-
+        Defender protections were switched off or shadow copies deleted on the same host
+        before the encryptor started, which the agent derives by ordering the returned
+        events.
+      source: process_creation
+      field: image_name
+      indicates: pre_encryption_preparation
+    - id: multiple_remote_execution_mechanisms
+      name: Several remote-execution tools aimed at one target
+      description: >-
+        PsExec, WMIC, sc, schtasks and PowerShell remoting name the same remote host
+        within minutes of each other, which the agent derives from the returned events;
+        the query does not count them.
+      source: process_creation
+      field: parent_process_id
+      indicates: self_propagation_routine
+
+  contradicting:
+    - id: name_belongs_to_installed_product
+      name: Name belongs to an installed product
+      description: >-
+        Software inventory shows a product on the host that registers a task or service
+        called UpdateSvc, UpdateSystem or UpdateUser.
+      source: asset_inventory
+      field: ComputerName
+      indicates: vendor_update_component
+    - id: authorised_ransomware_simulation
+      name: Activity is a recorded simulation
+      description: >-
+        A change record covers a ransomware simulation on this host at this time.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_security_test
+
+  risk_logic:
+    required:
+      - gentlemen_command_fingerprint
+
+    supporting:
+      any:
+        - run_value_registered
+        - run_value_target_path
+        - payload_staged_in_temp
+        - recovery_inhibited_first
+        - multiple_remote_execution_mechanisms
+      all:
+        - run_value_registered
+        - payload_staged_in_temp
+
+    contradicting:
+      any:
+        - name_belongs_to_installed_product
+        - authorised_ransomware_simulation
+      all: []
+
+  verdict:
+    low_risk_when:
+      - gentlemen_command_fingerprint
+      - name_belongs_to_installed_product
+      - authorised_ransomware_simulation
+    suspicious_when:
+      - gentlemen_command_fingerprint
+      - run_value_registered
+    high_risk_when:
+      - gentlemen_command_fingerprint
+      - run_value_registered
+      - payload_staged_in_temp
+      - recovery_inhibited_first
+
+  false_positive:
+    - condition: A vendor updater uses a generic name.
+      explanation: >-
+        UpdateSvc and UpdateSystem are plausible names for a real product. The
+        gentlemen_system task, the Gupdate values and the --password with --spread
+        pairing are not.
+    - condition: A command-line tool takes --password and --full.
+      explanation: >-
+        Backup and database tools accept both. They run from an installed path under a
+        service account and do not create tasks, services or shares.
+    - condition: Deployment tooling stages files in C:\Temp.
+      explanation: >-
+        The writer is the deployment agent and the file is a signed installer.

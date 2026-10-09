@@ -1,0 +1,267 @@
+# Converted from THORCollective/HEARTH Flames/H060.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h060-firewall-rule-change-from-user-context-t1686-003
+version: 1.0.0
+
+info:
+  name: Windows Firewall rules changed through netsh or PowerShell from a user context
+  description: >-
+    An operator who needs a port open for a tool, or wants a restriction on outbound
+    traffic gone, changes the host firewall with netsh advfirewall or the NetSecurity
+    cmdlets, and may put it back afterwards so an audit of the final rule set finds
+    nothing. Hunting the act instead of the end state catches that. Windows services and
+    management agents change rules too, almost always as SYSTEM, so HEARTH leaves out
+    processes at System integrity and keeps changes made from user and elevated
+    contexts. The firewall's own event channel is not collected here; the commands are.
+  severity: medium
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-impairment
+    - firewall
+    - netsh
+    - powershell
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H060.md
+    - https://attack.mitre.org/techniques/T1686
+    - https://attack.mitre.org/techniques/T1686/003
+    - https://attack.mitre.org/detectionstrategies/DET0901
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1686
+  sub_techniques:
+    - T1686.003
+  detection_strategies:
+    - DET0901
+  analytics:
+    - AN2043
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    Threat actors may abuse netsh.exe or PowerShell to create, modify or delete Windows
+    Firewall rules or profiles, weakening host-based defences, permitting inbound or
+    outbound communication for malicious tooling or removing restrictions on
+    command-and-control traffic, with the change initiated from a user or elevated
+    context and not from a System integrity process.
+  attacker_behavior:
+    - Adds an inbound allow rule for a listener port or for a tool's executable.
+    - Turns a firewall profile off with netsh advfirewall set or Set-NetFirewallProfile.
+    - Enables a built-in rule group such as Remote Desktop or file sharing to prepare lateral movement.
+    - Deletes or disables a blocking rule, then restores it after use.
+    - Names the rule after a Windows component so it passes a review.
+  legitimate_behavior:
+    - Installers add rules for their applications, usually as SYSTEM or through an elevation prompt.
+    - Administrators adjust rules while troubleshooting connectivity.
+    - Developers open ports for local test services.
+  risk_indicator:
+    - A profile is switched off or all profiles are set to allow.
+    - The rule allows a binary in a user-writable path or a port used by remote access tooling.
+    - The command runs from a script host, a remote session or a non-administrative user's elevated shell.
+    - The same host shows the rule added and removed within a short span.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        integrity_level: IntegrityLevel
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: netsh-firewall-rule-change
+        name: netsh adding, changing or deleting a firewall rule below System integrity
+        purpose: >-
+          Return netsh firewall rule changes from processes that are not at System
+          integrity (16384). The image name is an exact match and runs first. The
+          integrity filter depends on the sensor populating IntegrityLevel.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^netsh\.exe$/i
+          | CommandLine=/\b(advfirewall|firewall)\b/i
+          | CommandLine=/\b(add|delete|set)\b/i
+          | IntegrityLevel!=16384
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: powershell-firewall-cmdlet-change
+        name: PowerShell firewall cmdlet changing rules or profiles below System integrity
+        purpose: >-
+          Return the NetSecurity cmdlets that create, modify, remove or disable rules and
+          profiles, with the same integrity filter.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/(New|Set|Remove|Disable|Enable|Rename|Copy)-NetFirewall(Rule|Profile)|Set-NetFirewallSetting|HNetCfg\.FwPolicy2/i
+          | IntegrityLevel!=16384
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: firewall-profile-disabled
+        name: Firewall profile switched off
+        purpose: >-
+          Return the commands that disable a profile outright, at any integrity level,
+          because nothing routine does this.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(netsh|powershell|pwsh)\.exe$/i
+          | CommandLine=/set\s+(allprofiles|currentprofile|domainprofile|privateprofile|publicprofile)\s+state\s+off|firewall\s+set\s+opmode\s+(mode=)?disable|Set-NetFirewallProfile\b.*-Enabled\s+(\$?false|0)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: firewall_change_command
+      name: Firewall rule or profile changed from the command line
+      description: >-
+        A netsh or PowerShell command line adds, modifies, deletes or disables a Windows
+        Firewall rule or profile.
+      source: process_creation
+      field: command_line
+      indicates: host_firewall_modified
+
+  supporting:
+    - id: below_system_integrity
+      name: Change made below System integrity
+      description: >-
+        The integrity level on the process event is medium or high, showing a user or
+        elevated context and not a Windows service.
+      source: process_creation
+      field: integrity_level
+      indicates: user_initiated_firewall_change
+    - id: permissive_or_disabling_change
+      name: Change disables protection or allows a risky target
+      description: >-
+        The command switches a profile off, allows any traffic, or allows a binary in a
+        user-writable path or a remote-access port.
+      source: process_creation
+      field: command_line
+      indicates: firewall_weakened_for_tooling
+    - id: scripted_or_remote_parent
+      name: Issued by a script or remote session
+      description: >-
+        The parent is a script host, a remote-management process, an Office application
+        or an unknown executable.
+      source: process_creation
+      field: parent_process
+      indicates: abnormal_execution_chain
+    - id: non_admin_role_user
+      name: User does not administer the host
+      description: >-
+        The account has no network or endpoint administration role.
+      source: process_creation
+      field: user
+      indicates: activity_outside_user_role
+
+  contradicting:
+    - id: software_installation
+      name: Change accompanies a software installation
+      description: >-
+        A change record or deployment job covers an installation on the host at the time
+        and the rule is for the installed application.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_software_deployment
+    - id: rule_change_fleet_wide
+      name: Same change recurs across the fleet
+      description: >-
+        Earlier activity shows the identical command on many hosts, as a deployment
+        package or logon script would produce.
+      source: baseline
+      field: CommandLine
+      indicates: established_software_behaviour
+
+  risk_logic:
+    required:
+      - firewall_change_command
+
+    supporting:
+      any:
+        - below_system_integrity
+        - permissive_or_disabling_change
+        - scripted_or_remote_parent
+        - non_admin_role_user
+      all:
+        - below_system_integrity
+        - permissive_or_disabling_change
+
+    contradicting:
+      any:
+        - software_installation
+        - rule_change_fleet_wide
+      all: []
+
+  verdict:
+    low_risk_when:
+      - firewall_change_command
+      - software_installation
+      - rule_change_fleet_wide
+    suspicious_when:
+      - firewall_change_command
+      - below_system_integrity
+    high_risk_when:
+      - firewall_change_command
+      - below_system_integrity
+      - permissive_or_disabling_change
+      - scripted_or_remote_parent
+
+  false_positive:
+    - condition: Installers add rules for their applications.
+      explanation: >-
+        Setup programs call netsh or the cmdlets, sometimes from an elevated user
+        context. The rule names the product's own binary under Program Files and the
+        same command appears wherever the product is installed.
+    - condition: Administrators troubleshoot connectivity.
+      explanation: >-
+        Turning a profile off to test and back on again is a common shortcut. It is done
+        by an administrator from a console and is short-lived.
+    - condition: Developers open ports for local services.
+      explanation: >-
+        Development tools prompt to add a rule on first run. The host is a developer
+        machine and the binary is a known runtime.

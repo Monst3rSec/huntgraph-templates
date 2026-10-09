@@ -1,0 +1,291 @@
+# Converted from THORCollective/HEARTH Flames/H020.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h020-wmi-powershell-reverse-shell-t1047
+version: 1.0.0
+
+info:
+  name: WMI used to run PowerShell that opens a reverse shell
+  description: >-
+    Windows Management Instrumentation can create a process on a local or remote host,
+    and the process it creates is a child of WmiPrvSE.exe, not of anything the operator
+    ran. Using it to start PowerShell with a socket one-liner gives interactive control
+    of a server with no file written and no logon session of the usual kind. The hunt
+    returns PowerShell started by the WMI provider host, the WMI process-create calls
+    that request it, PowerShell command lines that build a TCP client, and the outbound
+    connections PowerShell then makes.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - execution
+    - wmi
+    - powershell
+    - reverse-shell
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H020.md
+    - https://attack.mitre.org/techniques/T1047
+    - https://attack.mitre.org/detectionstrategies/DET0364
+    - https://www.huntress.com/blog/inside-bluenoroff-web3-intrusion-analysis
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1047
+  sub_techniques: []
+  detection_strategies:
+    - DET0364
+  analytics:
+    - AN1031
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    Threat actors are using the Windows Management Instrumentation system to execute
+    PowerShell commands that establish a reverse shell, allowing them to gain remote
+    control over Windows servers in the financial sector.
+  attacker_behavior:
+    - Calls Win32_Process Create through wmic, Invoke-WmiMethod or Invoke-CimMethod with a PowerShell command.
+    - Has the WMI provider host start PowerShell hidden and with an encoded command.
+    - Builds a System.Net.Sockets.TCPClient in PowerShell and loops reading commands from its stream.
+    - Connects the shell to an external address on a non-web port.
+    - Targets servers remotely with the node or ComputerName option and explicit credentials.
+  legitimate_behavior:
+    - Management and monitoring platforms run PowerShell through WMI for inventory and remediation.
+    - Administrators use Invoke-CimMethod for remote maintenance.
+    - Software deployment tools create processes over WMI during installation.
+  risk_indicator:
+    - PowerShell under WmiPrvSE carries an encoded, hidden or socket-building command line.
+    - The PowerShell process makes an outbound connection to a public address on an unusual port.
+    - The WMI call names a remote node and supplies credentials.
+    - The target is a server that management tooling does not reach this way.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: wmiprvse-spawned-powershell
+        name: PowerShell started by the WMI provider host
+        purpose: >-
+          Return every PowerShell or cmd process created through WMI on the host that ran
+          it, with the command line the caller supplied.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^WmiPrvSE\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: wmi-process-create-with-powershell
+        name: WMI process-create call that requests PowerShell
+        purpose: >-
+          Return the caller side: wmic, Invoke-WmiMethod and Invoke-CimMethod commands
+          that ask WMI to create a PowerShell process, locally or on a named node.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(wmic|powershell|pwsh)\.exe$/i
+          | CommandLine=/process\s+call\s+create|Win32_Process|Invoke-WmiMethod|Invoke-CimMethod/i
+          | CommandLine=/powershell|pwsh/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: powershell-tcp-client-command
+        name: PowerShell command line building a TCP client
+        purpose: >-
+          Return PowerShell runs whose command line constructs a socket and reads from
+          its stream, the body of a reverse shell, whatever started them.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/Net\.Sockets\.TCPClient|Sockets\.TcpListener|\.GetStream\(\)|Net\.Sockets\.Socket|New-Object\s+.*UdpClient/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: powershell-external-nonweb-connection
+        name: PowerShell connecting to a public address on a non-web port
+        purpose: >-
+          Return outbound connections from PowerShell to public addresses on ports other
+          than 80 and 443, where a raw reverse shell connects and module downloads do
+          not.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | ContextBaseFileName=/^(powershell|pwsh)\.exe$/i
+          | RemotePort!=443
+          | RemotePort!=80
+          | !cidr(RemoteAddressIP4, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: wmi_launched_powershell
+      name: PowerShell executed through WMI
+      description: >-
+        A process event shows PowerShell with WmiPrvSE.exe as its parent, or a command
+        line that asks WMI to create a PowerShell process.
+      source: process_creation
+      field: parent_process
+      indicates: wmi_command_execution
+
+  supporting:
+    - id: socket_building_command
+      name: Command line builds a network socket
+      description: >-
+        The PowerShell command line constructs a TCP client and reads from its stream, or
+        carries an encoded command that hides the same.
+      source: process_creation
+      field: command_line
+      indicates: reverse_shell_payload
+    - id: powershell_outbound_connection
+      name: PowerShell reached a public address on an unusual port
+      description: >-
+        A connection attributed to PowerShell goes to an address outside the private
+        ranges on a port other than 80 or 443.
+      source: network_connection
+      field: remote_port
+      indicates: interactive_remote_control_channel
+    - id: connection_destination
+      name: Destination address is unfamiliar
+      description: >-
+        The remote address has no history for this host and does not belong to a known
+        management or cloud service.
+      source: network_connection
+      field: remote_address
+      indicates: attacker_controlled_endpoint
+    - id: wmi_caller_account
+      name: WMI call made by an unexpected account
+      description: >-
+        The user on the event is not the management platform's service account or an
+        administrator who maintains the server.
+      source: process_creation
+      field: user
+      indicates: activity_outside_user_role
+
+  contradicting:
+    - id: management_platform_job
+      name: Execution belongs to a management platform
+      description: >-
+        The host is managed by a monitoring or configuration platform that runs
+        PowerShell through WMI, and the command matches its known jobs.
+      source: asset_inventory
+      field: ComputerName
+      indicates: managed_tooling_activity
+    - id: recurring_wmi_command
+      name: Same WMI-launched command recurs on schedule
+      description: >-
+        Earlier activity shows the identical command line under WmiPrvSE on this host at
+        regular intervals.
+      source: baseline
+      field: CommandLine
+      indicates: established_software_behaviour
+
+  risk_logic:
+    required:
+      - wmi_launched_powershell
+
+    supporting:
+      any:
+        - socket_building_command
+        - powershell_outbound_connection
+        - connection_destination
+        - wmi_caller_account
+      all:
+        - socket_building_command
+        - powershell_outbound_connection
+
+    contradicting:
+      any:
+        - management_platform_job
+        - recurring_wmi_command
+      all: []
+
+  verdict:
+    low_risk_when:
+      - wmi_launched_powershell
+      - management_platform_job
+      - recurring_wmi_command
+    suspicious_when:
+      - wmi_launched_powershell
+      - wmi_caller_account
+    high_risk_when:
+      - wmi_launched_powershell
+      - wmi_caller_account
+      - socket_building_command
+      - powershell_outbound_connection
+
+  false_positive:
+    - condition: Monitoring and configuration platforms run PowerShell through WMI.
+      explanation: >-
+        These are the main source of PowerShell under WmiPrvSE. Their commands repeat on
+        a timer across the managed fleet and make no raw socket connections.
+    - condition: Administrators use CIM methods for remote maintenance.
+      explanation: >-
+        The call is the same. It comes from an administrative host and account, targets
+        servers the administrator owns, and runs a recognisable maintenance command.
+    - condition: PowerShell scripts use sockets for legitimate checks.
+      explanation: >-
+        Port tests and health checks build a TCP client briefly. They connect to internal
+        addresses and do not read commands from the stream in a loop.

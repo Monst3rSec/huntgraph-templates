@@ -1,0 +1,377 @@
+# Converted from THORCollective/HEARTH Flames/H115.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+# Also holds H114 (SEO poisoning and malvertising delivering trojanized installers
+# for IT tools). The search result, the referrer and the look-alike site are not
+# visible to the sensor; what happens on the endpoint is an installer run from a
+# download directory, which is this file's behaviour. It has its own case below.
+type: detection
+
+id: hg-win-hearth-h115-msiexec-proxy-execution-t1218-007
+version: 1.0.0
+
+info:
+  name: msiexec used to run remote packages, DLLs and trojanized installers
+  description: >-
+    msiexec.exe is signed by Microsoft and trusted by most application control policies.
+    It will install a package straight from a URL, run custom actions that start any
+    program, and with /y or /z load a DLL and call its registration export without any
+    package at all. In the Bumblebee-to-Akira intrusion a user searching for ManageEngine
+    OpManager was led by a poisoned search result to a trojanized MSI that side-loaded
+    Bumblebee while installing the real product. The search, the site and the DLL being
+    loaded are not visible here: module loads are not collected. The hunt returns what is:
+    msiexec command lines with a remote source, silent installs from user-writable paths,
+    the DLL switches, what msiexec starts, where it connects, and installers named after
+    IT tools that a browser or Explorer starts from a download directory.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - stealth
+    - msiexec
+    - system-binary-proxy-execution
+    - trojanized-installer
+    - seo-poisoning
+    - bumblebee
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H115.md
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H114.md
+    - https://attack.mitre.org/techniques/T1218
+    - https://attack.mitre.org/techniques/T1218/007
+    - https://attack.mitre.org/detectionstrategies/DET0158
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1218
+  sub_techniques:
+    - T1218.007
+  detection_strategies:
+    - DET0158
+  analytics:
+    - AN0445
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary is abusing msiexec.exe to proxy execution of malicious code through
+    crafted MSI packages or DLL loading, bypassing application control solutions that
+    trust the signed Windows Installer binary, including packages delivered as trojanized
+    installers for IT tools through poisoned search results.
+  attacker_behavior:
+    - Runs msiexec /i against an http or https URL with a quiet switch.
+    - Drops an MSI into Temp, Downloads or ProgramData and installs it silently.
+    - Calls msiexec /y or /z on a DLL to run its registration export.
+    - Uses a custom action to start cmd.exe, PowerShell or rundll32.
+    - Serves a trojanized installer for an administration tool from a look-alike site.
+  legitimate_behavior:
+    - Software deployment tools run msiexec silently all day.
+    - Users install approved software from their Downloads folder.
+    - Custom actions in genuine packages start helper programs.
+  risk_indicator:
+    - The package source is a URL on a host the organisation does not use.
+    - A quiet install runs from a user-writable path under a script host or Office parent.
+    - msiexec is given /y or /z with a DLL outside System32.
+    - msiexec starts a shell with an encoded or download command.
+    - An installer named after an IT tool runs from Downloads and msiexec then connects outward or starts a shell.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: msiexec-remote-package-source
+        name: msiexec given a URL or remote share as its package
+        purpose: >-
+          Return msiexec command lines that carry an http or https URL or a UNC path.
+          Deployment shares match; the host named in the path decides.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^msiexec\.exe$/i
+          | CommandLine=/https?:\/\/|\s"?\\\\[^\\\s"]+\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: msiexec-quiet-install-from-user-writable-path
+        name: Silent msiexec install from a user-writable path
+        purpose: >-
+          Return msiexec runs with a quiet or passive switch whose package sits under a
+          user profile, Public, Windows\Temp or ProgramData. Self-updating applications
+          match; the parent and the package name tell them apart.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^msiexec\.exe$/i
+          | CommandLine=/\s[\/-](q[nbr]?[+!-]?|quiet|passive)\b/i
+          | CommandLine=/\\(Users\\[^\\]+\\(Downloads|Desktop|Documents|AppData\\Local\\Temp|AppData\\Roaming)|Users\\Public|Windows\\Temp|ProgramData)\\[^"]*\.(msi|msp|mst)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: msiexec-dll-registration-switch
+        name: msiexec /y or /z against a DLL
+        purpose: >-
+          Return msiexec runs with the /y or /z switch, which call DllRegisterServer or
+          DllUnregisterServer in the named file. The DLL being loaded is a Module Load
+          event and is not collected; the command line is the only record.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^msiexec\.exe$/i
+          | CommandLine=/\s[\/-][yz]\s+"?\S+/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: msiexec-spawned-shell-or-proxy-binary
+        name: Shell, script host or proxy binary started by msiexec
+        purpose: >-
+          Return shells, script hosts, proxy-execution and discovery utilities whose
+          parent is msiexec, the usual shape of a malicious custom action. Genuine
+          packages start cmd.exe and rundll32 as well, so the child's command line has to
+          be read. Code that a custom-action DLL runs inside msiexec starts no process and
+          is not seen.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^msiexec\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh|rundll32|regsvr32|mshta|wscript|cscript|certutil|bitsadmin|curl|schtasks|net1?|nltest|whoami|systeminfo)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: it-tool-installer-started-from-download-directory
+        name: Installer named after an IT tool started from a download directory
+        purpose: >-
+          Return installers that a browser or Explorer starts from Downloads, Temp or the
+          browser cache and whose file name is that of an administration tool often used
+          as a search-poisoning lure. This is H114's endpoint half. It lists genuine
+          installs too; the agent compares the file hash on the event, and the child and
+          connection cases for the same host, against the vendor's release. The list of
+          names is a sample and the lure can use any product.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(explorer|chrome|msedge|firefox|brave|opera)\.exe$/i
+          | CommandLine=/\\(Downloads|AppData\\Local\\Temp|INetCache)\\[^"]*(ManageEngine|OpManager|putty|winscp|anydesk|teamviewer|advanced[_ -]?ip[_ -]?scanner|angry[_ -]?ip|rvtools|keepass|filezilla|treesize|mobaxterm|zoom|webex|teams)[^"\\]*\.(msi|exe)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: msiexec-external-connection
+        name: msiexec connecting to a public address
+        purpose: >-
+          Return outbound connections owned by msiexec to addresses outside private
+          ranges: a package fetched from a URL, or a custom action calling out.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | ContextBaseFileName=/^msiexec\.exe$/i
+          | !cidr(RemoteAddressIP4, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: msiexec_proxy_command
+      name: msiexec run with a remote source, a user-writable package or a DLL switch
+      description: >-
+        An msiexec command line names a URL or remote share, installs silently from a
+        user-writable path, or uses /y or /z; or an installer named after an IT tool was
+        started from a download directory.
+      source: process_creation
+      field: command_line
+      indicates: installer_proxy_execution
+
+  supporting:
+    - id: msiexec_child_process
+      name: msiexec started a shell or proxy binary
+      description: >-
+        A shell, script host or proxy-execution utility has msiexec as its parent.
+      source: process_creation
+      field: parent_process
+      indicates: custom_action_execution
+    - id: installer_started_by_browser_or_user
+      name: Installer started from a browser download
+      description: >-
+        The installer's parent is a browser or Explorer and its path is a download
+        directory.
+      source: process_creation
+      field: image_path
+      indicates: user_downloaded_installer
+    - id: msiexec_public_connection
+      name: msiexec connected to a public address
+      description: >-
+        A connection event owned by msiexec goes to an address outside private ranges.
+      source: network_connection
+      field: remote_address
+      indicates: remote_package_or_callback
+    - id: connection_on_unusual_port
+      name: Connection uses a port other than 80 or 443
+      description: >-
+        The remote port on msiexec's connection is not a web port.
+      source: network_connection
+      field: remote_port
+      indicates: non_web_callback
+    - id: msiexec_owns_connection
+      name: Connection belongs to the same msiexec run
+      description: >-
+        The process id on the connection equals the process id of an msiexec command the
+        other cases returned, which the agent matches.
+      source: network_connection
+      field: process_id
+      indicates: command_and_connection_linked
+    - id: unusual_parent
+      name: msiexec parent is a script host, Office program or shell with a pasted command
+      description: >-
+        The parent of msiexec is not a deployment agent, the Windows Installer service or
+        Explorer.
+      source: process_creation
+      field: parent_process
+      indicates: installer_started_by_intrusion_chain
+
+  contradicting:
+    - id: software_deployment_job
+      name: Install belongs to a deployment job
+      description: >-
+        Change and deployment records show the package was pushed by the organisation's
+        software distribution tool.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_software_deployment
+    - id: vendor_release_hash
+      name: Installer matches the vendor's release
+      description: >-
+        The installer's hash equals the one the vendor publishes for that version.
+      source: threat_intel
+      field: SHA256HashData
+      indicates: genuine_vendor_installer
+    - id: recurring_self_update
+      name: Same package installs recur as a product update
+      description: >-
+        Earlier activity shows the same product updating itself through msiexec from the
+        same path and vendor host.
+      source: baseline
+      field: CommandLine
+      indicates: established_update_behaviour
+
+  risk_logic:
+    required:
+      - msiexec_proxy_command
+
+    supporting:
+      any:
+        - msiexec_child_process
+        - installer_started_by_browser_or_user
+        - msiexec_public_connection
+        - connection_on_unusual_port
+        - msiexec_owns_connection
+        - unusual_parent
+      all:
+        - msiexec_child_process
+        - msiexec_public_connection
+
+    contradicting:
+      any:
+        - software_deployment_job
+        - vendor_release_hash
+        - recurring_self_update
+      all: []
+
+  verdict:
+    low_risk_when:
+      - msiexec_proxy_command
+      - software_deployment_job
+      - vendor_release_hash
+    suspicious_when:
+      - msiexec_proxy_command
+      - msiexec_child_process
+    high_risk_when:
+      - msiexec_proxy_command
+      - msiexec_child_process
+      - msiexec_public_connection
+
+  false_positive:
+    - condition: Software distribution.
+      explanation: >-
+        Configuration Manager, Intune and similar tools run msiexec /qn from their cache,
+        sometimes against a URL. The parent is the agent and the package is in the
+        deployment record.
+    - condition: Self-updating applications.
+      explanation: >-
+        Browsers, conferencing clients and drivers install MSI updates from Temp. The same
+        product does so on every host.
+    - condition: Genuine packages with custom actions.
+      explanation: >-
+        Many installers start cmd.exe, rundll32 or PowerShell to configure the product.
+        The command touches the product's own folder.
+    - condition: Administrators downloading the real tool.
+      explanation: >-
+        An administrator installs PuTTY or WinSCP from the vendor's site. The hash is the
+        vendor's and nothing unusual follows.

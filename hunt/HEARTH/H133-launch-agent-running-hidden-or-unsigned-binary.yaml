@@ -1,0 +1,338 @@
+# Converted from THORCollective/HEARTH Flames/H133.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-mac-hearth-h133-launch-agent-running-hidden-or-unsigned-binary-t1543-001
+version: 1.0.0
+
+info:
+  name: Launch Agent plist that runs a hidden or temporary-path binary at login
+  description: >-
+    A property list in ~/Library/LaunchAgents makes launchd start a program each time
+    the user logs in, with no root rights needed. Sapphire Sleet installed Launch Agents
+    beside its Launch Daemons so that losing one left the other, pointing at binaries in
+    hidden folders. A plist is not an executable, so the sensor does not report its
+    creation, and code-signing status is not on the events this hunt reads. What is
+    visible: the plist path on the command line of whatever writes or loads it, the keys
+    when they are set from a shell, launchd starting a program from a hidden or
+    temporary path, and an executable being written into a hidden folder in the home
+    directory. An implant that writes the plist from its own code and waits for the next
+    login shows only the last two. H030 covers the root-level Launch Daemon.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - persistence
+    - launch-agent
+    - launchd
+    - plist
+    - sapphire-sleet
+    - phantompulse
+    - macos
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H133.md
+    - https://attack.mitre.org/techniques/T1543
+    - https://attack.mitre.org/techniques/T1543/001
+    - https://attack.mitre.org/detectionstrategies/DET0434
+    - https://www.microsoft.com/en-us/security/blog/2026/04/16/dissecting-sapphire-sleets-macos-intrusion-from-lure-to-compromise/
+
+mitre:
+  tactics:
+    - TA0003
+  techniques:
+    - T1543
+  sub_techniques:
+    - T1543.001
+  detection_strategies:
+    - DET0434
+  analytics:
+    - AN1208
+  platforms:
+    - macOS
+  data_sources:
+    - macos:unifiedlog
+    - fs:fsusage
+  data_components:
+    - Command Execution
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary has established persistence on macOS by creating or modifying a Launch
+    Agent plist in ~/Library/LaunchAgents/ that executes a hidden or unsigned binary on
+    user login, indicated by plist file creation events followed by immediate launchctl
+    load commands or login-triggered process execution from non-standard paths.
+  attacker_behavior:
+    - Writes a plist into ~/Library/LaunchAgents with RunAtLoad and KeepAlive set.
+    - Points ProgramArguments at a binary in a dot-prefixed folder, /tmp or /Users/Shared.
+    - Sends the agent's output to /dev/null.
+    - Loads the agent at once with launchctl load or bootstrap.
+    - Installs a Launch Daemon as well, for redundancy.
+  legitimate_behavior:
+    - Applications install Launch Agents for updaters and helpers during setup.
+    - Homebrew services and developer tools register user agents.
+    - Device management deploys agents for its own components.
+  risk_indicator:
+    - The plist is written by a shell, a script interpreter or curl, not an installer.
+    - launchctl loads it within seconds of the write.
+    - launchd starts a program from a hidden folder or a temporary path in a user session.
+    - The plist name borrows a vendor prefix that the binary's location does not match.
+    - An executable was written into a hidden home-directory folder shortly before.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NewExecutableWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+        file_hash: SHA256HashData
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: launch-agent-plist-written-by-command
+        name: Command that writes a Launch Agent plist
+        purpose: >-
+          Return commands that name a plist under a LaunchAgents folder and are run by a
+          file utility, a shell or an interpreter, leaving out installer and management
+          parents. The path literal is tested before the image name, as H030 does for
+          daemons.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | CommandLine=/\/Library\/LaunchAgents\/[^\s"']+\.plist/
+          | FileName=/^(cp|mv|tee|sh|bash|zsh|plutil|defaults|osascript|curl|install|ditto|PlistBuddy|python3?|perl|ruby|chmod|chown|touch)$/
+          | ParentBaseFileName!=/^(installd|system_installd|package_script_service|jamf|JamfDaemon|JamfAgent|munki.*|managedsoftwareupdate|kandji.*|softwareupdated|brew|ruby)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: launchctl-loading-launch-agent
+        name: launchctl loading or starting a Launch Agent
+        purpose: >-
+          Return launchctl load, bootstrap, enable and kickstart commands that name a
+          LaunchAgents plist or a per-user gui domain. The agent compares the time with
+          the write returned by the first case.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=launchctl
+          | CommandLine=/\s(load|bootstrap|enable|kickstart)\s/
+          | CommandLine=/LaunchAgents\/|gui\/\d+/
+          | ParentBaseFileName!=/^(installd|system_installd|package_script_service|jamf|JamfDaemon|JamfAgent|munki.*|managedsoftwareupdate|kandji.*|softwareupdated|brew|ruby)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: agent-keys-set-from-command-line
+        name: Launch Agent keys set from a shell or plist tool
+        purpose: >-
+          Return commands that name a LaunchAgents plist together with the keys that
+          make an agent start at login and restart, or that silence its output. The keys
+          are visible only when the plist is built on a command line; a plist copied
+          into place shows none of them.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | CommandLine=/\/Library\/LaunchAgents\//
+          | CommandLine=/RunAtLoad|KeepAlive|ProgramArguments|\/dev\/null/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: launchd-started-program-from-hidden-or-temporary-path
+        name: launchd starting a program from a hidden or temporary path
+        purpose: >-
+          Return processes launchd starts from a dot-prefixed folder in a home
+          directory, a hidden folder under the user Library, a temporary directory or
+          /Users/Shared. This is what the agent's payload looks like at every login,
+          however the plist was written. Root-owned daemons from the same paths are
+          H030's third case and appear here too.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | ParentBaseFileName=launchd
+          | ImageFileName=/^\/(Users\/[^\/]+\/\.[^\/]+\/|Users\/[^\/]+\/Library\/\.[^\/]+|Users\/Shared\/|private\/tmp\/|tmp\/|private\/var\/tmp\/|var\/tmp\/)/
+          | ImageFileName!=/^\/Users\/[^\/]+\/\.(nvm|cargo|rustup|pyenv|rbenv|local|docker|vscode[^\/]*|cursor|bun|sdkman|asdf|volta|orbstack|rd)\//
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: executable-written-to-hidden-home-folder
+        name: Executable written into a hidden folder in a home directory
+        purpose: >-
+          Return executables created in a dot-prefixed folder directly under a home
+          directory or under the user Library, with hash and writing process id.
+          Developer toolchain folders are excluded; on developer machines the remainder
+          is still large and the agent keeps the paths that a plist or a launchd start
+          also names.
+        query: |
+          #event_simpleName=NewExecutableWritten
+          | event_platform=Mac
+          | TargetFileName=/^\/Users\/[^\/]+\/(\.[^\/]+\/|Library\/\.[^\/]+\/)/
+          | TargetFileName!=/^\/Users\/[^\/]+\/\.(nvm|cargo|rustup|pyenv|rbenv|local|docker|vscode[^\/]*|cursor|bun|sdkman|asdf|volta|orbstack|rd|npm|cache|gradle|m2|Trash|git|oh-my-zsh|gem|go|conda|platformio|cocoapods|swiftpm)\//
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: launch_agent_install_or_start
+      name: Launch Agent written, loaded or started from an odd path
+      description: >-
+        A command names a LaunchAgents plist while writing or loading it, or launchd
+        starts a program from a hidden or temporary path.
+      source: process_creation
+      field: command_line
+      indicates: launch_agent_persistence
+
+  supporting:
+    - id: payload_in_hidden_or_temporary_path
+      name: Program runs from a hidden or temporary path
+      description: >-
+        The image path of a launchd child is under a dot-prefixed home folder, a hidden
+        Library folder, a temporary directory or /Users/Shared.
+      source: process_creation
+      field: image_path
+      indicates: concealed_payload_location
+    - id: load_follows_write
+      name: launchctl load follows the plist write within seconds
+      description: >-
+        The write and the load of the same plist are seconds apart on the same host. The
+        agent derives the interval from the returned events.
+      source: process_creation
+      field: command_line
+      indicates: programmatic_persistence_install
+    - id: script_or_download_parent
+      name: Installed by a script, interpreter or download tool
+      description: >-
+        The parent of the writing or loading command is a shell, osascript, curl or an
+        interpreter, not an installer.
+      source: process_creation
+      field: parent_process
+      indicates: scripted_installation
+    - id: hidden_executable_dropped
+      name: Executable written into a hidden home folder
+      description: >-
+        An executable was created in a dot-prefixed folder under the home directory or
+        the user Library.
+      source: file_creation
+      field: file_path
+      indicates: payload_dropped
+    - id: dropped_payload_hash
+      name: Hash of the dropped executable
+      description: >-
+        The hash on the file event, for reputation lookup and for matching the launchd
+        child.
+      source: file_creation
+      field: file_hash
+      indicates: payload_identity
+
+  contradicting:
+    - id: application_installation
+      name: Agent installed with an application
+      description: >-
+        The plist label and program belong to an application installed at that time.
+      source: asset_inventory
+      field: ComputerName
+      indicates: software_installation
+    - id: fleet_wide_agent
+      name: Same agent present across the fleet
+      description: >-
+        The same plist name and program path exist on many managed Macs.
+      source: baseline
+      field: CommandLine
+      indicates: known_software_component
+
+  risk_logic:
+    required:
+      - launch_agent_install_or_start
+
+    supporting:
+      any:
+        - payload_in_hidden_or_temporary_path
+        - load_follows_write
+        - script_or_download_parent
+        - hidden_executable_dropped
+        - dropped_payload_hash
+      all:
+        - payload_in_hidden_or_temporary_path
+        - script_or_download_parent
+
+    contradicting:
+      any:
+        - application_installation
+        - fleet_wide_agent
+      all: []
+
+  verdict:
+    low_risk_when:
+      - launch_agent_install_or_start
+      - fleet_wide_agent
+    suspicious_when:
+      - launch_agent_install_or_start
+      - script_or_download_parent
+    high_risk_when:
+      - launch_agent_install_or_start
+      - script_or_download_parent
+      - payload_in_hidden_or_temporary_path
+
+  false_positive:
+    - condition: Application updaters and helpers.
+      explanation: >-
+        Many applications install a Launch Agent on first run. The program is inside the
+        application bundle and the label matches the vendor.
+    - condition: Developer tools kept in dot-folders.
+      explanation: >-
+        Version managers, container tools and editors keep binaries under dot-folders
+        and some register agents. The common ones are excluded; others show on developer
+        machines.
+    - condition: Users loading their own agents.
+      explanation: >-
+        Technical users write and load agents for personal automation. The program is a
+        script they own and the account is technical.

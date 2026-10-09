@@ -1,0 +1,256 @@
+# Converted from THORCollective/HEARTH Flames/H180.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h180-print-command-copying-ntds-from-shadow-copy-t1003-003
+version: 1.0.0
+
+info:
+  name: print.exe used to copy NTDS.dit or registry hives out of a shadow copy
+  description: >-
+    print.exe sends a file to a print device, and the device can be a file path. In the
+    STAC4713 intrusions Sophos linked to GOLD ENCOUNTER, the operators used that to copy
+    NTDS.dit and the SAM and SYSTEM hives out of a Volume Shadow Copy to a temporary
+    directory over SMB, a route that avoids ntdsutil, vssadmin copy idioms and the
+    detections written for them. print.exe is rarely run at all, and a /D: destination
+    that is a file rather than a printer has no ordinary use. The copied files are data,
+    which the sensor does not report as written, so the command is the evidence.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - credential-access
+    - ntds
+    - shadow-copy
+    - print-exe
+    - living-off-the-land
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H180.md
+    - https://attack.mitre.org/techniques/T1003
+    - https://attack.mitre.org/techniques/T1003/003
+    - https://attack.mitre.org/detectionstrategies/DET0586
+
+mitre:
+  tactics:
+    - TA0006
+  techniques:
+    - T1003
+  sub_techniques:
+    - T1003.003
+  detection_strategies:
+    - DET0586
+  analytics:
+    - AN1611
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    Adversaries are using the print command to copy the Active Directory database
+    (NTDS.dit) and SAM and SYSTEM registry hives from Volume Shadow Copy snapshots to
+    temporary directories over SMB to extract domain credentials for lateral movement
+    and privilege escalation.
+  attacker_behavior:
+    - Creates or finds a Volume Shadow Copy on a domain controller.
+    - "Runs print /D: with a file path as the device and a shadow-copy path as the source."
+    - Copies NTDS.dit, SAM and SYSTEM to a temporary directory or a remote share.
+    - Extracts hashes from the copies offline.
+  legitimate_behavior:
+    - Legacy batch jobs send text files to a parallel port or a shared printer with print.
+    - Backup software creates shadow copies on domain controllers.
+  risk_indicator:
+    - "The /D: argument is a drive path or a three-part UNC path, not a printer."
+    - The source is under HarddiskVolumeShadowCopy or names ntds.dit or a hive.
+    - The host is a domain controller.
+    - A shadow copy was created on the host shortly before.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: print-command-with-file-destination
+        name: print.exe with a file path as its device
+        purpose: >-
+          Return print.exe runs whose /D: argument is a path on a drive or a UNC path
+          with a file component. A printer is a port name or a two-part share name, so
+          neither matches.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^print\.exe$/i
+          | CommandLine=/\/D:\s*"?([A-Z]:\\\S+|\\\\[^\\\s"]+\\[^\\\s"]+\\\S+)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: print-command-reading-shadow-copy-or-hive
+        name: print.exe reading a shadow copy, NTDS.dit or a registry hive
+        purpose: >-
+          Return print.exe runs whose source is a shadow-copy path or one of the
+          credential stores by name.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^print\.exe$/i
+          | CommandLine=/HarddiskVolumeShadowCopy|ntds\.dit|\\config\\(SAM|SYSTEM|SECURITY)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: shadow-copy-created-by-command
+        name: Shadow copy created from a command
+        purpose: >-
+          Return shadow-copy creation by vssadmin, WMIC or diskshadow, the step that
+          makes the locked files readable. The agent keeps the events that precede a
+          print.exe hit on the same host. A snapshot made through the VSS API, as backup
+          agents do, starts none of these and is not seen.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(vssadmin|wmic|diskshadow)\.exe$/i
+          | CommandLine=/create\s+shadow|shadowcopy\s+call\s+create|diskshadow/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: print_copy_to_file
+      name: print.exe writes to a file path
+      description: >-
+        print.exe runs with a file path as its device, or with a shadow-copy or
+        credential-store source.
+      source: process_creation
+      field: command_line
+      indicates: credential_store_copy
+
+  supporting:
+    - id: source_is_credential_store
+      name: Source is NTDS.dit or a hive in a shadow copy
+      description: >-
+        The source argument is under HarddiskVolumeShadowCopy and names ntds.dit, SAM or
+        SYSTEM.
+      source: process_creation
+      field: command_line
+      indicates: ntds_extraction
+    - id: runs_on_domain_controller
+      name: Host is a domain controller
+      description: >-
+        The host on the event holds the Active Directory database.
+      source: process_creation
+      field: host
+      indicates: domain_credential_exposure
+    - id: shadow_copy_precedes_copy
+      name: Shadow copy created beforehand
+      description: >-
+        A shadow copy was created by command on the same host before the print run,
+        which the agent derives by ordering the returned events.
+      source: process_creation
+      field: parent_process
+      indicates: locked_file_access_preparation
+    - id: copy_under_remote_session
+      name: Command issued from a remote session
+      description: >-
+        The parent chain is a remote shell, a service or a scheduled task rather than a
+        console logon.
+      source: process_creation
+      field: parent_process_id
+      indicates: remote_operator_activity
+
+  contradicting:
+    - id: legacy_print_job
+      name: Run is a scheduled legacy print job
+      description: >-
+        The same command line recurs on a schedule and sends a text file to a port or
+        share that is a printer.
+      source: baseline
+      field: CommandLine
+      indicates: routine_print_job
+    - id: authorised_dc_backup_test
+      name: A recorded recovery test covers the host
+      description: >-
+        A change record covers a directory recovery or migration exercise on this host.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_directory_maintenance
+
+  risk_logic:
+    required:
+      - print_copy_to_file
+
+    supporting:
+      any:
+        - source_is_credential_store
+        - runs_on_domain_controller
+        - shadow_copy_precedes_copy
+        - copy_under_remote_session
+      all:
+        - source_is_credential_store
+        - runs_on_domain_controller
+
+    contradicting:
+      any:
+        - legacy_print_job
+        - authorised_dc_backup_test
+      all: []
+
+  verdict:
+    low_risk_when:
+      - print_copy_to_file
+      - legacy_print_job
+      - authorised_dc_backup_test
+    suspicious_when:
+      - print_copy_to_file
+      - runs_on_domain_controller
+    high_risk_when:
+      - print_copy_to_file
+      - source_is_credential_store
+      - runs_on_domain_controller
+      - shadow_copy_precedes_copy
+
+  false_positive:
+    - condition: A batch job prints reports.
+      explanation: >-
+        The device is LPT1 or a printer share and the source is a report file.
+    - condition: Backup software snapshots the domain controller.
+      explanation: >-
+        The shadow copy is made by the backup agent and no print.exe follows.

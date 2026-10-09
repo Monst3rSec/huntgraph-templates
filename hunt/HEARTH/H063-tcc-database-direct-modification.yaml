@@ -1,0 +1,358 @@
+# Converted from THORCollective/HEARTH Flames/H063.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+# Also holds H130 (TCC database manipulation, Sapphire Sleet rename-inject-restore). It
+# adds the dscl home-directory route and tccutil reset; both have cases below.
+type: detection
+
+id: hg-mac-hearth-h063-tcc-database-direct-modification-t1548-006
+version: 1.1.0
+
+info:
+  name: User TCC database modified directly to grant privacy permissions
+  description: >-
+    macOS records which applications may read Desktop, Documents and Downloads, or use
+    the camera and microphone, in a per-user TCC.db. The system protects the file, but
+    Finder holds Full Disk Access, so UNC1069's DEEPBREATH malware has Finder rename the
+    com.apple.TCC folder, edits a copy of the database to add its own authorisations,
+    and puts it back. No consent prompt is shown. File modification is not reported by
+    the sensor for this path, so the hunt reads the commands: anything that names TCC.db
+    or the TCC folder together with a database tool, a copy or rename, or an AppleScript
+    instruction to Finder. HEARTH files this under disabling tools; ATT&CK has a
+    sub-technique for it, TCC Manipulation.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - privilege-escalation
+    - tcc
+    - privacy-bypass
+    - unc1069
+    - macos
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H063.md
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H130.md
+    - https://attack.mitre.org/techniques/T1548
+    - https://attack.mitre.org/techniques/T1548/006
+    - https://attack.mitre.org/detectionstrategies/DET0534
+    - https://cloud.google.com/blog/topics/threat-intelligence/unc1069-targets-cryptocurrency-ai-social-engineering
+
+mitre:
+  tactics:
+    - TA0004
+  techniques:
+    - T1548
+  sub_techniques:
+    - T1548.006
+  detection_strategies:
+    - DET0534
+  analytics:
+    - AN1474
+  platforms:
+    - macOS
+  data_sources:
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    Adversaries are directly modifying the user-specific TCC.db database file by
+    leveraging Finder's Full Disk Access permissions to programmatically insert
+    authorization entries, bypassing macOS privacy prompts to gain unauthorized access to
+    protected user directories including Desktop, Documents and Downloads.
+  attacker_behavior:
+    - Tells Finder through AppleScript to rename or move the com.apple.TCC folder.
+    - Copies TCC.db to a working location and inserts rows into its access table with sqlite3.
+    - Moves the modified database back and restarts tccd so the entries take effect.
+    - Grants its own binary access to Desktop, Documents, Downloads or Full Disk Access.
+    - Begins bulk collection from the protected folders straight afterwards.
+  legitimate_behavior:
+    - Device-management profiles grant privacy permissions without touching the database file.
+    - Administrators and developers read TCC.db with sqlite3 to audit permissions.
+    - tccutil reset is used to clear an application's permissions during troubleshooting.
+  risk_indicator:
+    - A write statement, not a read, is issued against TCC.db.
+    - The TCC folder is renamed, moved or replaced.
+    - osascript addresses Finder with a path under com.apple.TCC.
+    - The parent is a script, an unsigned binary or a process in a temporary path.
+    - tccd is killed or restarted from the same parent.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: tcc-database-write-statement
+        name: Write statement issued against TCC.db
+        purpose: >-
+          Return sqlite3 and scripted commands that name TCC.db together with an insert,
+          replace, update or delete. The file name is a fixed literal and runs first.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | CommandLine=/TCC\.db/
+          | CommandLine=/\b(insert|replace|update|delete)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: tcc-folder-moved-or-replaced
+        name: TCC folder or database copied, moved or renamed
+        purpose: >-
+          Return file-management commands whose arguments include the com.apple.TCC
+          folder or its database, the staging step around the edit.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | CommandLine=/com\.apple\.TCC|TCC\.db/
+          | FileName=/^(mv|cp|ditto|rsync|rm|ln|chflags|chmod|install|tar)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: finder-scripted-against-tcc
+        name: AppleScript instructing Finder to act on the TCC folder
+        purpose: >-
+          Return osascript commands that address Finder and name the TCC folder, the
+          route that borrows Finder's Full Disk Access.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=osascript
+          | CommandLine=/com\.apple\.TCC|TCC\.db/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: tccd-restarted-or-killed
+        name: tccd killed or restarted from the command line
+        purpose: >-
+          Return commands that stop the TCC daemon, which is how a replaced database is
+          made to load without a logout.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=/^(killall|pkill|kill|launchctl)$/
+          | CommandLine=/\btccd\b|com\.apple\.tccd/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: home-directory-repointed-with-dscl
+        name: User home directory repointed with dscl
+        purpose: >-
+          Return dscl commands that change a user's NFSHomeDirectory. Moving the home
+          directory makes the system read a TCC database the attacker wrote, the route
+          used by HM Surf (CVE-2024-44133).
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=dscl
+          | CommandLine=/NFSHomeDirectory/
+          | CommandLine=/-(change|create|append|merge)\b/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: tcc-service-identifier-in-database-command
+        name: sqlite3 command naming a TCC service identifier
+        purpose: >-
+          Return sqlite3 commands that name a kTCCService permission. This catches an
+          insert against a renamed copy of the database, whose path no longer says
+          TCC.db.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=sqlite3
+          | CommandLine=/kTCCService/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: tccutil-reset
+        name: tccutil reset
+        purpose: >-
+          Return tccutil reset commands. Developers and support staff run it routinely,
+          so it supports a finding and never makes one.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=tccutil
+          | CommandLine=/\breset\b/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: tcc_database_tampering_command
+      name: Command that alters the TCC database or folder
+      description: >-
+        A command line issues a write statement against TCC.db, or copies, moves or
+        renames the com.apple.TCC folder or its database.
+      source: process_creation
+      field: command_line
+      indicates: privacy_control_database_tampering
+
+  supporting:
+    - id: finder_used_as_proxy
+      name: Finder instructed through AppleScript
+      description: >-
+        An osascript command names the TCC folder, showing Finder's Full Disk Access was
+        used to reach the protected path.
+      source: process_creation
+      field: command_line
+      indicates: permission_borrowed_from_trusted_application
+    - id: daemon_restarted
+      name: TCC daemon stopped or restarted
+      description: >-
+        A command on the host kills or restarts tccd around the time of the database
+        change.
+      source: process_creation
+      field: image_name
+      indicates: modified_database_activated
+    - id: script_or_unknown_parent
+      name: Commands issued by a script or unknown binary
+      description: >-
+        The parent is an interpreter, osascript or an executable outside installed
+        application paths.
+      source: process_creation
+      field: parent_process
+      indicates: automated_tampering
+    - id: ordinary_user_session
+      name: Run in an ordinary user's session
+      description: >-
+        The user is a standard account, not an administrator performing an audit.
+      source: process_creation
+      field: user
+      indicates: activity_outside_user_role
+    - id: home_directory_repointed
+      name: Home directory repointed with dscl
+      description: >-
+        A dscl command changed a user's NFSHomeDirectory, relocating the path the TCC
+        database is read from.
+      source: process_creation
+      field: command_line
+      indicates: protected_path_relocated
+    - id: permissions_reset
+      name: TCC permissions reset with tccutil
+      description: >-
+        tccutil reset cleared stored consent decisions on the host around the time of
+        the other commands.
+      source: process_creation
+      field: image_name
+      indicates: consent_state_cleared
+
+  contradicting:
+    - id: permission_audit_read
+      name: Command is a read-only permission audit
+      description: >-
+        The statement against the database is a select issued by an administrator or a
+        compliance tool, with no write and no file move.
+      source: derived
+      field: CommandLine
+      indicates: read_only_audit
+    - id: developer_tcc_testing
+      name: Host is a developer or test machine with protections relaxed
+      description: >-
+        Asset records class the host as a development or test system where privacy
+        settings are reset and manipulated deliberately.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_development_activity
+
+  risk_logic:
+    required:
+      - tcc_database_tampering_command
+
+    supporting:
+      any:
+        - finder_used_as_proxy
+        - daemon_restarted
+        - script_or_unknown_parent
+        - ordinary_user_session
+        - home_directory_repointed
+        - permissions_reset
+      all:
+        - finder_used_as_proxy
+        - script_or_unknown_parent
+
+    contradicting:
+      any:
+        - permission_audit_read
+        - developer_tcc_testing
+      all: []
+
+  verdict:
+    low_risk_when:
+      - tcc_database_tampering_command
+      - developer_tcc_testing
+    suspicious_when:
+      - tcc_database_tampering_command
+      - script_or_unknown_parent
+    high_risk_when:
+      - tcc_database_tampering_command
+      - script_or_unknown_parent
+      - finder_used_as_proxy
+
+  false_positive:
+    - condition: An administrator audits permissions with sqlite3.
+      explanation: >-
+        Reading the access table is common. The first case requires a write verb; a
+        select that mentions one of those words in a string is the residue.
+    - condition: Developers reset or seed permissions on test machines.
+      explanation: >-
+        Test automation edits TCC on machines with protections disabled. The host is a
+        test system and the entries are for the application under test.
+    - condition: Backup tools copy the user Library.
+      explanation: >-
+        A whole-Library backup names the TCC folder among thousands of paths. The parent
+        is the backup product and nothing is moved back.

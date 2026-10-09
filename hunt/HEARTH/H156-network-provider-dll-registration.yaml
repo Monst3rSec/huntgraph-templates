@@ -1,0 +1,336 @@
+# Converted from THORCollective/HEARTH Flames/H156.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h156-network-provider-dll-registration-t1556-008
+version: 1.0.0
+
+info:
+  name: Network provider DLL registered to receive logon credentials
+  description: >-
+    Windows passes the clear-text user name and password of every interactive logon, and
+    of every password change, to each registered network provider through mpnotify.exe.
+    A provider is a service key with a NetworkProvider subkey whose ProviderPath names a
+    DLL, and whose service name is listed in the provider order. An intruder with
+    administrator rights registers a DLL of their own, mslogon.dll in the reported
+    intrusion, on a domain controller and collects credentials from then on. The DLL
+    being loaded by mpnotify is a Module Load event and is not claimed. The registration
+    is a registry write, the DLL has to be written to disk first, and either may be done
+    through a command. A new provider on any host is uncommon and on a domain controller
+    it is close to never legitimate.
+  severity: critical
+  author: huntgraph
+  tags:
+    - hearth
+    - credential-access
+    - persistence
+    - network-provider
+    - mpnotify
+    - domain-controller
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H156.md
+    - https://attack.mitre.org/techniques/T1556
+    - https://attack.mitre.org/techniques/T1556/008
+    - https://attack.mitre.org/detectionstrategies/DET0580
+
+mitre:
+  tactics:
+    - TA0006
+    - TA0003
+  techniques:
+    - T1556
+  sub_techniques:
+    - T1556.008
+  detection_strategies:
+    - DET0580
+  analytics:
+    - AN1598
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Windows Registry Key Modification
+    - File Creation
+
+hypothesis:
+  statement: >-
+    Threat actors are registering a malicious Network Provider DLL (for example
+    mslogon.dll) at
+    HKLM\SYSTEM\CurrentControlSet\Services\<service>\NetworkProvider\ProviderPath on a
+    domain controller, so that Windows invokes NPLogonNotify and NPPasswordChangeNotify
+    on every interactive logon and password change to harvest clear-text credentials.
+  attacker_behavior:
+    - Writes a provider DLL to disk, usually into System32.
+    - Creates a service key with a NetworkProvider subkey and sets ProviderPath to the DLL.
+    - Appends the service name to the ProviderOrder value.
+    - Collects the credentials the DLL writes to a file or sends out.
+  legitimate_behavior:
+    - "Windows ships a small fixed set of providers: LanmanWorkstation, RDPNP, WebClient and P9NP."
+    - VPN, single sign-on and virtual-desktop clients register their own provider when installed.
+    - Feature updates rewrite the built-in providers' values.
+  risk_indicator:
+    - ProviderPath is written under a service name that is not a built-in or installed product.
+    - ProviderOrder gains a new name.
+    - The DLL the path names was written recently by a process that is not an installer.
+    - The host is a domain controller.
+    - The registration is made by reg.exe or PowerShell from a remote session.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: network-provider-path-registered
+        name: ProviderPath written under a NetworkProvider subkey
+        purpose: >-
+          Return every write of ProviderPath under Services\<name>\NetworkProvider, with
+          the DLL path as its data. No provider is excluded: writes are rare enough to
+          read in full, and a built-in provider's path being changed is as interesting
+          as a new one. This case depends on the sensor reporting writes under
+          Services\*\NetworkProvider; confirm in the tenant.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\Services\\[^\\]+\\NetworkProvider\\?$/i
+          | RegValueName=/^ProviderPath$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: network-provider-order-changed
+        name: ProviderOrder value written
+        purpose: >-
+          Return writes of the provider order, with the new list as its data. A provider
+          is called only when its name is in this list, so the list gains a name when
+          one is added.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\Control\\NetworkProvider\\(Order|HwOrder)\\?$/i
+          | RegValueName=/^ProviderOrder$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: command-registering-network-provider
+        name: Command naming a NetworkProvider key
+        purpose: >-
+          Return reg.exe, PowerShell and other commands whose line names a service's
+          NetworkProvider subkey or the provider order key. This is seen whether or not
+          the sensor reports the registry write, and gives the account and parent. A
+          registration made through registry API calls from the intruder's own program
+          starts no such command.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/\\Services\\[^\\\s"']+\\NetworkProvider\b|\\Control\\NetworkProvider\\(Order|HwOrder)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: dll-written-to-system32-outside-servicing
+        name: DLL written into System32 by something other than Windows servicing
+        purpose: >-
+          Return DLLs written directly into System32 when the writer is not Windows
+          servicing, the installer service or the antivirus engine. A provider DLL can
+          live anywhere its ProviderPath points, so this catches the usual placement and
+          not every one. Third-party installers that put a DLL in System32 appear and
+          are named by the writer.
+        query: |
+          #event_simpleName=PeFileWritten
+          | TargetFileName=/\\Windows\\System32\\[^\\]+\.dll$/i
+          | ContextBaseFileName!=/^(TiWorker|TrustedInstaller|msiexec|wuauclt|MoUsoCoreWorker|dism|DismHost|poqexec|drvinst|setup|SetupHost|wusa|MsMpEng|mscorsvw|ngen|OfficeClickToRun)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: provider_path_registered
+      name: ProviderPath written for a network provider
+      description: >-
+        A registry write sets ProviderPath under a service's NetworkProvider subkey.
+      source: registry
+      field: registry_path
+      indicates: credential_provider_hook_registered
+
+  supporting:
+    - id: provider_dll_unfamiliar
+      name: DLL path is not a Windows or installed-product provider
+      description: >-
+        The data of ProviderPath names a DLL other than the built-in providers and those
+        of software installed on the host.
+      source: registry
+      field: registry_data
+      indicates: untrusted_provider_dll
+    - id: provider_order_extended
+      name: Provider order gained a name
+      description: >-
+        A write to ProviderOrder is recorded on the host around the same time.
+      source: registry
+      field: registry_value
+      indicates: provider_activated
+    - id: registration_by_command
+      name: Registration made by a command
+      description: >-
+        reg.exe, PowerShell or another process names the NetworkProvider key on its
+        command line.
+      source: process_creation
+      field: command_line
+      indicates: manual_registry_registration
+    - id: registration_from_remote_or_script_parent
+      name: Command came from a remote session or script
+      description: >-
+        The parent of the registering command is a remote-management process, a script
+        host or a service.
+      source: process_creation
+      field: parent_process
+      indicates: operator_driven_execution
+    - id: dll_written_to_system32
+      name: DLL written into System32 beforehand
+      description: >-
+        A DLL is written into System32 on the host by a process that is not Windows
+        servicing or an installer.
+      source: file_creation
+      field: file_path
+      indicates: provider_dll_staged
+    - id: dll_writer_unexpected
+      name: DLL writer is a shell, script host or copy utility
+      description: >-
+        The process named on the file-write event is cmd, PowerShell, a remote
+        administration tool or an unknown executable.
+      source: file_creation
+      field: writer_process_name
+      indicates: payload_dropped_by_untrusted_process
+    - id: host_is_domain_controller
+      name: Host is a domain controller
+      description: >-
+        The host on the registry event is a domain controller or another server with
+        many administrator logons.
+      source: registry
+      field: host
+      indicates: high_value_credential_source
+
+  contradicting:
+    - id: vendor_provider_installed
+      name: Provider belongs to installed software
+      description: >-
+        Asset records show a VPN, single sign-on or virtual-desktop client on the host
+        whose documented provider matches the service name and DLL.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_software_installation
+    - id: operating_system_upgrade
+      name: Write happened during an operating system upgrade
+      description: >-
+        A change record or the update history places a feature update on the host at the
+        time, and the service name is a built-in provider.
+      source: change_management
+      field: ComputerName
+      indicates: system_servicing
+
+  risk_logic:
+    required:
+      - provider_path_registered
+
+    supporting:
+      any:
+        - provider_dll_unfamiliar
+        - provider_order_extended
+        - registration_by_command
+        - registration_from_remote_or_script_parent
+        - dll_written_to_system32
+        - dll_writer_unexpected
+        - host_is_domain_controller
+      all:
+        - provider_dll_unfamiliar
+        - host_is_domain_controller
+
+    contradicting:
+      any:
+        - vendor_provider_installed
+        - operating_system_upgrade
+      all: []
+
+  verdict:
+    low_risk_when:
+      - provider_path_registered
+      - vendor_provider_installed
+    suspicious_when:
+      - provider_path_registered
+      - provider_dll_unfamiliar
+    high_risk_when:
+      - provider_path_registered
+      - provider_dll_unfamiliar
+      - host_is_domain_controller
+
+  false_positive:
+    - condition: VPN and single sign-on clients.
+      explanation: >-
+        Several register a provider so they can log on to the network with the Windows
+        credentials. The service name and DLL are the vendor's, and the same write
+        appears on every host that has the client. They are not installed on domain
+        controllers.
+    - condition: Feature updates.
+      explanation: >-
+        An upgrade rewrites the built-in providers. The names are LanmanWorkstation,
+        RDPNP, WebClient or P9NP and the paths are under System32.

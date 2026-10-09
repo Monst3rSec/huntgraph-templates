@@ -1,0 +1,269 @@
+# Converted from THORCollective/HEARTH Flames/H146.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-lin-hearth-h146-su-started-from-anomalous-parent-by-non-root-t1068
+version: 1.0.0
+
+info:
+  name: su started by a non-root process whose parent is not a shell
+  description: >-
+    Copy Fail (CVE-2026-31431) is a flaw in the kernel's algif_aead interface that lets
+    an unprivileged user write chosen bytes into the page-cache copy of a setuid binary.
+    The public exploit is a short Python script: it opens an AF_ALG socket, uses
+    splice() to corrupt the cached copy of /usr/bin/su and then runs su, which now gives
+    a root shell. Nothing changes on disk. The socket and splice calls are system calls
+    this deployment does not collect, so they are not claimed. The last step is a
+    process start: su run by a non-root user from a parent that is a script interpreter
+    or a service, not an interactive shell. The same shape follows other page-cache and
+    setuid hijacks, so the hunt is not tied to this one flaw.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - privilege-escalation
+    - copy-fail
+    - cve-2026-31431
+    - setuid
+    - kernel-exploit
+    - linux
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H146.md
+    - https://attack.mitre.org/techniques/T1068
+    - https://attack.mitre.org/detectionstrategies/DET0514
+
+mitre:
+  tactics:
+    - TA0004
+  techniques:
+    - T1068
+  sub_techniques: []
+  detection_strategies:
+    - DET0514
+  analytics:
+    - AN1420
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    Non-root processes invoke /usr/bin/su from anomalous parent processes shortly after
+    issuing AF_ALG socket and splice() system calls, indicating Copy Fail
+    (CVE-2026-31431) exploitation against page-cached setuid binaries.
+  attacker_behavior:
+    - Fetches or pastes a short exploit script, usually Python using only the standard library.
+    - Corrupts the page-cache copy of a setuid-root binary through the kernel crypto interface.
+    - Starts su, or another setuid binary, directly from the script to obtain a root shell.
+    - Runs the exploit inside a container to reach the host.
+  legitimate_behavior:
+    - Administrators run su from an interactive shell or over SSH.
+    - Init scripts and service wrappers run su as root to drop to a service account.
+    - Configuration-management agents call su or runuser as root.
+  risk_indicator:
+    - su is started by a non-root user from Python, Perl, a web service or another non-shell parent.
+    - A script interpreter run by a service account starts a setuid binary.
+    - A command on the host names the exploit, its site or the vulnerable kernel interface.
+    - A root shell appears under the su process straight afterwards.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: su-started-by-non-shell-parent
+        name: su started by a non-root user from a parent that is not a shell
+        purpose: >-
+          Return starts of su where the user is not root and the parent is not a shell,
+          sudo, su, login or sshd. This is the final step of the exploit and the only
+          one the sensor records. The user test relies on UserName being filled on Linux
+          process events; where it is empty the test passes and the case returns every
+          su with an unusual parent. An exploit started by hand from a shell that then
+          execs su has a shell as its parent and is not returned here.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ImageFileName=/\/su$/
+          | ParentBaseFileName!=/^(bash|sh|zsh|ksh|dash|fish|tcsh|csh|sudo|su|login|sshd)$/
+          | UserName!=root
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: setuid-binary-started-by-script-interpreter
+        name: Setuid binary started directly by a script interpreter
+        purpose: >-
+          Return su and other common setuid-root binaries whose parent is Python, Perl,
+          Ruby, Node, PHP or Lua. The flaw works against any cached setuid binary, so
+          the target need not be su. Root-owned automation appears and is told apart by
+          the user on the event.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ParentBaseFileName=/^(python[0-9.]*|perl|ruby|node|php[0-9.]*|lua[0-9.]*)$/
+          | ImageFileName=/\/(su|passwd|mount|umount|newgrp|chsh|chfn|gpasswd|pkexec|fusermount3?)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: exploit-named-on-command-line
+        name: Command naming the exploit or the vulnerable interface
+        purpose: >-
+          Return commands that name the vulnerability, its public site or the algif_aead
+          interface: a download of the proof of concept, a module check, or a mitigation
+          being applied. An exploit saved under another name and run without arguments
+          does not match.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | CommandLine=/copy\.fail|copy[_-]?fail|CVE-2026-31431|algif_aead|AF_ALG/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: setuid_binary_from_anomalous_parent
+      name: su or a setuid binary started from a non-shell parent
+      description: >-
+        su, or another setuid-root binary, is started by a parent that is a script
+        interpreter, a service or an unknown program instead of an interactive shell.
+      source: process_creation
+      field: parent_process
+      indicates: setuid_binary_hijack_attempt
+
+  supporting:
+    - id: non_root_service_or_user_account
+      name: Caller is an unprivileged or service account
+      description: >-
+        The user on the event is a web-service, container or ordinary account with no
+        reason to switch user.
+      source: process_creation
+      field: user
+      indicates: unprivileged_origin
+    - id: exploit_reference_on_host
+      name: Exploit named in a command on the same host
+      description: >-
+        A command on the host names the vulnerability, its site or the kernel crypto
+        interface around the same time.
+      source: process_creation
+      field: command_line
+      indicates: exploit_tooling_present
+    - id: root_shell_follows
+      name: Root shell under the su process
+      description: >-
+        A shell or command running as root has the returned su process as its parent,
+        which the agent establishes by matching parent process id to process id in a
+        follow-up query on the host.
+      source: process_creation
+      field: process_id
+      indicates: privilege_escalation_succeeded
+    - id: script_run_from_temporary_path
+      name: Parent script sits in a temporary directory
+      description: >-
+        The parent's own command line, read from the host's process events, runs a
+        script from /tmp, /dev/shm or a download directory.
+      source: process_creation
+      field: parent_process_id
+      indicates: dropped_exploit_script
+
+  contradicting:
+    - id: application_wraps_su
+      name: Application is known to call su
+      description: >-
+        Asset records identify the parent as a control panel, backup agent or job
+        scheduler that runs commands as other users through su.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_application_behaviour
+    - id: kernel_patched
+      name: Kernel is not vulnerable
+      description: >-
+        The host runs a kernel with the fix, or has the algif_aead module blocked, so
+        this flaw cannot be the cause; another setuid hijack still could be.
+      source: asset_inventory
+      field: ComputerName
+      indicates: vulnerability_not_present
+
+  risk_logic:
+    required:
+      - setuid_binary_from_anomalous_parent
+
+    supporting:
+      any:
+        - non_root_service_or_user_account
+        - exploit_reference_on_host
+        - root_shell_follows
+        - script_run_from_temporary_path
+      all:
+        - non_root_service_or_user_account
+        - root_shell_follows
+
+    contradicting:
+      any:
+        - application_wraps_su
+        - kernel_patched
+      all: []
+
+  verdict:
+    low_risk_when:
+      - setuid_binary_from_anomalous_parent
+      - application_wraps_su
+    suspicious_when:
+      - setuid_binary_from_anomalous_parent
+      - non_root_service_or_user_account
+    high_risk_when:
+      - setuid_binary_from_anomalous_parent
+      - non_root_service_or_user_account
+      - root_shell_follows
+
+  false_positive:
+    - condition: Hosting control panels and job schedulers.
+      explanation: >-
+        Some run su from a daemon written in Python or Perl to act as a customer
+        account. They run as root, so the first case leaves them out and the second
+        shows root as the user.
+    - condition: Test harnesses and installers.
+      explanation: >-
+        A Python installer may call su or mount. It is run by an administrator, at
+        install time, on many hosts alike.
+    - condition: Patch and mitigation work.
+      explanation: >-
+        The third case matches the module name, so a command that blacklists algif_aead
+        appears. It comes from configuration management as root.

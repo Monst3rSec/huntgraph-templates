@@ -1,0 +1,319 @@
+# Converted from THORCollective/HEARTH Flames/H078.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h078-office-webdav-fetch-and-outlook-vba-backdoor-t1059-005
+version: 1.0.0
+
+info:
+  name: Office OLE payload fetched over WebDAV followed by an Outlook VBA backdoor
+  description: >-
+    In the APT28 activity HEARTH describes, an Office document's OLE object pulls a
+    payload from a WebDAV share with no click needed, and the intrusion then installs
+    NotDoor, a backdoor that lives in Outlook's own VBA project and wakes on incoming
+    mail, with COM hijacking for persistence and a cloud storage service for control.
+    The OLE exploitation itself is not something the sensor reports, and HEARTH's
+    phishing technique is left out for the same reason. The surrounding steps are
+    visible: the WebDAV client being invoked for an external host, Outlook's macro
+    security being lowered and its VBA project replaced, and a per-user COM class being
+    redirected to a DLL in a writable path.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - execution
+    - persistence
+    - webdav
+    - outlook-vba
+    - com-hijacking
+    - apt28
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H078.md
+    - https://attack.mitre.org/techniques/T1059
+    - https://attack.mitre.org/techniques/T1059/005
+    - https://attack.mitre.org/techniques/T1546
+    - https://attack.mitre.org/techniques/T1546/015
+    - https://attack.mitre.org/detectionstrategies/DET0076
+    - https://attack.mitre.org/detectionstrategies/DET0481
+
+mitre:
+  tactics:
+    - TA0002
+    - TA0003
+  techniques:
+    - T1059
+    - T1546
+  sub_techniques:
+    - T1059.005
+    - T1546.015
+  detection_strategies:
+    - DET0076
+    - DET0481
+  analytics:
+    - AN0209
+    - AN1323
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An adversary is exploiting Microsoft Office OLE objects to fetch payloads over WebDAV
+    and establish an Outlook VBA backdoor, targeting defense and logistics organizations,
+    to conduct long-term espionage through cloud-based command and control.
+  attacker_behavior:
+    - Embeds an OLE object that resolves a WebDAV path on an external host when the document is previewed.
+    - Causes Windows to start the WebDAV client through rundll32 davclnt.dll for that host.
+    - Lowers Outlook's macro security and enables macro loading at start-up through the registry.
+    - Replaces Outlook's VbaProject.OTM with a project that reacts to incoming mail.
+    - Registers a per-user COM class whose server is a DLL in a user-writable path.
+  legitimate_behavior:
+    - Users open files from SharePoint and internal WebDAV shares, which starts the same client.
+    - A small number of users write their own Outlook macros.
+    - Software registers per-user COM classes during installation.
+  risk_indicator:
+    - The WebDAV client is invoked for an external host or a raw IP address.
+    - The parent of that invocation is an Office application.
+    - Outlook's security level or macro-provider values are changed outside Group Policy.
+    - VbaProject.OTM is copied into place by a script or an unknown binary.
+    - A per-user InprocServer32 value points into AppData, ProgramData or Temp.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: webdav-client-invoked-for-external-host
+        name: WebDAV client started for an external host
+        purpose: >-
+          Return rundll32 davclnt invocations, which name the WebDAV server on the
+          command line, leaving out Microsoft 365 and single-label intranet hosts.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^rundll32\.exe$/i
+          | CommandLine=/davclnt\.dll\s*,\s*DavSetCookie/i
+          | CommandLine!=/DavSetCookie\s+\S*(sharepoint\.com|office\.com|office365\.com|onedrive\.com|live\.com)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: outlook-macro-security-changed
+        name: Command changing Outlook macro security or macro start-up loading
+        purpose: >-
+          Return commands that set Outlook's security level or LoadMacroProviderOnBoot,
+          the settings a VBA backdoor needs.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/LoadMacroProviderOnBoot|Outlook\\Security.*(\bLevel\b|PONT_STRING)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: outlook-macro-registry-value-written
+        name: Outlook macro security value written in the registry
+        purpose: >-
+          Return the registry writes themselves, which are present however the change
+          was made. This case depends on the sensor reporting writes under the Outlook
+          key; confirm in the tenant.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\Office\\[0-9.]+\\Outlook\\(Security|Options)/i
+          | RegValueName=/^(LoadMacroProviderOnBoot|Level|PONT_STRING)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: outlook-vba-project-replaced
+        name: Outlook VBA project file copied or written by a command
+        purpose: >-
+          Return commands that name VbaProject.OTM, which is how the backdoor project is
+          put in place without opening the VBA editor.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/VbaProject\.OTM/i
+          | FileName!=/^outlook\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: per-user-com-class-redirected
+        name: Per-user COM class server set to a writable path
+        purpose: >-
+          Return commands that write an InprocServer32 or LocalServer32 value under the
+          per-user Classes hive with a path in a user-writable directory.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/(HKCU|HKEY_CURRENT_USER|HKU)[:\\].*\\Classes\\CLSID\\\{[0-9a-f-]{36}\}\\(InprocServer32|LocalServer32|TreatAs|ScriptletURL)/i
+          | CommandLine=/\\(AppData|ProgramData|Users\\Public|Temp)\\|https?:\/\//i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: webdav_or_outlook_persistence_command
+      name: WebDAV fetch or Outlook backdoor preparation
+      description: >-
+        A command line invokes the WebDAV client for an external host, changes Outlook's
+        macro settings, replaces its VBA project, or redirects a per-user COM class.
+      source: process_creation
+      field: command_line
+      indicates: office_delivered_backdoor_installation
+
+  supporting:
+    - id: office_parent_of_webdav_client
+      name: WebDAV client started from an Office application
+      description: >-
+        The parent of the rundll32 davclnt process, directly or through svchost, is an
+        Office application handling a document.
+      source: process_creation
+      field: parent_process
+      indicates: document_triggered_remote_fetch
+    - id: outlook_macro_setting_written
+      name: Outlook macro setting written in the registry
+      description: >-
+        A registry write sets LoadMacroProviderOnBoot or lowers the Outlook security
+        level.
+      source: registry
+      field: registry_value
+      indicates: outlook_macro_execution_enabled
+    - id: outlook_security_key_path
+      name: Write targets the Outlook security key
+      description: >-
+        The registry path of the write is the per-user Outlook Security or Options key.
+      source: registry
+      field: registry_path
+      indicates: mail_client_configuration_tampering
+    - id: targeted_sector_user
+      name: User is in a targeted role
+      description: >-
+        The account belongs to someone in defence, logistics or government-facing work.
+      source: process_creation
+      field: user
+      indicates: targeted_victim_profile
+
+  contradicting:
+    - id: internal_webdav_share
+      name: WebDAV host is an internal or partner share
+      description: >-
+        The host on the command line is an inventoried internal or partner document
+        server.
+      source: asset_inventory
+      field: CommandLine
+      indicates: expected_document_access
+    - id: managed_outlook_policy
+      name: Outlook settings are set by policy
+      description: >-
+        A Group Policy or management profile sets the same Outlook macro values across
+        the fleet.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_configuration
+
+  risk_logic:
+    required:
+      - webdav_or_outlook_persistence_command
+
+    supporting:
+      any:
+        - office_parent_of_webdav_client
+        - outlook_macro_setting_written
+        - outlook_security_key_path
+        - targeted_sector_user
+      all:
+        - office_parent_of_webdav_client
+        - outlook_macro_setting_written
+
+    contradicting:
+      any:
+        - internal_webdav_share
+        - managed_outlook_policy
+      all: []
+
+  verdict:
+    low_risk_when:
+      - webdav_or_outlook_persistence_command
+      - internal_webdav_share
+      - managed_outlook_policy
+    suspicious_when:
+      - webdav_or_outlook_persistence_command
+      - office_parent_of_webdav_client
+    high_risk_when:
+      - webdav_or_outlook_persistence_command
+      - office_parent_of_webdav_client
+      - outlook_macro_setting_written
+
+  false_positive:
+    - condition: Users open documents from SharePoint or an internal WebDAV share.
+      explanation: >-
+        This starts the WebDAV client many times a day. Microsoft 365 hosts are excluded
+        in the query; other internal document servers will appear and are recognisable
+        by name.
+    - condition: A user writes their own Outlook macros.
+      explanation: >-
+        Outlook itself writes VbaProject.OTM, and is excluded. A power user lowering
+        their own macro security does so through the Trust Center, not reg.exe.
+    - condition: Software registers per-user COM classes.
+      explanation: >-
+        Per-user installs register classes under HKCU with a server path in AppData.
+        The parent is the product's installer and the class belongs to it.

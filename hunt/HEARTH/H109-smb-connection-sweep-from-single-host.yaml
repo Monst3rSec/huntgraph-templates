@@ -1,0 +1,267 @@
+# Converted from THORCollective/HEARTH Flames/H109.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h109-smb-connection-sweep-from-single-host-t1018
+version: 1.0.0
+
+info:
+  name: SMB connection sweep from one host to many
+  description: >-
+    After the ActiveMQ compromise the beachhead host opened SMB connections to systems
+    across the network within minutes, mapping live hosts and shares before moving. The
+    hypothesis is a spike, and counting is left to the agent. Returning every port 445
+    connection in a fleet over a long window is not practical, because ordinary file and
+    print traffic is made by the Windows SMB redirector in the kernel. Scanners and
+    offensive tooling open the socket themselves, so the connection case keeps port 445
+    connections whose owning process is not System; the agent counts distinct destinations
+    per host and process. A second case returns failed network logons arriving from
+    internal addresses, which is how the sweep looks from the hosts being probed. A sweep
+    made with net view or by browsing shares goes through the redirector and is not
+    returned by the connection case.
+  severity: medium
+  author: huntgraph
+  tags:
+    - hearth
+    - discovery
+    - smb
+    - remote-system-discovery
+    - network-sweep
+    - ransomware-precursor
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H109.md
+    - https://attack.mitre.org/techniques/T1018
+    - https://attack.mitre.org/detectionstrategies/DET0574
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1018
+  sub_techniques: []
+  detection_strategies:
+    - DET0574
+  analytics:
+    - AN1583
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary is performing internal network reconnaissance by generating a spike in
+    SMB connection attempts from a single host to many endpoints across the network,
+    indicating enumeration of live hosts and accessible shares.
+  attacker_behavior:
+    - Runs a scanner or script on the first compromised host that connects to port 445 across subnets.
+    - Tries the credentials it holds against each host that answers.
+    - Lists shares on the hosts that accept the logon.
+    - Uses the result to pick domain controllers, file servers and backup servers.
+  legitimate_behavior:
+    - Vulnerability scanners and asset-discovery tools probe port 445 on schedule.
+    - Backup, deployment and monitoring servers connect to many hosts over SMB.
+    - Domain controllers and file servers receive SMB from everywhere.
+  risk_indicator:
+    - One process on one host connects to port 445 on dozens of internal addresses within minutes.
+    - The destinations run in address order across a subnet.
+    - The process runs from a user-writable path or is a script interpreter.
+    - Many hosts log failed network logons from the same internal source.
+    - The source is a workstation or an application server, not a management system.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+    - source: authentication
+      connector: crowdstrike-ngsiem
+      event_types:
+        - UserLogonFailed2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        logon_type: LogonType
+        remote_address: RemoteAddressIP4
+        failure_reason: SubStatus
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: smb-connection-from-user-mode-process
+        name: Port 445 connection opened by a process other than System
+        purpose: >-
+          Return connections to port 445 on internal addresses whose owning process is
+          named and is not System. File access through the Windows redirector is made by
+          the kernel and is left out on purpose; what remains is tools that open the
+          socket themselves. The agent counts distinct remote addresses per host and
+          process and looks at the spacing. The case depends on kernel SMB connections
+          carrying System as the process name; confirm in the tenant.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | RemotePort=445
+          | cidr(RemoteAddressIP4, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"])
+          | ContextBaseFileName=*
+          | ContextBaseFileName!=/^System$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: failed-network-logon-from-internal-source
+        name: Failed network logon from an internal address
+        purpose: >-
+          Return failed type 3 logons whose source is an internal address and whose
+          account is not a machine account. Each probed host records its own; the agent
+          counts distinct target hosts per source address.
+        query: |
+          #event_simpleName=UserLogonFailed2
+          | LogonType=3
+          | RemoteAddressIP4=*
+          | cidr(RemoteAddressIP4, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"])
+          | UserName!=/\$$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: smb_connection_by_tool
+      name: Port 445 connection opened by a user-mode process
+      description: >-
+        A connection to port 445 on an internal address is owned by a process other than
+        System.
+      source: network_connection
+      field: process_name
+      indicates: smb_probe_by_tool
+
+  supporting:
+    - id: many_destinations_from_one_process
+      name: Many destinations from one host and process
+      description: >-
+        One process id on one host connects to port 445 on dozens of distinct addresses
+        within minutes. The agent counts this from the returned events; the query does
+        not.
+      source: network_connection
+      field: remote_address
+      indicates: host_and_share_enumeration
+    - id: sequential_destinations
+      name: Destinations follow address order
+      description: >-
+        The remote addresses step through a subnet in order, as a scanner does.
+      source: network_connection
+      field: remote_address
+      indicates: subnet_sweep
+    - id: one_connecting_process
+      name: Connections share one process id
+      description: >-
+        The connections carry the same process id, tying the sweep to one program run.
+      source: network_connection
+      field: process_id
+      indicates: single_tool_run
+    - id: failed_logons_on_targets
+      name: Targets log failed network logons from the source
+      description: >-
+        Several hosts record failed type 3 logons from the sweeping host's address in the
+        same minutes, which the agent matches by address and time.
+      source: authentication
+      field: remote_address
+      indicates: credential_testing_during_sweep
+    - id: logon_failure_reason
+      name: Failures are bad password or unknown user
+      description: >-
+        The failure sub-status shows a wrong password or an account that does not exist,
+        not an expired or disabled one.
+      source: authentication
+      field: failure_reason
+      indicates: guessed_or_stale_credentials
+
+  contradicting:
+    - id: authorised_scanner_or_management_host
+      name: Source is a scanner or management system
+      description: >-
+        Asset records show the source host is a vulnerability scanner, discovery tool,
+        backup or deployment server.
+      source: asset_inventory
+      field: ComputerName
+      indicates: authorised_scanning
+    - id: recurring_sweep
+      name: Same sweep recurs on a schedule
+      description: >-
+        Earlier activity shows the same process on the same host reaching the same range
+        at regular intervals.
+      source: baseline
+      field: ContextBaseFileName
+      indicates: established_management_behaviour
+
+  risk_logic:
+    required:
+      - smb_connection_by_tool
+
+    supporting:
+      any:
+        - many_destinations_from_one_process
+        - sequential_destinations
+        - one_connecting_process
+        - failed_logons_on_targets
+        - logon_failure_reason
+      all:
+        - many_destinations_from_one_process
+        - failed_logons_on_targets
+
+    contradicting:
+      any:
+        - authorised_scanner_or_management_host
+        - recurring_sweep
+      all: []
+
+  verdict:
+    low_risk_when:
+      - smb_connection_by_tool
+      - authorised_scanner_or_management_host
+    suspicious_when:
+      - smb_connection_by_tool
+      - many_destinations_from_one_process
+    high_risk_when:
+      - smb_connection_by_tool
+      - many_destinations_from_one_process
+      - failed_logons_on_targets
+
+  false_positive:
+    - condition: Vulnerability and asset scanners.
+      explanation: >-
+        They sweep port 445 by design. The source host is the scanner and the schedule is
+        known.
+    - condition: Backup, deployment and monitoring agents with their own SMB client.
+      explanation: >-
+        Some products carry an SMB library and connect from their own process. The process
+        is the product's and the destinations are its clients.
+    - condition: Mistyped or expired service credentials.
+      explanation: >-
+        A job with a stale password fails against the same few servers repeatedly. The
+        targets are few and do not change.

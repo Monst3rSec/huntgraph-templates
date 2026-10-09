@@ -1,0 +1,322 @@
+# Converted from THORCollective/HEARTH Flames/H147.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-mac-hearth-h147-base64-paste-into-terminal-curl-to-osascript-t1204-004
+version: 1.0.0
+
+info:
+  name: Base64 command pasted into macOS Terminal that pipes curl into osascript or a shell
+  description: >-
+    ClickFix pages posing as macOS utilities tell the visitor to open Terminal and paste
+    a line. The line echoes a Base64 string into base64 -D and pipes the result into a
+    shell; the decoded command fetches a script with curl and pipes it into osascript or
+    sh, so SHub Stealer, AMOS or Macsync runs without a script file being written. The
+    page and the clipboard are not visible to the sensor. The process chain is, in
+    pieces: echo is a shell builtin and starts nothing, base64 runs as a child of the
+    Terminal shell, the inner shell and osascript start with no arguments because they
+    read from a pipe, and curl carries the URL. The hunt returns each piece and the
+    agent joins them on parent process id.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - execution
+    - clickfix
+    - user-execution
+    - osascript
+    - shub-stealer
+    - amos
+    - macos
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H147.md
+    - https://attack.mitre.org/techniques/T1204
+    - https://attack.mitre.org/techniques/T1204/004
+    - https://attack.mitre.org/detectionstrategies/DET0340
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1204
+  sub_techniques:
+    - T1204.004
+  detection_strategies:
+    - DET0340
+  analytics:
+    - AN0964
+  platforms:
+    - macOS
+  data_sources:
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    Threat actors deliver macOS infostealers through ClickFix lures that trick users
+    into pasting a Base64-encoded shell pipeline into Terminal, which decodes into a
+    curl-piped osascript or sh payload.
+  attacker_behavior:
+    - Shows a fake utility or verification page that tells the visitor to paste a line into Terminal.
+    - Encodes the real command in Base64 so the visitor cannot read it.
+    - Decodes it with base64 -D and pipes the result into zsh, bash or sh.
+    - Fetches an AppleScript or shell loader with curl and pipes it into osascript or a shell.
+    - Stages collected files under a /tmp directory before sending them out.
+  legitimate_behavior:
+    - Developers decode Base64 in a terminal while working with tokens and configuration.
+    - Vendor installers are documented as a curl command piped into a shell.
+    - Management agents run osascript with a script supplied on standard input.
+  risk_indicator:
+    - base64 decodes under an interactive shell and a bare shell or osascript starts beside it.
+    - osascript starts with no script argument under a shell.
+    - A shell command line holds a decode or curl pipeline that ends in a shell or osascript.
+    - curl carries a build or transaction parameter reported for these loaders.
+    - The user is not technical staff.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: base64-decode-under-interactive-shell
+        name: base64 decoding as a child of a shell
+        purpose: >-
+          Return base64 run with a decode flag whose parent is zsh, bash or sh. In the
+          pasted line this is the first process the Terminal shell starts. The encoded
+          string is not on this event, because it reaches base64 through a pipe from the
+          shell's own echo. Developers decode Base64 routinely, so this case is a
+          starting point: the agent looks for a bare shell or osascript with the same
+          parent process id.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=base64
+          | ParentBaseFileName=/^(zsh|bash|sh)$/
+          | CommandLine=/\s(-D|-d|--decode)\b/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: osascript-reading-script-from-pipe
+        name: osascript started by a shell with no script argument
+        purpose: >-
+          Return osascript whose command line is the program name alone, or the name and
+          a single dash, under a shell. That is how it appears when a script is piped
+          into it, which is the end of the reported chain. The script text is not on the
+          event.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=osascript
+          | ParentBaseFileName=/^(zsh|bash|sh)$/
+          | CommandLine=/osascript\s*(-\s*)?$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: shell-command-holding-decode-or-fetch-pipeline
+        name: Shell command line that decodes or fetches and pipes into an interpreter
+        purpose: >-
+          Return shells whose own command line holds the whole pipeline: a Base64 decode
+          or a curl fetch piped into a shell or osascript. This is seen when the lure
+          wraps the line in sh -c, or when an application or AppleScript runs it through
+          do shell script. A line typed or pasted at an interactive prompt is never on
+          the shell's command line and is seen only through the other cases.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=/^(zsh|bash|sh)$/
+          | CommandLine=/base64\s+(-D|-d|--decode)[^|]*\|\s*(\/bin\/|\/usr\/bin\/)?(zsh|bash|sh|osascript)\b|curl\s[^|]*\|\s*(\/bin\/|\/usr\/bin\/)?(osascript|zsh|bash|sh)\b/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: curl-carrying-reported-loader-parameters
+        name: curl request carrying the loader's reported parameters
+        purpose: >-
+          Return curl commands with the path and form parameters Microsoft reported for
+          these loaders. These strings belong to the current campaign and will change;
+          the first three cases do not depend on them.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=curl
+          | CommandLine=/loader\.sh\?build=|payload\.applescript\?build=|\btxid=|\bbmodule\b/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: stealer-staging-directory-on-command-line
+        name: Command naming the stealer's /tmp staging directory
+        purpose: >-
+          Return commands that name a /tmp/shub_ directory, where SHub gathers files
+          before it archives them. Directory creation is not a reported event, so the
+          directory is seen only when a command names it.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | CommandLine=/\/tmp\/shub_/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: pasted_pipeline_execution
+      name: Decode or fetch pipeline feeding an interpreter
+      description: >-
+        A shell starts base64 in decode mode, osascript with no script argument, or a
+        command whose line pipes a decode or a curl fetch into a shell or osascript.
+      source: process_creation
+      field: command_line
+      indicates: pasted_command_execution
+
+  supporting:
+    - id: pipeline_members_share_shell
+      name: Decode, fetch and interpreter share one parent shell
+      description: >-
+        The base64, curl and osascript or bare shell processes carry the same parent
+        process id, or a chain of two, which the agent derives from the returned events.
+      source: process_creation
+      field: parent_process_id
+      indicates: single_pasted_command_chain
+    - id: interpreter_is_osascript
+      name: Fetched content is handed to osascript
+      description: >-
+        The process at the end of the chain is osascript, the interpreter the reported
+        stealers use for their collection script.
+      source: process_creation
+      field: image_name
+      indicates: applescript_payload_execution
+    - id: reported_loader_parameters
+      name: curl carries the campaign's parameters
+      description: >-
+        A curl command line holds the build, txid or bmodule parameters or a /tmp/shub_
+        path.
+      source: process_creation
+      field: command_line
+      indicates: known_stealer_loader
+    - id: non_technical_user
+      name: User seldom uses a terminal
+      description: >-
+        The account belongs to a non-technical role with no history of Terminal
+        sessions.
+      source: process_creation
+      field: user
+      indicates: activity_outside_user_role
+    - id: shell_is_terminal_session
+      name: Shell belongs to a Terminal window
+      description: >-
+        The parent shell's own parent is login under Terminal, which the agent confirms
+        by looking up the shell's process id on the host.
+      source: process_creation
+      field: parent_process
+      indicates: user_initiated_execution
+
+  contradicting:
+    - id: technical_staff_account
+      name: Account belongs to technical staff
+      description: >-
+        The user is a developer or administrator who decodes Base64 and runs installer
+        one-liners routinely.
+      source: identity_context
+      field: UserName
+      indicates: routine_development_activity
+    - id: management_agent_script
+      name: Chain belongs to a management agent
+      description: >-
+        The shell is a child of the device-management agent and the same command runs
+        across the fleet.
+      source: asset_inventory
+      field: ComputerName
+      indicates: managed_script_execution
+
+  risk_logic:
+    required:
+      - pasted_pipeline_execution
+
+    supporting:
+      any:
+        - pipeline_members_share_shell
+        - interpreter_is_osascript
+        - reported_loader_parameters
+        - non_technical_user
+        - shell_is_terminal_session
+      all:
+        - pipeline_members_share_shell
+        - interpreter_is_osascript
+
+    contradicting:
+      any:
+        - technical_staff_account
+        - management_agent_script
+      all: []
+
+  verdict:
+    low_risk_when:
+      - pasted_pipeline_execution
+      - technical_staff_account
+    suspicious_when:
+      - pasted_pipeline_execution
+      - non_technical_user
+    high_risk_when:
+      - pasted_pipeline_execution
+      - pipeline_members_share_shell
+      - interpreter_is_osascript
+      - non_technical_user
+
+  false_positive:
+    - condition: Developers decoding tokens and secrets.
+      explanation: >-
+        base64 -d under a shell is everyday work. No bare shell or osascript shares the
+        parent, and the account is technical.
+    - condition: Vendor installers piped into a shell.
+      explanation: >-
+        Package managers document curl piped into bash. The URL is the vendor's and
+        osascript is not at the end of the chain.
+    - condition: Device-management scripts.
+      explanation: >-
+        Agents pipe AppleScript into osascript to show dialogs. The parent chain leads
+        to the agent and repeats on every managed Mac.

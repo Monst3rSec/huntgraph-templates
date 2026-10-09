@@ -1,0 +1,304 @@
+# Converted from THORCollective/HEARTH Flames/H153.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+# Also holds H155 (stolen or forged certificates submitted to a domain controller
+# through PKINIT). H155's own evidence is event 4768 on the controller, which is not
+# collected; the request it describes is the last step of this chain and has its own
+# case below.
+type: detection
+
+id: hg-any-hearth-h153-certificate-requested-for-another-identity-and-used-for-pkinit-t1649
+version: 1.0.0
+
+info:
+  name: Certificate requested for another identity and used for a PKINIT ticket
+  description: >-
+    A certificate template that lets the requester supply the subject, allows client
+    authentication and needs no approval (ESC1) lets any enrolling user ask for a
+    certificate in the name of a domain administrator. Certify and Certipy find such
+    templates, request the certificate with an alternate name, and the certificate is
+    then presented to a domain controller through PKINIT for a ticket as that
+    administrator. The same last step follows shadow credentials and an exported PFX.
+    The certificate authority's events 4886 and 4887 and the controller's event 4768 are
+    Windows event channels this deployment does not collect, so whether the certificate
+    was issued, and whether the ticket was granted, is not known here. The hunt returns
+    the tools as they are run on a managed host: template enumeration, the request with
+    an alternate subject, conversion to PFX and the ticket request with a certificate. A
+    request made from a machine with no sensor leaves nothing.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - credential-access
+    - ad-cs
+    - esc1
+    - certify
+    - certipy
+    - pkinit
+    - kerberos
+    - windows
+    - linux
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H153.md
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H155.md
+    - https://attack.mitre.org/techniques/T1649
+    - https://attack.mitre.org/detectionstrategies/DET0240
+
+mitre:
+  tactics:
+    - TA0006
+  techniques:
+    - T1649
+  sub_techniques: []
+  detection_strategies:
+    - DET0240
+  analytics: []
+  platforms:
+    - Windows
+    - Linux
+  data_sources:
+    - CrowdStrike:Endpoint
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    Threat actors are exploiting ESC1-vulnerable certificate templates
+    (ENROLLEE_SUPPLIES_SUBJECT, Client Authentication EKU, low or empty approval
+    requirements) through Certify or Certipy to request a certificate with an arbitrary
+    Subject Alternative Name impersonating a privileged account, then authenticating to
+    a domain controller through PKINIT with that or another stolen or forged
+    certificate.
+  attacker_behavior:
+    - Enumerates certificate authorities and templates for ones that let the enrollee supply the subject.
+    - Requests a certificate naming an administrator in the alternate name, UPN or SID.
+    - Converts the returned certificate and key into a PFX.
+    - Requests a Kerberos ticket with the certificate using Rubeus, Certipy or PKINITtools.
+    - Recovers the account's NT hash from the ticket.
+  legitimate_behavior:
+    - PKI administrators list templates and authorities with certutil.
+    - Web-server operators request certificates with DNS alternate names through certreq.
+    - Smart-card and Windows Hello logons use PKINIT with no command line at all.
+  risk_indicator:
+    - Certify or Certipy requests a certificate with an alternate name, UPN or SID.
+    - The alternate name is a privileged account that is not the requester.
+    - Template enumeration for vulnerable settings comes first on the same host.
+    - A certificate-based ticket request follows from a host that does not act for that account.
+
+requires:
+  platforms:
+    - windows
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: certificate-requested-with-alternate-subject
+        name: Certificate request that supplies an alternate subject
+        purpose: >-
+          Return Certify and Certipy request commands that set an alternate name, UPN,
+          DNS name or SID, and certreq submissions that add a SAN attribute. This is the
+          ESC1 request itself. certreq with a DNS SAN is ordinary web server work and is
+          told apart by the UPN form and by who runs it.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | CommandLine=/\bcertify(\.exe)?["']?\s+request\b.*\/(altname|altupn|upn|sid|sidextension):|\bcertipy(-ad)?(\.exe)?["']?\s+req\b.*\s-(upn|dns|sid)\b|\bcertreq(\.exe)?\b.*\bSAN:\s*(upn|dns|email)=/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: vulnerable-template-enumeration
+        name: Enumeration of certificate templates for abusable settings
+        purpose: >-
+          Return Certify and Certipy find commands and any command that names the
+          enrollee-supplies-subject flag. This is the step before the request and the
+          one most often run from a compromised workstation.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | CommandLine=/\bcertify(\.exe)?["']?\s+(find|cas|enum-templates|pkiobjects)\b|\bcertipy(-ad)?(\.exe)?["']?\s+find\b|\/enrolleeSuppliesSubject\b|ENROLLEE_SUPPLIES_SUBJECT|msPKI-Certificate-Name-Flag/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: certificate-converted-to-pfx
+        name: Certificate and key converted to a PFX
+        purpose: >-
+          Return openssl pkcs12 exports and certutil MergePFX, the conversion Certify
+          tells the operator to run on its output. Administrators do the same when
+          moving a server certificate, so this case supports the others and does not
+          stand alone.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | CommandLine=/\bopenssl(\.exe)?["']?\s+pkcs12\b.*-export\b|\bcertutil(\.exe)?\b.*-mergepfx\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: ticket-requested-with-certificate
+        name: Kerberos ticket requested with a certificate
+        purpose: >-
+          Return Rubeus asktgt with a certificate, Certipy auth, the PKINITtools scripts
+          and kekeo's certificate ticket request. This is H155's subject. The request as
+          the domain controller sees it, pre-authentication type 16 on event 4768, is
+          not collected, and a PKINIT logon made by Windows itself with a smart card or
+          Windows Hello starts no process and does not appear.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | CommandLine=/\basktgt\b.*\/certificate:|\bcertipy(-ad)?(\.exe)?["']?\s+auth\b|gettgtpkinit|getnthash\.py|PKINITtools|\btgt::ask\b.*\/(pfx|subject|caname):/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: certificate_abuse_tool_command
+      name: Certificate request or certificate logon tool on a command line
+      description: >-
+        A process command line requests a certificate with an alternate subject,
+        enumerates templates for abusable settings, or requests a Kerberos ticket with a
+        certificate.
+      source: process_creation
+      field: command_line
+      indicates: authentication_certificate_abuse
+
+  supporting:
+    - id: alternate_subject_is_privileged
+      name: Alternate subject names a privileged account
+      description: >-
+        The alternate name, UPN or SID on the request is an administrator, a domain
+        controller or a service account, and differs from the user running the command.
+      source: process_creation
+      field: user
+      indicates: identity_impersonation_in_request
+    - id: enumerate_request_authenticate_sequence
+      name: Enumeration, request and ticket in order on one host
+      description: >-
+        Template enumeration, a request with an alternate subject and a
+        certificate-based ticket request occur on the same host in that order, which the
+        agent derives from the returned events.
+      source: process_creation
+      field: process_id
+      indicates: complete_certificate_abuse_chain
+    - id: non_pki_host
+      name: Host is not a PKI or administration server
+      description: >-
+        The host on the event is a workstation or a server with no certificate
+        management role.
+      source: process_creation
+      field: host
+      indicates: certificate_tooling_on_unexpected_host
+    - id: offensive_tool_image
+      name: Image is a known offensive tool or a script interpreter
+      description: >-
+        The process is Certify, Rubeus, kekeo, or Python running Certipy or PKINITtools,
+        not certreq or certutil.
+      source: process_creation
+      field: image_name
+      indicates: offensive_tooling
+    - id: operator_driven_parent
+      name: Started from a shell, script or remote session
+      description: >-
+        The parent is an interactive shell, a script host or a remote-management
+        process.
+      source: process_creation
+      field: parent_process
+      indicates: operator_driven_execution
+
+  contradicting:
+    - id: sanctioned_adcs_assessment
+      name: Run is an authorised AD CS assessment
+      description: >-
+        A change or engagement record covers the host, account and time for a
+        certificate-services review or penetration test.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_security_testing
+    - id: pki_administration
+      name: Account is a PKI administrator doing certificate work
+      description: >-
+        The user is on the PKI team and the command is certreq or certutil against a
+        server template with a DNS name.
+      source: identity_context
+      field: UserName
+      indicates: routine_certificate_administration
+
+  risk_logic:
+    required:
+      - certificate_abuse_tool_command
+
+    supporting:
+      any:
+        - alternate_subject_is_privileged
+        - enumerate_request_authenticate_sequence
+        - non_pki_host
+        - offensive_tool_image
+        - operator_driven_parent
+      all:
+        - alternate_subject_is_privileged
+        - enumerate_request_authenticate_sequence
+
+    contradicting:
+      any:
+        - sanctioned_adcs_assessment
+        - pki_administration
+      all: []
+
+  verdict:
+    low_risk_when:
+      - certificate_abuse_tool_command
+      - sanctioned_adcs_assessment
+    suspicious_when:
+      - certificate_abuse_tool_command
+      - non_pki_host
+    high_risk_when:
+      - certificate_abuse_tool_command
+      - alternate_subject_is_privileged
+      - offensive_tool_image
+
+  false_positive:
+    - condition: PKI teams auditing their own templates.
+      explanation: >-
+        Certify and Certipy find are the standard audit tools. The run is planned, comes
+        from an administration host and stops at enumeration.
+    - condition: Web-server certificate requests.
+      explanation: >-
+        certreq with SAN:dns= is how an operator asks for a server certificate. The name
+        is a host name, not a user principal.
+    - condition: Certificate export and migration.
+      explanation: >-
+        openssl pkcs12 -export is everyday work for anyone moving a certificate. On its
+        own it says nothing.

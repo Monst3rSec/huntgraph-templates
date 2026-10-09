@@ -1,0 +1,318 @@
+# Converted from THORCollective/HEARTH Flames/H174.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-mac-hearth-h174-app-bundle-shell-fingerprint-and-chrome-search-hijack-t1059-004
+version: 1.0.0
+
+info:
+  name: GUI application shelling out to fingerprint the Mac and relaunch Chrome with a hijacked search provider
+  description: >-
+    FlutterShell arrives as a notarized, validly signed Flutter application posing as a
+    podcast or PDF tool (Unit 42, June 2026). Static and reputation checks pass. What
+    gives it away is what the application's main executable starts: /bin/sh reading the
+    hardware UUID through ioreg, killall against Google Chrome, and Chrome reopened with
+    a search URL on attacker infrastructure and the switches that hide the crash-restore
+    prompt. It also rewrites Chrome's Secure Preferences directly. File writes to that
+    preferences file are not reported by the sensor, and the JavaScript bridge that
+    issues the commands is inside the application, so the hunt reads the shell commands
+    and the Chrome relaunch.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - execution
+    - unix-shell
+    - malvertising
+    - browser-hijack
+    - fluttershell
+    - macos
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H174.md
+    - https://attack.mitre.org/techniques/T1059
+    - https://attack.mitre.org/techniques/T1059/004
+    - https://attack.mitre.org/detectionstrategies/DET0384
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1059
+  sub_techniques:
+    - T1059.004
+  detection_strategies:
+    - DET0384
+  analytics:
+    - AN1082
+  platforms:
+    - macOS
+  data_sources:
+    - macos:unifiedlog
+    - macos:osquery
+  data_components:
+    - Process Creation
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    A notarized macOS GUI application delivered via malvertising (masquerading as
+    PodcastsLounge, PDF-Brain or PDF-Ninja) is spawning a Unix shell from its .app
+    bundle to fingerprint the host via ioreg and IOPlatformUUID, terminate Google Chrome
+    with killall, and relaunch the browser with a hijacked search-provider URL plus
+    crash-suppression flags, or directly editing Chrome's Secure Preferences to repoint
+    default_search_provider_data at attacker infrastructure.
+  attacker_behavior:
+    - Ships a signed and notarized application built with Flutter.
+    - Runs sh -c from the application to read IOPlatformUUID through ioreg, grep and sed.
+    - Kills Google Chrome with killall.
+    - Reopens Chrome with a search URL and switches that hide the crash-restore bubble.
+    - Edits Chrome's Secure Preferences to change the default search provider.
+    - Fetches further JavaScript from its update domains.
+  legitimate_behavior:
+    - Management agents, licensing code and updaters read IOPlatformUUID.
+    - Kiosk and test automation start Chrome with crash-suppression switches.
+    - Browser management tooling restarts Chrome after a policy change.
+  risk_indicator:
+    - The parent of the shell is a consumer application, not a management agent.
+    - The same parent reads the hardware UUID, kills Chrome and reopens it.
+    - Chrome is started with a URL on an unfamiliar search domain.
+    - A command names Chrome's Secure Preferences file.
+    - The host resolves one of the reported update or search domains.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: shell-reading-hardware-uuid
+        name: Shell command reading IOPlatformUUID through ioreg
+        purpose: >-
+          Return shells whose command line reads the platform UUID with ioreg, with the
+          parent name on each event. Many legitimate agents do the same; the parent is
+          what the agent judges, and the next two cases show whether that parent also
+          touched Chrome.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | ImageFileName=/\/(sh|bash|zsh)$/
+          | CommandLine=/IOPlatformUUID/
+          | CommandLine=/ioreg\s/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: chrome-terminated-by-command
+        name: Google Chrome killed from a command
+        purpose: >-
+          Return killall and pkill against Google Chrome, run directly or through a
+          shell.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | ImageFileName=/\/(killall|pkill|sh|bash|zsh)$/
+          | CommandLine=/\b(killall|pkill)\b[^|;&]*Google Chrome/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: chrome-relaunched-with-crash-suppression
+        name: Chrome started with switches that hide the crash-restore prompt
+        purpose: >-
+          Return any process, Chrome itself or the open command that starts it, whose
+          command line carries a crash-bubble switch together with session restore or
+          error-dialog suppression. The URL passed on the same line is the hijacked
+          search provider.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | CommandLine=/--hide-crash-restore-bubble|--disable-session-crashed-bubble/
+          | CommandLine=/--restore-last-session|--noerrdialogs/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: chrome-secure-preferences-named-in-command
+        name: Command naming Chrome's Secure Preferences or the search-provider key
+        purpose: >-
+          Return commands that name the Secure Preferences file or the
+          default_search_provider_data key. An edit made by the application through its
+          own file calls starts no process and is not seen.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | CommandLine=/Google\/Chrome\/[^\/]+\/Secure Preferences|default_search_provider_data/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: reported-fluttershell-domain-resolved
+        name: DNS request for a reported FlutterShell domain
+        purpose: >-
+          Return requests for the reported update, payload and search-redirect domains.
+        query: |
+          #event_simpleName=DnsRequest
+          | DomainName=/(^|\.)(sinterfumesco\.com|atsheisdomestic\.org|etoftheappyrince\.org|healightejustb\.org)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: application_shell_browser_tampering
+      name: Application-started command kills or relaunches Chrome
+      description: >-
+        A command kills Google Chrome or starts it with crash-suppression switches, or
+        names its Secure Preferences file, and the parent is an application rather than
+        a management agent.
+      source: process_creation
+      field: command_line
+      indicates: browser_search_hijack
+
+  supporting:
+    - id: hardware_uuid_read
+      name: Same parent reads the hardware UUID
+      description: >-
+        A shell under the same parent process reads IOPlatformUUID through ioreg, which
+        the agent establishes by matching parent names and process ids across the
+        returned events.
+      source: process_creation
+      field: parent_process
+      indicates: host_fingerprinting
+    - id: shell_from_application_bundle
+      name: Shell is a child of an application's main executable
+      description: >-
+        The parent process id belongs to a GUI application launched from Applications or
+        Downloads.
+      source: process_creation
+      field: parent_process_id
+      indicates: shell_from_gui_application
+    - id: unfamiliar_search_url
+      name: Chrome started with an unfamiliar search URL
+      description: >-
+        The relaunch command passes a search URL on a domain the organisation does not
+        use.
+      source: process_creation
+      field: command_line
+      indicates: search_provider_redirect
+    - id: reported_domain_resolved
+      name: Reported domain resolved
+      description: >-
+        A process on the host resolves a reported update or search-redirect domain.
+      source: dns_request
+      field: query_name
+      indicates: command_and_control_contact
+
+  contradicting:
+    - id: management_agent_parent
+      name: Parent is a management or test tool
+      description: >-
+        The parent is the organisation's device management agent, a kiosk launcher or a
+        test runner.
+      source: asset_inventory
+      field: ComputerName
+      indicates: managed_browser_restart
+    - id: browser_policy_change
+      name: A browser policy change is recorded
+      description: >-
+        A change record covers a Chrome policy rollout on this host at this time.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_browser_configuration
+
+  risk_logic:
+    required:
+      - application_shell_browser_tampering
+
+    supporting:
+      any:
+        - hardware_uuid_read
+        - shell_from_application_bundle
+        - unfamiliar_search_url
+        - reported_domain_resolved
+      all:
+        - hardware_uuid_read
+        - shell_from_application_bundle
+
+    contradicting:
+      any:
+        - management_agent_parent
+        - browser_policy_change
+      all: []
+
+  verdict:
+    low_risk_when:
+      - application_shell_browser_tampering
+      - management_agent_parent
+      - browser_policy_change
+    suspicious_when:
+      - application_shell_browser_tampering
+      - hardware_uuid_read
+    high_risk_when:
+      - application_shell_browser_tampering
+      - hardware_uuid_read
+      - shell_from_application_bundle
+      - unfamiliar_search_url
+
+  false_positive:
+    - condition: Agents read the hardware UUID.
+      explanation: >-
+        Device management, licensing and update code reads it routinely. None of them
+        kills Chrome afterwards.
+    - condition: Test automation starts Chrome with these switches.
+      explanation: >-
+        The parent is a test runner on a developer or build machine and the URL is
+        local.
+    - condition: Managed browser restarts.
+      explanation: >-
+        Management tooling restarts Chrome after an update under its own agent's name.

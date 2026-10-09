@@ -1,0 +1,309 @@
+# Converted from THORCollective/HEARTH Flames/H179.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-lin-hearth-h179-container-escape-through-misconfiguration-primitives-t1611
+version: 1.0.0
+
+info:
+  name: Container escape through release_agent, kernel module, host mount or runtime socket
+  description: >-
+    Kaspersky's June 2026 survey of container escapes lists the paths that turn a
+    compromised container into a compromised node: a payload written to a cgroup
+    release_agent, a kernel module loaded from a container that holds CAP_SYS_MODULE,
+    the host's disk mounted from a container that holds CAP_SYS_ADMIN, and a privileged
+    container started through a bind-mounted Docker socket. The Linux sensor on the node
+    records the processes containers start, but the event does not say which namespace a
+    process is in, and the mount, module-load and write system calls themselves are not
+    collected. The hunt therefore returns the commands that drive each primitive, with
+    their parent, and the agent decides from the parent chain whether the process ran
+    inside a container. An escape written directly against the system calls leaves
+    nothing here.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - privilege-escalation
+    - container-escape
+    - cgroup
+    - kernel-module
+    - docker-socket
+    - kubernetes
+    - linux
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H179.md
+    - https://attack.mitre.org/techniques/T1611
+    - https://attack.mitre.org/detectionstrategies/DET0219
+
+mitre:
+  tactics:
+    - TA0004
+  techniques:
+    - T1611
+  sub_techniques: []
+  detection_strategies:
+    - DET0219
+  analytics:
+    - AN0613
+  platforms:
+    - Linux
+  data_sources:
+    - linux:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    A process running inside a Linux container is escaping to the host by one of the
+    high-signal misconfiguration paths: writing a payload to a cgroup release_agent
+    (CVE-2022-0492 class), loading a kernel module via insmod or modprobe from a
+    CAP_SYS_MODULE container, mounting the host filesystem after abusing CAP_SYS_ADMIN,
+    or driving the Docker API through a bind-mounted /var/run/docker.sock to launch a
+    privileged container, to gain code execution in the host namespace.
+  attacker_behavior:
+    - Mounts a cgroup hierarchy, sets notify_on_release and writes a payload path to release_agent.
+    - Loads a kernel module with insmod from inside a container.
+    - Mounts the node's block device inside the container and edits host files.
+    - Calls the Docker API over the mounted socket to create a privileged container.
+    - Enters the host's namespaces with nsenter against process 1.
+  legitimate_behavior:
+    - Node agents, CNI and CSI plugins mount host paths and devices.
+    - Build and CI agents talk to the Docker socket.
+    - Driver installers load kernel modules on the node.
+    - Administrators use nsenter in a node debug session.
+  risk_indicator:
+    - The command's parent chain leads to a container shim or runtime.
+    - release_agent or notify_on_release appears on a command line at all.
+    - insmod runs with a module path under /tmp, /dev/shm or a container layer.
+    - curl or a script posts containers/create with Privileged true to the runtime socket.
+    - The workload is an application container with no infrastructure role.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: cgroup-release-agent-command
+        name: Command naming release_agent or notify_on_release
+        purpose: >-
+          Return commands that name either cgroup control file. Legitimate use on a node
+          is close to nil. The write is seen when it is issued as a shell line; a
+          program that writes the file itself starts no process.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | CommandLine=/release_agent|notify_on_release/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: kernel-module-loaded-by-file
+        name: Kernel module loaded from a file path
+        purpose: >-
+          Return insmod, and modprobe given a .ko file, with the parent on each event.
+          modprobe by module name is what the kernel and systemd run all day and is left
+          out. The finit_module call itself is not collected, so a loader that makes the
+          call directly is not seen.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | CommandLine=/\binsmod\s+\S+|\bmodprobe\b[^|;&]*\.ko\b/
+          | ParentBaseFileName!=/^(systemd|systemd-udevd|systemd-modules-load|dkms|dracut)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: host-block-device-or-cgroup-mounted
+        name: mount of a block device or a cgroup hierarchy
+        purpose: >-
+          Return mount commands whose source is a disk device or whose type is cgroup,
+          excluding those systemd and the udev stack issue. Inside a container this is
+          the host-filesystem step; the agent reads the parent chain to tell.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ImageFileName=/\/mount$/
+          | CommandLine=/\s\/dev\/(sd[a-z]\d*|vd[a-z]\d*|xvd[a-z]\d*|nvme\d+n\d+(p\d+)?|dm-\d+|mapper\/\S+)\s+\S+|-t\s+cgroup\b/
+          | ParentBaseFileName!=/^(systemd|systemd-udevd|udisksd|dracut)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: container-runtime-socket-driven-by-hand
+        name: Runtime socket called with curl, netcat or a script
+        purpose: >-
+          Return commands that name a container runtime socket together with a raw
+          client or a container-create call. The docker and nerdctl clients are not
+          matched; they do not name the socket unless told to.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | CommandLine=/(docker|containerd|crio)\.sock/
+          | CommandLine=/--unix-socket|UNIX-CONNECT|\bnc\s+-U|-H\s+unix:|\/containers\/create|Privileged"?\s*:\s*true/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: namespace-entry-against-init
+        name: nsenter targeting process 1
+        purpose: >-
+          Return nsenter runs that target the host's init process.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ImageFileName=/\/nsenter$/
+          | CommandLine=/(--target|-t)[=\s]*1(\s|$)/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: escape_primitive_command
+      name: Command drives a container escape primitive
+      description: >-
+        A command names a cgroup release agent, loads a kernel module from a file,
+        mounts a host device, calls the runtime socket by hand or enters the namespaces
+        of process 1.
+      source: process_creation
+      field: command_line
+      indicates: container_escape_attempt
+
+  supporting:
+    - id: parent_is_container_runtime
+      name: Parent chain leads to a container shim
+      description: >-
+        The parent, or an ancestor the agent reaches by following parent process ids, is
+        containerd-shim, runc, conmon, docker-init or tini.
+      source: process_creation
+      field: parent_process
+      indicates: execution_inside_container
+    - id: module_from_scratch_path
+      name: Module or payload path is a scratch directory
+      description: >-
+        The module or release-agent payload sits under /tmp, /dev/shm or a container
+        layer path.
+      source: process_creation
+      field: image_path
+      indicates: attacker_supplied_payload
+    - id: application_workload_identity
+      name: Workload runs as an application user
+      description: >-
+        The user on the event is an application account, not root on the node or an
+        infrastructure agent.
+      source: process_creation
+      field: user
+      indicates: non_infrastructure_workload
+    - id: primitives_chained
+      name: Several primitives on one host in sequence
+      description: >-
+        A cgroup mount is followed by a release_agent write, or a socket call by a
+        namespace entry, on the same host within minutes, which the agent derives from
+        the returned events.
+      source: process_creation
+      field: parent_process_id
+      indicates: escape_sequence
+
+  contradicting:
+    - id: infrastructure_workload
+      name: Workload is a node agent or CI runner
+      description: >-
+        The pod or container is a CNI, CSI, monitoring or build agent whose manifest
+        grants these rights.
+      source: asset_inventory
+      field: ComputerName
+      indicates: privileged_by_design
+    - id: node_debug_session
+      name: A node debug session is recorded
+      description: >-
+        An administrator was debugging the node under a change record.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_node_maintenance
+
+  risk_logic:
+    required:
+      - escape_primitive_command
+
+    supporting:
+      any:
+        - parent_is_container_runtime
+        - module_from_scratch_path
+        - application_workload_identity
+        - primitives_chained
+      all:
+        - parent_is_container_runtime
+        - application_workload_identity
+
+    contradicting:
+      any:
+        - infrastructure_workload
+        - node_debug_session
+      all: []
+
+  verdict:
+    low_risk_when:
+      - escape_primitive_command
+      - infrastructure_workload
+      - node_debug_session
+    suspicious_when:
+      - escape_primitive_command
+      - parent_is_container_runtime
+    high_risk_when:
+      - escape_primitive_command
+      - parent_is_container_runtime
+      - application_workload_identity
+      - primitives_chained
+
+  false_positive:
+    - condition: Driver and storage installers load modules and mount devices.
+      explanation: >-
+        They run on the node from a package or a DaemonSet with a known name.
+    - condition: CI agents call the Docker socket.
+      explanation: >-
+        Build agents mount it on purpose. They use the docker client and do not request
+        privileged containers.
+    - condition: kubectl debug uses nsenter.
+      explanation: >-
+        The session belongs to an administrator and a record exists.

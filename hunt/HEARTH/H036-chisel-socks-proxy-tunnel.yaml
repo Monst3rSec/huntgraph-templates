@@ -1,0 +1,294 @@
+# Converted from THORCollective/HEARTH Flames/H036.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-any-hearth-h036-chisel-socks-proxy-tunnel-t1090-001
+version: 1.0.0
+
+info:
+  name: Chisel used to create a SOCKS proxy on a compromised host
+  description: >-
+    Chisel is an open-source tunnel that carries TCP and UDP over an HTTP connection
+    secured with SSH. Run in client mode with a reverse SOCKS remote, it turns a
+    compromised host into a proxy the operator can route any tool through, and the
+    traffic leaving the network looks like one web session. The binary is routinely
+    renamed, but its arguments are distinctive: the client or server keyword, a remote
+    specification such as R:socks, and a server URL. The hunt returns the invocation by
+    those arguments, by name, and by the SOCKS listener it opens.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - command-and-control
+    - proxy
+    - tunneling
+    - chisel
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H036.md
+    - https://attack.mitre.org/techniques/T1090
+    - https://attack.mitre.org/techniques/T1090/001
+    - https://attack.mitre.org/detectionstrategies/DET0075
+    - https://unit42.paloaltonetworks.com/cybercriminals-attack-financial-sector-across-africa
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1090
+  sub_techniques:
+    - T1090.001
+  detection_strategies:
+    - DET0075
+  analytics:
+    - AN0204
+    - AN0205
+    - AN0206
+  platforms:
+    - Windows
+    - Linux
+    - macOS
+  data_sources:
+    - WinEventLog:Sysmon
+    - auditd:SYSCALL
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    Threat actors are using Chisel, an open-source tunneling utility, to create SOCKS
+    proxies on compromised hosts in order to bypass network security controls and conceal
+    command-and-control traffic.
+  attacker_behavior:
+    - Runs chisel client against an external server with a reverse remote such as R:socks or R:1080:socks.
+    - Renames the binary to something that resembles a system or vendor process.
+    - Runs chisel server with the reverse or socks5 option on a foothold host inside the network.
+    - Stores and runs the binary from a temporary, public or hidden directory.
+    - Routes scanning, RDP and SMB tooling through the resulting proxy.
+  legitimate_behavior:
+    - Penetration testers use Chisel during authorised engagements.
+    - Developers occasionally tunnel to a lab or cloud environment with it.
+    - Unrelated software may carry the word chisel in a path or argument.
+  risk_indicator:
+    - A command line holds a reverse remote specification or the socks keyword after client or server.
+    - The process has a system-like name but runs from a user-writable directory.
+    - A non-proxy process listens on port 1080.
+    - The server URL is a public address or a recently seen domain.
+    - Internal scanning or lateral logons follow from the same host.
+
+requires:
+  platforms:
+    - windows
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_path: ImageFileName
+        image_hash: SHA256HashData
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: network_listen
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkListenIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        local_port: LocalPort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: chisel-remote-specification
+        name: Command line with a Chisel reverse or SOCKS remote
+        purpose: >-
+          Return invocations by their argument shape, which survives renaming the
+          binary: the client or server keyword together with a reverse remote or the
+          socks option.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | CommandLine=/\s(client|server)\s/i
+          | CommandLine=/\sR:(\d{1,5}:)?socks\b|\sR:\d{1,5}:[^\s:]+:\d{1,5}\b|\s--socks5\b|\s--reverse\b.*\s(-p|--port)\s|\s\d{1,5}:socks\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: chisel-binary-by-name
+        name: Process named chisel
+        purpose: >-
+          Return runs where the binary keeps its own name, on any platform, in client or
+          server mode.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | ImageFileName=/[\\\/]chisel[^\\\/]*$/i
+          | CommandLine=/\s(client|server)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: tunnel-client-to-http-server
+        name: Client-mode tunnel pointed at an HTTP server with auth or fingerprint options
+        purpose: >-
+          Return client invocations that carry Chisel's own option names beside a server
+          URL, a second shape that does not depend on the remote specification.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | CommandLine=/\sclient\s/i
+          | CommandLine=/\s--(fingerprint|auth|keepalive|max-retry-count|max-retry-interval|tls-skip-verify)\b/i
+          | CommandLine=/https?:\/\/|\s(\d{1,3}\.){3}\d{1,3}:\d{2,5}\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: socks-port-listener
+        name: Process listening on the default SOCKS port
+        purpose: >-
+          Return listeners on port 1080 opened by anything other than known proxy
+          software, the local end of a SOCKS tunnel.
+        query: |
+          #event_simpleName=NetworkListenIP4
+          | LocalPort=1080
+          | ContextBaseFileName!=/^(squid|dante|sockd|danted|3proxy|privoxy|ssh|sshd)(\.exe)?$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: tunnel_tool_invocation
+      name: Tunnelling tool invoked with proxy arguments
+      description: >-
+        A process command line carries Chisel's client or server keyword with a reverse
+        remote, a socks option or its distinctive flags.
+      source: process_creation
+      field: command_line
+      indicates: proxy_tunnel_established
+
+  supporting:
+    - id: renamed_or_misplaced_binary
+      name: Binary renamed or run from a writable path
+      description: >-
+        The image path is under a temporary, public, download or hidden directory, or
+        the file name imitates a system process while the arguments are Chisel's.
+      source: process_creation
+      field: image_path
+      indicates: masqueraded_tool
+    - id: socks_listener_opened
+      name: SOCKS port opened by an unexpected process
+      description: >-
+        A listen event shows port 1080 bound by a process that is not proxy software
+        installed on the host.
+      source: network_listen
+      field: local_port
+      indicates: local_proxy_endpoint
+    - id: listener_process_identity
+      name: Listener process matches the tunnel process
+      description: >-
+        The process name on the listen event is the same binary seen with tunnel
+        arguments.
+      source: network_listen
+      field: process_name
+      indicates: tunnel_process_confirmed
+    - id: hands_on_parent
+      name: Started from a shell, script or remote session
+      description: >-
+        The parent is an interactive shell, a script host, a remote-management process
+        or a web server worker.
+      source: process_creation
+      field: parent_process
+      indicates: operator_driven_execution
+
+  contradicting:
+    - id: authorised_penetration_test
+      name: Host and time fall inside an authorised test
+      description: >-
+        A recorded engagement covers the host, the source and the time window, and names
+        tunnelling in its rules.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_security_testing
+    - id: developer_lab_tunnel
+      name: User routinely tunnels to a lab environment
+      description: >-
+        Earlier activity shows the same user and server address using the tool from this
+        host over a long period.
+      source: baseline
+      field: CommandLine
+      indicates: established_user_behaviour
+
+  risk_logic:
+    required:
+      - tunnel_tool_invocation
+
+    supporting:
+      any:
+        - renamed_or_misplaced_binary
+        - socks_listener_opened
+        - listener_process_identity
+        - hands_on_parent
+      all:
+        - renamed_or_misplaced_binary
+        - hands_on_parent
+
+    contradicting:
+      any:
+        - authorised_penetration_test
+        - developer_lab_tunnel
+      all: []
+
+  verdict:
+    low_risk_when:
+      - tunnel_tool_invocation
+      - authorised_penetration_test
+    suspicious_when:
+      - tunnel_tool_invocation
+      - hands_on_parent
+    high_risk_when:
+      - tunnel_tool_invocation
+      - hands_on_parent
+      - renamed_or_misplaced_binary
+
+  false_positive:
+    - condition: A penetration test is under way.
+      explanation: >-
+        Testers use Chisel exactly as an adversary does. Only the engagement record, the
+        tester's source and the agreed window separate the two.
+    - condition: Other software uses client and server keywords.
+      explanation: >-
+        Many tools take a client or server argument. The first case also requires
+        Chisel's remote syntax; a hit without it should be read for what the binary is.
+    - condition: Proxy software legitimately listens on 1080.
+      explanation: >-
+        Installed SOCKS servers are excluded by name. Another listener on that port is a
+        lead to check against the tunnel cases, not a finding by itself.

@@ -1,0 +1,277 @@
+# Converted from THORCollective/HEARTH Flames/H110.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h110-domain-account-and-group-enumeration-t1087-002
+version: 1.0.0
+
+info:
+  name: Domain account and group enumeration with built-in utilities
+  description: >-
+    Shortly after getting in, the ActiveMQ-to-LockBit operators ran net group to list the
+    domain administrators and then dumped LSASS to get one of them. net.exe, nltest.exe,
+    the directory query utilities and the Active Directory PowerShell cmdlets are all
+    present or easily loaded on a Windows host and trigger no malware detection. The hunt
+    returns each such command with its account and parent; whether several came from one
+    host in a burst, and whether that host or account normally does directory work, is for
+    the agent to establish. Cmdlets typed into an open PowerShell session start no process
+    and are not seen.
+  severity: medium
+  author: huntgraph
+  tags:
+    - hearth
+    - discovery
+    - account-discovery
+    - active-directory
+    - net-group
+    - nltest
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H110.md
+    - https://attack.mitre.org/techniques/T1087
+    - https://attack.mitre.org/techniques/T1087/002
+    - https://attack.mitre.org/detectionstrategies/DET0129
+
+mitre:
+  tactics:
+    - TA0007
+  techniques:
+    - T1087
+  sub_techniques:
+    - T1087.002
+  detection_strategies:
+    - DET0129
+  analytics:
+    - AN0363
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary is enumerating Active Directory accounts and group memberships using
+    built-in Windows utilities such as net group, net user, nltest, or PowerShell AD
+    cmdlets to identify privileged accounts for targeted credential theft.
+  attacker_behavior:
+    - Runs net group "Domain Admins" /domain and net user /domain.
+    - Runs nltest to list domain controllers and trusts.
+    - Runs Get-ADGroupMember, Get-ADUser or an ADSI searcher from PowerShell.
+    - Uses dsquery or AdFind where the cmdlets are not installed.
+    - Issues the commands one after another from the same shell.
+  legitimate_behavior:
+    - Help desk and directory administrators query users and groups daily.
+    - Logon scripts and inventory agents check group membership.
+    - Developers test directory lookups from their workstations.
+  risk_indicator:
+    - The query names Domain Admins, Enterprise Admins or another privileged group.
+    - Several enumeration commands run from one host within minutes.
+    - The account is a service account or a user with no directory role.
+    - The parent is an application server, a script host or a remote-access tool.
+    - LSASS dumping or lateral movement follows on the same host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: net-domain-user-or-group-query
+        name: net.exe querying domain users or groups
+        purpose: >-
+          Return net and net1 commands that list users, groups or the account policy with
+          the /domain switch. net.exe starts net1.exe with the same arguments, so each
+          command appears twice.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^net1?\.exe$/i
+          | CommandLine=/\s(group|user|users|accounts)\b/i
+          | CommandLine=/\/do(m|ma|mai|main)?\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: nltest-domain-query
+        name: nltest listing domain controllers or trusts
+        purpose: >-
+          Return nltest run with the switches that list domain controllers, trusts or a
+          user's directory record.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^nltest\.exe$/i
+          | CommandLine=/\/(dclist|domain_trusts|dsgetdc|trusted_domains|user):?/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: powershell-directory-enumeration
+        name: PowerShell command line enumerating directory accounts
+        purpose: >-
+          Return PowerShell started with an Active Directory cmdlet, a PowerView function
+          or an ADSI searcher on its command line.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/Get-AD(User|Group|GroupMember|PrincipalGroupMembership|Computer|DomainController)\b|Get-(Domain|Net)(User|Group|GroupMember)\b|adsisearcher|DirectorySearcher|samAccountType=805306368/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: directory-query-utility
+        name: Directory query utility
+        purpose: >-
+          Return dsquery, dsget, AdFind, ldifde and csvde runs. They are returned by image
+          name; AdFind renamed is not matched.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(dsquery|dsget|adfind|ldifde|csvde)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: domain_enumeration_command
+      name: Command that lists domain accounts or groups
+      description: >-
+        net, nltest, PowerShell or a directory utility ran with arguments that enumerate
+        domain users, groups, controllers or trusts.
+      source: process_creation
+      field: command_line
+      indicates: domain_account_enumeration
+
+  supporting:
+    - id: privileged_group_named
+      name: Query names a privileged group
+      description: >-
+        The command line names Domain Admins, Enterprise Admins, Schema Admins,
+        Administrators or a similar group.
+      source: process_creation
+      field: command_line
+      indicates: privileged_account_targeting
+    - id: burst_from_one_host
+      name: Several enumeration commands from one host within minutes
+      description: >-
+        Different enumeration commands share a host and usually a parent process id within
+        a few minutes. The agent derives this from the returned events.
+      source: process_creation
+      field: parent_process_id
+      indicates: hands_on_keyboard_reconnaissance
+    - id: account_without_directory_role
+      name: Account has no directory role
+      description: >-
+        The user is a service account or a person with no administrative or help desk
+        duties.
+      source: process_creation
+      field: user
+      indicates: activity_outside_user_role
+    - id: unusual_parent
+      name: Parent is not an administrator's shell
+      description: >-
+        The parent is an application server, a script host, an Office program or a
+        remote-access tool.
+      source: process_creation
+      field: parent_process
+      indicates: enumeration_from_intrusion_chain
+
+  contradicting:
+    - id: directory_administration_account
+      name: Account administers the directory
+      description: >-
+        The user is a directory administrator or help desk operator working from an
+        administration host.
+      source: identity_context
+      field: UserName
+      indicates: routine_administration
+    - id: recurring_script_or_agent
+      name: Same command recurs from a script or agent
+      description: >-
+        Earlier activity shows the same command line from the same parent on a schedule,
+        as a logon script or inventory agent runs it.
+      source: baseline
+      field: CommandLine
+      indicates: established_automation
+
+  risk_logic:
+    required:
+      - domain_enumeration_command
+
+    supporting:
+      any:
+        - privileged_group_named
+        - burst_from_one_host
+        - account_without_directory_role
+        - unusual_parent
+      all:
+        - privileged_group_named
+        - burst_from_one_host
+
+    contradicting:
+      any:
+        - directory_administration_account
+        - recurring_script_or_agent
+      all: []
+
+  verdict:
+    low_risk_when:
+      - domain_enumeration_command
+      - directory_administration_account
+    suspicious_when:
+      - domain_enumeration_command
+      - privileged_group_named
+    high_risk_when:
+      - domain_enumeration_command
+      - privileged_group_named
+      - burst_from_one_host
+
+  false_positive:
+    - condition: Help desk and directory administration.
+      explanation: >-
+        These are the everyday tools of the job. The account has the role and the host is
+        an administration workstation.
+    - condition: Logon scripts and inventory agents.
+      explanation: >-
+        Scripts check group membership at logon with net or ADSI. The same line runs on
+        every host from the same parent.

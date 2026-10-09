@@ -1,0 +1,283 @@
+# Converted from THORCollective/HEARTH Flames/H143.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h143-logi-ai-prompt-builder-plugin-sideload-t1574-001
+version: 1.0.0
+
+info:
+  name: Logi AI Prompt Builder run from a user profile with a planted plugin DLL
+  description: >-
+    TCLBANKER copies the signed Logitech Logi AI Prompt Builder executable into
+    %LocalAppData%\LogiAI\ and puts its own screen_retriever_plugin.dll beside it. The
+    application is built on Flutter and loads its plugins from its own directory, so the
+    signed host loads the trojan's loader without any change to the host itself. The DLL
+    load is a Module Load event and this deployment does not collect it, so it is not
+    claimed. What the sensor does record is the signed host running from a directory
+    under the user profile where the genuine product installs under Program Files, the
+    plugin DLL being written there, and whatever the host then starts.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - stealth
+    - dll-side-loading
+    - tclbanker
+    - flutter
+    - masquerading
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H143.md
+    - https://attack.mitre.org/techniques/T1574
+    - https://attack.mitre.org/techniques/T1574/001
+    - https://attack.mitre.org/detectionstrategies/DET0201
+
+mitre:
+  tactics:
+    - TA0005
+    - TA0002
+  techniques:
+    - T1574
+  sub_techniques:
+    - T1574.001
+  detection_strategies:
+    - DET0201
+  analytics:
+    - AN0577
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    Threat actors are abusing the signed Logitech Logi AI Prompt Builder binary to
+    sideload a malicious screen_retriever_plugin.dll from %LocalAppData%\LogiAI\,
+    executing TCLBANKER under the trust of a legitimate Flutter plugin loader path.
+  attacker_behavior:
+    - Drops a copy of LogiAiPromptBuilder.exe into a LogiAI directory under the user's local application data.
+    - Writes a malicious screen_retriever_plugin.dll beside it, where the Flutter runtime looks for plugins.
+    - Starts the signed executable so that it loads the planted plugin.
+    - Runs the banking trojan's loader and later stages from inside or beneath the signed process.
+  legitimate_behavior:
+    - Logi Options+ installs the Prompt Builder under Program Files and starts it from there.
+    - Other Flutter desktop applications ship their own screen_retriever_plugin.dll in their install directory.
+    - Per-user installers place Flutter applications under AppData\Local\Programs.
+  risk_indicator:
+    - LogiAiPromptBuilder.exe runs from a path outside Program Files.
+    - A plugin DLL is written into AppData\Local\LogiAI by something that is not a Logitech installer.
+    - The Prompt Builder starts a shell, msiexec or an unknown executable.
+    - No Logitech software is installed on the host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: prompt-builder-running-outside-program-files
+        name: Logi AI Prompt Builder running from outside Program Files
+        purpose: >-
+          Return every start of LogiAiPromptBuilder.exe whose image is not under Program
+          Files. The image name is exact, so the case is cheap over a long window. A
+          copy renamed before it is run does not match; the file case below still
+          records the plugin being written.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^LogiAiPromptBuilder\.exe$/i
+          | ImageFileName!=/\\Program Files( \(x86\))?\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: process-started-by-prompt-builder
+        name: Process started by Logi AI Prompt Builder
+        purpose: >-
+          Return every child of LogiAiPromptBuilder.exe with its parent process id, so
+          the agent can tie a child to a host returned by the first case. The genuine
+          application starts few processes; the reported chain starts tclloader.exe,
+          cmd, msiexec or PowerShell. A loader that stays inside the host process starts
+          nothing and is not seen here.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^LogiAiPromptBuilder\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: screen-retriever-plugin-written-outside-program-files
+        name: screen_retriever_plugin.dll written outside Program Files
+        purpose: >-
+          Return writes of the plugin DLL by name anywhere but Program Files, with the
+          writing process. screen_retriever is a public Flutter plugin, so per-user
+          installs of other Flutter applications appear; the directory and the writer
+          tell them apart.
+        query: |
+          #event_simpleName=PeFileWritten
+          | TargetFileName=/\\screen_retriever_plugin\.dll$/i
+          | TargetFileName!=/\\Program Files( \(x86\))?\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: executable-content-written-into-logiai-profile-directory
+        name: PE file written into AppData\Local\LogiAI
+        purpose: >-
+          Return any PE file written into the LogiAI directory under a user profile,
+          whatever its name, which covers the copied host and a plugin given another
+          name.
+        query: |
+          #event_simpleName=PeFileWritten
+          | TargetFileName=/\\AppData\\Local\\LogiAI\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: signed_host_outside_install_path
+      name: Signed Logitech host runs from a user-writable path
+      description: >-
+        LogiAiPromptBuilder.exe starts from an image path outside Program Files, where
+        the genuine product is not installed.
+      source: process_creation
+      field: image_path
+      indicates: relocated_signed_binary
+
+  supporting:
+    - id: plugin_dll_planted
+      name: Plugin DLL written beside the relocated host
+      description: >-
+        A PE file named screen_retriever_plugin.dll, or any PE file, is written into
+        AppData\Local\LogiAI.
+      source: file_creation
+      field: file_path
+      indicates: side_load_payload_staged
+    - id: plugin_writer_not_installer
+      name: DLL writer is not a Logitech installer
+      description: >-
+        The process named on the file-write event is a script host, an archive tool, a
+        browser or an unknown executable, not Logi Options+ or its updater.
+      source: file_creation
+      field: writer_process_name
+      indicates: payload_dropped_by_untrusted_process
+    - id: host_started_child_process
+      name: Prompt Builder started a shell, installer or unknown executable
+      description: >-
+        A process whose parent is LogiAiPromptBuilder.exe is cmd, PowerShell, msiexec or
+        an executable that is not part of the Logitech product.
+      source: process_creation
+      field: image_name
+      indicates: payload_execution_under_signed_host
+    - id: child_of_relocated_host
+      name: Child belongs to the relocated copy
+      description: >-
+        The child's parent process id is the process id of a Prompt Builder start
+        returned from outside Program Files, which the agent matches across the two
+        cases.
+      source: process_creation
+      field: parent_process_id
+      indicates: execution_chain_from_side_loaded_host
+
+  contradicting:
+    - id: logitech_software_installed_per_user
+      name: Logitech software is deployed to that path
+      description: >-
+        Asset records show Logi Options+ or the Prompt Builder packaged to install under
+        the user profile on this host.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_software_installation
+
+  risk_logic:
+    required:
+      - signed_host_outside_install_path
+
+    supporting:
+      any:
+        - plugin_dll_planted
+        - plugin_writer_not_installer
+        - host_started_child_process
+        - child_of_relocated_host
+      all:
+        - plugin_dll_planted
+        - host_started_child_process
+
+    contradicting:
+      any:
+        - logitech_software_installed_per_user
+      all: []
+
+  verdict:
+    low_risk_when:
+      - signed_host_outside_install_path
+      - logitech_software_installed_per_user
+    suspicious_when:
+      - signed_host_outside_install_path
+      - plugin_dll_planted
+    high_risk_when:
+      - signed_host_outside_install_path
+      - plugin_dll_planted
+      - host_started_child_process
+
+  false_positive:
+    - condition: A repackaged or portable copy of Logi Options+.
+      explanation: >-
+        Some software-distribution tools unpack vendor software under the user profile.
+        The writer is the deployment agent and the same path appears on many hosts on
+        the same day.
+    - condition: Another Flutter application installed per user.
+      explanation: >-
+        The third case matches the plugin's file name wherever it lands. The directory
+        belongs to a named application and no Logitech executable runs from it.

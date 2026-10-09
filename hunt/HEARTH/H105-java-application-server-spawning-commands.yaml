@@ -1,0 +1,294 @@
+# Converted from THORCollective/HEARTH Flames/H105.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-any-hearth-h105-java-application-server-spawning-commands-t1190
+version: 1.0.0
+
+info:
+  name: Java application server starting shells and transfer tools after exploitation
+  description: >-
+    CVE-2023-46604 lets an unauthenticated OpenWire message make an Apache ActiveMQ broker
+    load a Spring XML file from an attacker's server and run the commands in it.
+    Ransomware operators, LockBit affiliates among them, have used it as their way in. The
+    OpenWire message and the broker's own log are not visible to the sensor. The outcome
+    is: the Java process that is the broker starts cmd.exe, PowerShell, certutil, msiexec
+    or a Unix shell, which a message broker has no reason to do. A child event names its
+    parent only as java, so one case returns the ActiveMQ processes with their process ids
+    and the others return what Java starts; the agent keeps the children whose parent is a
+    broker, and the same cases serve any other internet-facing Java application once its
+    process is identified.
+  severity: critical
+  author: huntgraph
+  tags:
+    - hearth
+    - initial-access
+    - activemq
+    - cve-2023-46604
+    - java
+    - exploit-public-facing-application
+    - ransomware-precursor
+    - windows
+    - linux
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H105.md
+    - https://attack.mitre.org/techniques/T1190
+    - https://attack.mitre.org/detectionstrategies/DET0080
+
+mitre:
+  tactics:
+    - TA0001
+  techniques:
+    - T1190
+  sub_techniques: []
+  detection_strategies:
+    - DET0080
+  analytics:
+    - AN0219
+    - AN0220
+  platforms:
+    - Windows
+    - Linux
+  data_sources:
+    - WinEventLog:Sysmon
+    - auditd:SYSCALL
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary is exploiting a known vulnerability in an internet-facing application
+    such as Apache ActiveMQ (CVE-2023-46604) to achieve remote code execution and
+    establish initial access to the environment.
+  attacker_behavior:
+    - Sends a crafted OpenWire command that makes the broker load a remote Spring XML file.
+    - Has the broker's Java process start cmd.exe, PowerShell or a Unix shell.
+    - Downloads a payload with certutil, bitsadmin, curl or msiexec from the broker host.
+    - Runs account and host discovery commands from the service account.
+    - Installs a remote-access tool or a beacon and moves on to other hosts.
+  legitimate_behavior:
+    - Service wrappers start Java, and Java applications start helper scripts at start-up.
+    - Build servers and schedulers written in Java run shell steps all day.
+    - Administrators run the activemq script to start, stop and query the broker.
+  risk_indicator:
+    - A shell or transfer utility has an ActiveMQ Java process as its parent.
+    - The child command line downloads from a URL or carries an encoded command.
+    - msiexec, certutil or bitsadmin is started by Java with a remote address.
+    - Discovery commands run under the broker's service account.
+    - The host is reachable from the internet on the OpenWire port.
+
+requires:
+  platforms:
+    - windows
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: activemq-broker-process
+        name: ActiveMQ broker process
+        purpose: >-
+          Return the Java and service-wrapper processes whose command line names ActiveMQ,
+          with their process ids, so the agent can tell which Java parent in the other
+          cases is the broker. Swap the product name to scope the hunt to another Java
+          application.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | FileName=/^(java|javaw|wrapper|prunsrv)(\.exe)?$/i
+          | CommandLine=/activemq/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: java-spawned-windows-shell-or-transfer-utility
+        name: Windows shell or transfer utility started by Java
+        purpose: >-
+          Return shells, script hosts and transfer utilities whose parent is Java and
+          whose command line fetches remote content, carries an encoded command, runs
+          discovery or points at a remote share. Java applications that shell out for
+          their own purposes are common; the parent process id and the command decide.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(java|javaw|wrapper|prunsrv)\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh|certutil|bitsadmin|msiexec|mshta|rundll32|regsvr32|curl|wscript|cscript)\.exe$/i
+          | CommandLine=/https?:\/\/|\bIEX\b|Invoke-Expression|DownloadString|DownloadFile|Invoke-WebRequest|-urlcache|\/transfer\b|\s-e(nc|ncodedcommand)?\s+[A-Za-z0-9+\/=]{40,}|\bwhoami\b|\bnet1?\s+(user|group|localgroup)\b|\bnltest\b|\bsysteminfo\b|\\\\[^\\\s]+\\[^\\\s]+\.(exe|dll|msi|bat|ps1)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: java-spawned-unix-shell-or-tool
+        name: Unix shell or tool started by Java
+        purpose: >-
+          Return shells, interpreters and network tools whose parent is Java and whose
+          command line fetches content, opens a socket, decodes a blob, checks identity or
+          works in a scratch directory.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ParentBaseFileName=java
+          | FileName=/^(sh|bash|dash|ash|busybox|curl|wget|python[0-9.]*|perl|nc|ncat|socat)$/
+          | CommandLine=/\b(curl|wget)\s|\/dev\/tcp\/|base64\s+(-d|--decode)|\b(id|whoami)\b|uname\s+-a|\/(tmp|dev\/shm|var\/tmp)\/|chmod\s+\+x|python[0-9.]*\s+-c|\bnc(at)?\s/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: second-stage-under-java-spawned-shell
+        name: Transfer utility or installer started by a shell with a remote address
+        purpose: >-
+          Return msiexec, certutil, bitsadmin and curl started by cmd.exe or PowerShell
+          with a URL, one level below Java. The reported ActiveMQ intrusions ran 'cmd /c
+          msiexec /q /i http://...', so the installer's parent is the shell; the agent
+          follows the shell's process id back to the Java case.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(cmd|powershell|pwsh)\.exe$/i
+          | FileName=/^(msiexec|certutil|bitsadmin|curl)\.exe$/i
+          | CommandLine=/https?:\/\//i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: java_child_command
+      name: Shell or transfer utility started by a Java application server
+      description: >-
+        A shell, script host or transfer utility has Java or its service wrapper as
+        parent.
+      source: process_creation
+      field: parent_process
+      indicates: code_execution_from_application_server
+
+  supporting:
+    - id: parent_is_activemq_broker
+      name: Parent process is the ActiveMQ broker
+      description: >-
+        The child's parent process id is that of a process the broker case returned. The
+        agent makes the match; the query does not.
+      source: process_creation
+      field: parent_process_id
+      indicates: exploited_application_identified
+    - id: remote_fetch_or_encoded_command
+      name: Child command fetches remote content or is encoded
+      description: >-
+        The command line holds a URL, a download method or a long Base64 argument.
+      source: process_creation
+      field: command_line
+      indicates: payload_retrieval
+    - id: installer_from_remote_address
+      name: Installer or transfer utility run against a URL
+      description: >-
+        msiexec, certutil, bitsadmin or curl ran with a remote address under the shell
+        Java started.
+      source: process_creation
+      field: image_name
+      indicates: second_stage_delivery
+    - id: service_account_discovery
+      name: Discovery under the application's service account
+      description: >-
+        whoami, net, nltest or systeminfo ran as the account the application service uses.
+      source: process_creation
+      field: user
+      indicates: hands_on_keyboard_activity
+
+  contradicting:
+    - id: known_application_helper
+      name: Child is a known helper of the application
+      description: >-
+        Earlier activity shows the same child image and command line started by the same
+        Java application on this host regularly.
+      source: baseline
+      field: CommandLine
+      indicates: established_application_behaviour
+    - id: patched_or_not_exposed
+      name: Application is patched or not reachable
+      description: >-
+        Asset and vulnerability records show the application is fixed for the
+        vulnerability or is not reachable from outside.
+      source: asset_inventory
+      field: ComputerName
+      indicates: vulnerability_not_present
+
+  risk_logic:
+    required:
+      - java_child_command
+
+    supporting:
+      any:
+        - parent_is_activemq_broker
+        - remote_fetch_or_encoded_command
+        - installer_from_remote_address
+        - service_account_discovery
+      all:
+        - parent_is_activemq_broker
+        - remote_fetch_or_encoded_command
+
+    contradicting:
+      any:
+        - known_application_helper
+        - patched_or_not_exposed
+      all: []
+
+  verdict:
+    low_risk_when:
+      - java_child_command
+      - known_application_helper
+    suspicious_when:
+      - java_child_command
+      - remote_fetch_or_encoded_command
+    high_risk_when:
+      - java_child_command
+      - parent_is_activemq_broker
+      - remote_fetch_or_encoded_command
+
+  false_positive:
+    - condition: Java build servers and schedulers.
+      explanation: >-
+        Jenkins, TeamCity agents and job schedulers start shells that download
+        dependencies. Their parent process is not the broker, and the commands belong to a
+        job definition.
+    - condition: Application start-up and management scripts.
+      explanation: >-
+        Service wrappers and the activemq script start Java and a few helpers at start-up.
+        They repeat unchanged at each restart.
+    - condition: A patched broker shows the same children for another reason.
+      explanation: >-
+        A shell under the broker is still worth explaining on a fixed host, but it then
+        points at a different flaw or at stolen console credentials.

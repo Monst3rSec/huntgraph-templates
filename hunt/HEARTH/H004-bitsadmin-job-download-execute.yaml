@@ -1,0 +1,255 @@
+# Converted from THORCollective/HEARTH Flames/H004.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h004-bitsadmin-job-download-execute-t1197
+version: 1.0.0
+
+info:
+  name: BITSAdmin jobs used to download and execute payloads
+  description: >-
+    The Background Intelligent Transfer Service moves files over HTTP and SMB on behalf
+    of Windows Update and many updaters, and bitsadmin.exe is the preinstalled tool that
+    drives it. A job is held in the BITS database, not in a new file or registry key, is
+    usually allowed by the host firewall, and can run a command when it completes. That
+    makes one binary enough to fetch a payload, run it, and run it again after a reboot.
+    The hunt returns every bitsadmin and PowerShell BITS invocation that transfers a file
+    or sets a notify command.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - persistence
+    - lolbin
+    - bits
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H004.md
+    - https://attack.mitre.org/techniques/T1197
+    - https://attack.mitre.org/detectionstrategies/DET0098
+    - https://redcanary.com/blog/threat-detection/bitsadmin/
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0005
+  techniques:
+    - T1197
+  sub_techniques: []
+  detection_strategies:
+    - DET0098
+  analytics:
+    - AN0274
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:PowerShell
+  data_components:
+    - Process Creation
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    An adversary is leveraging BITSAdmin jobs to download payloads onto a Windows host
+    and execute them, using the job's notify command to run the payload when the transfer
+    completes and to keep it running across reboots.
+  attacker_behavior:
+    - Runs bitsadmin /transfer to pull a payload from an external URL into a writable directory.
+    - Builds a job in steps with /create, /addfile and /resume to avoid the one-line pattern.
+    - Sets /SetNotifyCmdLine so BITS launches the payload when the job completes or errors.
+    - Extends the job lifetime or leaves it in an error state so the notify command reruns after reboot.
+    - Uses Start-BitsTransfer from PowerShell when bitsadmin.exe is watched.
+  legitimate_behavior:
+    - IT administrators script bitsadmin or Start-BitsTransfer to fetch installers from internal servers.
+    - Software updaters and deployment agents create BITS jobs to their vendor's download hosts.
+    - Help-desk scripts list or cancel stuck jobs with /list and /reset.
+  risk_indicator:
+    - The transfer source is an external host, a raw IP address or a file-sharing service.
+    - The destination is under a user profile, ProgramData, Public or a temporary directory.
+    - A notify command line names an interpreter or a binary in a writable path.
+    - bitsadmin is launched by an Office application, a script host or a remote-management process.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: bitsadmin-transfer-job
+        name: bitsadmin creating or feeding a transfer job
+        purpose: >-
+          Return every bitsadmin run that creates a job or adds a file to one, with the
+          source URL and destination path intact on the command line for the agent to
+          read.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^bitsadmin\.exe$/i
+          | CommandLine=/\/(transfer|addfile|addfileset|addfilewithranges|create|resume)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: bitsadmin-notify-command
+        name: bitsadmin setting a notify command line
+        purpose: >-
+          Return jobs given a program to run on completion, the step that turns a
+          download into execution and persistence.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^bitsadmin\.exe$/i
+          | CommandLine=/\/(SetNotifyCmdLine|SetNotifyFlags|SetMinRetryDelay|SetNoProgressTimeout)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: powershell-bits-transfer
+        name: PowerShell driving BITS through its cmdlets or COM object
+        purpose: >-
+          Cover the same job creation when it is issued from PowerShell and bitsadmin.exe
+          never runs.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/Start-BitsTransfer|Add-BitsFile|Set-BitsTransfer|BackgroundIntelligentTransfer/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: bits_job_command
+      name: BITS job created or modified from the command line
+      description: >-
+        A bitsadmin or PowerShell command line creates a transfer job, adds a file to
+        one, or sets what the job runs on completion.
+      source: process_creation
+      field: command_line
+      indicates: bits_job_abuse_candidate
+
+  supporting:
+    - id: external_transfer_source
+      name: Transfer source is an external address
+      description: >-
+        The URL on the command line points at a public host, a raw IP address or a
+        file-sharing service, not an internal distribution server.
+      source: process_creation
+      field: command_line
+      indicates: payload_retrieval_from_internet
+    - id: notify_command_set
+      name: Job configured to launch a program
+      description: >-
+        The command line carries SetNotifyCmdLine naming an executable or interpreter,
+        which BITS will start when the job completes or errors.
+      source: process_creation
+      field: command_line
+      indicates: execution_and_persistence_through_bits
+    - id: unusual_bits_parent
+      name: BITS tooling launched by an unexpected parent
+      description: >-
+        The parent is an Office application, script host, browser or remote-management
+        process, not an administrator's shell or a deployment agent.
+      source: process_creation
+      field: parent_process
+      indicates: abnormal_execution_chain
+
+  contradicting:
+    - id: internal_distribution_source
+      name: Source is an inventoried internal distribution server
+      description: >-
+        The transfer source resolves to a software distribution or update server recorded
+        in the asset inventory.
+      source: asset_inventory
+      field: ComputerName
+      indicates: managed_software_delivery
+    - id: approved_deployment_task
+      name: Job matches an approved deployment
+      description: >-
+        A change record covers the host, account and time for a scripted installation
+        that uses BITS.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_administration
+
+  risk_logic:
+    required:
+      - bits_job_command
+
+    supporting:
+      any:
+        - external_transfer_source
+        - notify_command_set
+        - unusual_bits_parent
+      all:
+        - external_transfer_source
+        - notify_command_set
+
+    contradicting:
+      any:
+        - internal_distribution_source
+        - approved_deployment_task
+      all: []
+
+  verdict:
+    low_risk_when:
+      - bits_job_command
+      - internal_distribution_source
+      - approved_deployment_task
+    suspicious_when:
+      - bits_job_command
+      - external_transfer_source
+    high_risk_when:
+      - bits_job_command
+      - external_transfer_source
+      - notify_command_set
+      - unusual_bits_parent
+
+  false_positive:
+    - condition: Administrators script BITS downloads of installers.
+      explanation: >-
+        The command is the same one an adversary uses. Administrative use pulls from
+        internal or vendor hosts under a known account, repeats across many hosts, and
+        rarely sets a notify command.
+    - condition: A vendor updater shells out to bitsadmin.
+      explanation: >-
+        Some older updaters call bitsadmin directly. The parent is the updater's own
+        signed binary and the URL is the vendor's download host, the same on every
+        machine that runs the product.
+    - condition: Help-desk staff inspect or clear stuck jobs.
+      explanation: >-
+        Listing and resetting jobs is routine troubleshooting. The transfer case does
+        match /resume, so a resume with no earlier create on that host is support work
+        on an existing job, not a new download.

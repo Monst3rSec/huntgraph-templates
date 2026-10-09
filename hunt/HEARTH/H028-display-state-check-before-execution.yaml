@@ -1,0 +1,254 @@
+# Converted from THORCollective/HEARTH Flames/H028.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-mac-hearth-h028-display-state-check-before-execution-t1497-003
+version: 1.0.0
+
+info:
+  name: Display state queried with system_profiler before running commands
+  description: >-
+    An implant that wants to act unobserved can ask macOS whether the screen is on.
+    system_profiler SPDisplaysDataType reports whether the display is asleep, and ioreg
+    and pmset expose the same power and idle state. BlueNoroff tooling checks it and
+    holds its commands until the user has stepped away. People seldom run these queries,
+    and when they do it is from a terminal; a script, a hidden binary or a launch item
+    doing so on a loop is the thing to find. The hunt returns the queries with the parent
+    that issued them.
+  severity: medium
+  author: huntgraph
+  tags:
+    - hearth
+    - stealth
+    - evasion
+    - time-based-checks
+    - bluenoroff
+    - macos
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H028.md
+    - https://attack.mitre.org/techniques/T1497
+    - https://attack.mitre.org/techniques/T1497/003
+    - https://attack.mitre.org/detectionstrategies/DET0141
+    - https://www.huntress.com/blog/inside-bluenoroff-web3-intrusion-analysis
+
+mitre:
+  tactics:
+    - TA0005
+    - TA0007
+  techniques:
+    - T1497
+  sub_techniques:
+    - T1497.003
+  detection_strategies:
+    - DET0141
+  analytics:
+    - AN0398
+  platforms:
+    - macOS
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    Sophisticated threat actors are querying display state using system_profiler before
+    executing malicious commands, timing their activity for when users are away from
+    their systems to avoid detection.
+  attacker_behavior:
+    - Runs system_profiler SPDisplaysDataType and reads whether the display is asleep.
+    - Repeats the check on an interval from an implant or launch item until the screen is off.
+    - Uses ioreg or pmset to read idle time and display power state for the same purpose.
+    - Starts its command execution, collection or transfer only after the check passes.
+  legitimate_behavior:
+    - Inventory and device-management agents collect display hardware details.
+    - Support staff and users run system_profiler to diagnose a monitor problem.
+    - Display and energy utilities query power state as part of their function.
+  risk_indicator:
+    - The query is issued by a binary in a user-writable, hidden or temporary path.
+    - The parent is a script interpreter, osascript or an unsigned launch item.
+    - The same parent repeats the query many times in a day.
+    - Other commands from the same parent follow shortly after a query.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: system-profiler-display-query
+        name: system_profiler asked for display data
+        purpose: >-
+          Return each display query, leaving out the device-management and Apple parents
+          that collect inventory. The image name is an exact match and runs first.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=system_profiler
+          | CommandLine=/SPDisplaysDataType/
+          | ParentBaseFileName!=/^(jamf|JamfDaemon|JamfAgent|munki.*|managedsoftwareupdate|osqueryd|sysdiagnose|System Information|fleetd|orbit|kandji.*|mdmclient)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: display-power-state-query
+        name: ioreg or pmset asked for display power or idle state
+        purpose: >-
+          Return the other ways to learn whether the user is present, limited to the
+          arguments that read display power and idle time.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=/^(ioreg|pmset)$/
+          | CommandLine=/IODisplayWrangler|HIDIdleTime|IOPowerManagement|CurrentPowerState|-g\s+(powerstate|assertions|log)\b/
+          | ParentBaseFileName!=/^(jamf|JamfDaemon|JamfAgent|munki.*|osqueryd|sysdiagnose|fleetd|orbit|kandji.*|powerd)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: display-query-from-script-parent
+        name: Display query issued by a script interpreter or AppleScript host
+        purpose: >-
+          Narrow to queries whose parent is an interpreter, which is how an implant or a
+          script issues them and how a person at a terminal does not.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=/^(system_profiler|ioreg|pmset)$/
+          | CommandLine=/SPDisplaysDataType|IODisplayWrangler|HIDIdleTime|powerstate/
+          | ParentBaseFileName=/^(osascript|python[0-9.]*|perl|ruby|node|sh|bash|zsh|curl)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: display_state_query
+      name: Display or idle state queried
+      description: >-
+        A process command line asks system_profiler for display data, or asks ioreg or
+        pmset for display power or idle time.
+      source: process_creation
+      field: command_line
+      indicates: user_presence_check
+
+  supporting:
+    - id: script_or_implant_parent
+      name: Query issued by an interpreter or unknown binary
+      description: >-
+        The parent is a script interpreter, osascript or a binary that is not a
+        management agent, a terminal or an Apple system process.
+      source: process_creation
+      field: parent_process
+      indicates: automated_environment_check
+    - id: repeated_from_one_parent
+      name: Same parent repeats the query
+      description: >-
+        Many queries share one parent process id, which the agent derives by counting the
+        returned events per host and parent process id.
+      source: process_creation
+      field: parent_process_id
+      indicates: polling_for_user_absence
+    - id: query_by_standard_user
+      name: Query runs in a standard user's session
+      description: >-
+        The user is an ordinary account, not root or a management service, and has no
+        support or engineering role.
+      source: process_creation
+      field: user
+      indicates: activity_outside_user_role
+
+  contradicting:
+    - id: inventory_agent_collection
+      name: Query belongs to an inventory or management agent
+      description: >-
+        The host's management agent is recorded as collecting display hardware data and
+        the parent chain leads to it.
+      source: asset_inventory
+      field: ComputerName
+      indicates: managed_inventory_collection
+    - id: query_recurs_fleet_wide
+      name: Same query recurs across the fleet
+      description: >-
+        Earlier activity shows the identical query and parent on most macOS hosts on a
+        regular schedule.
+      source: baseline
+      field: CommandLine
+      indicates: established_software_behaviour
+
+  risk_logic:
+    required:
+      - display_state_query
+
+    supporting:
+      any:
+        - script_or_implant_parent
+        - repeated_from_one_parent
+        - query_by_standard_user
+      all:
+        - script_or_implant_parent
+        - repeated_from_one_parent
+
+    contradicting:
+      any:
+        - inventory_agent_collection
+        - query_recurs_fleet_wide
+      all: []
+
+  verdict:
+    low_risk_when:
+      - display_state_query
+      - inventory_agent_collection
+      - query_recurs_fleet_wide
+    suspicious_when:
+      - display_state_query
+      - script_or_implant_parent
+    high_risk_when:
+      - display_state_query
+      - script_or_implant_parent
+      - repeated_from_one_parent
+
+  false_positive:
+    - condition: Device management collects hardware inventory.
+      explanation: >-
+        Management agents run system_profiler on every Mac. The common agents are
+        excluded by parent name; any other shows the same query fleet-wide on a schedule.
+    - condition: A user or technician diagnoses a display problem.
+      explanation: >-
+        The query is run once or twice from a terminal during a support session, not
+        polled by a background process.
+    - condition: Display, docking or energy utilities read power state.
+      explanation: >-
+        These products query ioreg and pmset as part of their job. The parent is the
+        installed utility and the pattern is the same wherever it is installed.

@@ -1,0 +1,371 @@
+# Converted from THORCollective/HEARTH Flames/H119.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h119-psexec-style-execution-over-admin-shares-t1021-002
+version: 1.0.0
+
+info:
+  name: PsExec-style execution over SMB administrative shares
+  description: >-
+    PsExec and its relatives copy a service binary to ADMIN$ on the target, register it
+    as a service over RPC, and talk to it through a named pipe. Impacket's smbexec does
+    the same with a cmd.exe one-liner as the service, and atexec uses a scheduled task
+    that redirects output to a file in Windows\Temp. In the domain compromise Microsoft
+    described, the operator used PsExec and atexec with sprayed credentials to reach at
+    least fourteen servers. Service-install event 7045, the PSEXESVC pipe and
+    share-access event 5145 are not collected here. The process and file events on both
+    ends are: the client command on the source, and on the target the service binary
+    written to the Windows folder, the service process, and what it starts. Fan-out from
+    one source to many targets is left to the agent, which reads target names off the
+    client commands and counts hosts on the target-side events. SMB connections on port
+    445 are too many to return raw and are left out.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - lateral-movement
+    - smb
+    - admin-shares
+    - psexec
+    - impacket
+    - service-execution
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H119.md
+    - https://attack.mitre.org/techniques/T1021
+    - https://attack.mitre.org/techniques/T1021/002
+    - https://attack.mitre.org/detectionstrategies/DET0530
+    - https://www.microsoft.com/en-us/security/blog/2026/04/17/domain-compromise-predictive-shielding-shut-down-lateral-movement/
+
+mitre:
+  tactics:
+    - TA0008
+  techniques:
+    - T1021
+  sub_techniques:
+    - T1021.002
+  detection_strategies:
+    - DET0530
+  analytics:
+    - AN1468
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary is using PsExec or similar tools to laterally move via SMB
+    administrative shares (C$, ADMIN$), indicated by service installation events on
+    remote hosts and authenticated SMB connections from a single source to multiple
+    destinations in a short timeframe.
+  attacker_behavior:
+    - Runs PsExec or PAExec against a remote host name with explicit credentials.
+    - Copies a service executable to ADMIN$ on the target and starts it as a service.
+    - Runs commands through the service, which start as children of the service process.
+    - Uses Impacket smbexec or atexec, leaving a cmd.exe line that redirects output to a share or a Temp file.
+    - Repeats against many servers with the same reused password.
+  legitimate_behavior:
+    - Administrators use PsExec for remote maintenance from management workstations.
+    - Software deployment and backup agents copy to ADMIN$ and install services.
+    - Help desk scripts map C$ to collect logs.
+  risk_indicator:
+    - One source issues the client command against many targets in a short time.
+    - The source is a user workstation, not a management host.
+    - The service starts a shell that runs discovery or credential commands.
+    - The service executable has a random eight-letter name.
+    - A services.exe child is cmd.exe with output redirected to a loopback share.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: psexec-client-targeting-remote-host
+        name: PsExec-family client run against a remote host
+        purpose: >-
+          Return the client command on the source host, with the target in its
+          arguments. The agent counts distinct targets per source and user.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(psexec|psexec64|paexec|csexec|remcom)\.exe$/i
+          | CommandLine=/\\\\[A-Za-z0-9_.*,-]+/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: renamed-psexec-client-by-arguments
+        name: Client arguments of PsExec under another file name
+        purpose: >-
+          Return commands that carry PsExec's licence switch together with a remote
+          host, whatever the file is called.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName!=/^(psexec|psexec64)\.exe$/i
+          | CommandLine=/\s[-\/]accepteula\b/i
+          | CommandLine=/\s\\\\[A-Za-z0-9_.*,-]+\s/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: remote-execution-service-process-started
+        name: PsExec-family service process started on the target
+        purpose: >-
+          Return the service side of the tool starting on a target. Each event is one
+          remote execution received by that host.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(PSEXESVC|PAExec[^\\]*|RemComSvc|csexecsvc)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: process-started-by-remote-execution-service
+        name: Process started by the PsExec-family service
+        purpose: >-
+          Return what the service ran: the command the operator sent.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(PSEXESVC|PAExec[^\\]*|RemComSvc|csexecsvc)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: service-control-manager-started-shell
+        name: Shell or proxy binary started directly by services.exe
+        purpose: >-
+          Return interpreters whose parent is the service control manager. A service
+          whose binary path is a cmd.exe line is how smbexec and several frameworks run
+          a command; a PsExec service installed under a custom name with -r is also a
+          child of services.exe, but what it starts is one level further down and is not
+          returned here.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^services\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh|rundll32|regsvr32|mshta|wscript|cscript)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: task-run-command-with-temp-output-redirect
+        name: Task-started command redirecting output to a random Temp file
+        purpose: >-
+          Return cmd.exe lines that redirect both output streams to an eight-letter .tmp
+          file in a Temp folder, the form atexec uses to read results back over the
+          share.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^cmd\.exe$/i
+          | ParentBaseFileName=/^(svchost|taskeng|taskhostw)\.exe$/i
+          | CommandLine=/>\s*\S*\\Temp\\[A-Za-z]{8}\.tmp\s+2>&1/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: admin-share-mapped-from-command-line
+        name: net use against an administrative share
+        purpose: >-
+          Return net use commands that name ADMIN$, C$ or IPC$ on a remote host. The
+          agent counts distinct targets per source.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^net1?\.exe$/i
+          | CommandLine=/\buse\b/i
+          | CommandLine=/\\(ADMIN|IPC|[A-Z])\$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: service-executable-written-to-windows-folder
+        name: Service executable written to the root of the Windows folder
+        purpose: >-
+          Return executables written directly into the Windows folder under a
+          PsExec-family service name or a random eight-letter name, which is where a
+          copy to ADMIN$ lands. Operating system servicing also writes eight-letter
+          names there; the agent separates the two by name and time.
+        query: |
+          #event_simpleName=PeFileWritten
+          | TargetFileName=/\\Windows\\(PSEXESVC|PAExec[^\\]*|RemComSvc|csexecsvc|[A-Za-z]{8})\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: remote_service_execution
+      name: PsExec-style remote execution issued or received
+      description: >-
+        A PsExec-family client names a remote host, or on a target the PsExec-family
+        service starts, the service control manager starts a shell, or a task-run
+        command redirects to a random Temp file.
+      source: process_creation
+      field: command_line
+      indicates: smb_admin_share_lateral_movement
+
+  supporting:
+    - id: service_binary_dropped
+      name: Service executable written to the Windows folder
+      description: >-
+        An executable with a PsExec-family or random eight-letter name was written into
+        the Windows folder on the target.
+      source: file_creation
+      field: file_path
+      indicates: service_binary_copied_over_admin_share
+    - id: service_parent_chain
+      name: Command runs under the remote execution service
+      description: >-
+        The parent of the command is PSEXESVC, a relative of it, or services.exe.
+      source: process_creation
+      field: parent_process
+      indicates: service_based_remote_execution
+    - id: fan_out_from_one_source
+      name: One source reaches many targets
+      description: >-
+        One host and user issue client commands or share mappings against several
+        targets, or several hosts receive the service within a short period. The agent
+        derives the count from the returned events.
+      source: process_creation
+      field: host
+      indicates: lateral_movement_at_breadth
+    - id: non_admin_source_account
+      name: Account does not administer servers
+      description: >-
+        The user on the client command has no history of remote administration.
+      source: process_creation
+      field: user
+      indicates: activity_outside_user_role
+
+  contradicting:
+    - id: management_host_source
+      name: Source is a management or deployment host
+      description: >-
+        Asset records class the source as a jump host, deployment server or backup
+        server that uses admin shares routinely.
+      source: asset_inventory
+      field: ComputerName
+      indicates: routine_administration
+    - id: recurring_admin_job
+      name: Same command recurs on a schedule
+      description: >-
+        The same client command, targets and account repeat at fixed times.
+      source: baseline
+      field: CommandLine
+      indicates: scheduled_administration
+
+  risk_logic:
+    required:
+      - remote_service_execution
+
+    supporting:
+      any:
+        - service_binary_dropped
+        - service_parent_chain
+        - fan_out_from_one_source
+        - non_admin_source_account
+      all:
+        - service_parent_chain
+        - fan_out_from_one_source
+
+    contradicting:
+      any:
+        - management_host_source
+        - recurring_admin_job
+      all: []
+
+  verdict:
+    low_risk_when:
+      - remote_service_execution
+      - management_host_source
+    suspicious_when:
+      - remote_service_execution
+      - non_admin_source_account
+    high_risk_when:
+      - remote_service_execution
+      - fan_out_from_one_source
+      - non_admin_source_account
+
+  false_positive:
+    - condition: Administrators using PsExec.
+      explanation: >-
+        Remote maintenance with PsExec is common. It comes from management hosts and
+        known accounts, and reaches the servers that team runs.
+    - condition: Deployment and inventory products.
+      explanation: >-
+        Several products copy a service to ADMIN$ under their own name. The file name is
+        the product's and the source is its server.
+    - condition: Services that legitimately start cmd.exe.
+      explanation: >-
+        Some vendor services run batch files. They repeat with the same command line on
+        the same host and do not redirect output to a share.

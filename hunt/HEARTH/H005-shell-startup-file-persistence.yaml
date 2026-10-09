@@ -1,0 +1,275 @@
+# Converted from THORCollective/HEARTH Flames/H005.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-lin-hearth-h005-shell-startup-file-persistence-t1546-004
+version: 1.0.0
+
+info:
+  name: Persistence through bash startup and logout files
+  description: >-
+    Bash runs .bash_profile, .bash_login and .bashrc when a user opens a shell or
+    connects over SSH, and .bash_logout when the session ends. A line appended to any of
+    them runs as that user every time, with no new service, cron entry or binary. The
+    sensor does not report edits to arbitrary text files, so the hunt reads the commands
+    that write to these files and the scripts created under /etc/profile.d, and returns
+    them with the full command line.
+  severity: medium
+  author: huntgraph
+  tags:
+    - hearth
+    - persistence
+    - lolbas
+    - shell-profile
+    - linux
+    - macos
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H005.md
+    - https://attack.mitre.org/techniques/T1546
+    - https://attack.mitre.org/techniques/T1546/004
+    - https://attack.mitre.org/detectionstrategies/DET0020
+    - https://pberba.github.io/security/2022/02/06/linux-threat-hunting-for-persistence-initialization-scripts-and-shell-configuration/
+
+mitre:
+  tactics:
+    - TA0003
+  techniques:
+    - T1546
+  sub_techniques:
+    - T1546.004
+  detection_strategies:
+    - DET0020
+  analytics:
+    - AN0059
+    - AN0060
+  platforms:
+    - Linux
+    - macOS
+  data_sources:
+    - auditd:EXECVE
+    - auditd:SYSCALL
+    - macos:unifiedlog
+    - macos:endpointsecurity
+  data_components:
+    - Process Creation
+    - File Modification
+
+hypothesis:
+  statement: >-
+    An adversary is establishing persistence on Linux hosts by adding commands to the
+    files a user's shell runs automatically, .bash_profile, .bashrc, .bash_login and
+    .bash_logout, so the commands execute at every login, new shell or logout.
+  attacker_behavior:
+    - Appends a download-and-run or reverse-shell line to a user's .bashrc or .bash_profile.
+    - Adds cleanup or beacon commands to .bash_logout so they fire as the session closes.
+    - Drops a script into /etc/profile.d to cover every user who logs in.
+    - Edits the file with echo, tee, sed or printf from a non-interactive parent to avoid opening an editor.
+  legitimate_behavior:
+    - Users and administrators add aliases, PATH entries and prompts to their own startup files.
+    - Installers for language toolchains and version managers append an initialisation line.
+    - Configuration management writes standard profile snippets across the fleet.
+  risk_indicator:
+    - The written content fetches remote code, decodes a blob or opens a network socket.
+    - The command edits another user's home directory or root's startup files.
+    - The parent is a web server, database, container runtime or another non-interactive service.
+    - The payload referenced lives in /tmp, /dev/shm, /var/tmp or a hidden directory.
+
+requires:
+  platforms:
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NewScriptWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: bash-startup-file-written
+        name: Command writing to a bash startup or logout file
+        purpose: >-
+          Return each command that names a bash startup file together with a write
+          operator. The filename test is a plain case-sensitive match and runs first, so
+          most process events are dropped before the second pattern is tried.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=/^(Lin|Mac)$/
+          | CommandLine=/\.bash(rc|_profile|_login|_logout)\b|\/etc\/(profile|bash\.bashrc)\b/
+          | CommandLine=/>>?|\btee\b|\bsed\s+-i|\bprintf\b|\becho\b|\bcp\b|\bmv\b|\binstall\b/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: startup-file-fetch-or-decode
+        name: Startup-file command carrying a fetch, decode or socket
+        purpose: >-
+          Narrow to writes whose own command line shows what is being planted: a
+          downloader, a decoder, a socket or a payload in a scratch directory.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=/^(Lin|Mac)$/
+          | CommandLine=/\.bash(rc|_profile|_login|_logout)\b|\/etc\/profile\.d\//
+          | CommandLine=/\b(curl|wget|nc|ncat|socat|base64|python3?|perl|nohup)\b|\/dev\/tcp\/|\/(tmp|dev\/shm|var\/tmp)\//
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: profile-d-script-written
+        name: Script created under /etc/profile.d
+        purpose: >-
+          Return new scripts in the system-wide profile directory, which run for every
+          login and are the one startup location the sensor reports as a file write.
+        query: |
+          #event_simpleName=NewScriptWritten
+          | event_platform=/^(Lin|Mac)$/
+          | TargetFileName=/^\/etc\/profile\.d\//
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: startup_file_write_command
+      name: Command writes to a shell startup or logout file
+      description: >-
+        The command line names .bashrc, .bash_profile, .bash_login, .bash_logout or a
+        system profile file together with a redirection or an in-place edit.
+      source: process_creation
+      field: command_line
+      indicates: shell_startup_persistence_candidate
+
+  supporting:
+    - id: planted_remote_code
+      name: Written content fetches or decodes code
+      description: >-
+        The same command line carries curl, wget, a base64 decode, a /dev/tcp socket or
+        a path in a scratch directory, showing what the startup file will run.
+      source: process_creation
+      field: command_line
+      indicates: malicious_startup_payload
+    - id: service_parent_process
+      name: Edit issued by a non-interactive service
+      description: >-
+        The parent is a web server, database, container runtime, cron or another daemon,
+        not a login shell or a package manager.
+      source: process_creation
+      field: parent_process
+      indicates: post_exploitation_activity
+    - id: system_wide_profile_script
+      name: New script in /etc/profile.d
+      description: >-
+        A script was created in the system-wide profile directory, extending the
+        persistence to every account that logs in.
+      source: file_creation
+      field: file_path
+      indicates: system_wide_login_persistence
+    - id: privileged_target_account
+      name: Edit made as root or to another user's files
+      description: >-
+        The user on the event is root, or the path edited is in a home directory that
+        does not belong to the account running the command.
+      source: process_creation
+      field: user
+      indicates: cross_account_persistence
+
+  contradicting:
+    - id: configuration_management_run
+      name: Change made by configuration management
+      description: >-
+        The host is managed by a configuration tool whose recorded run covers the time
+        and the profile snippet written.
+      source: change_management
+      field: ComputerName
+      indicates: managed_configuration_change
+    - id: developer_workstation
+      name: Host is a developer workstation
+      description: >-
+        Asset records class the host as a developer machine, where toolchain installers
+        routinely append to the owner's startup files.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_toolchain_setup
+
+  risk_logic:
+    required:
+      - startup_file_write_command
+
+    supporting:
+      any:
+        - planted_remote_code
+        - service_parent_process
+        - system_wide_profile_script
+        - privileged_target_account
+      all:
+        - planted_remote_code
+        - service_parent_process
+
+    contradicting:
+      any:
+        - configuration_management_run
+        - developer_workstation
+      all: []
+
+  verdict:
+    low_risk_when:
+      - startup_file_write_command
+      - configuration_management_run
+      - developer_workstation
+    suspicious_when:
+      - startup_file_write_command
+      - planted_remote_code
+    high_risk_when:
+      - startup_file_write_command
+      - planted_remote_code
+      - service_parent_process
+
+  false_positive:
+    - condition: A toolchain installer appends its initialisation line.
+      explanation: >-
+        Version managers and SDK installers add an eval or source line to .bashrc and
+        often use curl to do it. The line points at the tool's own directory under the
+        user's home, and the parent is the installer the user just ran.
+    - condition: A user customises their own shell.
+      explanation: >-
+        Aliases, exports and prompt changes are everyday edits. They carry no network or
+        decode commands and are made by the owner from an interactive shell.
+    - condition: Configuration management distributes profile snippets.
+      explanation: >-
+        The same content lands on many hosts at once from the management agent. Breadth
+        and the agent as parent distinguish it from a single host edited by a service
+        process.

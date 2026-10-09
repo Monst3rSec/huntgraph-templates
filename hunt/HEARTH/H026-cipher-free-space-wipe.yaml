@@ -1,0 +1,251 @@
+# Converted from THORCollective/HEARTH Flames/H026.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h026-cipher-free-space-wipe-t1070-004
+version: 1.0.0
+
+info:
+  name: cipher.exe /w used to overwrite free space after ransomware deployment
+  description: >-
+    cipher.exe is the Windows tool for the Encrypting File System. Its /w option
+    overwrites every unallocated cluster on a volume three times, which destroys deleted
+    files that forensic tools could otherwise recover: the originals a ransomware payload
+    deleted after encrypting them, and the operator's own dropped tools. CyberLock runs
+    it after encryption. The option has almost no everyday use, so each run is worth
+    reading. The hunt returns them with the volume named and the parent that issued the
+    command.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - stealth
+    - indicator-removal
+    - cipher
+    - ransomware
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H026.md
+    - https://attack.mitre.org/techniques/T1070
+    - https://attack.mitre.org/techniques/T1070/004
+    - https://attack.mitre.org/detectionstrategies/DET0140
+    - https://blog.talosintelligence.com/fake-ai-tool-installers/
+
+# The Windows analytic for T1070.004 lists command execution, file access and file
+# deletion but not process creation, which is what this hunt reads. No analytic is
+# declared, so data_sources and data_components describe the hunt, not an ATT&CK mapping.
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1070
+  sub_techniques:
+    - T1070.004
+  detection_strategies:
+    - DET0140
+  analytics: []
+  platforms:
+    - Windows
+  data_sources:
+    - CrowdStrike:Endpoint
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    Threat actors are using the built-in Windows tool cipher.exe with the /w option to
+    overwrite free space on the victim's drive partitions, hindering forensic recovery of
+    deleted files after deploying the CyberLock ransomware.
+  attacker_behavior:
+    - Runs cipher /w against each drive letter after the encryption pass finishes.
+    - Issues the command from the ransomware process, a PowerShell script or a batch file.
+    - Wipes several volumes in sequence, including data and backup drives.
+    - Pairs the wipe with shadow-copy deletion and event-log clearing.
+  legitimate_behavior:
+    - An administrator wipes free space before decommissioning or reassigning a machine.
+    - A data-sanitisation procedure runs it after removing sensitive files.
+    - Security-hardening scripts include it on shared or kiosk machines.
+  risk_indicator:
+    - The parent is PowerShell, a script host or an unsigned executable in a user-writable path.
+    - Several volumes are wiped in a short span on one host.
+    - Shadow copies are deleted or recovery is disabled on the same host around the same time.
+    - The host is a production server or a user workstation with no decommissioning record.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: cipher-wipe-free-space
+        name: cipher.exe run with the /w option
+        purpose: >-
+          Return every free-space wipe. The image-name test is exact and runs first, and
+          the switch pattern accepts both the slash and dash forms.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^cipher\.exe$/i
+          | CommandLine=/\s[\/-]w\s*:?/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: cipher-wipe-from-scripted-parent
+        name: Free-space wipe issued by a script or unknown executable
+        purpose: >-
+          Narrow to wipes whose parent is not an interactive console, which is how a
+          payload or a post-encryption script issues it.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^cipher\.exe$/i
+          | CommandLine=/\s[\/-]w\s*:?/i
+          | ParentBaseFileName!=/^(explorer|WindowsTerminal|OpenConsole|conhost)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: recovery-inhibition-alongside-wipe
+        name: Shadow-copy deletion or recovery disabling on the host
+        purpose: >-
+          Return the recovery-inhibiting commands ransomware runs beside the wipe, so the
+          agent can see whether a cipher run on a host sits inside that sequence.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(vssadmin|wmic|bcdedit|wbadmin|wevtutil|powershell|pwsh)\.exe$/i
+          | CommandLine=/delete\s+shadows|shadowcopy\s+delete|Win32_ShadowCopy|recoveryenabled\s+no|bootstatuspolicy\s+ignoreallfailures|delete\s+catalog|\bcl\s+(security|system|application)\b|Clear-EventLog/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: free_space_wipe_command
+      name: cipher.exe overwriting free space
+      description: >-
+        A cipher.exe command line carries the /w option and a drive or directory,
+        showing unallocated space on that volume was overwritten.
+      source: process_creation
+      field: command_line
+      indicates: forensic_recovery_hindered
+
+  supporting:
+    - id: scripted_wipe_parent
+      name: Wipe issued by a script or unknown executable
+      description: >-
+        The parent is PowerShell, cmd started by another program, a script host or an
+        executable outside the system and Program Files directories.
+      source: process_creation
+      field: parent_process
+      indicates: automated_post_impact_cleanup
+    - id: recovery_inhibited_same_host
+      name: Recovery inhibited on the same host
+      description: >-
+        Shadow copies were deleted, boot recovery was disabled or event logs were cleared
+        on the host around the time of the wipe.
+      source: process_creation
+      field: command_line
+      indicates: ransomware_impact_sequence
+    - id: wipe_run_by_unexpected_account
+      name: Wipe run under an unexpected account
+      description: >-
+        The user is SYSTEM, a service account or a standard user, not the administrator
+        responsible for the machine.
+      source: process_creation
+      field: user
+      indicates: activity_outside_user_role
+
+  contradicting:
+    - id: decommissioning_record
+      name: Host is being decommissioned or sanitised
+      description: >-
+        A change or asset-disposal record covers the host and time for a free-space wipe.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_data_sanitisation
+    - id: hardening_script_host
+      name: Host runs a sanctioned sanitisation script
+      description: >-
+        Asset records place the host in a kiosk, lab or shared-machine group whose
+        maintenance script includes the wipe.
+      source: asset_inventory
+      field: ComputerName
+      indicates: scheduled_maintenance
+
+  risk_logic:
+    required:
+      - free_space_wipe_command
+
+    supporting:
+      any:
+        - scripted_wipe_parent
+        - recovery_inhibited_same_host
+        - wipe_run_by_unexpected_account
+      all:
+        - scripted_wipe_parent
+        - recovery_inhibited_same_host
+
+    contradicting:
+      any:
+        - decommissioning_record
+        - hardening_script_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - free_space_wipe_command
+      - decommissioning_record
+      - hardening_script_host
+    suspicious_when:
+      - free_space_wipe_command
+      - scripted_wipe_parent
+    high_risk_when:
+      - free_space_wipe_command
+      - scripted_wipe_parent
+      - recovery_inhibited_same_host
+
+  false_positive:
+    - condition: An administrator sanitises a machine before reuse or disposal.
+      explanation: >-
+        This is the documented purpose of the option. It is run interactively by a known
+        administrator on a machine with a disposal or reassignment record.
+    - condition: A maintenance script wipes free space on shared machines.
+      explanation: >-
+        Kiosk and lab builds sometimes schedule it. The same task runs on the whole
+        group at the same time each cycle.
+    - condition: Backup software deletes shadow copies.
+      explanation: >-
+        The third case matches routine shadow-copy management by backup products. Those
+        hits matter only on a host that also shows a wipe.

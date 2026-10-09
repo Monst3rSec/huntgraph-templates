@@ -1,0 +1,319 @@
+# Converted from THORCollective/HEARTH Flames/H069.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+# Also holds H090 (ClickFix commands that use finger.exe to fetch ransomware precursor
+# tooling, Velvet Tempest). It differs from H069 in how the command reaches the host, a
+# pasted line and not a script; the finger.exe run and the port 79 connection are the
+# same. The csc.exe compilation H090 mentions is a case in H088.
+type: detection
+
+id: hg-win-hearth-h069-finger-exe-renamed-payload-retrieval-t1036-003
+version: 1.1.0
+
+info:
+  name: finger.exe copied, renamed and used to fetch payloads over TCP 79
+  description: >-
+    finger.exe ships with every Windows installation and asks a remote Finger server
+    about a user. The server can answer with any text, so the reply can be a script. In
+    the CrashFix and KongTuke campaign the binary is copied to the temporary directory
+    as ct.exe, run against the attacker's server, and its output piped to cmd or
+    PowerShell. Renaming it defeats rules that key on the file name, but the copy
+    command names the original, the invocation keeps Finger's user@host argument, and
+    the connection still goes to TCP port 79, which nothing in a modern estate uses.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - command-and-control
+    - ingress-tool-transfer
+    - finger
+    - lolbin
+    - masquerading
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H069.md
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H090.md
+    - https://attack.mitre.org/techniques/T1105
+    - https://attack.mitre.org/techniques/T1036
+    - https://attack.mitre.org/techniques/T1036/003
+    - https://attack.mitre.org/detectionstrategies/DET0060
+    - https://attack.mitre.org/detectionstrategies/DET0005
+
+mitre:
+  tactics:
+    - TA0011
+    - TA0005
+  techniques:
+    - T1105
+    - T1036
+  sub_techniques:
+    - T1036.003
+  detection_strategies:
+    - DET0060
+    - DET0005
+  analytics:
+    - AN0165
+    - AN0012
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary is abusing the native Windows utility finger.exe by copying and renaming
+    it to a temporary directory to retrieve remote payloads over TCP port 79, targeting
+    enterprise endpoints to establish command and control while evading application
+    controls.
+  attacker_behavior:
+    - Copies finger.exe from System32 to the temporary directory under a short name such as ct.exe.
+    - Runs the copy with a user@host argument pointing at an attacker Finger server.
+    - Pipes the reply into cmd or PowerShell so the returned text executes.
+    - Checks whether the machine is domain-joined before continuing.
+    - Issues the whole chain from a pasted command or a malicious browser extension's prompt.
+  legitimate_behavior:
+    - Almost none; Finger is not used in modern enterprise networks.
+    - Network engineers on legacy or academic networks occasionally query a Finger server.
+    - Penetration testers use it to demonstrate the technique.
+  risk_indicator:
+    - Any process connects to TCP port 79.
+    - finger.exe runs at all, or is named as the source of a copy.
+    - A binary in Temp is run with a user@host argument.
+    - The output is piped to an interpreter.
+    - The parent is cmd or PowerShell started from Explorer.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        image_hash: SHA256HashData
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        file_hash: SHA256HashData
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: connection-to-finger-port
+        name: Outbound connection to TCP port 79
+        purpose: >-
+          Return every connection to port 79, whatever the process is called. This is
+          the case that survives renaming, and an exact port match makes it the cheapest
+          query in the template.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | RemotePort=79
+          | !cidr(RemoteAddressIP4, subnet=["127.0.0.0/8", "169.254.0.0/16"])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: finger-executed-or-copied
+        name: finger.exe executed or named in a command
+        purpose: >-
+          Return runs of finger.exe under its own name, and any command that names it,
+          which includes the copy that creates the renamed binary.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^finger\.exe$/i
+            or CommandLine=/\bfinger(\.exe)?\b.*(@|\bcopy\b|\bCopy-Item\b|\bxcopy\b)|(\bcopy\b|\bCopy-Item\b|\bxcopy\b).*\bfinger\.exe\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: temp-binary-with-finger-style-argument
+        name: Binary in a temporary directory run with a user@host argument
+        purpose: >-
+          Return executables under Temp and other writable directories whose only
+          argument has Finger's user@host shape, the renamed copy in use.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ImageFileName=/\\(AppData\\Local\\Temp|Windows\\Temp|Users\\Public|ProgramData)\\[^\\]+\.exe$/i
+          | CommandLine=/\.exe"?\s+[A-Za-z0-9._-]*@[A-Za-z0-9.-]+\s*(\||$)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: executable-written-to-temp-by-shell
+        name: Executable written to a temporary directory by a shell copy
+        purpose: >-
+          Return PE files written directly into Temp, so the agent can compare the hash
+          with the system's own finger.exe and confirm a renamed copy.
+        query: |
+          #event_simpleName=PeFileWritten
+          | TargetFileName=/\\(AppData\\Local\\Temp|Windows\\Temp)\\[^\\]{1,12}\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: finger_protocol_use
+      name: Finger client used from the host
+      description: >-
+        A connection goes to TCP port 79, or a process event shows finger.exe run,
+        copied, or a renamed copy invoked with a user@host argument.
+      source: network_connection
+      field: remote_port
+      indicates: payload_retrieval_over_finger_protocol
+
+  supporting:
+    - id: finger_server_address
+      name: Finger server is a public address
+      description: >-
+        The remote address of the port 79 connection is outside the private ranges.
+      source: network_connection
+      field: remote_address
+      indicates: external_payload_server
+    - id: connecting_process_not_finger
+      name: Connecting process is not named finger.exe
+      description: >-
+        The process that connected to port 79 has a different name, showing the binary
+        was renamed.
+      source: network_connection
+      field: process_name
+      indicates: renamed_system_utility
+    - id: output_piped_to_interpreter
+      name: Reply piped to cmd or PowerShell
+      description: >-
+        The command line pipes the client's output into an interpreter, so the server's
+        reply is executed.
+      source: process_creation
+      field: command_line
+      indicates: remote_content_executed
+    - id: renamed_copy_hash
+      name: Temp executable has finger.exe's hash
+      description: >-
+        An executable written to Temp carries the same hash as the system's finger.exe.
+      source: file_creation
+      field: file_hash
+      indicates: system_binary_copied_and_renamed
+    - id: copy_in_temp_path
+      name: Client runs from a temporary directory
+      description: >-
+        The image path of the process is under Temp, Public or ProgramData.
+      source: process_creation
+      field: image_path
+      indicates: execution_from_staging_directory
+
+  contradicting:
+    - id: sanctioned_test_host
+      name: Host is a designated testing endpoint
+      description: >-
+        Asset records list the host as a detection-validation or penetration-test
+        system.
+      source: asset_inventory
+      field: ComputerName
+      indicates: authorised_security_testing
+    - id: legacy_finger_service
+      name: Destination is a known internal legacy service on port 79
+      description: >-
+        The remote address is an inventoried internal system that still runs a service
+        on port 79.
+      source: asset_inventory
+      field: RemoteAddressIP4
+      indicates: legacy_service_use
+
+  risk_logic:
+    required:
+      - finger_protocol_use
+
+    supporting:
+      any:
+        - finger_server_address
+        - connecting_process_not_finger
+        - output_piped_to_interpreter
+        - renamed_copy_hash
+        - copy_in_temp_path
+      all:
+        - finger_server_address
+        - connecting_process_not_finger
+
+    contradicting:
+      any:
+        - sanctioned_test_host
+        - legacy_finger_service
+      all: []
+
+  verdict:
+    low_risk_when:
+      - finger_protocol_use
+      - sanctioned_test_host
+    suspicious_when:
+      - finger_protocol_use
+      - finger_server_address
+    high_risk_when:
+      - finger_protocol_use
+      - finger_server_address
+      - connecting_process_not_finger
+      - output_piped_to_interpreter
+
+  false_positive:
+    - condition: A tester demonstrates the technique.
+      explanation: >-
+        Finger as a download channel is a known trick. It appears on test hosts inside
+        recorded exercises.
+    - condition: A legacy internal system uses port 79.
+      explanation: >-
+        Rare, but some old equipment answers on it. The destination is internal and
+        inventoried, and the client is not a renamed binary in Temp.
+    - condition: Installers write executables to Temp.
+      explanation: >-
+        The file case returns short-named executables that installers unpack. It is
+        there for hash comparison on a host that already shows a port 79 connection.

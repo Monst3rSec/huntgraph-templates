@@ -1,0 +1,334 @@
+# Converted from THORCollective/HEARTH Flames/H162.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-lin-hearth-h162-web-service-chmod-staging-in-dev-shm-t1222-002
+version: 1.0.0
+
+info:
+  name: Web service opening up permissions on a payload staged in /dev/shm or /tmp
+  description: >-
+    After exploiting a Linux web service, Confluence under Java in the reported
+    intrusion, the intruder downloads a second stage into /dev/shm or /tmp, makes it
+    world-writable and executable with chmod 777, and runs it. /dev/shm is held in
+    memory, is writable by every account and is seldom covered by rules that list where
+    executables may run. The sanity check that shapes this hunt: a Java process seldom
+    starts chmod itself. It starts sh -c with the whole command, and chmod is a child of
+    that shell. The cases therefore look for the chmod text on the command line of the
+    service's direct child, and separately for chmod 777 on /dev/shm whatever its
+    parent. A permission change made by a system call from the payload's own code starts
+    no process and is not seen. The F5 management plane HEARTH also names carries no
+    sensor.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-impairment
+    - chmod
+    - dev-shm
+    - payload-staging
+    - web-service
+    - confluence
+    - linux
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H162.md
+    - https://attack.mitre.org/techniques/T1222
+    - https://attack.mitre.org/techniques/T1222/002
+    - https://attack.mitre.org/detectionstrategies/DET0351
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1222
+  sub_techniques:
+    - T1222.002
+  detection_strategies:
+    - DET0351
+  analytics:
+    - AN0998
+  platforms:
+    - Linux
+  data_sources:
+    - linux:osquery
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    A compromised Linux web service (Confluence under Java, F5 management) is staging a
+    payload in /dev/shm or /tmp by performing chmod 777 on the directory or file,
+    enabling execution of a downloaded second-stage binary from a world-writable,
+    RAM-backed location that survives no reboots but defeats common executable-path
+    allowlists.
+  attacker_behavior:
+    - Runs a shell command through the exploited service.
+    - Downloads or decodes a binary into /dev/shm or /tmp.
+    - Runs chmod 777 on the file or the directory.
+    - Executes the binary from that location, often under a name copied from a system tool.
+  legitimate_behavior:
+    - Java applications unpack native libraries into /tmp and load them.
+    - Installers and build jobs mark scripts in /tmp executable.
+    - Databases and browsers use /dev/shm for shared memory segments, without executing from it.
+  risk_indicator:
+    - A child of the web service runs chmod on a path under /dev/shm, /tmp or /var/tmp.
+    - chmod 777 is applied to anything under /dev/shm.
+    - The same service fetches or decodes a file into that path beforehand.
+    - A process then runs from /dev/shm.
+    - The user is the web application's service account.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NewExecutableWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: permission-change-on-staging-path-under-web-service
+        name: Child of a web service running chmod on a staging path
+        purpose: >-
+          Return direct children of Java, Tomcat, Apache, nginx, PHP-FPM or Node whose
+          command line runs chmod against /dev/shm, /tmp or /var/tmp. The child is
+          usually sh -c carrying the whole command, and sometimes chmod itself; both
+          match. A chmod started two shells below the service has a shell as its parent
+          and is left to the next case.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ParentBaseFileName=/^(java|jsvc|tomcat[0-9]*|catalina\.sh|httpd|apache2?|nginx|php-fpm[0-9.]*|node)$/
+          | CommandLine=/chmod\s+(-[a-zA-Z]+\s+)*\S+\s+["']?\/(dev\/shm|tmp|var\/tmp)(\/|\s|["';&|]|$)/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: chmod-777-on-dev-shm
+        name: chmod 777 applied under /dev/shm
+        purpose: >-
+          Return chmod processes that give everyone full access to a path under
+          /dev/shm, whatever started them. Narrow enough to run without a parent test.
+          The same command against /tmp is left out here because installers do it
+          constantly; it is returned only under a web-service parent, above.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ImageFileName=/\/chmod$/
+          | CommandLine=/\/dev\/shm(\/|\s|$)/
+          | CommandLine=/\b0?777\b|\ba\+rwx\b|\bugo\+rwx\b/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: download-or-decode-into-staging-path-under-web-service
+        name: Child of a web service fetching or decoding into a staging path
+        purpose: >-
+          Return direct children of the same services whose command line writes a curl
+          or wget download, or a Base64 decode, into /dev/shm, /tmp or /var/tmp. This is
+          the step before the chmod.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ParentBaseFileName=/^(java|jsvc|tomcat[0-9]*|catalina\.sh|httpd|apache2?|nginx|php-fpm[0-9.]*|node)$/
+          | CommandLine=/(curl|wget)\s[^|;]*\s-(o|O)\s*["']?\/(dev\/shm|tmp|var\/tmp)\/|base64\s+(-d|--decode)[^|;]*>\s*["']?\/(dev\/shm|tmp|var\/tmp)\//
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: process-running-from-dev-shm
+        name: Process whose image is under /dev/shm
+        purpose: >-
+          Return every process that runs from /dev/shm. Execution from /tmp is far more
+          common and is not returned raw here; H019 carries a case for it.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ImageFileName=/^\/dev\/shm\//
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: executable-written-to-dev-shm
+        name: Executable file written under /dev/shm
+        purpose: >-
+          Return executables the sensor sees written into /dev/shm, with the writing
+          process id, so a payload that is staged and never run in the window is still
+          seen.
+        query: |
+          #event_simpleName=NewExecutableWritten
+          | event_platform=Lin
+          | TargetFileName=/^\/dev\/shm\//
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: staging_path_permission_change
+      name: chmod run against /dev/shm or a temporary path
+      description: >-
+        A process command line runs chmod on a path under /dev/shm, /tmp or /var/tmp,
+        under a web service or with mode 777 on /dev/shm.
+      source: process_creation
+      field: command_line
+      indicates: payload_made_executable
+
+  supporting:
+    - id: web_service_parent
+      name: Parent is a web or application server
+      description: >-
+        The parent of the process is Java, Tomcat, a web server worker, PHP-FPM or Node.
+      source: process_creation
+      field: parent_process
+      indicates: execution_from_compromised_service
+    - id: service_account_context
+      name: Runs as the application's service account
+      description: >-
+        The user on the event is the account the web application runs under.
+      source: process_creation
+      field: user
+      indicates: post_exploitation_of_web_service
+    - id: execution_from_dev_shm
+      name: Process runs from /dev/shm
+      description: >-
+        A process on the host has an image path under /dev/shm.
+      source: process_creation
+      field: image_path
+      indicates: payload_execution_from_memory_backed_path
+    - id: staged_name_copies_system_tool
+      name: Staged binary is named after a system tool
+      description: >-
+        The image name of the process running from /dev/shm copies a system daemon or
+        utility.
+      source: process_creation
+      field: image_name
+      indicates: masqueraded_payload_name
+    - id: executable_written_to_dev_shm
+      name: Executable written into /dev/shm
+      description: >-
+        A file-write event records a new executable under /dev/shm.
+      source: file_creation
+      field: file_path
+      indicates: payload_staged
+    - id: fetch_chmod_execute_sequence
+      name: Fetch, chmod and execution in order
+      description: >-
+        A download or decode into the path, the chmod and a process running from the
+        path occur in that order within about a minute on one host, which the agent
+        derives from the returned events.
+      source: process_creation
+      field: process_id
+      indicates: staged_payload_chain
+
+  contradicting:
+    - id: application_unpacks_native_code
+      name: Application is known to unpack native code there
+      description: >-
+        Asset records or vendor documentation show the application extracts native
+        libraries or helpers into /tmp and marks them executable at start-up.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_application_behaviour
+    - id: recorded_deployment
+      name: Activity is a recorded deployment
+      description: >-
+        A change record covers an install or upgrade of the application on the host at
+        the time.
+      source: change_management
+      field: ComputerName
+      indicates: approved_change
+
+  risk_logic:
+    required:
+      - staging_path_permission_change
+
+    supporting:
+      any:
+        - web_service_parent
+        - service_account_context
+        - execution_from_dev_shm
+        - staged_name_copies_system_tool
+        - executable_written_to_dev_shm
+        - fetch_chmod_execute_sequence
+      all:
+        - web_service_parent
+        - execution_from_dev_shm
+
+    contradicting:
+      any:
+        - application_unpacks_native_code
+        - recorded_deployment
+      all: []
+
+  verdict:
+    low_risk_when:
+      - staging_path_permission_change
+      - application_unpacks_native_code
+    suspicious_when:
+      - staging_path_permission_change
+      - web_service_parent
+    high_risk_when:
+      - staging_path_permission_change
+      - web_service_parent
+      - execution_from_dev_shm
+
+  false_positive:
+    - condition: Java libraries that unpack native code.
+      explanation: >-
+        Compression, database and networking libraries extract a shared object into /tmp
+        and may chmod it. The file is a .so, the path repeats at every start and nothing
+        is downloaded first.
+    - condition: Node build steps on a server.
+      explanation: >-
+        A package's install script may chmod a helper under /tmp. It happens during a
+        deployment and the parent is npm under a build account.
+    - condition: Test and benchmark tools.
+      explanation: >-
+        Some performance tools run from /dev/shm on purpose. They are started by an
+        administrator, not by the web service.

@@ -1,0 +1,317 @@
+# Converted from THORCollective/HEARTH Flames/H154.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h154-certificate-authority-audit-filter-tampering-t1685-001
+version: 1.0.0
+
+info:
+  name: Certificate Services audit filter lowered on a certification authority
+  description: >-
+    A certification authority writes its request and issuance events (4886, 4887, 4898)
+    to the Security log only for the categories set in its AuditFilter registry value;
+    127 turns all of them on and 0 turns all of them off. An intruder with administrator
+    rights on the authority lowers the value with certutil -setreg, or writes the
+    registry directly, before abusing templates, so that nothing is logged. The change
+    takes effect when the service restarts. Event 4885, which reports the change, is
+    itself a Security-log event this deployment does not collect. The hunt reads the
+    command, the registry write, the audit-policy subcategory being turned off and the
+    service restart. The value is a number and the sensor's string field does not carry
+    it, so the new value is known only when a command states it.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-impairment
+    - ad-cs
+    - certutil
+    - audit-policy
+    - certification-authority
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H154.md
+    - https://attack.mitre.org/techniques/T1685
+    - https://attack.mitre.org/techniques/T1685/001
+    - https://attack.mitre.org/detectionstrategies/DET0187
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1685
+  sub_techniques:
+    - T1685.001
+  detection_strategies:
+    - DET0187
+  analytics:
+    - AN0535
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    Threat actors with local administrator access to an Enterprise CA host are modifying
+    HKLM\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\<CA name>\AuditFilter,
+    through certutil -setreg CA\AuditFilter 0 or a direct registry write, to silence
+    Certificate Services events 4886, 4887 and 4898 before performing ESC1 to ESC16
+    abuse.
+  attacker_behavior:
+    - Runs certutil -setreg CA\AuditFilter with 0 or another value below 127.
+    - Writes the AuditFilter value with reg.exe or PowerShell.
+    - Turns off the Certification Services audit subcategory with auditpol.
+    - Restarts the certificate service so the change takes effect.
+    - Requests or forges certificates while nothing is logged.
+  legitimate_behavior:
+    - PKI administrators set AuditFilter to 127 when building or hardening an authority.
+    - The certificate service is restarted after patching and configuration changes.
+    - Backup and migration scripts read and restore the authority's registry configuration.
+  risk_indicator:
+    - AuditFilter is set to a value below 127.
+    - The change is made outside a recorded maintenance window.
+    - The Certification Services audit subcategory is disabled on the same host.
+    - The certificate service is restarted straight afterwards.
+    - The account is not a PKI administrator.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: certutil-setting-audit-filter
+        name: certutil setting the CA audit filter
+        purpose: >-
+          Return certutil -setreg commands that name CA\AuditFilter, with the value
+          being set. A value of 127 is hardening and anything lower removes categories;
+          the agent reads the number from the command line.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^certutil\.exe$/i
+          | CommandLine=/-setreg\s+["']?CA\\AuditFilter\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: command-writing-audit-filter-in-registry
+        name: Command writing AuditFilter under the CertSvc configuration key
+        purpose: >-
+          Return reg.exe, PowerShell and other commands that name both the CertSvc
+          configuration key and AuditFilter, the direct route that avoids certutil.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/CertSvc\\Configuration\b.*\bAuditFilter\b|\bAuditFilter\b.*CertSvc\\Configuration\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: audit-filter-registry-value-written
+        name: AuditFilter value written in the registry
+        purpose: >-
+          Return the registry write itself, however it was made, including through the
+          Certification Authority console. The new number is not on the event. This case
+          depends on the sensor reporting writes under Services\CertSvc\Configuration;
+          confirm in the tenant.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\Services\\CertSvc\\Configuration\\/i
+          | RegValueName=/^AuditFilter$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: certification-services-audit-subcategory-disabled
+        name: auditpol disabling the Certification Services subcategory
+        purpose: >-
+          Return auditpol commands that turn off success or failure auditing for
+          Certification Services, by name or by its GUID. With the subcategory off the
+          filter value no longer matters.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^auditpol\.exe$/i
+          | CommandLine=/\/set\b/i
+          | CommandLine=/Certification Services|0CCE9221-69AE-11D9-BED3-505054503030/i
+          | CommandLine=/:disable\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: certificate-service-restarted
+        name: Certificate service stopped or restarted by command
+        purpose: >-
+          Return commands that stop, start or restart CertSvc. The filter is read at
+          service start, so a restart after the change is what makes it effective.
+          Restarts are also routine after patching; the agent keeps those that follow a
+          filter change on the same host.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(net|net1|sc|powershell|pwsh)\.exe$/i
+          | CommandLine=/\b(stop|start|restart)(-service)?\s+(-name\s+)?["']?certsvc\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: audit_filter_change_command
+      name: Command changes the CA audit filter or audit subcategory
+      description: >-
+        A process command line sets CA\AuditFilter, writes AuditFilter under the CertSvc
+        configuration key, or disables the Certification Services audit subcategory.
+      source: process_creation
+      field: command_line
+      indicates: certificate_audit_logging_reduced
+
+  supporting:
+    - id: audit_filter_registry_write
+      name: AuditFilter value written
+      description: >-
+        A registry write to AuditFilter under Services\CertSvc\Configuration is recorded
+        on the host.
+      source: registry
+      field: registry_path
+      indicates: audit_configuration_modified
+    - id: service_restart_follows
+      name: Certificate service restarted after the change
+      description: >-
+        A command stops or restarts CertSvc after the filter change on the same host,
+        which the agent establishes from the order of the returned events.
+      source: process_creation
+      field: image_name
+      indicates: change_made_effective
+    - id: non_pki_administrator
+      name: Account is not a PKI administrator
+      description: >-
+        The user on the event is not a member of the team that manages the authority.
+      source: process_creation
+      field: user
+      indicates: unauthorised_configuration_change
+    - id: remote_or_script_parent
+      name: Started from a remote session or script
+      description: >-
+        The parent is a remote-management process, a script host or a service, not an
+        administrator's console session.
+      source: process_creation
+      field: parent_process
+      indicates: operator_driven_execution
+
+  contradicting:
+    - id: filter_set_to_full_auditing
+      name: Value set is 127
+      description: >-
+        The command sets AuditFilter to 127, which turns every category on.
+      source: process_creation
+      field: command_line
+      indicates: audit_hardening
+    - id: recorded_ca_maintenance
+      name: Change is recorded CA maintenance
+      description: >-
+        A change record covers the host and time for building, migrating or hardening
+        the authority.
+      source: change_management
+      field: ComputerName
+      indicates: approved_configuration_change
+
+  risk_logic:
+    required:
+      - audit_filter_change_command
+
+    supporting:
+      any:
+        - audit_filter_registry_write
+        - service_restart_follows
+        - non_pki_administrator
+        - remote_or_script_parent
+      all:
+        - service_restart_follows
+        - non_pki_administrator
+
+    contradicting:
+      any:
+        - filter_set_to_full_auditing
+        - recorded_ca_maintenance
+      all: []
+
+  verdict:
+    low_risk_when:
+      - audit_filter_change_command
+      - filter_set_to_full_auditing
+    suspicious_when:
+      - audit_filter_change_command
+      - non_pki_administrator
+    high_risk_when:
+      - audit_filter_change_command
+      - service_restart_follows
+      - non_pki_administrator
+
+  false_positive:
+    - condition: Building or hardening an authority.
+      explanation: >-
+        The documented hardening step is certutil -setreg CA\AuditFilter 127 followed by
+        a service restart. The value is 127 and the work is recorded.
+    - condition: Migration and restore.
+      explanation: >-
+        Restoring an authority's registry configuration rewrites AuditFilter with the
+        value it had. The registry case shows the write; the change record explains it.
+    - condition: Patch restarts.
+      explanation: >-
+        The last case returns every commanded restart of CertSvc. Without a filter
+        change before it, a restart means nothing.

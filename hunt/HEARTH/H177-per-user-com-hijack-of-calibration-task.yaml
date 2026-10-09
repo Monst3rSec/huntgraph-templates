@@ -1,0 +1,316 @@
+# Converted from THORCollective/HEARTH Flames/H177.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h177-per-user-com-hijack-of-calibration-task-t1546-015
+version: 1.0.0
+
+info:
+  name: Per-user COM hijack loaded by the WindowsColorSystem Calibration task
+  description: >-
+    Argamal (Kaspersky, June 2026) persists without touching HKLM or a Run key. It
+    registers a CLSID under the user's own Classes hive with an InprocServer32 that
+    points at a randomly named DLL in AppData\Local. The user hive is consulted before
+    the machine hive, so the built-in WindowsColorSystem Calibration task loads the DLL
+    at every logon. The load itself is a Module Load event and is not collected. The
+    registration is a registry write, and a per-user InprocServer32 pointing into a
+    user-writable directory is a short list on a clean estate.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - persistence
+    - com-hijacking
+    - registry
+    - scheduled-task
+    - argamal
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H177.md
+    - https://attack.mitre.org/techniques/T1546
+    - https://attack.mitre.org/techniques/T1546/015
+    - https://attack.mitre.org/detectionstrategies/DET0481
+
+mitre:
+  tactics:
+    - TA0004
+    - TA0003
+  techniques:
+    - T1546
+  sub_techniques:
+    - T1546.015
+  detection_strategies:
+    - DET0481
+  analytics:
+    - AN1323
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Windows Registry Key Modification
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    The Argamal RAT is persisting on Windows by hijacking a Component Object Model (COM)
+    object, writing an InprocServer32 (and ShellFolder) value under
+    HKCU\SOFTWARE\Classes\CLSID\{B210D694-C8DF-490D-9576-9E20CDBC20BD} or
+    {722D0F89-B69C-4700-AE8C-4A44350E4876} that points at a randomly named DLL dropped
+    under %LOCALAPPDATA%, so that the legitimate
+    \Microsoft\Windows\WindowsColorSystem\Calibration scheduled task loads the malicious
+    DLL on every user logon.
+  attacker_behavior:
+    - Drops a randomly named DLL in a random subdirectory of AppData\Local.
+    - Registers a CLSID in the user's Classes hive with InprocServer32 set to that DLL.
+    - Relies on the built-in Calibration scheduled task to load it at logon.
+    - Keeps its encrypted payload in settings.dat beside the DLL.
+  legitimate_behavior:
+    - Per-user installers register COM servers under the user's Classes hive.
+    - Cloud storage and collaboration clients register shell extensions from AppData.
+  risk_indicator:
+    - A per-user InprocServer32 points at a DLL under AppData, Temp, Public or ProgramData.
+    - The CLSID is one of the two the report names.
+    - The DLL name and its directory look random.
+    - The writer is not an installer.
+    - The Calibration task is run on demand afterwards.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: per-user-inprocserver32-set-to-user-writable-path
+        name: Per-user InprocServer32 set to a DLL in a user-writable directory
+        purpose: >-
+          Return writes of an InprocServer32 value under a user's Classes hive whose
+          data is a path under AppData, Temp, Public or ProgramData. The key test is
+          anchored on the hive and runs first.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\REGISTRY\\USER\\S-1-5-21-[^\\]+(\\Software\\Classes|_Classes)\\CLSID\\\{[0-9A-F-]{36}\}\\InprocServer32$/i
+          | RegStringValue=/\\(AppData|Temp|Users\\Public|ProgramData)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: reported-clsid-registered-in-user-hive
+        name: Reported Argamal CLSID written in a user hive
+        purpose: >-
+          Return any write under the two reported CLSIDs in a user hive, whatever the
+          value.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\CLSID\\\{(B210D694-C8DF-490D-9576-9E20CDBC20BD|722D0F89-B69C-4700-AE8C-4A44350E4876)\}/i
+          | RegObjectName=/\\REGISTRY\\USER\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: per-user-clsid-registered-by-command
+        name: Command registering a per-user CLSID server
+        purpose: >-
+          Return reg.exe and PowerShell commands that write InprocServer32 or
+          ShellFolder under HKCU Classes. A registration made through the registry API
+          starts no process; the two registry cases cover it.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(reg|powershell|pwsh|cmd|regedit)\.exe$/i
+          | CommandLine=/(HKCU|HKEY_CURRENT_USER)[:\\]+Software\\Classes\\CLSID\\\{[0-9A-F-]{36}\}\\(InprocServer32|ShellFolder)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: calibration-task-run-on-demand
+        name: WindowsColorSystem Calibration task run or changed from a command
+        purpose: >-
+          Return schtasks and PowerShell commands that name the Calibration task. The
+          task normally runs from its logon trigger with no command.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(schtasks|powershell|pwsh)\.exe$/i
+          | CommandLine=/WindowsColorSystem\\Calibration/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: dll-written-one-level-under-local-appdata
+        name: DLL written into a first-level directory of AppData\Local
+        purpose: >-
+          Return DLLs written directly into a first-level subdirectory of AppData\Local,
+          where the report places the hijack DLL. Many applications write there; the
+          agent keeps the files whose path equals the data of a registry write from the
+          first two cases. settings.dat is a data file and is not reported.
+        query: |
+          #event_simpleName=PeFileWritten
+          | TargetFileName=/\\AppData\\Local\\[^\\]+\\[^\\]+\.dll$/i
+          | TargetFileName!=/\\AppData\\Local\\(Microsoft|Google|Programs|Packages|Temp)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: per_user_com_server_registered
+      name: Per-user COM server registered to a user-writable DLL
+      description: >-
+        An InprocServer32 value under a user's Classes hive is set to a DLL in a
+        user-writable directory, or one of the reported CLSIDs is written.
+      source: registry
+      field: registry_path
+      indicates: com_hijack_persistence
+
+  supporting:
+    - id: server_path_in_local_appdata
+      name: Server path is a random directory in AppData\Local
+      description: >-
+        The value's data is a DLL whose name and directory match no installed product.
+      source: registry
+      field: registry_data
+      indicates: payload_in_user_profile
+    - id: hijack_dll_written
+      name: DLL written at the registered path
+      description: >-
+        A DLL is written at the path the registry value names, shortly before the write.
+      source: file_creation
+      field: file_path
+      indicates: hijack_payload_dropped
+    - id: registration_by_script
+      name: Registration issued by a script or reg.exe
+      description: >-
+        The registration comes from reg.exe or PowerShell rather than an installer.
+      source: process_creation
+      field: command_line
+      indicates: scripted_registry_persistence
+    - id: calibration_task_invoked
+      name: Calibration task run on demand
+      description: >-
+        A command runs or edits the Calibration task after the registration.
+      source: process_creation
+      field: image_name
+      indicates: persistence_trigger_tested
+
+  contradicting:
+    - id: installed_per_user_product
+      name: CLSID belongs to an installed per-user product
+      description: >-
+        Software inventory shows a product installed per user that registers this CLSID
+        and DLL.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_com_registration
+    - id: registration_common_across_estate
+      name: Same CLSID and path on many hosts
+      description: >-
+        The same CLSID and relative path appear across the estate and predate the hunt
+        window.
+      source: baseline
+      field: RegObjectName
+      indicates: established_software_footprint
+
+  risk_logic:
+    required:
+      - per_user_com_server_registered
+
+    supporting:
+      any:
+        - server_path_in_local_appdata
+        - hijack_dll_written
+        - registration_by_script
+        - calibration_task_invoked
+      all:
+        - server_path_in_local_appdata
+        - hijack_dll_written
+
+    contradicting:
+      any:
+        - installed_per_user_product
+        - registration_common_across_estate
+      all: []
+
+  verdict:
+    low_risk_when:
+      - per_user_com_server_registered
+      - installed_per_user_product
+      - registration_common_across_estate
+    suspicious_when:
+      - per_user_com_server_registered
+      - server_path_in_local_appdata
+    high_risk_when:
+      - per_user_com_server_registered
+      - server_path_in_local_appdata
+      - hijack_dll_written
+      - registration_by_script
+
+  false_positive:
+    - condition: Per-user applications register shell extensions.
+      explanation: >-
+        Cloud storage and chat clients do this from AppData. Their CLSIDs and DLL names
+        are stable and vendor-signed.
+    - condition: Developers register COM components they are building.
+      explanation: >-
+        The host is a development machine and the DLL sits in a build output directory.

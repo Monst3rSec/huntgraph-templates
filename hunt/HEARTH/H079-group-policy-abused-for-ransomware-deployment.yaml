@@ -1,0 +1,299 @@
+# Converted from THORCollective/HEARTH Flames/H079.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h079-group-policy-abused-for-ransomware-deployment-t1484-001
+version: 1.0.0
+
+info:
+  name: Group Policy abused to deploy tooling and disable defences before ransomware
+  description: >-
+    CrazyHunter operators enter through weak Active Directory credentials, then use
+    Group Policy as their software distribution system: a new or edited policy carries a
+    start-up script or scheduled task that runs their binaries on every machine it
+    applies to, including a vulnerable driver that kills security tools, and then the
+    encryptor. Policy changes look like administration. The hunt reads the policy being
+    created and linked from the command line, scripts and executables written into
+    SYSVOL, and executables that the Group Policy script host starts. The
+    bring-your-own-driver half is H058's subject and is not repeated here.
+  severity: critical
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-impairment
+    - privilege-escalation
+    - group-policy
+    - ransomware
+    - crazyhunter
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H079.md
+    - https://attack.mitre.org/techniques/T1484
+    - https://attack.mitre.org/techniques/T1484/001
+    - https://attack.mitre.org/detectionstrategies/DET0305
+
+mitre:
+  tactics:
+    - TA0112
+    - TA0004
+  techniques:
+    - T1484
+  sub_techniques:
+    - T1484.001
+  detection_strategies:
+    - DET0305
+  analytics:
+    - AN0854
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary is abusing Group Policy Objects for lateral deployment and using
+    bring-your-own-vulnerable-driver techniques to terminate security tools, targeting
+    enterprise Active Directory environments, to disable defenses before executing
+    ransomware with hybrid encryption.
+  attacker_behavior:
+    - Creates a policy with New-GPO or edits an existing one and links it at the domain or a broad unit.
+    - Places a batch file, script or executable in the policy's folder under SYSVOL or in NETLOGON.
+    - Adds a start-up script or an immediate scheduled task to the policy that runs it.
+    - Forces a refresh with gpupdate or Invoke-GPUpdate across many machines.
+    - Has the deployed script install a vulnerable driver, stop security services and start the encryptor.
+  legitimate_behavior:
+    - Domain administrators create and link policies as routine work.
+    - Software is deployed through start-up scripts stored in SYSVOL.
+    - Policy refreshes are forced during roll-outs.
+  risk_indicator:
+    - A policy is created or linked by an account or from a host that does not normally manage policy.
+    - An executable or a driver is written into SYSVOL or NETLOGON.
+    - The Group Policy script host starts a binary that stops services or loads a driver.
+    - A domain-wide refresh is pushed outside a change window.
+    - The same new binary starts on many hosts within minutes.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+        - NewScriptWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        file_hash: SHA256HashData
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: group-policy-created-or-linked
+        name: Group Policy created, edited or linked from the command line
+        purpose: >-
+          Return the GroupPolicy module cmdlets and equivalent tools that create a
+          policy, set its contents or link it.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/\b(New-GPO|New-GPLink|Set-GPLink|Import-GPO|Set-GPRegistryValue|Set-GPPrefRegistryValue|Set-GPPermission|New-GPOImmediateTask|SharpGPOAbuse|pyGPOAbuse|Invoke-GPUpdate)\b|\bgpupdate(\.exe)?"?\s+\/force\b.*\/target|GroupPolicy\\ScheduledTasks/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: code-written-into-sysvol
+        name: Executable or script written into SYSVOL or NETLOGON
+        purpose: >-
+          Return executables, drivers and scripts created under the domain's policy and
+          logon-script shares. The path test is a short literal on one field.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewScriptWritten)$/
+          | TargetFileName=/\\(SYSVOL|sysvol)\\[^\\]+\\(Policies|scripts)\\|\\Windows\\SYSVOL\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: gpscript-spawned-binary
+        name: Process started by the Group Policy script host
+        purpose: >-
+          Return what Group Policy start-up and logon scripts ran on member machines,
+          leaving out the interpreters themselves when they are given no arguments of
+          interest.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^gpscript\.exe$/i
+          | CommandLine=/\\(SYSVOL|NETLOGON)\\|\.sys\b|\bsc(\.exe)?\s+(create|stop|delete|config)\b|\bnet1?\s+stop\b|taskkill|vssadmin|bcdedit|wevtutil|Set-MpPreference|\.exe\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: binary-run-from-sysvol-or-netlogon
+        name: Executable run directly from SYSVOL or NETLOGON
+        purpose: >-
+          Return processes whose image is on the domain's SYSVOL or NETLOGON share, the
+          deployed payload starting on a member machine.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ImageFileName=/\\(SYSVOL|NETLOGON)\\.*\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: group_policy_change_or_payload
+      name: Group Policy changed or carrying a payload
+      description: >-
+        A command line creates, edits or links a policy, or a file-write event records
+        an executable or script placed under SYSVOL.
+      source: process_creation
+      field: command_line
+      indicates: group_policy_used_for_deployment
+
+  supporting:
+    - id: payload_in_sysvol
+      name: Executable or driver written into SYSVOL
+      description: >-
+        A PE file or script is written into a policy folder or the logon-script share.
+      source: file_creation
+      field: file_path
+      indicates: payload_staged_for_domain_wide_execution
+    - id: sysvol_writer_unusual
+      name: Writer is not a policy management tool
+      description: >-
+        The process that wrote the file is a shell, a remote session host or an unknown
+        binary, not the Group Policy console or replication service.
+      source: file_creation
+      field: writer_process_name
+      indicates: manual_payload_placement
+    - id: defence_stopping_child
+      name: Policy script stopped services or loaded a driver
+      description: >-
+        A child of gpscript.exe creates a kernel service, stops security services or
+        deletes shadow copies.
+      source: process_creation
+      field: command_line
+      indicates: defences_disabled_through_policy
+    - id: policy_changed_by_unexpected_account
+      name: Policy changed by an unexpected account or host
+      description: >-
+        The user or host on the policy command is not one that normally administers
+        Group Policy.
+      source: process_creation
+      field: user
+      indicates: policy_administration_outside_role
+    - id: binary_run_from_domain_share
+      name: Binary executed from SYSVOL or NETLOGON
+      description: >-
+        A process image path is on the domain's SYSVOL or NETLOGON share.
+      source: process_creation
+      field: image_path
+      indicates: domain_distributed_payload_execution
+
+  contradicting:
+    - id: approved_policy_change
+      name: Policy change matches a change record
+      description: >-
+        A change record covers the policy, the administrator and the time.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_administration
+    - id: established_logon_script
+      name: Script or binary is a long-standing logon item
+      description: >-
+        Earlier activity shows the same file run from SYSVOL or NETLOGON across the
+        fleet for a long period.
+      source: baseline
+      field: ImageFileName
+      indicates: established_software_behaviour
+
+  risk_logic:
+    required:
+      - group_policy_change_or_payload
+
+    supporting:
+      any:
+        - payload_in_sysvol
+        - sysvol_writer_unusual
+        - defence_stopping_child
+        - policy_changed_by_unexpected_account
+        - binary_run_from_domain_share
+      all:
+        - payload_in_sysvol
+        - defence_stopping_child
+
+    contradicting:
+      any:
+        - approved_policy_change
+        - established_logon_script
+      all: []
+
+  verdict:
+    low_risk_when:
+      - group_policy_change_or_payload
+      - approved_policy_change
+      - established_logon_script
+    suspicious_when:
+      - group_policy_change_or_payload
+      - policy_changed_by_unexpected_account
+    high_risk_when:
+      - group_policy_change_or_payload
+      - policy_changed_by_unexpected_account
+      - payload_in_sysvol
+      - defence_stopping_child
+
+  false_positive:
+    - condition: Administrators manage Group Policy.
+      explanation: >-
+        Creating and linking policies is daily work. The account, the host and a change
+        record identify it.
+    - condition: Software is deployed by start-up script.
+      explanation: >-
+        Installers in SYSVOL run through gpscript on every machine. They are known
+        files that have been there for months and do not stop security services.
+    - condition: Domain controllers replicate SYSVOL.
+      explanation: >-
+        Replication writes each new file on every controller. One real change therefore
+        appears once per controller, written by the replication service.

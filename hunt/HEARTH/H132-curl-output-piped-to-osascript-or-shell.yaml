@@ -1,0 +1,316 @@
+# Converted from THORCollective/HEARTH Flames/H132.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-mac-hearth-h132-curl-output-piped-to-osascript-or-shell-t1059-002
+version: 1.0.0
+
+info:
+  name: curl output piped straight into osascript or a shell
+  description: >-
+    Sapphire Sleet ran its whole macOS infection as a chain of curl commands whose
+    output went straight into osascript or a shell: five stages, each fetched and run
+    without a file on disk, each sent with its own user-agent string (mac-cur1 to
+    mac-cur5) so the operator could see how far a victim had got. Nothing is written, so
+    quarantine and Gatekeeper never see a file. H032 covers the other direction,
+    AppleScript that starts a download. Here the download feeds the interpreter. The
+    pipe is visible when the whole line is the argument of a shell, as it is when a
+    script, an application or do shell script runs it. Typed at an interactive prompt,
+    curl and osascript start as two sibling processes with no pipe on either command
+    line, so the hunt also returns osascript started with no script argument and curl
+    given a custom user agent. The user-agent sequence across stages is left to the
+    agent.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - execution
+    - applescript
+    - curl
+    - fileless
+    - sapphire-sleet
+    - phantompulse
+    - macos
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H132.md
+    - https://attack.mitre.org/techniques/T1059
+    - https://attack.mitre.org/techniques/T1059/002
+    - https://attack.mitre.org/detectionstrategies/DET0414
+    - https://www.microsoft.com/en-us/security/blog/2026/04/16/dissecting-sapphire-sleets-macos-intrusion-from-lure-to-compromise/
+    - https://www.elastic.co/security-labs/phantom-in-the-vault
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1059
+  sub_techniques:
+    - T1059.002
+  detection_strategies:
+    - DET0414
+  analytics:
+    - AN1164
+  platforms:
+    - macOS
+  data_sources:
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary is using cascading curl-to-osascript or curl-to-shell chains on macOS
+    to download and immediately execute multi-stage payloads without writing
+    intermediate files to disk, indicated by curl output piped directly to osascript,
+    bash, or zsh.
+  attacker_behavior:
+    - Runs curl silently and pipes the response into osascript, bash or zsh.
+    - Has each stage fetch and run the next the same way.
+    - Sets a custom user-agent string on each request to mark the stage.
+    - Starts the chain from Script Editor, a compiled AppleScript applet or a note-taking application.
+    - Runs JavaScript for Automation through osascript -l JavaScript.
+  legitimate_behavior:
+    - Homebrew, rustup, nvm and many other tools publish a curl-pipe-shell installer.
+    - Management scripts fetch and run configuration from an internal server.
+    - Scripts set a user agent when calling an API.
+  risk_indicator:
+    - The pipe ends in osascript, not a shell.
+    - The URL is a raw IP address or a newly seen domain.
+    - The user-agent value is a short campaign-style token.
+    - The parent is Script Editor, an applet or a document application.
+    - Several such commands follow one another on the host within minutes.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: shell-command-piping-download-into-osascript
+        name: Shell command piping a download into osascript
+        purpose: >-
+          Return shells whose command line pipes curl or wget into osascript. There is
+          no common legitimate use of this form.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=/^(sh|bash|zsh|dash)$/
+          | CommandLine=/(curl|wget)\s[^|]*\|\s*(sudo\s+)?(\/usr\/bin\/)?osascript\b/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: shell-command-piping-download-into-shell
+        name: Shell command piping a download into a shell
+        purpose: >-
+          Return shells whose command line pipes curl into sh, bash or zsh. Vendor
+          installers use the same form, so the URL and the parent decide; the agent
+          removes known installer hosts.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=/^(sh|bash|zsh|dash)$/
+          | CommandLine=/curl\s[^|]*\|\s*(sudo\s+)?(\/bin\/)?(ba|z|da)?sh\b/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: osascript-reading-script-from-standard-input
+        name: osascript started by a shell with no script argument
+        purpose: >-
+          Return osascript started with nothing after its name, or only a language
+          switch, by a shell. With no file and no -e text the script comes from standard
+          input, which is the receiving end of a pipe typed at a prompt.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=osascript
+          | ParentBaseFileName=/^(sh|bash|zsh|dash)$/
+          | CommandLine=/osascript(\s+-l\s+\w+)?(\s+-)?\s*$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: curl-with-custom-user-agent
+        name: curl run with a user-agent switch
+        purpose: >-
+          Return curl runs that set a user agent, with the value on the command line.
+          The agent looks for short token values and for a numbered run of them on one
+          host.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=curl
+          | CommandLine=/\s(-A|--user-agent)[\s=]*\S/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: document-or-script-application-starting-download-or-shell
+        name: Script Editor or a note-taking application starting curl or a shell
+        purpose: >-
+          Return curl, shells and osascript whose parent is Script Editor, Obsidian or a
+          document application. PhantomPulse reached execution through an Obsidian
+          plugin.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | ParentBaseFileName=/^(Script Editor|Obsidian.*|Notes|TextEdit|Preview|Pages|Numbers|Keynote|Microsoft Word|Microsoft Excel|Microsoft PowerPoint)$/
+          | FileName=/^(curl|wget|sh|bash|zsh|osascript|python3?)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: download_fed_to_interpreter
+      name: Downloaded content fed straight to an interpreter
+      description: >-
+        A shell command pipes curl into osascript or a shell, or osascript starts under
+        a shell with no script argument, or a document application starts curl or a
+        shell.
+      source: process_creation
+      field: command_line
+      indicates: fileless_download_and_execute
+
+  supporting:
+    - id: pipe_ends_in_osascript
+      name: The interpreter is osascript
+      description: >-
+        The receiving end of the pipe is osascript, which vendor installers do not use.
+      source: process_creation
+      field: image_name
+      indicates: applescript_payload_execution
+    - id: custom_user_agent
+      name: curl sent a custom user agent
+      description: >-
+        The curl command sets a user-agent value that is a short token, not a browser
+        string.
+      source: process_creation
+      field: command_line
+      indicates: campaign_stage_marker
+    - id: staged_sequence
+      name: Several stages follow one another
+      description: >-
+        Two or more such commands run on the host within minutes with different URLs or
+        user-agent values. The agent derives the sequence from the returned events.
+      source: process_creation
+      field: command_line
+      indicates: multi_stage_chain
+    - id: application_parent
+      name: Started by a script or document application
+      description: >-
+        The parent is Script Editor, an applet, Obsidian or a document application.
+      source: process_creation
+      field: parent_process
+      indicates: user_opened_lure
+    - id: ordinary_user_session
+      name: Runs in an ordinary user's session
+      description: >-
+        The user is not a developer or administrator.
+      source: process_creation
+      field: user
+      indicates: activity_outside_user_role
+
+  contradicting:
+    - id: vendor_installer_url
+      name: URL is a published vendor installer
+      description: >-
+        The address is the documented install script of a tool approved on the host.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_software_installation
+    - id: management_script
+      name: Command belongs to device management
+      description: >-
+        The same command recurs across the fleet from the management agent.
+      source: baseline
+      field: CommandLine
+      indicates: routine_management_activity
+
+  risk_logic:
+    required:
+      - download_fed_to_interpreter
+
+    supporting:
+      any:
+        - pipe_ends_in_osascript
+        - custom_user_agent
+        - staged_sequence
+        - application_parent
+        - ordinary_user_session
+      all:
+        - pipe_ends_in_osascript
+        - application_parent
+
+    contradicting:
+      any:
+        - vendor_installer_url
+        - management_script
+      all: []
+
+  verdict:
+    low_risk_when:
+      - download_fed_to_interpreter
+      - vendor_installer_url
+    suspicious_when:
+      - download_fed_to_interpreter
+      - ordinary_user_session
+    high_risk_when:
+      - download_fed_to_interpreter
+      - pipe_ends_in_osascript
+      - staged_sequence
+
+  false_positive:
+    - condition: Developer tool installers.
+      explanation: >-
+        Homebrew, rustup, nvm and similar tools are installed with curl piped to a
+        shell. The host is the vendor's and the user is technical.
+    - condition: Scripts that call an API with a user agent.
+      explanation: >-
+        Setting a user agent is ordinary in automation. The value names the script or
+        product and nothing is piped to an interpreter.
+    - condition: Obsidian and editor plugins that run shell commands.
+      explanation: >-
+        Some plugins run git or a build command. The child is not curl and the command
+        is the plugin's documented one.

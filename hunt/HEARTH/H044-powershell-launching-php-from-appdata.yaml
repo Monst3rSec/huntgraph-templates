@@ -1,0 +1,281 @@
+# Converted from THORCollective/HEARTH Flames/H044.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h044-powershell-launching-php-from-appdata-t1059-001
+version: 1.0.0
+
+info:
+  name: PowerShell running PHP from AppData with extension directives
+  description: >-
+    The PHP variant of the Interlock RAT arrives through the KongTuke FileFix lure: a
+    pasted PowerShell command unpacks a portable PHP runtime into the user's AppData and
+    starts php.exe with -d directives that load the zip and OpenSSL extensions, pointing
+    it at a configuration file that is in fact the RAT. PHP is not part of Windows and a
+    real installation does not live in a user's roaming profile. The hunt returns php.exe
+    running from user-writable locations, php started by PowerShell, and the directive
+    pattern itself.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - execution
+    - powershell
+    - php
+    - interlock
+    - remote-access-trojan
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H044.md
+    - https://attack.mitre.org/techniques/T1059
+    - https://attack.mitre.org/techniques/T1059/001
+    - https://attack.mitre.org/detectionstrategies/DET0455
+    - https://thedfirreport.com/2025/07/14/kongtuke-filefix-leads-to-new-interlock-rat-variant/
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1059
+  sub_techniques:
+    - T1059.001
+  detection_strategies:
+    - DET0455
+  analytics:
+    - AN1252
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    Threat actors are using PowerShell to execute PHP from non-standard AppData locations
+    with specific extension directives, loading malicious configuration files to
+    establish remote access trojan persistence on target Windows systems.
+  attacker_behavior:
+    - Unpacks a portable PHP runtime into a folder under AppData\Roaming.
+    - Starts php.exe from PowerShell with -d extension=zip and -d extension=openssl.
+    - Passes a file with a .cfg or similar extension as the script to run.
+    - Adds a Run key that repeats the same command at logon.
+    - Has the PHP process run discovery commands and connect to tunnelling hostnames.
+  legitimate_behavior:
+    - Web developers install PHP under Program Files, a tools directory or a package manager's path.
+    - Development stacks bundle php.exe inside their own install directory.
+    - Composer and build scripts start php with directives from a terminal.
+  risk_indicator:
+    - php.exe runs from AppData, Temp, Downloads or Public.
+    - The parent is PowerShell, Explorer or a script host and not a terminal or web server.
+    - The command line enables extensions with -d and runs a file that is not .php.
+    - php.exe starts cmd, PowerShell or discovery utilities.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: php-from-user-writable-path
+        name: php.exe running from a user-writable location
+        purpose: >-
+          Return PHP interpreters whose image is under a user profile's AppData, Temp or
+          Downloads, or under Public. The image name is an exact match and runs first.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^php(-cgi|-win)?\.exe$/i
+          | ImageFileName=/\\(Users\\[^\\]+\\(AppData|Downloads|Desktop)|Users\\Public|Windows\\Temp|ProgramData)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: php-extension-directives-non-php-script
+        name: php.exe given extension directives and a non-PHP file
+        purpose: >-
+          Return PHP runs that enable extensions on the command line and execute a file
+          with a configuration-style extension, the invocation the RAT uses.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^php(-cgi|-win)?\.exe$/i
+          | CommandLine=/-d\s+extension\s*=\s*(zip|openssl|curl|sockets)/i
+          | CommandLine=/\.(cfg|conf|config|ini|dat|log|txt|tmp)("|'|\s|$)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: powershell-spawned-php
+        name: php.exe started by PowerShell, Explorer or a script host
+        purpose: >-
+          Return PHP processes with a parent that is not a terminal, web server or
+          build tool, the launch arrangement of a pasted command and of its Run key.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^php(-cgi|-win)?\.exe$/i
+          | ParentBaseFileName=/^(powershell|pwsh|explorer|wscript|cscript|mshta|rundll32)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: php-spawned-shell-or-discovery
+        name: Shell or discovery utility started by php.exe
+        purpose: >-
+          Return what the PHP process went on to run, which shows the RAT executing
+          operator commands.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^php(-cgi|-win)?\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh|whoami|systeminfo|tasklist|nltest|net1?|ipconfig|arp|reg|schtasks|rundll32)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: portable_php_execution
+      name: PHP interpreter run outside an installation
+      description: >-
+        A process event shows php.exe with an image path under a user-writable
+        directory, with extension directives and a non-PHP script, or with PowerShell as
+        its parent.
+      source: process_creation
+      field: image_path
+      indicates: portable_interpreter_running_delivered_code
+
+  supporting:
+    - id: directive_and_config_script
+      name: Extension directives with a configuration-named script
+      description: >-
+        The command line enables zip or OpenSSL with -d and runs a file whose extension
+        is not .php.
+      source: process_creation
+      field: command_line
+      indicates: disguised_script_payload
+    - id: non_terminal_php_parent
+      name: PHP started by PowerShell or Explorer
+      description: >-
+        The parent is PowerShell, Explorer or a script host, consistent with a pasted
+        command or a logon Run entry.
+      source: process_creation
+      field: parent_process
+      indicates: user_triggered_or_persistent_launch
+    - id: php_ran_operator_commands
+      name: PHP process started shells or discovery tools
+      description: >-
+        Processes whose parent is php.exe are cmd, PowerShell or discovery utilities.
+      source: process_creation
+      field: image_name
+      indicates: remote_operator_activity
+    - id: non_developer_user
+      name: User is not a web developer
+      description: >-
+        The account has no development role and the host has no PHP installation on
+        record.
+      source: process_creation
+      field: user
+      indicates: activity_outside_user_role
+
+  contradicting:
+    - id: developer_php_environment
+      name: Host is a web developer's machine
+      description: >-
+        Asset records class the host as a developer workstation with a PHP toolchain,
+        and the path belongs to a known development stack.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_development_activity
+    - id: php_path_common
+      name: Same PHP path runs across developer hosts
+      description: >-
+        Earlier activity shows the same image path and command line on several developer
+        machines over a long period.
+      source: baseline
+      field: ImageFileName
+      indicates: established_development_workflow
+
+  risk_logic:
+    required:
+      - portable_php_execution
+
+    supporting:
+      any:
+        - directive_and_config_script
+        - non_terminal_php_parent
+        - php_ran_operator_commands
+        - non_developer_user
+      all:
+        - directive_and_config_script
+        - non_terminal_php_parent
+
+    contradicting:
+      any:
+        - developer_php_environment
+        - php_path_common
+      all: []
+
+  verdict:
+    low_risk_when:
+      - portable_php_execution
+      - developer_php_environment
+      - php_path_common
+    suspicious_when:
+      - portable_php_execution
+      - non_terminal_php_parent
+    high_risk_when:
+      - portable_php_execution
+      - non_terminal_php_parent
+      - directive_and_config_script
+      - php_ran_operator_commands
+
+  false_positive:
+    - condition: A developer runs a portable PHP build.
+      explanation: >-
+        Version managers and editors unpack PHP under a profile. It is started from a
+        terminal or an IDE, runs .php files, and belongs to a developer.
+    - condition: A desktop application bundles PHP.
+      explanation: >-
+        A few packaged applications ship php.exe under AppData. The parent is the
+        application and the path and hash are the same wherever it is installed.
+    - condition: Composer or a build script passes -d directives.
+      explanation: >-
+        Memory-limit and extension directives are normal in build tooling. The script
+        is a .php or .phar file and the parent is a terminal or build runner.

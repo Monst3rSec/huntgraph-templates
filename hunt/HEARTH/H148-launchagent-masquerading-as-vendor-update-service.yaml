@@ -1,0 +1,289 @@
+# Converted from THORCollective/HEARTH Flames/H148.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-mac-hearth-h148-launchagent-masquerading-as-vendor-update-service-t1543-001
+version: 1.0.0
+
+info:
+  name: LaunchAgent named after an Apple or Google service that starts a binary from a user path
+  description: >-
+    macOS infostealers and their loaders persist with a property list in
+    ~/Library/LaunchAgents whose label copies a vendor service, most often
+    com.google.keystone.agent, and whose program is a binary the user's own account can
+    write, such as ~/Library/Application Support/Google/GoogleUpdate.app. launchd starts
+    it at every login. The sensor does not report the plist being written or what it
+    contains, and it does not report code-signing state, so the write is read from the
+    command that performs it and the result is read from what launchd starts. A stealer
+    that writes the plist from its own code, with no cp, tee or launchctl, is seen only
+    when its binary runs.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - persistence
+    - launch-agent
+    - masquerading
+    - clickfix
+    - infostealer
+    - macos
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H148.md
+    - https://attack.mitre.org/techniques/T1543
+    - https://attack.mitre.org/techniques/T1543/001
+    - https://attack.mitre.org/detectionstrategies/DET0434
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1543
+  sub_techniques:
+    - T1543.001
+  detection_strategies:
+    - DET0434
+  analytics: []
+  platforms:
+    - macOS
+  data_sources:
+    - CrowdStrike:Endpoint
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    Threat actors persist macOS infostealers through LaunchAgent plists in
+    ~/Library/LaunchAgents/ that masquerade as Apple or Google update services and
+    reference unsigned binaries under user-writable paths.
+  attacker_behavior:
+    - Writes a plist into the user's LaunchAgents folder with a com.apple or com.google label.
+    - Points the plist at a binary under Application Support, a hidden folder or a temporary directory.
+    - Loads the agent with launchctl so it starts at once and at every login.
+    - Names the binary and its bundle after the vendor's real updater.
+  legitimate_behavior:
+    - Google's updater registers its own Keystone agent from its installer.
+    - Applications install per-user LaunchAgents for helpers and updaters.
+    - Device-management tools deploy LaunchAgents to every Mac.
+  risk_indicator:
+    - A shell, osascript, curl or a script interpreter handles a vendor-named plist in LaunchAgents.
+    - The command's parent is not an installer or the vendor's updater.
+    - launchd starts a binary from Application Support/Google/GoogleUpdate.app, a hidden folder or /tmp.
+    - The host has no Google software that would own the label.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: vendor-named-launchagent-plist-handled-by-command
+        name: Command naming a com.apple or com.google plist in LaunchAgents
+        purpose: >-
+          Return commands that name a LaunchAgents plist carrying an Apple or Google
+          label, leaving out those started by the system installer and Google's own
+          updater. Google's updater does write and load com.google.keystone.agent, so
+          its helper processes are excluded by parent; a parent this list does not know
+          still appears and the agent judges it.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | CommandLine=/\/LaunchAgents\/com\.(apple|google)\.[^\s"'\/]*\.plist/i
+          | ParentBaseFileName!=/^(installd|system_installd|package_script_service|softwareupdated|ksinstall|GoogleUpdater|GoogleSoftwareUpdateAgent|GoogleSoftwareUpdateDaemon|Keystone.*)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: launchagent-plist-written-or-loaded-by-utility
+        name: LaunchAgents plist written or loaded by a shell or file utility
+        purpose: >-
+          Return file utilities, shells, script interpreters and launchctl whose command
+          line names any plist under a LaunchAgents folder, leaving out installers and
+          management agents. This covers labels that copy no vendor, such as the random
+          com names reported beside the Keystone one.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | CommandLine=/\/LaunchAgents\/[^\s"']+\.plist/
+          | FileName=/^(launchctl|cp|mv|tee|sh|bash|zsh|plutil|defaults|osascript|curl|python[0-9.]*|install|ditto|PlistBuddy|chown|chmod)$/
+          | ParentBaseFileName!=/^(installd|system_installd|package_script_service|jamf|JamfDaemon|munki.*|managedsoftwareupdate|kandji.*|softwareupdated)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: fake-google-updater-bundle-running
+        name: Process running from Application Support/Google/GoogleUpdate.app
+        purpose: >-
+          Return processes whose image is inside the GoogleUpdate.app bundle under
+          Application Support, the path reported for the fake updater. Google's current
+          updater lives under GoogleUpdater and its older one under
+          Library/Google/GoogleSoftwareUpdate, so neither matches.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | ImageFileName=/\/Library\/Application Support\/Google\/GoogleUpdate\.app\//
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: launchd-started-binary-from-user-writable-path
+        name: launchd starting a binary from a hidden, shared or temporary path
+        purpose: >-
+          Return processes launchd starts from /Users/Shared, a temporary directory or a
+          hidden folder in a home directory. This is where an agent's program shows up
+          when its plist was written without any command. Signing state is not on the
+          event, so the path is the only test.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | ParentBaseFileName=launchd
+          | ImageFileName=/^\/(Users\/Shared|private\/tmp|tmp|private\/var\/tmp|var\/tmp|Users\/[^\/]+\/\.[^\/]+)\//
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: launchagent_plist_command
+      name: Command writes or loads a LaunchAgents plist
+      description: >-
+        A process command line names a plist under a LaunchAgents folder and the process
+        is a file utility, shell, script interpreter or launchctl.
+      source: process_creation
+      field: command_line
+      indicates: launch_agent_persistence
+
+  supporting:
+    - id: vendor_label_copied
+      name: Plist label copies an Apple or Google service
+      description: >-
+        The plist name begins com.apple or com.google, and the command's parent is not
+        that vendor's installer or updater.
+      source: process_creation
+      field: parent_process
+      indicates: masqueraded_service_name
+    - id: writer_is_script_or_download_tool
+      name: Plist handled by a script host or download tool
+      description: >-
+        The process that names the plist is osascript, curl, a script interpreter or a
+        shell, not an installer.
+      source: process_creation
+      field: image_name
+      indicates: persistence_written_by_untrusted_process
+    - id: program_in_user_writable_path
+      name: Agent's program runs from a user-writable path
+      description: >-
+        A process starts from Application Support/Google/GoogleUpdate.app, a hidden
+        folder in the home directory, /Users/Shared or a temporary directory.
+      source: process_creation
+      field: image_path
+      indicates: payload_in_user_writable_location
+    - id: login_user_owns_agent
+      name: Agent runs as the logged-in user
+      description: >-
+        The program launchd starts runs under an ordinary user account, as a per-user
+        agent does.
+      source: process_creation
+      field: user
+      indicates: per_user_persistence
+
+  contradicting:
+    - id: vendor_software_installed
+      name: Vendor software that owns the label is installed
+      description: >-
+        Asset records show Chrome or another Google product on the host and the plist
+        was handled during its install or update.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_software_installation
+    - id: managed_agent_deployment
+      name: Agent deployed by device management
+      description: >-
+        A change record or the management console shows the LaunchAgent pushed to the
+        fleet.
+      source: change_management
+      field: ComputerName
+      indicates: managed_configuration
+
+  risk_logic:
+    required:
+      - launchagent_plist_command
+
+    supporting:
+      any:
+        - vendor_label_copied
+        - writer_is_script_or_download_tool
+        - program_in_user_writable_path
+        - login_user_owns_agent
+      all:
+        - vendor_label_copied
+        - program_in_user_writable_path
+
+    contradicting:
+      any:
+        - vendor_software_installed
+        - managed_agent_deployment
+      all: []
+
+  verdict:
+    low_risk_when:
+      - launchagent_plist_command
+      - vendor_software_installed
+    suspicious_when:
+      - launchagent_plist_command
+      - vendor_label_copied
+    high_risk_when:
+      - launchagent_plist_command
+      - vendor_label_copied
+      - program_in_user_writable_path
+
+  false_positive:
+    - condition: Google Chrome installs or repairs its updater.
+      explanation: >-
+        The updater writes and loads com.google.keystone.agent itself. A helper whose
+        name is not on the exclusion list appears; its parent chain leads to Chrome or
+        the installer and the program path is under GoogleUpdater.
+    - condition: Applications that install their own LaunchAgent.
+      explanation: >-
+        Many do, from a post-install script. The label is the application's own and the
+        program sits inside its bundle under /Applications.
+    - condition: Developers testing launchd jobs.
+      explanation: >-
+        A developer copies and loads plists by hand. The account is technical and the
+        label is theirs.

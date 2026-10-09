@@ -1,0 +1,299 @@
+# Converted from THORCollective/HEARTH Flames/H095.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-lin-hearth-h095-n8n-workflow-server-spawning-commands-t1059-004
+version: 1.0.0
+
+info:
+  name: n8n workflow server starting shells and tools after expression injection
+  description: >-
+    CVE-2025-68613 lets a workflow expression in n8n escape its evaluation context and run
+    code inside the n8n server, which holds the API keys, OAuth tokens and database
+    passwords of every integration configured on it. The request that carries the
+    expression is in n8n's own HTTP log, which this connector does not ingest. What the
+    sensor records is the outcome: the Node.js process that runs n8n starting a shell or a
+    tool. A child event names its parent only as node, so one case returns the n8n server
+    processes with their process ids and the others return what Node.js starts; the agent
+    keeps the children whose parent process id is an n8n server. Code that stays inside
+    the Node.js process, reading environment variables or calling an integration with the
+    stored credential, starts no process and is not seen.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - execution
+    - n8n
+    - workflow-automation
+    - cve-2025-68613
+    - expression-injection
+    - linux
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H095.md
+    - https://attack.mitre.org/techniques/T1059
+    - https://attack.mitre.org/techniques/T1059/004
+    - https://attack.mitre.org/detectionstrategies/DET0384
+    - https://www.cisa.gov/known-exploited-vulnerabilities-catalog
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1059
+  sub_techniques:
+    - T1059.004
+  detection_strategies:
+    - DET0384
+  analytics:
+    - AN1081
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary is exploiting n8n workflow automation servers via expression injection
+    (CVE-2025-68613) to execute arbitrary commands and use the platform's internal trust
+    and integrations for lateral movement and credential access.
+  attacker_behavior:
+    - Submits a workflow whose expression reaches child_process and runs a command.
+    - Runs identity and host commands first to confirm execution.
+    - Fetches a second stage or opens a reverse shell from the n8n service account.
+    - Reads the n8n configuration and encryption key to decrypt stored credentials.
+    - Starts scanners or remote-login clients from the server to reach internal systems.
+  legitimate_behavior:
+    - The Execute Command node runs shell commands a workflow author wrote.
+    - Community nodes and the task runner start helper processes.
+    - Administrators run the n8n command-line tool to export or import workflows.
+  risk_indicator:
+    - A shell under the n8n process runs id, whoami or uname and nothing else.
+    - The child command downloads and runs content or opens a socket.
+    - A command reads the .n8n configuration or asks for decrypted credentials.
+    - A scanner or ssh client starts under the n8n process.
+    - No workflow on the server uses the Execute Command node.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: n8n-server-process
+        name: n8n server process
+        purpose: >-
+          Return the Node.js processes that are n8n, with their process ids. Every other
+          case returns children whose parent is named only as node; the agent keeps those
+          whose parent process id appears here. An n8n container with no sensor on the
+          host returns nothing.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | FileName=/^(node|nodejs|n8n)$/
+          | CommandLine=/\bn8n\b/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: node-spawned-shell-with-recon-or-fetch
+        name: Shell started by Node.js running reconnaissance or a fetch
+        purpose: >-
+          Return shells whose parent is Node.js and whose command confirms execution,
+          fetches content, decodes a blob, opens a socket or works in a scratch directory.
+          child_process.exec starts sh -c with the whole command, so the pipeline is on
+          one command line. Any Node.js application matches; the parent process id
+          separates n8n from the rest. An Execute Command node looks the same and is told
+          apart by the command and the workflow that owns it.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ParentBaseFileName=/^(node|nodejs|n8n)$/
+          | FileName=/^(sh|bash|dash|ash|busybox)$/
+          | CommandLine=/\b(id|whoami|uname|hostname|printenv|env)\b|\/etc\/(passwd|shadow)|\b(curl|wget)\s|\/dev\/tcp\/|base64\s+(-d|--decode)|\bnc(at)?\s|python[0-9.]*\s+-c|chmod\s+\+x|\/(tmp|dev\/shm|var\/tmp)\//
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: n8n-credential-store-read-by-command
+        name: Command reading the n8n credential store
+        purpose: >-
+          Return commands that name the n8n configuration file, its database, the
+          encryption key or the decrypted credential export. Reads made from inside the
+          Node.js process are not file events the sensor reports and are not seen.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | CommandLine=/\.n8n\/(config|database\.sqlite)|N8N_ENCRYPTION_KEY|export:credentials/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: node-spawned-scanner-or-remote-login
+        name: Scanner or remote-login client started by Node.js
+        purpose: >-
+          Return network tools started directly by Node.js, the step from the server
+          towards internal systems. Connections the n8n process opens itself through an
+          HTTP or database node are its normal work and are not returned.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ParentBaseFileName=/^(node|nodejs|n8n)$/
+          | FileName=/^(nmap|masscan|nc|ncat|netcat|socat|ssh|scp|sshpass|telnet)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: n8n_child_command
+      name: Command started by the n8n server process
+      description: >-
+        A shell or tool was started by Node.js and its parent process id is that of an n8n
+        server the first case returned. The agent makes the match; the query does not.
+      source: process_creation
+      field: parent_process_id
+      indicates: command_execution_from_workflow_server
+
+  supporting:
+    - id: execution_check_or_fetch
+      name: Child command confirms execution or fetches content
+      description: >-
+        The child command line is an identity or host check, a download, a decode step, a
+        socket or a path under a scratch directory.
+      source: process_creation
+      field: command_line
+      indicates: post_exploitation_activity
+    - id: credential_store_read
+      name: n8n credential store read from a command
+      description: >-
+        A command names the n8n configuration file, database, encryption key or decrypted
+        credential export.
+      source: process_creation
+      field: command_line
+      indicates: stored_integration_credentials_targeted
+    - id: network_tool_under_node
+      name: Scanner or remote-login client under Node.js
+      description: >-
+        The child image is a scanner, a netcat variant or an ssh client.
+      source: process_creation
+      field: image_name
+      indicates: movement_from_workflow_server
+    - id: commands_in_quick_succession
+      name: Several different commands under one n8n process
+      description: >-
+        Several distinct child commands share one parent process id within minutes, which
+        the agent derives from the returned events.
+      source: process_creation
+      field: process_id
+      indicates: interactive_command_execution
+
+  contradicting:
+    - id: execute_command_workflow
+      name: A workflow on the server uses the Execute Command node
+      description: >-
+        Workflow records show an Execute Command or SSH node that issues this command on a
+        schedule its owner set.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_workflow_step
+    - id: recurring_child_command
+      name: Same child command recurs on a schedule
+      description: >-
+        Earlier activity shows the same command line from the same server at regular
+        intervals.
+      source: baseline
+      field: CommandLine
+      indicates: established_workflow_behaviour
+    - id: fixed_n8n_version
+      name: Server runs a fixed n8n release
+      description: >-
+        Asset records show the n8n version is one in which CVE-2025-68613 is fixed.
+      source: asset_inventory
+      field: ComputerName
+      indicates: vulnerability_not_present
+
+  risk_logic:
+    required:
+      - n8n_child_command
+
+    supporting:
+      any:
+        - execution_check_or_fetch
+        - credential_store_read
+        - network_tool_under_node
+        - commands_in_quick_succession
+      all:
+        - execution_check_or_fetch
+        - credential_store_read
+
+    contradicting:
+      any:
+        - execute_command_workflow
+        - recurring_child_command
+        - fixed_n8n_version
+      all: []
+
+  verdict:
+    low_risk_when:
+      - n8n_child_command
+      - execute_command_workflow
+      - recurring_child_command
+    suspicious_when:
+      - n8n_child_command
+      - execution_check_or_fetch
+    high_risk_when:
+      - n8n_child_command
+      - execution_check_or_fetch
+      - credential_store_read
+
+  false_positive:
+    - condition: Workflows that use the Execute Command node.
+      explanation: >-
+        The node exists to run shell commands. The command is the one in the workflow
+        definition and repeats on the workflow's schedule.
+    - condition: Other Node.js applications on the same host.
+      explanation: >-
+        Build tools and web applications start shells under node. Their parent process id
+        is not an n8n server's, which is why the first case is returned.
+    - condition: Administrators exporting credentials during a migration.
+      explanation: >-
+        export:credentials is the documented way to move an instance. It is run by a
+        person from a login shell during a planned change.

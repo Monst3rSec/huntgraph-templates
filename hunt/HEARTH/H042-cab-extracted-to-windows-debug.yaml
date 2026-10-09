@@ -1,0 +1,260 @@
+# Converted from THORCollective/HEARTH Flames/H042.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h042-cab-extracted-to-windows-debug-t1140
+version: 1.0.0
+
+info:
+  name: Archive unpacked into C:\Windows\debug and then deleted
+  description: >-
+    Earth Estries delivers the DEMODEX rootkit as a CAB file holding an encrypted
+    configuration and shellcode. A PowerShell script unpacks it into C:\Windows\debug, a
+    directory that exists on every Windows host, holds only a few log files and is
+    seldom looked at, then deletes the archive so nothing but the unpacked parts remain.
+    Nothing legitimate unpacks archives into that directory or runs code from it. The
+    hunt returns extraction commands that name it, executables and scripts written into
+    it, and processes that run from it.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - stealth
+    - deobfuscation
+    - earth-estries
+    - demodex
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H042.md
+    - https://attack.mitre.org/techniques/T1140
+    - https://attack.mitre.org/detectionstrategies/DET0275
+    - https://www.trendmicro.com/en_us/research/24/k/earth-estries.html
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1140
+  sub_techniques: []
+  detection_strategies:
+    - DET0275
+  analytics:
+    - AN0767
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    Threat actors are using PowerShell's Expand-Archive cmdlet to extract malicious CAB
+    files containing encrypted DEMODEX rootkit configurations and shellcode payloads to
+    C:\Windows\debug, before deleting the original archive to evade detection.
+  attacker_behavior:
+    - Copies a CAB or zip archive onto the host through a remote session or an earlier foothold.
+    - Unpacks it into C:\Windows\debug with Expand-Archive, expand.exe or extrac32.
+    - Deletes the archive in the same script with Remove-Item or del.
+    - Loads the unpacked shellcode through a service, a scheduled task or a loader DLL.
+  legitimate_behavior:
+    - Windows writes plain log files such as NetSetup.LOG and PASSWD.LOG into the directory.
+    - A few diagnostic tools write trace output there.
+    - Administrators occasionally collect those logs for a support case.
+  risk_indicator:
+    - An extraction command names C:\Windows\debug as its destination.
+    - An executable, DLL, script or archive is written into the directory.
+    - A process image or a command-line argument points into the directory.
+    - A deletion of an archive follows the extraction in the same command.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+        - NewScriptWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: archive-extracted-to-debug-directory
+        name: Extraction command naming C:\Windows\debug
+        purpose: >-
+          Return Expand-Archive, expand, extrac32 and tar commands whose command line
+          names the debug directory. The directory test is a short literal and discards
+          almost every process event before the second pattern is tried.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/\\Windows\\debug\\/i
+          | CommandLine=/Expand-Archive|\bexpand(\.exe)?\b|\bextrac32\b|\btar(\.exe)?\s+-?x|\.cab\b|\.zip\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: code-written-to-debug-directory
+        name: Executable or script written into C:\Windows\debug
+        purpose: >-
+          Return executables, DLLs and scripts created in the directory, however they
+          were unpacked. The path is anchored to the directory so only its contents
+          match.
+        query: |
+          #event_simpleName=/^(PeFileWritten|NewScriptWritten)$/
+          | TargetFileName=/\\Windows\\debug\\[^\\]+$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: process-running-from-debug-directory
+        name: Process started from or pointed at C:\Windows\debug
+        purpose: >-
+          Return processes whose image is in the directory, and loaders such as
+          rundll32 and regsvr32 given a file there, which is how the unpacked payload is
+          started.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ImageFileName=/\\Windows\\debug\\[^\\]+$/i
+            or CommandLine=/\\Windows\\debug\\[^\s"']+\.(dll|exe|dat|bin|ps1|bat|sys)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: debug_directory_extraction
+      name: Archive unpacked into the Windows debug directory
+      description: >-
+        A command line unpacks an archive with C:\Windows\debug as its destination, or
+        runs a loader against a file in that directory.
+      source: process_creation
+      field: command_line
+      indicates: payload_unpacked_into_system_directory
+
+  supporting:
+    - id: code_file_in_debug_directory
+      name: Executable or script created in the directory
+      description: >-
+        A file-write event records a PE file or script directly under C:\Windows\debug,
+        which ordinarily holds only text logs.
+      source: file_creation
+      field: file_path
+      indicates: payload_staged_in_system_directory
+    - id: image_in_debug_directory
+      name: Process image located in the directory
+      description: >-
+        A process event shows an image path under C:\Windows\debug.
+      source: process_creation
+      field: image_path
+      indicates: execution_from_staging_directory
+    - id: remote_or_script_parent
+      name: Extraction issued from a remote session or script
+      description: >-
+        The parent is a remote-management host, a WMI provider, a service or a script
+        host, not an administrator's console.
+      source: process_creation
+      field: parent_process
+      indicates: remote_operator_activity
+
+  contradicting:
+    - id: diagnostic_collection
+      name: Activity is a recorded diagnostic collection
+      description: >-
+        A support case or change record covers an administrator gathering or unpacking
+        diagnostic files in the directory.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_administration
+    - id: known_tool_writes_there
+      name: A known product writes to the directory fleet-wide
+      description: >-
+        Earlier activity shows the same file name written to the directory on many hosts
+        by the same signed product.
+      source: baseline
+      field: TargetFileName
+      indicates: established_software_behaviour
+
+  risk_logic:
+    required:
+      - debug_directory_extraction
+
+    supporting:
+      any:
+        - code_file_in_debug_directory
+        - image_in_debug_directory
+        - remote_or_script_parent
+      all:
+        - code_file_in_debug_directory
+        - remote_or_script_parent
+
+    contradicting:
+      any:
+        - diagnostic_collection
+        - known_tool_writes_there
+      all: []
+
+  verdict:
+    low_risk_when:
+      - debug_directory_extraction
+      - diagnostic_collection
+      - known_tool_writes_there
+    suspicious_when:
+      - debug_directory_extraction
+      - remote_or_script_parent
+    high_risk_when:
+      - debug_directory_extraction
+      - remote_or_script_parent
+      - code_file_in_debug_directory
+
+  false_positive:
+    - condition: An administrator archives or unpacks log files there.
+      explanation: >-
+        Collecting NetSetup.LOG for a domain-join problem can involve zip commands that
+        name the directory. The contents are text logs and no executable is written.
+    - condition: A diagnostic tool writes trace files into the directory.
+      explanation: >-
+        A few Microsoft and vendor tools use it for output. They write logs, not code,
+        and the same names appear across the fleet.
+    - condition: The encrypted configuration is not a PE or script.
+      explanation: >-
+        The file case sees only executables and scripts. A payload unpacked as opaque
+        data files shows only in the extraction command, so its absence from the file
+        case does not clear a host.

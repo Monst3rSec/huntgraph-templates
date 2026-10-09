@@ -1,0 +1,300 @@
+# Converted from THORCollective/HEARTH Flames/H086.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h086-software-updater-delivering-foreign-payload-t1195-002
+version: 1.0.0
+
+info:
+  name: Compromised update channel delivering a payload through a trusted updater
+  description: >-
+    Between June and December 2025 the Notepad++ update infrastructure was compromised
+    and its updater, GUP.exe, was redirected to fetch attacker installers for selected
+    victims. Three chains followed, each ending with a legitimate signed program such as
+    ProShow, GameHook or a Bluetooth service binary side-loading a malicious DLL, and
+    then Cobalt Strike or the Chrysalis backdoor. HEARTH centres on the side-loading,
+    which needs module-load events this deployment does not collect. The updater's
+    behaviour is visible without them: it resolves a host that is not the project's, it
+    starts something that is not the Notepad++ installer, and unrelated signed programs
+    then run from a writable directory.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - initial-access
+    - supply-chain
+    - software-update
+    - notepad-plus-plus
+    - chrysalis
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H086.md
+    - https://attack.mitre.org/techniques/T1195
+    - https://attack.mitre.org/techniques/T1195/002
+    - https://attack.mitre.org/detectionstrategies/DET0309
+
+mitre:
+  tactics:
+    - TA0001
+  techniques:
+    - T1195
+  sub_techniques:
+    - T1195.002
+  detection_strategies:
+    - DET0309
+  analytics:
+    - AN0862
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary is compromising software update infrastructure to deliver malicious DLLs
+    sideloaded by legitimate signed executables, targeting organizations in government,
+    finance and IT sectors, to establish persistent backdoor access.
+  attacker_behavior:
+    - Redirects the updater's request so it downloads an installer from an attacker server.
+    - Has the updater run that installer, which unpacks a signed program and a malicious DLL into a writable directory.
+    - Starts the signed program so it loads the DLL and decrypts the backdoor.
+    - Runs discovery commands on the host once the backdoor is active.
+    - Sets a Run key or service for the signed program to persist.
+  legitimate_behavior:
+    - The updater resolves the project's site and its release host and runs the official installer.
+    - Users install unrelated signed software in their profiles.
+    - IT deploys Notepad++ updates through its own tooling.
+  risk_indicator:
+    - GUP.exe resolves a domain or connects to an address that is not the project's or GitHub's.
+    - GUP.exe starts a process other than the Notepad++ installer.
+    - A signed multimedia, gaming or Bluetooth program runs from AppData or ProgramData for the first time.
+    - Discovery commands follow under the same parent.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        file_hash: SHA256HashData
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: updater-resolving-foreign-domain
+        name: Notepad++ updater resolving a domain that is not the project's
+        purpose: >-
+          Return DNS requests by GUP.exe for anything other than the project site and
+          its release hosts. The requester is an exact match and runs first, which leaves
+          very few events for the exclusion.
+        query: |
+          #event_simpleName=DnsRequest
+          | ContextBaseFileName=/^(gup|WinGUp)\.exe$/i
+          | DomainName!=/(^|\.)(notepad-plus-plus\.org|github\.com|githubusercontent\.com|github\.io)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: updater-spawned-unexpected-process
+        name: Notepad++ updater starting something other than its installer
+        purpose: >-
+          Return children of GUP.exe whose image is not a Notepad++ installer or the
+          editor itself.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(gup|WinGUp)\.exe$/i
+          | FileName!=/^(npp\.[0-9.]+\.Installer(\.x64|\.arm64)?\.exe|notepad\+\+\.exe|gup\.exe|explorer\.exe)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: executable-written-by-updater
+        name: Executable written by the Notepad++ updater
+        purpose: >-
+          Return PE files the updater saved, with their hash, so the agent can check each
+          against the project's published installers.
+        query: |
+          #event_simpleName=PeFileWritten
+          | ContextBaseFileName=/^(gup|WinGUp)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: reported-sideload-host-from-writable-path
+        name: Signed host program from the reported chains running from a writable path
+        purpose: >-
+          Return the signed programs named in the reporting when they run from AppData
+          or ProgramData, where the installer unpacked them beside the malicious DLL.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(ProShow|GameHook|BluetoothService)\.exe$/i
+          | ImageFileName=/\\(Users\\[^\\]+\\AppData|ProgramData|Users\\Public)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: updater_foreign_contact
+      name: Updater contacted a host outside its update channel
+      description: >-
+        A DNS request attributed to the Notepad++ updater names a domain other than the
+        project site and its release hosts.
+      source: dns_request
+      field: query_name
+      indicates: update_channel_redirected
+
+  supporting:
+    - id: updater_unexpected_child
+      name: Updater started a foreign process
+      description: >-
+        A process whose parent is the updater is not the official installer or the
+        editor.
+      source: process_creation
+      field: parent_process
+      indicates: payload_executed_by_trusted_updater
+    - id: unknown_installer_hash
+      name: Updater wrote an executable with an unknown hash
+      description: >-
+        The hash of the file the updater saved does not match a published Notepad++
+        installer.
+      source: file_creation
+      field: file_hash
+      indicates: trojanised_update_package
+    - id: signed_host_in_writable_path
+      name: Unrelated signed program running from a writable directory
+      description: >-
+        A signed multimedia, gaming or Bluetooth program runs from AppData or
+        ProgramData shortly after the update.
+      source: process_creation
+      field: image_path
+      indicates: sideloading_host_staged
+    - id: updater_wrote_outside_temp
+      name: Updater wrote an executable outside its temporary download path
+      description: >-
+        The path of the file the updater wrote is not under the user's Temp directory
+        with the installer's usual name.
+      source: file_creation
+      field: file_path
+      indicates: abnormal_update_behaviour
+
+  contradicting:
+    - id: proxy_or_mirror_domain
+      name: Domain is the organisation's proxy or an internal mirror
+      description: >-
+        The domain the updater resolved is a corporate proxy, a captive portal or an
+        internal update mirror.
+      source: asset_inventory
+      field: DomainName
+      indicates: expected_network_path
+    - id: managed_update_deployment
+      name: Update was deployed by IT
+      description: >-
+        A deployment record covers a Notepad++ update pushed to the host at that time.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_software_deployment
+
+  risk_logic:
+    required:
+      - updater_foreign_contact
+
+    supporting:
+      any:
+        - updater_unexpected_child
+        - unknown_installer_hash
+        - signed_host_in_writable_path
+        - updater_wrote_outside_temp
+      all:
+        - updater_unexpected_child
+        - unknown_installer_hash
+
+    contradicting:
+      any:
+        - proxy_or_mirror_domain
+        - managed_update_deployment
+      all: []
+
+  verdict:
+    low_risk_when:
+      - updater_foreign_contact
+      - proxy_or_mirror_domain
+    suspicious_when:
+      - updater_foreign_contact
+      - unknown_installer_hash
+    high_risk_when:
+      - updater_foreign_contact
+      - unknown_installer_hash
+      - updater_unexpected_child
+
+  false_positive:
+    - condition: The updater resolves a proxy or certificate host.
+      explanation: >-
+        Behind an explicit proxy the updater resolves the proxy's name, and certificate
+        checks resolve the authority's. Those domains are the same for every application
+        on the host.
+    - condition: The project changes where it hosts releases.
+      explanation: >-
+        A new release host would appear in the first case on every machine at once. A
+        redirected update appears on a few selected machines.
+    - condition: A user installs one of the named signed programs.
+      explanation: >-
+        The fourth case matches by file name. A genuine install sits under Program
+        Files, or is one the user can account for.

@@ -1,0 +1,335 @@
+# Converted from THORCollective/HEARTH Flames/H121.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+# The NTDS extraction commands themselves are H116's subject; this file holds the
+# scheduled-task vehicle and what the Task Scheduler starts.
+type: detection
+
+id: hg-win-hearth-h121-remote-scheduled-task-on-domain-controller-for-ntds-harvest-t1053-005
+version: 1.0.0
+
+info:
+  name: Scheduled task created remotely on a domain controller to harvest NTDS
+  description: >-
+    In the domain compromise Microsoft described, the operator created a scheduled task
+    on a domain controller from another host, had it take an NTDS snapshot as SYSTEM,
+    and packed the output with makecab. The task is the vehicle and the credential
+    database is the goal. Task events 4698 and 4699 and the Task Scheduler operational
+    log are not collected here. Process events on both ends are: schtasks.exe with
+    /create and /s on the source, and on the domain controller the NTDS tooling started
+    by the Task Scheduler service. A task registered over RPC by a tool such as
+    Impacket's atexec starts no schtasks.exe anywhere, so only the second half is seen
+    for it. The create-run-delete sequence within minutes is left to the agent. Nothing
+    on a process event says the host is a domain controller; asset records settle that.
+  severity: critical
+  author: huntgraph
+  tags:
+    - hearth
+    - execution
+    - scheduled-task
+    - domain-controller
+    - ntds
+    - credential-access
+    - makecab
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H121.md
+    - https://attack.mitre.org/techniques/T1053
+    - https://attack.mitre.org/techniques/T1053/005
+    - https://attack.mitre.org/detectionstrategies/DET0441
+    - https://www.microsoft.com/en-us/security/blog/2026/04/17/domain-compromise-predictive-shielding-shut-down-lateral-movement/
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1053
+  sub_techniques:
+    - T1053.005
+  detection_strategies:
+    - DET0441
+  analytics:
+    - AN1221
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary is remotely creating scheduled tasks on domain controllers to execute
+    NTDS.dit snapshot or credential harvesting operations, indicated by schtasks.exe or
+    at.exe creating tasks under SYSTEM context on DC hostnames.
+  attacker_behavior:
+    - Runs schtasks /create with /s naming a domain controller and /ru SYSTEM.
+    - Sets the task action to ntdsutil, vssadmin, esentutl or diskshadow, often through cmd.exe.
+    - Runs the task at once with schtasks /run and deletes it minutes later.
+    - Packs the snapshot output with makecab for transfer.
+    - Registers the task over RPC with a remote execution tool, leaving no schtasks.exe process.
+  legitimate_behavior:
+    - Administrators deploy maintenance tasks to servers with schtasks /s.
+    - Backup jobs on domain controllers run wbadmin from a scheduled task.
+    - Management products register and remove short-lived tasks.
+  risk_indicator:
+    - The remote task target is a domain controller.
+    - The task action names NTDS tooling or the ntds.dit path.
+    - NTDS tooling starts with the Task Scheduler service as its parent or grandparent.
+    - The task is created, run and deleted within minutes.
+    - makecab is given NTDS output or registry hive files.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: schtasks-create-on-remote-host
+        name: schtasks creating a task on a remote host
+        purpose: >-
+          Return schtasks /create commands that carry /s, with the target, the run-as
+          account and the action on the command line. The agent keeps targets that asset
+          records list as domain controllers.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^schtasks\.exe$/i
+          | CommandLine=/\/create\b/i
+          | CommandLine=/\/s\s+\S+/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: task-action-naming-ntds-tooling
+        name: Task creation whose action names NTDS tooling
+        purpose: >-
+          Return task creation by schtasks, at or PowerShell where the action names
+          ntdsutil, vssadmin, esentutl, diskshadow, makecab, wbadmin or the database
+          path, local or remote.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(schtasks|at|powershell|pwsh)\.exe$/i
+          | CommandLine=/\/create\b|Register-ScheduledTask|New-ScheduledTaskAction|\bat(\.exe)?"?\s+(\\\\|\d)/i
+          | CommandLine=/ntdsutil|vssadmin|esentutl|diskshadow|makecab|wbadmin|ntds\.dit|HarddiskVolumeShadowCopy/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: ntds-tooling-started-by-task-scheduler
+        name: NTDS tooling started by the Task Scheduler service
+        purpose: >-
+          Return ntdsutil, vssadmin, esentutl, diskshadow, makecab and wbadmin whose
+          parent is the Task Scheduler host. This is the half seen on the domain
+          controller whichever way the task was registered.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(svchost|taskeng|taskhostw)\.exe$/i
+          | FileName=/^(ntdsutil|vssadmin|esentutl|diskshadow|makecab|wbadmin)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: task-started-shell-naming-ntds-tooling
+        name: Shell started by the Task Scheduler service whose command names NTDS tooling
+        purpose: >-
+          Return shells the Task Scheduler host starts where the command line names the
+          tooling or the database, the form a task takes when its action is wrapped in
+          cmd.exe /c or PowerShell.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(svchost|taskeng|taskhostw)\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh)\.exe$/i
+          | CommandLine=/ntdsutil|vssadmin|esentutl|diskshadow|makecab|wbadmin|ntds\.dit|HarddiskVolumeShadowCopy/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: makecab-packaging-directory-database-output
+        name: makecab given NTDS or registry hive output
+        purpose: >-
+          Return makecab runs whose arguments name NTDS files, an IFM folder or registry
+          hives, the packaging step reported in the intrusion.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^makecab\.exe$/i
+          | CommandLine=/ntds|\.dit\b|\\Active Directory\\|\\registry\\(SYSTEM|SECURITY)\b|\\config\\(SYSTEM|SECURITY|SAM)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: schtasks-run-or-delete-on-remote-host
+        name: schtasks running or deleting a task on a remote host
+        purpose: >-
+          Return the run and delete commands sent to a remote host. With the create
+          events from the first case, the agent derives how long the task existed.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^schtasks\.exe$/i
+          | CommandLine=/\/(run|delete)\b/i
+          | CommandLine=/\/s\s+\S+/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: task_vehicle_for_ntds_tooling
+      name: Scheduled task used to run NTDS tooling
+      description: >-
+        A task is created on a remote host, or with an action naming NTDS tooling, or
+        the Task Scheduler host starts that tooling directly or through a shell.
+      source: process_creation
+      field: command_line
+      indicates: scheduled_task_credential_harvest
+
+  supporting:
+    - id: scheduler_parent
+      name: Tooling runs under the Task Scheduler host
+      description: >-
+        The parent of the NTDS tool, or of the shell that names it, is svchost.exe,
+        taskeng.exe or taskhostw.exe.
+      source: process_creation
+      field: parent_process
+      indicates: task_scheduler_execution
+    - id: domain_controller_host
+      name: Host or target is a domain controller
+      description: >-
+        The host on the event, or the name after /s, is a domain controller in asset
+        records.
+      source: process_creation
+      field: host
+      indicates: domain_controller_targeted
+    - id: system_context
+      name: Runs as SYSTEM
+      description: >-
+        The tooling runs as SYSTEM, or the create command asks for /ru SYSTEM.
+      source: process_creation
+      field: user
+      indicates: highest_privilege_execution
+    - id: short_lived_task
+      name: Task created, run and deleted within minutes
+      description: >-
+        Create, run and delete commands for the same task name and target fall within a
+        few minutes. The agent derives the interval from the returned events.
+      source: process_creation
+      field: command_line
+      indicates: anti_forensic_task_removal
+    - id: output_packaged
+      name: Output packed with makecab
+      description: >-
+        makecab is given NTDS or hive files on the same host.
+      source: process_creation
+      field: image_name
+      indicates: collection_packaged_for_transfer
+
+  contradicting:
+    - id: scheduled_backup_task
+      name: Task is the domain controller's standing backup job
+      description: >-
+        The same task action recurs on a fixed schedule under the backup account.
+      source: baseline
+      field: CommandLine
+      indicates: routine_backup
+    - id: approved_maintenance_window
+      name: Change record covers the task
+      description: >-
+        A change record covers directory maintenance on this host at this time.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_maintenance
+
+  risk_logic:
+    required:
+      - task_vehicle_for_ntds_tooling
+
+    supporting:
+      any:
+        - scheduler_parent
+        - domain_controller_host
+        - system_context
+        - short_lived_task
+        - output_packaged
+      all:
+        - scheduler_parent
+        - domain_controller_host
+
+    contradicting:
+      any:
+        - scheduled_backup_task
+        - approved_maintenance_window
+      all: []
+
+  verdict:
+    low_risk_when:
+      - task_vehicle_for_ntds_tooling
+      - scheduled_backup_task
+    suspicious_when:
+      - task_vehicle_for_ntds_tooling
+      - domain_controller_host
+    high_risk_when:
+      - task_vehicle_for_ntds_tooling
+      - domain_controller_host
+      - short_lived_task
+
+  false_positive:
+    - condition: wbadmin system state backup run from a scheduled task.
+      explanation: >-
+        A standing backup job matches the third case. It repeats at a fixed time and
+        nothing creates or deletes the task around it.
+    - condition: Administrators pushing maintenance tasks with schtasks /s.
+      explanation: >-
+        Remote task creation is a normal administrative method. The action is a
+        maintenance script, and the targets are not only domain controllers.
+    - condition: makecab used by diagnostics collection.
+      explanation: >-
+        Support tooling packs logs with makecab. The inputs are log files, not the
+        directory database or hives.

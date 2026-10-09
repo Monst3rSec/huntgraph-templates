@@ -1,0 +1,293 @@
+# Converted from THORCollective/HEARTH Flames/H052.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h052-dllhost-spawning-explorer-shell-uri-t1219-002
+version: 1.0.0
+
+info:
+  name: BackConnect VNC in dllhost.exe opening Explorer shell folders
+  description: >-
+    The BackConnect module used by IcedID and now Latrodectus gives its operator a VNC
+    session on the victim's desktop. It runs injected inside dllhost.exe, so when the
+    operator opens a file browser the new Explorer window is a child of dllhost, started
+    with a shell URI such as shell:mycomputerfolder. The injection itself is not
+    something this deployment collects. The child process is, and dllhost.exe has no
+    reason to start explorer.exe with a shell folder, or to start shells and discovery
+    tools at all. Lunar Spider held access for nearly two months this way.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - command-and-control
+    - backconnect
+    - vnc
+    - dllhost
+    - latrodectus
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H052.md
+    - https://attack.mitre.org/techniques/T1219
+    - https://attack.mitre.org/techniques/T1219/002
+    - https://attack.mitre.org/detectionstrategies/DET0259
+    - https://thedfirreport.com/2025/09/29/from-a-single-click-how-lunar-spider-enabled-a-near-two-month-intrusion/
+
+# HEARTH cites parent T1219; a VNC module is remote desktop software, so T1219.002. The
+# Windows analytic for it lists file creation, network connections and firewall changes,
+# not process creation, which is what this hunt reads. No analytic is declared, so
+# data_sources and data_components describe the hunt, not an ATT&CK mapping.
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1219
+  sub_techniques:
+    - T1219.002
+  detection_strategies:
+    - DET0259
+  analytics: []
+  platforms:
+    - Windows
+  data_sources:
+    - CrowdStrike:Endpoint
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    Adversaries are using BackConnect VNC modules injected into dllhost.exe to execute
+    Windows shell commands that open specific Explorer interfaces, such as
+    shell:mycomputerfolder, for interactive file system browsing on compromised hosts.
+  attacker_behavior:
+    - Injects the BackConnect module into a dllhost.exe process started without a COM class argument.
+    - Opens This PC or another shell folder through explorer.exe with a shell URI.
+    - Starts cmd, PowerShell or a browser from the same dllhost to work interactively.
+    - Keeps a long-lived outbound connection from dllhost to the BackConnect server.
+  legitimate_behavior:
+    - dllhost.exe hosts COM surrogates for thumbnails, photo viewing and shell extensions.
+    - Explorer is started by userinit, winlogon or itself.
+    - Some shell extensions cause dllhost to open a folder window in rare cases.
+  risk_indicator:
+    - explorer.exe has dllhost.exe as its parent and a shell URI on its command line.
+    - dllhost.exe starts a shell, a browser or discovery utilities.
+    - The dllhost process has no /Processid argument.
+    - dllhost.exe connects to a public address on a non-web port.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: dllhost-spawned-explorer-shell-uri
+        name: explorer.exe started by dllhost.exe with a shell URI
+        purpose: >-
+          Return the exact pattern HEARTH names. Parent and image are both anchored
+          matches, so the command-line test runs on a handful of events.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^dllhost\.exe$/i
+          | FileName=/^explorer\.exe$/i
+          | CommandLine=/shell:/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: dllhost-spawned-interactive-tool
+        name: Shell, browser or discovery tool started by dllhost.exe
+        purpose: >-
+          Return the other things an operator opens through the same session, none of
+          which a COM surrogate starts.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^dllhost\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh|explorer|chrome|msedge|firefox|whoami|net1?|nltest|ipconfig|systeminfo|tasklist|rundll32|mstsc)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: dllhost-without-class-argument
+        name: dllhost.exe started with no COM class argument
+        purpose: >-
+          Return dllhost processes whose command line lacks /Processid, the form a
+          malware loader creates as an injection target and the COM runtime never does.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^dllhost\.exe$/i
+          | CommandLine!=/\/Processid:/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: dllhost-external-connection
+        name: dllhost.exe connecting to a public address
+        purpose: >-
+          Return outbound connections from dllhost to public addresses, the BackConnect
+          channel itself.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | ContextBaseFileName=/^dllhost\.exe$/i
+          | !cidr(RemoteAddressIP4, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: dllhost_interactive_child
+      name: dllhost.exe started Explorer or an interactive tool
+      description: >-
+        A process event shows dllhost.exe as the parent of explorer.exe with a shell URI,
+        or of a shell, browser or discovery utility.
+      source: process_creation
+      field: parent_process
+      indicates: hands_on_activity_through_injected_surrogate
+
+  supporting:
+    - id: shell_uri_argument
+      name: Explorer given a shell URI
+      description: >-
+        The explorer.exe command line carries shell:mycomputerfolder or another shell
+        URI, opening a file browser on request.
+      source: process_creation
+      field: command_line
+      indicates: interactive_file_system_browsing
+    - id: surrogate_without_class
+      name: dllhost has no COM class argument
+      description: >-
+        The parent dllhost.exe process was started without /Processid, which the agent
+        confirms by matching its process id to a result of the third case.
+      source: process_creation
+      field: parent_process_id
+      indicates: process_created_as_injection_target
+    - id: dllhost_public_connection
+      name: dllhost.exe reached a public address
+      description: >-
+        A connection attributed to dllhost.exe goes to an address outside the private
+        ranges.
+      source: network_connection
+      field: remote_address
+      indicates: backconnect_channel
+    - id: dllhost_connection_port
+      name: Connection uses a non-web port
+      description: >-
+        The remote port of the dllhost connection is not 80 or 443.
+      source: network_connection
+      field: remote_port
+      indicates: custom_remote_access_protocol
+
+  contradicting:
+    - id: shell_extension_behaviour
+      name: A known shell extension produces the child
+      description: >-
+        Earlier activity shows the same dllhost child on many hosts, tied to an
+        installed shell extension or viewer.
+      source: baseline
+      field: CommandLine
+      indicates: established_software_behaviour
+    - id: sanctioned_test_host
+      name: Host is a designated testing endpoint
+      description: >-
+        Asset records list the host as a malware-analysis or detection-validation
+        system.
+      source: asset_inventory
+      field: ComputerName
+      indicates: authorised_security_testing
+
+  risk_logic:
+    required:
+      - dllhost_interactive_child
+
+    supporting:
+      any:
+        - shell_uri_argument
+        - surrogate_without_class
+        - dllhost_public_connection
+        - dllhost_connection_port
+      all:
+        - shell_uri_argument
+        - dllhost_public_connection
+
+    contradicting:
+      any:
+        - shell_extension_behaviour
+        - sanctioned_test_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - dllhost_interactive_child
+      - shell_extension_behaviour
+    suspicious_when:
+      - dllhost_interactive_child
+      - shell_uri_argument
+    high_risk_when:
+      - dllhost_interactive_child
+      - shell_uri_argument
+      - surrogate_without_class
+      - dllhost_public_connection
+
+  false_positive:
+    - condition: A shell extension opens a folder through its surrogate.
+      explanation: >-
+        A few extensions have dllhost open an Explorer window. The command line names a
+        specific folder path, not a shell URI, and the behaviour is the same on every
+        host with the extension.
+    - condition: COM surrogates make network connections.
+      explanation: >-
+        Some COM servers hosted in dllhost reach Microsoft or vendor services. Those
+        processes carry a /Processid argument and connect on 443.
+    - condition: dllhost starts without arguments during system operations.
+      explanation: >-
+        The third case returns some benign instances. It is context for the first two,
+        confirming that the dllhost that started Explorer was not a real surrogate.

@@ -1,0 +1,263 @@
+# Converted from THORCollective/HEARTH Flames/H008.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h008-domain-account-creation-t1136-002
+version: 1.0.0
+
+info:
+  name: Domain account created to maintain access to Active Directory
+  description: >-
+    A new domain account gives an adversary credentialed access that outlives any
+    implant: it works from any host, survives reimaging and looks like a user. With
+    sufficient rights it is one command, net user /add /domain, New-ADUser or dsadd, and
+    frameworks such as Empire and Pupy wrap the same call. Security event 4720 on the
+    domain controller is not collected here, so the hunt reads the creating command where
+    the sensor sees it, on the host that issued it, and the group change that usually
+    follows.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - persistence
+    - active-directory
+    - account-creation
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H008.md
+    - https://attack.mitre.org/techniques/T1136
+    - https://attack.mitre.org/techniques/T1136/002
+    - https://attack.mitre.org/detectionstrategies/DET0003
+    - https://github.com/0xAnalyst/CB-Threat-Hunting/blob/master/ATT%26CK/T1136.002%20-%20Domain%20Account%20Creation.md
+    - https://www.splunk.com/en_us/blog/security/active-directory-discovery-detection-threat-research-release-september-2021.html
+
+mitre:
+  tactics:
+    - TA0003
+  techniques:
+    - T1136
+  sub_techniques:
+    - T1136.002
+  detection_strategies:
+    - DET0003
+  analytics:
+    - AN0006
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    Adversaries may create domain accounts, whether user, administrator or service
+    accounts, to maintain access to systems joined to Active Directory without needing a
+    persistent remote access tool on any one of them.
+  attacker_behavior:
+    - Runs net user with /add and /domain from a compromised host that holds account-operator rights.
+    - Creates the account with New-ADUser or dsadd user from PowerShell or a remote session.
+    - Adds the new account to Domain Admins or another privileged group straight afterwards.
+    - Names the account to resemble a service or support account so it passes a casual review.
+  legitimate_behavior:
+    - Identity administrators and the service desk create accounts for joiners.
+    - Provisioning systems create accounts from HR feeds under a service identity.
+    - Application installers create a service account during setup.
+  risk_indicator:
+    - The command runs on a workstation or member server, not an identity management host.
+    - The parent is a script host, web server, remote-management or WMI provider process.
+    - The new account joins a privileged group within minutes.
+    - The creating account has not created accounts before.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: net-user-add-domain
+        name: net user creating an account in the domain
+        purpose: >-
+          Return each net or net1 run that adds a user with the /domain switch. The
+          image-name test runs first so the command-line patterns are only tried on net
+          itself.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^net1?\.exe$/i
+          | CommandLine=/\buser\b/i
+          | CommandLine=/\/add\b/i
+          | CommandLine=/\/do(m|ma|mai|main)?\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: directory-cmdlet-account-creation
+        name: New-ADUser or dsadd creating a domain account
+        purpose: >-
+          Cover creation through the Active Directory PowerShell module and dsadd, which
+          never involve net.exe.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh|dsadd)\.exe$/i
+          | CommandLine=/New-ADUser|New-ADServiceAccount|dsadd(\.exe)?"?\s+user\b|DirectoryEntry.*Create\(\s*["']user/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: privileged-group-addition
+        name: Account added to a privileged domain group
+        purpose: >-
+          Return domain group additions, so the agent can pair a new account with the
+          privilege it was given on the same host.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(net1?|powershell|pwsh|dsmod)\.exe$/i
+          | CommandLine=/\bgroup\b.*\/add\b.*\/do(m|ma|mai|main)?\b|\bgroup\b.*\/do(m|ma|mai|main)?\b.*\/add\b|Add-ADGroupMember|dsmod(\.exe)?"?\s+group\b.*-addmbr/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: domain_account_create_command
+      name: Command that creates a domain account
+      description: >-
+        A process command line adds a user with the domain switch, or calls New-ADUser or
+        dsadd user, showing the account was created from this host.
+      source: process_creation
+      field: command_line
+      indicates: domain_account_creation
+
+  supporting:
+    - id: privileged_group_followup
+      name: Privileged group addition on the same host
+      description: >-
+        A group-add command for Domain Admins, Enterprise Admins or another privileged
+        group runs on the same host soon after the creation.
+      source: process_creation
+      field: command_line
+      indicates: immediate_privilege_assignment
+    - id: scripted_or_remote_parent
+      name: Creation issued by a script or remote-management parent
+      description: >-
+        The parent is a script host, web server worker, WMI provider or remote shell
+        host, not an administrator's console.
+      source: process_creation
+      field: parent_process
+      indicates: abnormal_execution_chain
+    - id: creator_not_identity_admin
+      name: Creating account is not an identity administrator
+      description: >-
+        The user on the event is a standard user, a service account or an administrator
+        whose role does not include provisioning.
+      source: process_creation
+      field: user
+      indicates: account_creation_outside_role
+    - id: non_identity_host
+      name: Command run on a workstation or ordinary server
+      description: >-
+        The host is not a domain controller, identity management server or
+        administrative workstation.
+      source: process_creation
+      field: host
+      indicates: creation_from_unexpected_host
+
+  contradicting:
+    - id: provisioning_request
+      name: Account matches a provisioning request
+      description: >-
+        A joiner, service-account or access request covers the account name, the creator
+        and the time.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_account_provisioning
+    - id: identity_management_host
+      name: Host is an identity management system
+      description: >-
+        Asset records class the host as a domain controller, provisioning server or
+        privileged administrative workstation.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_provisioning_source
+
+  risk_logic:
+    required:
+      - domain_account_create_command
+
+    supporting:
+      any:
+        - privileged_group_followup
+        - scripted_or_remote_parent
+        - creator_not_identity_admin
+        - non_identity_host
+      all:
+        - privileged_group_followup
+        - creator_not_identity_admin
+
+    contradicting:
+      any:
+        - provisioning_request
+        - identity_management_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - domain_account_create_command
+      - provisioning_request
+      - identity_management_host
+    suspicious_when:
+      - domain_account_create_command
+      - non_identity_host
+    high_risk_when:
+      - domain_account_create_command
+      - non_identity_host
+      - privileged_group_followup
+      - creator_not_identity_admin
+
+  false_positive:
+    - condition: The service desk creates accounts for new staff.
+      explanation: >-
+        Provisioning uses the same commands. It comes from a small set of administrative
+        hosts and accounts, follows a request, and rarely grants a privileged group at
+        creation.
+    - condition: An identity management system provisions from an HR feed.
+      explanation: >-
+        These run New-ADUser in volume under one service identity on one server, on a
+        schedule that matches the feed.
+    - condition: An application installer creates its service account.
+      explanation: >-
+        The parent is the installer, the account name follows the product's convention,
+        and the same creation appears wherever the product is deployed.

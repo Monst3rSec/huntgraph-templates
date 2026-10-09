@@ -1,0 +1,336 @@
+# Converted from THORCollective/HEARTH Flames/H168.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h168-multi-hop-proxy-implant-and-softether-relay-t1090-003
+version: 1.0.0
+
+info:
+  name: Multi-hop proxy implant or SoftEther relay on a Windows endpoint
+  description: >-
+    Webworm does not let an implant talk to its controller directly. ChainWorm opens a
+    hardcoded listener and forwards through a chain of intermediates; WormSocket tries
+    ws, wss, http and https against the same upstream in turn; SoftEther VPN, sometimes
+    under another file name, adds a further layer. ESET reported the set in May 2026.
+    The hosting provider of the upstream, the WebSocket upgrade and the length of a
+    connection are not on any sensor event, and a renamed SoftEther copy is identified
+    by the DLLs it imports, which is a Module Load event this deployment does not
+    collect. What the sensor does record is SoftEther running or resolving its own
+    service names on an endpoint, a process that is not a browser connecting out on the
+    alternate web ports the scheme cycle uses, and the svchost to cmd lineage ESET
+    describes for the launch.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - command-and-control
+    - multi-hop-proxy
+    - softether
+    - webworm
+    - chainworm
+    - wormsocket
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H168.md
+    - https://attack.mitre.org/techniques/T1090
+    - https://attack.mitre.org/techniques/T1090/003
+    - https://attack.mitre.org/detectionstrategies/DET0359
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1090
+  sub_techniques:
+    - T1090.003
+  detection_strategies:
+    - DET0359
+  analytics:
+    - AN1020
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - dns:query
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+    - Network Traffic Flow
+
+hypothesis:
+  statement: >-
+    A Windows host is running a multi-hop proxy implant (Webworm's ChainWorm or
+    WormSocket, or a SoftEther VPN client under a renamed binary) that opens hardcoded
+    listener ports and forwards traffic through sequential ws, wss, http and https
+    upstream hops, visible as a non-browser, non-VPN-client process maintaining outbound
+    WebSocket connections to cloud VPS providers for hours at a time.
+  attacker_behavior:
+    - Installs a SoftEther VPN client or server component on a workstation, sometimes renamed.
+    - Runs a relay implant from cmd.exe started by svchost.exe.
+    - Tries the same upstream on ports 80, 443, 8080 and 8443 in quick succession.
+    - Holds the chosen connection open for hours and restarts the implant when the chain breaks.
+    - Pairs the proxy chain with Discord or Microsoft Graph for tasking.
+  legitimate_behavior:
+    - Network teams run SoftEther as a sanctioned VPN on named hosts.
+    - Developer tools, update agents and proxy-aware applications connect out on 8080 and 8443.
+    - Scheduled tasks run cmd.exe under svchost.exe.
+  risk_indicator:
+    - A SoftEther component runs on a host with no VPN role.
+    - SoftEther arguments or configuration names appear under a different image name.
+    - One process connects to the same public address on several web ports within seconds.
+    - The process is neither a browser nor a collaboration or VPN client.
+    - cmd.exe under svchost.exe starts a binary from ProgramData, Public or a temporary directory.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: softether-component-execution
+        name: SoftEther VPN component running
+        purpose: >-
+          Return SoftEther client, server, bridge and command-line components by their
+          shipped file names. The name test is anchored and runs first.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(vpnclient|vpnserver|vpnbridge|vpncmd|vpncmgr|vpnsmgr)(_x64)?\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: softether-arguments-under-another-name
+        name: SoftEther arguments or configuration names under another image name
+        purpose: >-
+          Return processes that are not named as SoftEther ships them but carry its
+          user-mode switches or configuration file names, which is how a renamed copy
+          shows without Module Load telemetry. A renamed copy installed as a service
+          with no such argument is not seen here.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName!=/^(vpnclient|vpnserver|vpnbridge|vpncmd|vpncmgr|vpnsmgr)(_x64)?\.exe$/i
+          | CommandLine=/\s\/usermode(_hidetray|_showtray)?\b|hamcore\.se2|vpn_(client|server|bridge)\.config/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: softether-service-name-resolution
+        name: DNS request for a SoftEther service name
+        purpose: >-
+          Return requests for SoftEther's dynamic DNS, NAT traversal, VPN Azure and VPN
+          Gate names, with the requesting process, whatever the process is called.
+        query: |
+          #event_simpleName=DnsRequest
+          | DomainName=/(^|\.)(softether\.net|softether-network\.net|vpnazure\.net|vpngate\.net)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: alternate-web-port-connection-from-non-browser
+        name: Outbound connection on port 8080 or 8443 from a process that is not a browser
+        purpose: >-
+          Return public connections on the two alternate web ports from processes other
+          than browsers and collaboration clients. WormSocket's scheme cycle touches 80,
+          443, 8080 and 8443 on one upstream; 80 and 443 are far too large to return raw
+          over months and are left out. The agent groups the returned events by process
+          id and remote address and looks for the same address on both ports within
+          seconds, then for the connection repeating over hours. The provider behind an
+          address is not on the event and has to be looked up.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | event_platform=Win
+          | in(field="RemotePort", values=[8080, 8443])
+          | !cidr(RemoteAddressIP4, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"])
+          | ContextBaseFileName!=/^(chrome|msedge|firefox|brave|opera|iexplore|msedgewebview2|teams|ms-teams|outlook|slack|zoom|onedrive)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: service-host-shell-starting-staged-binary
+        name: cmd.exe under svchost.exe starting a binary from a staging directory
+        purpose: >-
+          Return cmd.exe whose parent is svchost.exe and whose command line names an
+          executable under ProgramData, Public or a temporary directory, the launch
+          lineage ESET reports. Scheduled tasks produce the same lineage; the path is
+          what narrows it.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^svchost\.exe$/i
+          | FileName=/^cmd\.exe$/i
+          | CommandLine=/\\(ProgramData|Users\\Public|Windows\\Temp|AppData\\Local\\Temp)\\[^"\s]*\.exe\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: unsanctioned_relay_process
+      name: Relay or VPN component running outside its role
+      description: >-
+        A SoftEther component, a process carrying SoftEther arguments under another
+        name, or a staged binary started from cmd.exe under svchost.exe is running on a
+        host with no proxy or VPN role.
+      source: process_creation
+      field: command_line
+      indicates: proxy_relay_installed
+
+  supporting:
+    - id: scheme_cycle_connections
+      name: One process tries several web ports on one upstream
+      description: >-
+        A process that is not a browser connects to the same public address on 8080 and
+        8443 within seconds, which the agent derives by grouping the returned connection
+        events by process id and remote address.
+      source: network_connection
+      field: remote_port
+      indicates: protocol_negotiation_fingerprint
+    - id: sustained_upstream_connection
+      name: Connections to the upstream repeat for hours
+      description: >-
+        The same process and remote address recur across hours, which the agent derives
+        from the timestamps of the returned events.
+      source: network_connection
+      field: remote_address
+      indicates: long_lived_relay_channel
+    - id: softether_name_resolved
+      name: SoftEther service name resolved
+      description: >-
+        A process on the host resolves a SoftEther dynamic DNS or NAT traversal name.
+      source: dns_request
+      field: query_name
+      indicates: vpn_relay_rendezvous
+    - id: relay_under_service_host_shell
+      name: Component started from cmd.exe under svchost.exe
+      description: >-
+        The parent of the relay process is cmd.exe and its grandparent is svchost.exe.
+      source: process_creation
+      field: parent_process
+      indicates: implant_launch_lineage
+
+  contradicting:
+    - id: sanctioned_vpn_host
+      name: Host is an approved SoftEther or proxy endpoint
+      description: >-
+        Asset records show SoftEther or a proxy deployed on this host by the network
+        team.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_vpn_deployment
+    - id: known_application_port_use
+      name: Process is a known application using these ports
+      description: >-
+        The connecting process is an installed product whose documented service
+        endpoints use 8080 or 8443.
+      source: asset_inventory
+      field: ComputerName
+      indicates: documented_application_traffic
+
+  risk_logic:
+    required:
+      - unsanctioned_relay_process
+
+    supporting:
+      any:
+        - scheme_cycle_connections
+        - sustained_upstream_connection
+        - softether_name_resolved
+        - relay_under_service_host_shell
+      all:
+        - scheme_cycle_connections
+        - sustained_upstream_connection
+
+    contradicting:
+      any:
+        - sanctioned_vpn_host
+        - known_application_port_use
+      all: []
+
+  verdict:
+    low_risk_when:
+      - unsanctioned_relay_process
+      - sanctioned_vpn_host
+      - known_application_port_use
+    suspicious_when:
+      - unsanctioned_relay_process
+      - softether_name_resolved
+    high_risk_when:
+      - unsanctioned_relay_process
+      - scheme_cycle_connections
+      - sustained_upstream_connection
+
+  false_positive:
+    - condition: SoftEther is the organisation's VPN.
+      explanation: >-
+        It runs under its own names from Program Files on hosts the network team lists.
+    - condition: Developer and management tools use 8080 and 8443.
+      explanation: >-
+        Local proxies, application servers and update agents connect on these ports.
+        They talk to one port, not both, and to addresses their vendor documents.
+    - condition: Scheduled tasks run batch files from ProgramData.
+      explanation: >-
+        The Schedule service starts cmd.exe under svchost.exe for every such task. The
+        same line repeats on a schedule and names an installed product.

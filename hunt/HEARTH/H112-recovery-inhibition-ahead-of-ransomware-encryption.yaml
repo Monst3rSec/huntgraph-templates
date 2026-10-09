@@ -1,0 +1,260 @@
+# Converted from THORCollective/HEARTH Flames/H112.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+# HEARTH files this under T1486. Its main evidence, the rate of file modification and
+# rename, is not collected, so the template hunts the precursor commands HEARTH
+# names and is mapped to T1490.
+type: detection
+
+id: hg-win-hearth-h112-recovery-inhibition-ahead-of-ransomware-encryption-t1490
+version: 1.0.0
+
+info:
+  name: Shadow copies, boot recovery and backups removed ahead of ransomware encryption
+  description: >-
+    HEARTH describes ransomware by its file activity: thousands of writes and renames a
+    minute, new extensions, the same note in every directory. File modification, rename
+    and ordinary file creation are not events this deployment collects, so that rate
+    cannot be measured here and nothing in this file claims to. HEARTH also names what
+    precedes encryption, and those are commands: deleting volume shadow copies, turning
+    off boot recovery with bcdedit, and deleting the backup catalogue. They give a short
+    window before files are lost, and they are returned raw with their parent and account.
+    A ransomware binary that removes shadow copies through COM or WMI calls in its own
+    code runs no such command and is not seen.
+  severity: critical
+  author: huntgraph
+  tags:
+    - hearth
+    - impact
+    - ransomware
+    - lockbit
+    - shadow-copy
+    - inhibit-recovery
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H112.md
+    - https://attack.mitre.org/techniques/T1490
+    - https://attack.mitre.org/detectionstrategies/DET0329
+
+mitre:
+  tactics:
+    - TA0040
+  techniques:
+    - T1490
+  sub_techniques: []
+  detection_strategies:
+    - DET0329
+  analytics:
+    - AN0933
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary is executing ransomware that rapidly encrypts files across local and
+    network-accessible storage, indicated by a high rate of file modification events, mass
+    file extension changes, and creation of ransom note files across multiple directories.
+  attacker_behavior:
+    - Deletes all volume shadow copies with vssadmin, wmic or PowerShell.
+    - Shrinks shadow storage so existing copies are discarded.
+    - Sets recoveryenabled to no and the boot status policy to ignore failures.
+    - Deletes the Windows backup catalogue and system state backups.
+    - Starts the encryptor, often with flags that spread it over SMB.
+  legitimate_behavior:
+    - Backup products delete and recreate shadow copies as part of each job.
+    - Administrators clear old shadow copies to free disk space.
+    - Imaging tools change boot configuration during deployment.
+  risk_indicator:
+    - Shadow-copy deletion with /all and /quiet outside a backup job.
+    - bcdedit turns off recovery on a server or workstation in service.
+    - Two or three of these commands run within a minute from one parent.
+    - The parent is an unknown executable, a script host or a remote session.
+    - The same commands appear on several hosts at once.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: shadow-copy-deletion-command
+        name: Command deleting or discarding volume shadow copies
+        purpose: >-
+          Return vssadmin, wmic, diskshadow and PowerShell commands that delete shadow
+          copies or resize shadow storage. Backup software matches; the parent tells them
+          apart.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(vssadmin|wmic|diskshadow|powershell|pwsh)\.exe$/i
+          | CommandLine=/delete\s+shadows|resize\s+shadowstorage|shadowcopy\s+(where\s+.+\s+)?delete|Win32_ShadowCopy.*(Delete|Remove)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: boot-recovery-disabled
+        name: bcdedit turning off boot recovery
+        purpose: >-
+          Return bcdedit commands that disable the recovery environment or tell the boot
+          loader to ignore failures.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^bcdedit\.exe$/i
+          | CommandLine=/recoveryenabled\s+no|bootstatuspolicy\s+ignoreallfailures/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: backup-catalogue-deletion
+        name: Backup catalogue or recovery environment removed
+        purpose: >-
+          Return wbadmin commands that delete the catalogue or backups, and reagentc
+          disabling the recovery environment.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(wbadmin|reagentc)\.exe$/i
+          | CommandLine=/delete\s+(catalog|systemstatebackup|backup)|\/disable\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: recovery_inhibition_command
+      name: Command that removes a recovery option
+      description: >-
+        A command deleted shadow copies, disabled boot recovery or deleted the backup
+        catalogue.
+      source: process_creation
+      field: command_line
+      indicates: system_recovery_inhibited
+
+  supporting:
+    - id: several_recovery_commands_together
+      name: Several recovery options removed from one parent
+      description: >-
+        Shadow-copy deletion, bcdedit and wbadmin commands share a parent process id
+        within a minute, which the agent derives from the returned events.
+      source: process_creation
+      field: parent_process_id
+      indicates: ransomware_preparation_sequence
+    - id: unusual_parent
+      name: Parent is not backup software or an administrator's shell
+      description: >-
+        The parent is an executable outside Program Files, a script host or a
+        remote-execution service.
+      source: process_creation
+      field: parent_process
+      indicates: recovery_removed_by_untrusted_process
+    - id: same_commands_on_many_hosts
+      name: Same commands on several hosts
+      description: >-
+        The same command line appears on several hosts within minutes, which the agent
+        counts from the returned events.
+      source: process_creation
+      field: host
+      indicates: fleet_wide_deployment
+    - id: quiet_delete_all
+      name: Deletion is of all copies and silent
+      description: >-
+        The command line carries /all with /quiet, or deletes every Win32_ShadowCopy
+        instance.
+      source: process_creation
+      field: command_line
+      indicates: indiscriminate_deletion
+
+  contradicting:
+    - id: backup_product_parent
+      name: Command comes from backup software
+      description: >-
+        Asset records show the parent process belongs to the backup product installed on
+        the host, and the command recurs with each job.
+      source: asset_inventory
+      field: ComputerName
+      indicates: backup_job_housekeeping
+    - id: planned_disk_or_image_maintenance
+      name: Planned maintenance on the host
+      description: >-
+        Change records show disk clean-up, imaging or a rebuild on the host at the time.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_maintenance
+
+  risk_logic:
+    required:
+      - recovery_inhibition_command
+
+    supporting:
+      any:
+        - several_recovery_commands_together
+        - unusual_parent
+        - same_commands_on_many_hosts
+        - quiet_delete_all
+      all:
+        - several_recovery_commands_together
+        - unusual_parent
+
+    contradicting:
+      any:
+        - backup_product_parent
+        - planned_disk_or_image_maintenance
+      all: []
+
+  verdict:
+    low_risk_when:
+      - recovery_inhibition_command
+      - backup_product_parent
+    suspicious_when:
+      - recovery_inhibition_command
+      - unusual_parent
+    high_risk_when:
+      - recovery_inhibition_command
+      - unusual_parent
+      - several_recovery_commands_together
+
+  false_positive:
+    - condition: Backup software managing its own snapshots.
+      explanation: >-
+        Backup agents delete the shadow copies they created. The parent is the agent and
+        the command follows each job.
+    - condition: Disk-space clean-up.
+      explanation: >-
+        Administrators delete old shadow copies or resize storage on a full volume. It is
+        one command on one host, with a ticket.

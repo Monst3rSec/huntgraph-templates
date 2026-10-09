@@ -1,0 +1,291 @@
+# Converted from THORCollective/HEARTH Flames/H003.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-any-hearth-h003-small-chunk-zip-staging-t1560-001
+version: 1.0.0
+
+info:
+  name: Backup data split into small zip chunks ahead of exfiltration
+  description: >-
+    An adversary who reaches a backup server holds a copy of everything worth stealing,
+    and transfer-size monitoring is the control most likely to notice it leaving. Cutting
+    the data into archive volumes of about one megabyte keeps every transfer under that
+    limit. The sensor does not report bytes sent per connection, so the hunt reads the
+    staging step it can see: an archiver told to split its output into fixed-size
+    volumes, and many small archive files written to disk. Whether the host is a backup
+    server is asset context the agent applies to the returned events.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - exfiltration
+    - collection
+    - archive
+    - data-staging
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H003.md
+    - https://attack.mitre.org/techniques/T1030
+    - https://attack.mitre.org/techniques/T1560
+    - https://attack.mitre.org/techniques/T1560/001
+    - https://attack.mitre.org/detectionstrategies/DET0213
+    - https://attack.mitre.org/detectionstrategies/DET0298
+    - https://www.cisa.gov/news-events/cybersecurity-advisories/aa22-277a
+
+mitre:
+  tactics:
+    - TA0010
+    - TA0009
+  techniques:
+    - T1030
+    - T1560
+  sub_techniques:
+    - T1560.001
+  detection_strategies:
+    - DET0213
+    - DET0298
+  analytics:
+    - AN0831
+    - AN0832
+    - AN0833
+  platforms:
+    - Windows
+    - Linux
+    - macOS
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+    - auditd:SYSCALL
+    - auditd:FILE
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+    - Command Execution
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary has collected data from backup servers and packed it into small zip
+    volumes of roughly one megabyte each, so that each outbound transfer stays below the
+    size at which data-loss and large-file monitoring would raise it.
+  attacker_behavior:
+    - Runs 7-Zip, WinRAR or zip with a volume-size switch such as -v1m to cut an archive into fixed chunks.
+    - Uses split to break an existing archive or database dump into megabyte-sized parts.
+    - Writes the numbered volumes to a scratch directory on the backup server before moving them.
+    - Sends the chunks one at a time so no single transfer crosses a size threshold.
+  legitimate_behavior:
+    - Backup software writes its own segmented archives on a schedule under a service account.
+    - An administrator splits a large installer or log bundle to fit an upload or mail size limit.
+    - Software distribution tools unpack and repack multi-volume archives during deployment.
+  risk_indicator:
+    - An archiver is run with an explicit small volume size by an interactive or unexpected account.
+    - The source path is a backup repository, database dump or file-server share.
+    - Many archive files of about one megabyte appear in one directory within a short span.
+    - The volumes are written to a temporary or hidden directory and removed soon after.
+
+requires:
+  platforms:
+    - windows
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ZipFileWritten
+        - SevenZipFileWritten
+        - RarFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        file_size: Size
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: archiver-volume-split
+        name: Archiver run with a fixed small volume size
+        purpose: >-
+          Return each archiver invocation that asks for its output in fixed-size volumes,
+          the switch that turns one large archive into many small transfers. The
+          volume-size test runs first because it discards almost every process event.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | CommandLine=/\s-v\d{1,4}[bkm]\b|\s-s\s*\d{1,4}[km]\b/i
+          | CommandLine=/\b(7z|7za|7zr|rar|winrar|zip)(\.exe)?\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: split-utility-fixed-chunks
+        name: split cutting a file into megabyte-sized parts
+        purpose: >-
+          Catch the Unix route to the same result, where an existing archive or dump is
+          cut by split into parts of a stated byte size.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=/^(Lin|Mac)$/
+          | ImageFileName=/\/split$/
+          | CommandLine=/\s(-b|--bytes)[=\s]?\s*\d{1,4}[km]?\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: small-archive-file-written
+        name: Archive file of about one megabyte written
+        purpose: >-
+          Return each archive between 0.5 MB and 2 MB as it is written, so the agent can
+          count how many landed in one directory. This case depends on the sensor
+          reporting Size on archive-written events.
+        query: |
+          #event_simpleName=/^(ZipFileWritten|SevenZipFileWritten|RarFileWritten)$/
+          | Size>=524288
+          | Size<=2097152
+          | TargetFileName!=/\\(Program Files( \(x86\))?|Windows\\(WinSxS|SoftwareDistribution|Installer))\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: chunked_archive_creation
+      name: Archive deliberately produced in small fixed-size pieces
+      description: >-
+        A command line asks an archiver or split for fixed-size output volumes, showing
+        the chunk size was chosen and is not a property of the data.
+      source: process_creation
+      field: command_line
+      indicates: data_staged_in_size_limited_chunks
+
+  supporting:
+    - id: megabyte_sized_archives
+      name: Archive files of about one megabyte on disk
+      description: >-
+        Archive-written events report sizes clustered near one megabyte, the on-disk
+        result of a volume split.
+      source: file_creation
+      field: file_size
+      indicates: uniform_small_archive_volumes
+    - id: archive_scratch_path
+      name: Volumes written to a scratch or hidden directory
+      description: >-
+        The archive path is under a temporary, public, recycle or dot-prefixed directory
+        instead of the backup product's repository.
+      source: file_creation
+      field: file_path
+      indicates: staging_outside_normal_storage
+    - id: unexpected_archiving_account
+      name: Archiver run by an interactive or unexpected account
+      description: >-
+        The user on the process event is a person or a service account that does not own
+        the host's scheduled backup jobs.
+      source: process_creation
+      field: user
+      indicates: archiving_outside_scheduled_jobs
+    - id: interactive_archiver_parent
+      name: Archiver launched from a shell or remote session
+      description: >-
+        The parent process is an interactive shell, remote-management host or script
+        engine, not the backup agent or a scheduler.
+      source: process_creation
+      field: parent_process
+      indicates: hands_on_staging
+
+  contradicting:
+    - id: backup_product_job
+      name: Activity belongs to the host's backup product
+      description: >-
+        The writing process and schedule match the backup software inventoried for the
+        host, which segments its own archives.
+      source: asset_inventory
+      field: ComputerName
+      indicates: scheduled_backup_operation
+    - id: approved_data_transfer
+      name: Split archive covered by an approved transfer
+      description: >-
+        A change or transfer record covers the host, account and time, such as a vendor
+        support bundle split to fit an upload limit.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_data_handling
+
+  risk_logic:
+    required:
+      - chunked_archive_creation
+
+    supporting:
+      any:
+        - megabyte_sized_archives
+        - archive_scratch_path
+        - unexpected_archiving_account
+        - interactive_archiver_parent
+      all:
+        - megabyte_sized_archives
+        - unexpected_archiving_account
+
+    contradicting:
+      any:
+        - backup_product_job
+        - approved_data_transfer
+      all: []
+
+  verdict:
+    low_risk_when:
+      - chunked_archive_creation
+      - backup_product_job
+      - approved_data_transfer
+    suspicious_when:
+      - chunked_archive_creation
+      - unexpected_archiving_account
+    high_risk_when:
+      - chunked_archive_creation
+      - unexpected_archiving_account
+      - megabyte_sized_archives
+      - archive_scratch_path
+
+  false_positive:
+    - condition: Backup or deduplication software segments its own archives.
+      explanation: >-
+        These products write fixed-size segments all day. They run under a known service
+        account from the product's install path into its repository, on a schedule that
+        repeats, which an operator's one-off split does not.
+    - condition: An administrator splits a bundle to fit an upload or mail limit.
+      explanation: >-
+        The command is identical. It is a single run over an installer or log bundle by
+        a known administrator, usually with a ticket, and the source is not a backup
+        repository.
+    - condition: Small archives are written by ordinary software.
+      explanation: >-
+        Browsers, updaters and office suites write archives in this size range
+        constantly. On their own they mean nothing; they matter only on a host that also
+        shows a volume-split command, or when dozens share one directory.

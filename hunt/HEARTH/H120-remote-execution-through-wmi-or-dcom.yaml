@@ -1,0 +1,350 @@
+# Converted from THORCollective/HEARTH Flames/H120.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h120-remote-execution-through-wmi-or-dcom-t1021-003
+version: 1.0.0
+
+info:
+  name: Remote command execution through WMI or DCOM
+  description: >-
+    WMI and DCOM let an account with administrative rights start a process on another
+    host without installing a service. Impacket's wmiexec and dcomexec are the usual
+    tools: each command arrives as cmd.exe /Q /c with its output redirected to a file on
+    the loopback ADMIN$ share, started by WmiPrvSE.exe for WMI or by mmc.exe for the
+    MMC20 application object. In the domain compromise Microsoft described, wmiexec was
+    aimed at Entra Connect servers to reach their synchronisation credentials. WMI
+    activity logs and logon event 4648 are not collected; the process lineage on the
+    target is, and so is the issuing command on a source that has a sensor. Execution
+    through the ShellWindows and ShellBrowserWindow objects runs under explorer.exe and
+    cannot be told from the user's own activity by lineage. Whether a target is identity
+    infrastructure comes from asset records.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - lateral-movement
+    - dcom
+    - wmi
+    - wmiexec
+    - impacket
+    - entra-connect
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H120.md
+    - https://attack.mitre.org/techniques/T1021
+    - https://attack.mitre.org/techniques/T1021/003
+    - https://attack.mitre.org/detectionstrategies/DET0285
+    - https://www.microsoft.com/en-us/security/blog/2026/04/17/domain-compromise-predictive-shielding-shut-down-lateral-movement/
+
+mitre:
+  tactics:
+    - TA0008
+  techniques:
+    - T1021
+  sub_techniques:
+    - T1021.003
+  detection_strategies:
+    - DET0285
+  analytics:
+    - AN0791
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary is executing commands on remote hosts via WMI or DCOM, indicated by
+    wmiprvse.exe spawning unexpected child processes or remote WMI connections targeting
+    identity infrastructure such as Entra Connect servers.
+  attacker_behavior:
+    - Calls Win32_Process Create on a remote host with wmic, PowerShell or Impacket wmiexec.
+    - Activates MMC20.Application or a shell window object over DCOM and calls its execute method.
+    - Reads command output back from a file written to the loopback ADMIN$ share.
+    - Targets Entra Connect, AD FS and certificate servers for the credentials they hold.
+    - Switches between WMI and WinRM against the same targets.
+  legitimate_behavior:
+    - Configuration management and monitoring agents run commands through WMI.
+    - Administrators query and manage servers with wmic and CIM cmdlets.
+    - MMC snap-ins are opened by administrators and start helper processes.
+  risk_indicator:
+    - The command line is cmd.exe /Q /c with output redirected to a path on 127.0.0.1.
+    - WmiPrvSE.exe or an embedded mmc.exe starts a shell, a script host or a download utility.
+    - The target is an identity server and the source is a workstation.
+    - The child runs discovery or credential commands.
+    - A script interpreter on a workstation opens RPC port 135 to servers.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: wmi-provider-host-started-execution-engine
+        name: WmiPrvSE.exe starting a shell, script host or transfer utility
+        purpose: >-
+          Return execution engines whose parent is the WMI provider host, on the target
+          of a remote Win32_Process Create. This overlaps the first case of H020, which
+          is limited to shells; the list here is wider.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^WmiPrvSE\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh|mshta|rundll32|regsvr32|wscript|cscript|certutil|bitsadmin|msiexec|curl)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: impacket-style-output-redirect-to-loopback-share
+        name: cmd.exe /Q /c redirecting output to a loopback admin share
+        purpose: >-
+          Return the command form wmiexec and dcomexec use, whatever the parent: quiet
+          cmd.exe with output sent to a double-underscore file on the loopback ADMIN$ or
+          C$ share.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^cmd\.exe$/i
+          | CommandLine=/\/Q\s+\/c\s/i
+          | CommandLine=/\\\\(127\.0\.0\.1|localhost)\\(ADMIN|[A-Z])\$\\__/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: mmc-activated-as-dcom-server
+        name: mmc.exe started with the embedding switch
+        purpose: >-
+          Return mmc.exe started as a COM server, which is what a remote activation of
+          MMC20.Application produces. An administrator opening a console does not pass
+          this switch.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^mmc\.exe$/i
+          | CommandLine=/-Embedding\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: mmc-started-execution-engine
+        name: mmc.exe starting a shell or script host
+        purpose: >-
+          Return shells and script hosts whose parent is mmc.exe. The parent's own
+          command line is not on the child event; the agent matches the parent process
+          id to an embedded mmc.exe from the previous case.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^mmc\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh|mshta|rundll32|regsvr32|wscript|cscript)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: remote-wmi-or-dcom-call-issued
+        name: Command issuing a remote process creation over WMI or DCOM
+        purpose: >-
+          Return the source side where it has a sensor: wmic with /node, or PowerShell
+          creating a process through WMI, CIM or a DCOM application object on another
+          computer. The target name is on the command line. A tool such as Impacket run
+          from a host with no sensor leaves nothing here.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(wmic|powershell|pwsh)\.exe$/i
+          | CommandLine=/\/node:|-ComputerName\b|GetTypeFromProgID\(|GetTypeFromCLSID\(/i
+          | CommandLine=/process\s+call\s+create|Win32_Process|Invoke-WmiMethod|Invoke-CimMethod|MMC20\.Application|ShellWindows|ShellBrowserWindow|ExecuteShellCommand|ShellExecute/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: interpreter-connecting-to-rpc-endpoint-mapper
+        name: Script interpreter or wmic connecting to port 135
+        purpose: >-
+          Return connections to the RPC endpoint mapper made by wmic, PowerShell, Python
+          or a script host. Port 135 from every process is too large to return raw, so
+          the case is narrowed by image name. The agent counts distinct destinations per
+          source.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | RemotePort=135
+          | ContextBaseFileName=/^(wmic|powershell|pwsh|python\d*(\.\d+)?|cscript|wscript|mshta|rundll32)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: wmi_or_dcom_spawned_process
+      name: Process started through WMI or DCOM
+      description: >-
+        An execution engine starts under WmiPrvSE.exe or an embedded mmc.exe, or a
+        command carries the wmiexec output redirect, or a source issues a remote process
+        creation over WMI or DCOM.
+      source: process_creation
+      field: parent_process
+      indicates: remote_execution_via_wmi_or_dcom
+
+  supporting:
+    - id: loopback_share_redirect
+      name: Output redirected to a loopback admin share
+      description: >-
+        The command line sends output to a file under ADMIN$ or C$ on 127.0.0.1.
+      source: process_creation
+      field: command_line
+      indicates: impacket_remote_execution
+    - id: rpc_connection_from_interpreter
+      name: Interpreter connected to the RPC endpoint mapper
+      description: >-
+        wmic, PowerShell, Python or a script host on the source connected to port 135 on
+        the target.
+      source: network_connection
+      field: remote_address
+      indicates: remote_activation_request
+    - id: rpc_connecting_process
+      name: Connecting process is a scripting tool
+      description: >-
+        The process named on the connection is not a management agent.
+      source: network_connection
+      field: process_name
+      indicates: scripted_remote_execution
+    - id: identity_infrastructure_target
+      name: Target is identity infrastructure
+      description: >-
+        The host that received the execution is an Entra Connect, AD FS, certificate
+        authority or domain controller. The agent reads the role from asset records
+        against the host on the event.
+      source: process_creation
+      field: host
+      indicates: identity_infrastructure_targeted
+    - id: non_admin_account
+      name: Account has no history of remote administration
+      description: >-
+        The user on the spawned process or the issuing command does not manage servers.
+      source: process_creation
+      field: user
+      indicates: activity_outside_user_role
+
+  contradicting:
+    - id: management_agent_activity
+      name: Child is a known management agent action
+      description: >-
+        The same WmiPrvSE.exe child and command line recur across the fleet from the
+        configuration management or monitoring product.
+      source: baseline
+      field: CommandLine
+      indicates: routine_management_activity
+    - id: administration_from_jump_host
+      name: Issued from a sanctioned management host
+      description: >-
+        Asset records class the source as a jump host or management server.
+      source: asset_inventory
+      field: ComputerName
+      indicates: routine_administration
+
+  risk_logic:
+    required:
+      - wmi_or_dcom_spawned_process
+
+    supporting:
+      any:
+        - loopback_share_redirect
+        - rpc_connection_from_interpreter
+        - rpc_connecting_process
+        - identity_infrastructure_target
+        - non_admin_account
+      all:
+        - loopback_share_redirect
+        - identity_infrastructure_target
+
+    contradicting:
+      any:
+        - management_agent_activity
+        - administration_from_jump_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - wmi_or_dcom_spawned_process
+      - management_agent_activity
+    suspicious_when:
+      - wmi_or_dcom_spawned_process
+      - non_admin_account
+    high_risk_when:
+      - wmi_or_dcom_spawned_process
+      - loopback_share_redirect
+      - identity_infrastructure_target
+
+  false_positive:
+    - condition: Configuration management and monitoring products.
+      explanation: >-
+        SCCM, monitoring agents and inventory tools start cmd.exe and PowerShell under
+        WmiPrvSE.exe all day. The command lines repeat across hosts and name the
+        product's own scripts.
+    - condition: Administrators using wmic or CIM cmdlets against servers.
+      explanation: >-
+        Remote queries and occasional process creation from management hosts are
+        routine. They do not redirect output to a loopback share.
+    - condition: MMC snap-ins starting helper tools.
+      explanation: >-
+        An administrator's console can start a shell from a snap-in action. That mmc.exe
+        was not started with the embedding switch.

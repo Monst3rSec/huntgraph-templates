@@ -1,0 +1,255 @@
+# Converted from THORCollective/HEARTH Flames/H002.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h002-edr-response-feature-abuse-t1219
+version: 1.0.0
+
+info:
+  name: Response features of an EDR or defensive agent abused for remote access
+  description: >-
+    Endpoint detection and response products ship a remote shell so responders can reach
+    a host: Defender Live Response, Carbon Black Live Response, SentinelOne Remote Shell,
+    Cortex XDR Live Terminal. An adversary who holds a console account, or who installs
+    their own tenant's agent on a victim host, inherits that shell with SYSTEM rights and
+    a trusted, signed parent process. The hunt looks for the two things the sensor can
+    see: an interpreter spawned by a response-shell host binary, and an EDR or DFIR agent
+    running that this estate did not deploy.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - command-and-control
+    - remote-access
+    - edr
+    - lolbin
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H002.md
+    - https://attack.mitre.org/techniques/T1219
+    - https://attack.mitre.org/detectionstrategies/DET0496
+    - https://x.com/jamieantisocial/status/1829617254860013981
+    - https://github.com/cbecks2/edr-artifacts/tree/main
+
+# HEARTH pitches this hypothesis at the parent technique and no T1219 sub-technique
+# describes an EDR response shell, so the parent is kept as upstream wrote it.
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1219
+  sub_techniques: []
+  detection_strategies:
+    - DET0496
+  analytics:
+    - AN1366
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    Adversaries are abusing the remote response features built into EDR and other
+    defensive agents, driving a live-response shell from a compromised console account or
+    from an agent they enrolled themselves, to run commands on a host through a signed
+    security product.
+  attacker_behavior:
+    - Opens a live-response session from a compromised EDR console account and runs cmd or PowerShell on the host.
+    - Installs an EDR, DFIR or telemetry agent enrolled to an attacker-controlled tenant and uses its remote shell.
+    - Uses the response channel to stage tools, dump credentials or pull files without a separate implant.
+    - Relies on the agent's signature and SYSTEM context to stay out of allow-list and parentage alerts.
+  legitimate_behavior:
+    - The security operations team opens live-response sessions during a recorded investigation.
+    - A managed detection provider runs response scripts through its own agent under contract.
+    - A second security agent is deployed on purpose during a vendor migration or proof of concept.
+  risk_indicator:
+    - A response-shell host binary spawns an interpreter with no matching incident or ticket.
+    - An EDR or DFIR agent the estate does not license is running on the host.
+    - The session's child commands perform discovery, credential access or tool transfer.
+    - The agent binary runs from a user-writable or temporary directory instead of its install path.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: response-shell-spawned-interpreter
+        name: Interpreter spawned by an EDR response-shell host
+        purpose: >-
+          Return every command an EDR live-response channel ran on a host, by anchoring
+          on the product binaries that host the remote shell and the interpreters they
+          launch.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(SenseIR|cb|RepMgr|SentinelRemoteShellHost|cortex-xdr-payload)\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh|wscript|cscript|rundll32|certutil|bitsadmin|net1?|whoami)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: unlicensed-security-agent-running
+        name: EDR or DFIR agent this estate does not deploy
+        purpose: >-
+          Surface a second security or forensic agent starting on a host, which is how an
+          adversary brings their own response channel. Defender's own binaries are left
+          out because they are present on every Windows host.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(SentinelAgent|SentinelRemoteShellHost|cb|RepMgr|CylanceSvc|elastic-agent|elastic-endpoint|velociraptor|cyserver|cortex-xdr-payload|xagt|TaniumClient|wazuh-agent|osqueryd|rphcp)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: security-agent-outside-install-path
+        name: Security agent binary running from a user-writable path
+        purpose: >-
+          Catch an agent that was dropped and run in place instead of installed, which
+          separates an operator's portable copy from a managed deployment.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(SentinelAgent|cb|RepMgr|elastic-agent|elastic-endpoint|velociraptor|xagt|TaniumClient|wazuh-agent|osqueryd|rphcp)\.exe$/i
+          | ImageFileName=/\\(Users|ProgramData|Windows\\Temp|PerfLogs|Temp)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: response_channel_process
+      name: EDR response-shell host or foreign security agent executed
+      description: >-
+        A process event names an EDR response-shell host as the parent of an interpreter,
+        or names the service binary of a security agent other than the estate's own.
+      source: process_creation
+      field: image_name
+      indicates: remote_access_through_security_tooling
+
+  supporting:
+    - id: hands_on_child_command
+      name: Child command shows hands-on activity
+      description: >-
+        The command line run under the response shell performs discovery, credential
+        access, tool transfer or account changes instead of a scripted collection task.
+      source: process_creation
+      field: command_line
+      indicates: interactive_operator_activity
+    - id: agent_outside_install_path
+      name: Agent binary outside its install directory
+      description: >-
+        The agent image path is under a user profile, ProgramData, PerfLogs or a
+        temporary directory, where a managed installer never places it.
+      source: process_creation
+      field: image_path
+      indicates: portable_tool_deployment
+    - id: response_shell_parent
+      name: Interpreter parented by a response-shell host
+      description: >-
+        The parent process is the product component that hosts remote shell sessions,
+        which ties the interpreter to a console-driven session and not a local user.
+      source: process_creation
+      field: parent_process
+      indicates: console_driven_session
+
+  contradicting:
+    - id: recorded_response_session
+      name: Session matches a recorded investigation
+      description: >-
+        The host and time match an incident, case or response ticket in which the
+        security team opened a live-response session.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_incident_response
+    - id: sanctioned_second_agent
+      name: Agent is a sanctioned deployment on this host
+      description: >-
+        Asset records list the host in a migration, proof-of-concept or managed-provider
+        scope that deploys the agent observed.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_security_tooling
+
+  risk_logic:
+    required:
+      - response_channel_process
+
+    supporting:
+      any:
+        - hands_on_child_command
+        - agent_outside_install_path
+        - response_shell_parent
+      all:
+        - hands_on_child_command
+        - response_shell_parent
+
+    contradicting:
+      any:
+        - recorded_response_session
+        - sanctioned_second_agent
+      all: []
+
+  verdict:
+    low_risk_when:
+      - response_channel_process
+      - recorded_response_session
+      - sanctioned_second_agent
+    suspicious_when:
+      - response_channel_process
+      - response_shell_parent
+    high_risk_when:
+      - response_channel_process
+      - response_shell_parent
+      - hands_on_child_command
+
+  false_positive:
+    - condition: The security team uses live response during an investigation.
+      explanation: >-
+        A real response session produces the same parent and child processes. Only the
+        case record, the analyst account in the vendor console audit log and the timing
+        separate it from misuse of a stolen console account.
+    - condition: The estate runs two security agents on the same hosts.
+      explanation: >-
+        During a migration or under a managed-provider contract the second agent starts
+        on every boot. It repeats across the scoped fleet from its install path, where an
+        operator's copy appears on a few hosts and often from a writable directory.
+    - condition: A short binary name collides with unrelated software.
+      explanation: >-
+        Names such as cb.exe are short enough to belong to another product. The image
+        path and the signer on the process event show which product actually ran.
