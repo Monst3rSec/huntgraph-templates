@@ -1,0 +1,273 @@
+# Converted from THORCollective/HEARTH Flames/H200.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h200-vboxrt-dll-staged-beside-dbgview-executable-t1574-001
+version: 1.0.0
+
+info:
+  name: vboxrt.dll staged outside VirtualBox beside an executable named DbgView.exe that connects out
+  description: >-
+    Symantec reported DragonForce affiliates placing a malicious vboxrt.dll beside a
+    legitimately signed VirtualBox executable renamed DbgView.exe, so that running the
+    executable loads the DLL, which then downloads further code. The load itself is a
+    module load event, which this deployment does not collect, and it is not claimed
+    here. The pieces around it are reported: a file named vboxrt.dll written somewhere
+    other than the VirtualBox install directory, a process named DbgView.exe starting
+    from a writable path, and that process connecting to the internet, which neither
+    VirtualBox's runtime nor the Sysinternals debug viewer of the same name does. A
+    side-load that uses a different executable and DLL name is not found by this
+    template.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - stealth
+    - hijack-execution-flow
+    - dll-side-loading
+    - virtualbox
+    - dragonforce
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H200.md
+    - https://attack.mitre.org/techniques/T1574/001
+    - https://attack.mitre.org/detectionstrategies/DET0201
+    - https://symantec-enterprise-blogs.security.com/threat-intelligence/dragonforce-msteams-backdoor
+
+mitre:
+  tactics:
+    - TA0005
+    - TA0002
+  techniques:
+    - T1574
+  sub_techniques:
+    - T1574.001
+  detection_strategies:
+    - DET0201
+  analytics:
+    - AN0577
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - File Creation
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    Threat actors are using DLL side-loading to force legitimate signed VirtualBox
+    executables (DbgView.exe) to load malicious DLLs (vboxrt.dll) that download
+    additional malicious code from attacker-controlled servers to evade security
+    monitoring and achieve privileged code execution.
+  attacker_behavior:
+    - Copies a signed VirtualBox executable to a writable directory under the name DbgView.exe.
+    - Writes a malicious vboxrt.dll beside it.
+    - Runs the executable, which loads the DLL from its own directory.
+    - The DLL downloads further code from the operator's server.
+  legitimate_behavior:
+    - VirtualBox installs VBoxRT.dll under Program Files\Oracle\VirtualBox.
+    - Administrators run the Sysinternals DebugView tool, also named Dbgview.exe.
+    - Products that embed VirtualBox ship their own copy of its runtime in their install folder.
+  risk_indicator:
+    - vboxrt.dll is written under a user profile, ProgramData or a Temp folder.
+    - DbgView.exe runs from the same directory.
+    - The process connects to a public address.
+    - VirtualBox is not installed on the host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: vboxrt-dll-written-outside-virtualbox
+        name: vboxrt.dll written outside the VirtualBox install directory
+        purpose: >-
+          Return the DLL by name wherever it is written except under Program Files, with
+          the writing process. Products that embed VirtualBox in a folder of their own
+          outside Program Files match and are told apart by inventory.
+        query: |
+          #event_simpleName=PeFileWritten
+          | TargetFileName=/\\vboxrt\.dll$/i
+          | TargetFileName!=/\\Program Files( \(x86\))?\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: dbgview-named-process-from-writable-path
+        name: Process named DbgView.exe running from a user-writable directory
+        purpose: >-
+          Return processes named DbgView.exe whose image is under a user profile,
+          ProgramData, a Temp folder or PerfLogs. The Sysinternals tool run from a
+          Downloads folder matches by design; the DLL write beside it and the connection
+          case separate the two. The signer is not on the event.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^dbgview(64|64a)?\.exe$/i
+          | ImageFileName=/\\(Users|ProgramData|Windows\\Temp|PerfLogs)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: dbgview-named-process-connecting-to-public-address
+        name: Process named DbgView.exe connecting to a public address
+        purpose: >-
+          Return outbound connections to public addresses from a process of that name,
+          with the process id. The debug viewer can attach to another computer on the
+          internal network; it has no reason to reach the internet.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | ContextBaseFileName=/^dbgview(64|64a)?\.exe$/i
+          | !cidr(RemoteAddressIP4, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: vboxrt_written_outside_install_dir
+      name: vboxrt.dll written outside VirtualBox
+      description: >-
+        A file named vboxrt.dll was written to a directory that is not a Program Files
+        install path.
+      source: file_creation
+      field: file_path
+      indicates: side_load_dll_staged
+
+  supporting:
+    - id: written_by_non_installer
+      name: DLL written by a process that is not an installer
+      description: >-
+        The writing process is not the VirtualBox installer, msiexec or a software
+        deployment agent.
+      source: file_creation
+      field: writer_process_name
+      indicates: manual_payload_placement
+    - id: dbgview_ran_from_same_directory
+      name: DbgView.exe ran from a writable path
+      description: >-
+        A process named DbgView.exe ran from a writable directory on the same host. The
+        agent compares its directory with the DLL's.
+      source: process_creation
+      field: image_path
+      indicates: side_load_host_executed
+    - id: host_process_connected_out
+      name: The process connected to a public address
+      description: >-
+        The DbgView.exe process opened a connection to a public address.
+      source: network_connection
+      field: remote_address
+      indicates: second_stage_download
+    - id: connection_from_named_process
+      name: Connection made by the DbgView-named process
+      description: >-
+        The connecting process name is DbgView.exe.
+      source: network_connection
+      field: process_name
+      indicates: side_loaded_code_calling_out
+
+  contradicting:
+    - id: product_embeds_virtualbox
+      name: A deployed product embeds VirtualBox at this path
+      description: >-
+        Software inventory shows a sanctioned product that ships the VirtualBox runtime
+        in the directory written.
+      source: asset_inventory
+      field: ComputerName
+      indicates: sanctioned_software
+
+  risk_logic:
+    required:
+      - vboxrt_written_outside_install_dir
+
+    supporting:
+      any:
+        - written_by_non_installer
+        - dbgview_ran_from_same_directory
+        - host_process_connected_out
+        - connection_from_named_process
+      all:
+        - dbgview_ran_from_same_directory
+        - host_process_connected_out
+
+    contradicting:
+      any:
+        - product_embeds_virtualbox
+      all: []
+
+  verdict:
+    low_risk_when:
+      - vboxrt_written_outside_install_dir
+      - product_embeds_virtualbox
+    suspicious_when:
+      - vboxrt_written_outside_install_dir
+      - dbgview_ran_from_same_directory
+    high_risk_when:
+      - vboxrt_written_outside_install_dir
+      - dbgview_ran_from_same_directory
+      - host_process_connected_out
+
+  false_positive:
+    - condition: Android emulators and appliance tools bundle VirtualBox.
+      explanation: >-
+        They install under their own product folder, the same on every host that has
+        them, and start no DbgView.exe.
+    - condition: Administrators run Sysinternals DebugView.
+      explanation: >-
+        No vboxrt.dll is written beside it and it makes no connection to a public
+        address.

@@ -1,0 +1,295 @@
+# Converted from THORCollective/HEARTH Flames/H266.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h266-registry-hive-export-of-sam-security-system-t1003-002
+version: 1.0.0
+
+info:
+  name: SAM, SECURITY and SYSTEM hives exported with reg.exe and archived
+  description: >-
+    An operator holding SYSTEM takes local credentials off disk without touching LSASS:
+    reg save writes HKLM\SAM, HKLM\SECURITY and HKLM\SYSTEM to short, meaningless names
+    in C:\Windows\Temp, and Compress-Archive packs them into one zip for collection. SAM
+    is useless without the boot key in SYSTEM, and SECURITY holds LSA secrets and cached
+    domain credentials, so the set is the offline-cracking recipe. The hunt returns
+    every reg.exe export of one of the three hive roots, the archive commands that name
+    hive-like files in Windows\Temp, and the zip files written there. Whether two or
+    three hives left under one user within minutes is for the agent to work out from the
+    returned events.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - credential-access
+    - registry-hive
+    - sam
+    - lsa-secrets
+    - reg-save
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H266.md
+    - https://attack.mitre.org/techniques/T1003
+    - https://attack.mitre.org/techniques/T1003/002
+    - https://attack.mitre.org/detectionstrategies/DET0085
+
+mitre:
+  tactics:
+    - TA0006
+  techniques:
+    - T1003
+  sub_techniques:
+    - T1003.002
+  detection_strategies:
+    - DET0085
+  analytics:
+    - AN0235
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An operator with SYSTEM on a Windows host skips LSASS and takes the credentials off
+    disk: reg save writes HKLM\SAM, HKLM\SECURITY and HKLM\SYSTEM to innocuously named
+    files in C:\Windows\Temp, and Compress-Archive packs them into a single zip for
+    pickup.
+  attacker_behavior:
+    - Runs reg save against HKLM\SAM, HKLM\SECURITY and HKLM\SYSTEM in quick succession.
+    - Writes the exports to C:\Windows\Temp under short names such as s.dat, sy.dat and se.dat.
+    - Packs the exported files into one zip with Compress-Archive.
+    - Works from an interactive cmd.exe or a PowerShell one-liner started by an implant.
+  legitimate_behavior:
+    - Forensic collectors such as KAPE, Velociraptor and CyLR export all three hives together.
+    - Backup, imaging and migration tooling exports SYSTEM or SOFTWARE in a documented workflow.
+    - An administrator exports a single hive while troubleshooting a driver or a policy.
+  risk_indicator:
+    - HKLM\SECURITY is exported by anything other than a known forensic agent.
+    - Two or three of the hives are exported by one user on one host within minutes.
+    - The output file has a one or two letter name in Windows\Temp.
+    - reg.exe descends from an interactive shell or a binary built on the host.
+    - An archive is created over the exported files.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ZipFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: reg-export-of-credential-hive-root
+        name: reg.exe saving or exporting SAM, SECURITY or SYSTEM
+        purpose: >-
+          Return reg.exe runs whose verb is save or export and whose key is the root of
+          HKLM\SYSTEM, or HKLM\SAM or HKLM\SECURITY at any depth. Exports of a subkey of
+          SYSTEM, such as one service's key, are left out because troubleshooting
+          produces them constantly. Each hive is one event; the agent counts how many of
+          the three one user exported on one host and how close together.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^reg\.exe$/i
+          | CommandLine=/\s(save|export)\s/i
+          | CommandLine=/\b(HKLM|HKEY_LOCAL_MACHINE)\\((SAM|SECURITY)(\\[^\s"]*)?|SYSTEM\\?)"?\s/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: archive-command-naming-exported-hive-files
+        name: Archive command naming hive-like files in Windows\Temp
+        purpose: >-
+          Return PowerShell and archiver processes whose command line builds an archive
+          from data files in C:\Windows\Temp. Compress-Archive typed at an open
+          PowerShell prompt runs inside that process and starts nothing, so it is seen
+          here only when it arrives on a command line, as it does when an implant runs a
+          one-liner.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh|tar|7z|7za|7zr|rar|winrar|makecab)\.exe$/i
+          | CommandLine=/\\Windows\\Temp\\[^\\\s"',;]+\.(dat|hiv|hive|save|sav|bak|bin|tmp)\b/i
+          | CommandLine=/Compress-Archive|ZipFile|\s(a|-c[a-z]*f?|-a[a-z]*)\s|makecab/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: zip-written-to-windows-temp
+        name: Zip archive written to C:\Windows\Temp
+        purpose: >-
+          Return zip files created directly in C:\Windows\Temp, with the writing
+          process. This is the only view of an archive made by an in-process
+          Compress-Archive. The agent keeps the ones written on a host and within
+          minutes of a hive export from the first case.
+        query: |
+          #event_simpleName=ZipFileWritten
+          | TargetFileName=/\\Windows\\Temp\\[^\\]+\.zip$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: credential_hive_export
+      name: reg.exe exported a credential hive
+      description: >-
+        reg.exe ran with save or export against HKLM\SAM, HKLM\SECURITY or the root of
+        HKLM\SYSTEM.
+      source: process_creation
+      field: command_line
+      indicates: credential_hive_copied_to_disk
+
+  supporting:
+    - id: several_hives_in_one_session
+      name: Two or three hives exported together
+      description: >-
+        The same user exported more than one of the three hives on one host within a few
+        minutes. The agent derives this by grouping the returned events on host and user
+        and comparing their times.
+      source: process_creation
+      field: user
+      indicates: offline_credential_extraction_set
+    - id: security_hive_exported
+      name: SECURITY hive is among the exports
+      description: >-
+        One of the commands names HKLM\SECURITY, which has almost no administrative
+        reason to be exported.
+      source: process_creation
+      field: command_line
+      indicates: lsa_secret_collection
+    - id: terse_output_name_in_temp
+      name: Output is a short meaningless name in a temporary directory
+      description: >-
+        The export target is a one or two letter file name under Windows\Temp,
+        Users\Public or ProgramData rather than a named collection directory.
+      source: process_creation
+      field: command_line
+      indicates: disguised_output_naming
+    - id: shell_or_implant_parent
+      name: reg.exe started from a shell or an unknown binary
+      description: >-
+        The parent is cmd.exe, PowerShell or an executable that is not a backup, imaging
+        or forensic agent.
+      source: process_creation
+      field: parent_process
+      indicates: hands_on_keyboard_activity
+    - id: archive_over_exports
+      name: Archive built over the exported files
+      description: >-
+        A zip file was written to Windows\Temp, or an archive command named the exported
+        files, shortly after the exports.
+      source: file_creation
+      field: file_path
+      indicates: staging_for_collection
+
+  contradicting:
+    - id: forensic_collection_agent
+      name: Export made by a sanctioned collection agent
+      description: >-
+        The parent process and its path match the incident response or forensic
+        collector the organisation deploys, and a responder ran it.
+      source: baseline
+      field: CommandLine
+      indicates: sanctioned_forensic_collection
+    - id: backup_or_imaging_workflow
+      name: Host is in a backup or migration workflow
+      description: >-
+        The host is being imaged, migrated or backed up by tooling that documents the
+        same hive export.
+      source: asset_inventory
+      field: ComputerName
+      indicates: documented_backup_workflow
+
+  risk_logic:
+    required:
+      - credential_hive_export
+
+    supporting:
+      any:
+        - several_hives_in_one_session
+        - security_hive_exported
+        - terse_output_name_in_temp
+        - shell_or_implant_parent
+        - archive_over_exports
+      all:
+        - several_hives_in_one_session
+        - security_hive_exported
+
+    contradicting:
+      any:
+        - forensic_collection_agent
+        - backup_or_imaging_workflow
+      all: []
+
+  verdict:
+    low_risk_when:
+      - credential_hive_export
+      - forensic_collection_agent
+      - backup_or_imaging_workflow
+    suspicious_when:
+      - credential_hive_export
+      - shell_or_implant_parent
+    high_risk_when:
+      - credential_hive_export
+      - several_hives_in_one_session
+      - security_hive_exported
+
+  false_positive:
+    - condition: Forensic and incident response collection.
+      explanation: >-
+        KAPE, Velociraptor and CyLR take SAM, SECURITY and SYSTEM together and look
+        identical on the command line. The collector's image path and the responder who
+        started it separate them.
+    - condition: Single hive exported for troubleshooting.
+      explanation: >-
+        An administrator saves SYSTEM or SOFTWARE to compare offline. It is one hive,
+        written to a named folder, and SECURITY is not part of it.
+    - condition: Installers leaving zip files in Windows\Temp.
+      explanation: >-
+        Software deployment writes archives there all day. A zip matters only on a host
+        and at a time that a hive export was also returned.

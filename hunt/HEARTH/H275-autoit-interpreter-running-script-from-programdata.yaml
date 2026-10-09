@@ -1,0 +1,310 @@
+# Converted from THORCollective/HEARTH Flames/H275.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h275-autoit-interpreter-running-script-from-programdata-t1059-010
+version: 1.0.0
+
+info:
+  name: AutoIt interpreter running a script from ProgramData after LNK-delivered extraction
+  description: >-
+    A Kimsuky chain aimed at Korean targets arrives as an LNK whose embedded PowerShell
+    unpacks hex data into a decoy document, a genuine signed AutoIt interpreter and a
+    malicious .au3 script, then registers a scheduled task named like a OneDrive update.
+    The interpreter is unmodified, so reputation and signature checks pass; the logic is
+    in the script. The hunt returns AutoIt running from outside its install directory,
+    any process handed an .au3 or .a3x script from a user-writable path, executables
+    PowerShell writes into ProgramData, and schtasks commands that create a
+    OneDrive-named task pointing outside OneDrive's own folder. The source hunt keys on
+    the PE OriginalFileName to survive renaming. No template here reads that field, so a
+    renamed interpreter is caught only while its script keeps the AutoIt extension.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - execution
+    - autoit
+    - lnk
+    - kimsuky
+    - scheduled-task
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H275.md
+    - https://attack.mitre.org/techniques/T1059
+    - https://attack.mitre.org/techniques/T1059/010
+    - https://attack.mitre.org/detectionstrategies/DET0332
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1059
+  sub_techniques:
+    - T1059.010
+  detection_strategies:
+    - DET0332
+  analytics:
+    - AN0942
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An LNK file's embedded PowerShell extracts hex-encoded data into a decoy document, a
+    legitimate signed AutoIt interpreter and a malicious .au3 script, and the
+    interpreter then runs the script from C:\ProgramData or another user-writable
+    directory under powershell.exe, cmd.exe, explorer.exe or wscript.exe, with a
+    scheduled task named to look like a OneDrive update registered in the same session.
+  attacker_behavior:
+    - Delivers an LNK whose PowerShell writes an interpreter and a script into C:\ProgramData.
+    - Renames the AutoIt interpreter so its file name says nothing.
+    - Runs the interpreter with the script path as its argument.
+    - Registers a scheduled task named like a OneDrive update that points at the dropped
+      interpreter.
+  legitimate_behavior:
+    - Helpdesk and packaging teams automate installers with AutoIt from a script repository.
+    - AutoIt development runs from Program Files\AutoIt3 with SciTE as the parent.
+    - Commercial installers built with AutoIt run from an installer's temporary path
+      under an MSI parent.
+  risk_indicator:
+    - The interpreter image is under ProgramData, AppData or Temp.
+    - The image name does not contain autoit while the argument is an .au3 or .a3x file.
+    - The parent is PowerShell, cmd, Explorer or a script host.
+    - PowerShell wrote the executable into ProgramData shortly before.
+    - A OneDrive-named task points at a path outside the OneDrive folder.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: autoit-interpreter-outside-install-directory
+        name: AutoIt interpreter running from outside its install directory
+        purpose: >-
+          Return AutoIt3.exe under its own name wherever the image is not the AutoIt
+          install directory.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^autoit3(_x64)?\.exe$/i
+          | ImageFileName!=/\\Program Files( \(x86\))?\\AutoIt3\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: process-handed-autoit-script-from-writable-path
+        name: Process given an AutoIt script in a user-writable directory
+        purpose: >-
+          Return any process, whatever it is called, whose command line names an .au3 or
+          .a3x file under ProgramData, AppData, Public or Temp. This is what finds a
+          renamed interpreter. A script saved under another extension and a compiled
+          script executable carry no such argument and are not returned.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/\\(ProgramData|AppData\\Roaming|AppData\\Local|Users\\Public|Windows\\Temp)\\[^"]*\.(au3|a3x)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: executable-written-to-programdata-by-powershell
+        name: Executable written into ProgramData by PowerShell
+        purpose: >-
+          Return executables PowerShell writes directly into ProgramData or one folder
+          below it, the extraction step, with the hash so the agent can check whether
+          the file is a known AutoIt build.
+        query: |
+          #event_simpleName=PeFileWritten
+          | ContextBaseFileName=/^(powershell|pwsh)\.exe$/i
+          | TargetFileName=/\\ProgramData\\([^\\]+\\)?[^\\]+\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: onedrive-named-task-pointing-outside-onedrive
+        name: schtasks creating a OneDrive-named task outside OneDrive's folder
+        purpose: >-
+          Return schtasks /create commands that mention OneDrive and a user-writable
+          path but not OneDrive's own install path. A task registered through
+          Register-ScheduledTask or the COM interface starts no schtasks process and is
+          not returned.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^schtasks\.exe$/i
+          | CommandLine=/\/create\b/i
+          | CommandLine=/onedrive/i
+          | CommandLine=/\\(ProgramData|AppData|Users\\Public|Windows\\Temp)\\/i
+          | CommandLine!=/\\Microsoft\\OneDrive\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: autoit_script_execution
+      name: AutoIt script run from a user-writable path
+      description: >-
+        An AutoIt interpreter ran from outside its install directory, or a process was
+        handed an .au3 or .a3x script under ProgramData, AppData, Public or Temp.
+      source: process_creation
+      field: command_line
+      indicates: script_executed_by_trusted_interpreter
+
+  supporting:
+    - id: interpreter_renamed
+      name: Image name does not say AutoIt
+      description: >-
+        The process handed the script is not called AutoIt3.exe, so the interpreter was
+        renamed.
+      source: process_creation
+      field: image_name
+      indicates: renamed_interpreter
+    - id: interpreter_in_writable_path
+      name: Interpreter image is in a user-writable directory
+      description: >-
+        The interpreter itself runs from ProgramData, AppData or Temp rather than
+        Program Files.
+      source: process_creation
+      field: image_path
+      indicates: dropped_interpreter
+    - id: shell_or_explorer_parent
+      name: Started by a shell, Explorer or a script host
+      description: >-
+        The parent is PowerShell, cmd, explorer.exe or wscript.exe rather than SciTE, an
+        installer or an automation service.
+      source: process_creation
+      field: parent_process
+      indicates: delivery_chain_parent
+    - id: dropped_by_powershell
+      name: PowerShell wrote the executable
+      description: >-
+        PowerShell wrote an executable into ProgramData on the same host shortly before
+        the interpreter ran.
+      source: file_creation
+      field: file_path
+      indicates: lnk_extraction_step
+    - id: onedrive_named_task
+      name: OneDrive-named task pointing elsewhere
+      description: >-
+        A scheduled task named like a OneDrive update was created with an action outside
+        OneDrive's install path. Returned as a schtasks command line by the fourth case.
+      source: process_creation
+      field: command_line
+      indicates: masqueraded_task_persistence
+
+  contradicting:
+    - id: sanctioned_autoit_automation
+      name: Sanctioned AutoIt automation
+      description: >-
+        The script path, account and host match the organisation's AutoIt automation,
+        deployed to many hosts by the same tooling.
+      source: baseline
+      field: CommandLine
+      indicates: approved_automation
+    - id: autoit_based_installer
+      name: Vendor installer built with AutoIt
+      description: >-
+        The process runs from an installer's temporary folder under an MSI or setup
+        parent for software approved on the host.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_software_installation
+
+  risk_logic:
+    required:
+      - autoit_script_execution
+
+    supporting:
+      any:
+        - interpreter_renamed
+        - interpreter_in_writable_path
+        - shell_or_explorer_parent
+        - dropped_by_powershell
+        - onedrive_named_task
+      all:
+        - interpreter_in_writable_path
+        - shell_or_explorer_parent
+
+    contradicting:
+      any:
+        - sanctioned_autoit_automation
+        - autoit_based_installer
+      all: []
+
+  verdict:
+    low_risk_when:
+      - autoit_script_execution
+      - sanctioned_autoit_automation
+      - autoit_based_installer
+    suspicious_when:
+      - autoit_script_execution
+      - interpreter_in_writable_path
+    high_risk_when:
+      - autoit_script_execution
+      - interpreter_in_writable_path
+      - shell_or_explorer_parent
+      - dropped_by_powershell
+
+  false_positive:
+    - condition: IT automation with AutoIt.
+      explanation: >-
+        Where it exists it runs from a consistent repository under a known account and
+        lands on many hosts. The interpreter is not renamed.
+    - condition: Installers and game macros.
+      explanation: >-
+        AutoIt-built installers and macro tools run from temporary or user folders. The
+        parent is a setup program or the user's own launcher, and no OneDrive-named task
+        follows.

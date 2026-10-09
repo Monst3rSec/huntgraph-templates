@@ -1,0 +1,226 @@
+# Converted from THORCollective/HEARTH Flames/H210.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h210-powershell-writing-command-to-clipboard-t1059-001
+version: 1.0.0
+
+info:
+  name: PowerShell compiling inline C# to write a command into the clipboard
+  description: >-
+    HEARTH describes ClickFix chains in which PowerShell uses Add-Type with inline C# to
+    call System.Windows.Forms.Clipboard.SetText and place a Base64-encoded command in
+    the user's clipboard for the next paste. The clipboard itself is not observable and
+    PowerShell script block logging is not collected. The sensor sees this only where
+    the text reaches a process command line, and as a side effect: Windows PowerShell
+    compiles inline C# by starting csc.exe. The hunt reads both. A script that sets the
+    clipboard from a file, from an encoded command, or from PowerShell 7, which compiles
+    in-process, leaves nothing here. Where the clipboard is filled by the web page's own
+    JavaScript, as in most ClickFix lures, H024 and H088 hunt the paste.
+  severity: medium
+  author: huntgraph
+  tags:
+    - hearth
+    - execution
+    - powershell
+    - add-type
+    - clipboard
+    - clickfix
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H210.md
+    - https://attack.mitre.org/techniques/T1059/001
+    - https://attack.mitre.org/detectionstrategies/DET0455
+    - https://pushsecurity.com/blog/the-most-advanced-clickfix-yet/
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1059
+  sub_techniques:
+    - T1059.001
+  detection_strategies:
+    - DET0455
+  analytics:
+    - AN1252
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    Threat actors are using PowerShell's Add-Type cmdlet with inline C# code containing
+    System.Windows.Forms.Clipboard.SetText() to programmatically inject malicious
+    Base64-encoded commands into victims' clipboards, bypassing traditional file-based
+    payload delivery mechanisms.
+  attacker_behavior:
+    - Runs PowerShell that defines a C# class with Add-Type.
+    - Calls Clipboard.SetText from that class with an encoded command as the text.
+    - Prompts the user to paste into the Run dialog or a terminal.
+    - The pasted command fetches a stealer or a remote access tool.
+  legitimate_behavior:
+    - Administrators copy command output to the clipboard with Set-Clipboard or clip.
+    - Password managers and automation scripts place text in the clipboard.
+    - Many management scripts use Add-Type for unrelated Windows API calls.
+  risk_indicator:
+    - The text placed in the clipboard is itself a PowerShell, mshta or curl command.
+    - The text is Base64 or carries an encoded-command switch.
+    - PowerShell was started by a browser, a script host or a document.
+    - csc.exe runs under that PowerShell seconds later.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: powershell-command-line-setting-clipboard-text
+        name: PowerShell command line that sets clipboard text
+        purpose: >-
+          Return PowerShell runs whose command line calls Clipboard SetText or
+          SetDataObject, or the Set-Clipboard cmdlet. HEARTH names the Forms API; the
+          cmdlet is included because it does the same thing in one word. Only text
+          present on the command line is matched: an encoded command or a script file
+          hides it.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh|powershell_ise)\.exe$/i
+          | CommandLine=/Clipboard\]?\s*(::|\.)\s*Set(Text|DataObject)|Set-Clipboard\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: inline-csharp-compiled-under-powershell
+        name: csc.exe started by PowerShell
+        purpose: >-
+          Return compiler runs whose parent is PowerShell, which is what Add-Type with
+          inline C# produces on Windows PowerShell 5.1. Management scripts do this
+          constantly, so the case is context: the agent keeps the compiles whose parent
+          process id is a PowerShell returned by the first case or by H024 and H088.
+          PowerShell 7 compiles in-process and starts nothing.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(powershell|pwsh|powershell_ise)\.exe$/i
+          | FileName=/^csc\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: clipboard_set_from_powershell
+      name: PowerShell command line sets clipboard text
+      description: >-
+        A PowerShell command line calls Clipboard SetText or Set-Clipboard.
+      source: process_creation
+      field: command_line
+      indicates: clipboard_injection
+
+  supporting:
+    - id: clipboard_text_is_a_command
+      name: Clipboard text is itself a command
+      description: >-
+        The text handed to the clipboard names PowerShell, mshta, curl or an
+        encoded-command switch, or is a long Base64 string.
+      source: process_creation
+      field: command_line
+      indicates: staged_paste_payload
+    - id: started_by_browser_or_script
+      name: PowerShell started by a browser, script host or document
+      description: >-
+        The parent of the PowerShell process is a browser, mshta, wscript or an Office
+        application.
+      source: process_creation
+      field: parent_process
+      indicates: lure_driven_execution
+    - id: inline_compile_followed
+      name: Inline C# compiled under the same PowerShell
+      description: >-
+        csc.exe ran with that PowerShell process as its parent. The agent matches the
+        parent process id.
+      source: process_creation
+      field: parent_process_id
+      indicates: add_type_compilation
+
+  contradicting:
+    - id: known_admin_script
+      name: Command belongs to a known administrative script
+      description: >-
+        The command line matches a script the organisation deploys and the clipboard
+        text is its own output.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_script
+
+  risk_logic:
+    required:
+      - clipboard_set_from_powershell
+
+    supporting:
+      any:
+        - clipboard_text_is_a_command
+        - started_by_browser_or_script
+        - inline_compile_followed
+      all:
+        - clipboard_text_is_a_command
+        - started_by_browser_or_script
+
+    contradicting:
+      any:
+        - known_admin_script
+      all: []
+
+  verdict:
+    low_risk_when:
+      - clipboard_set_from_powershell
+      - known_admin_script
+    suspicious_when:
+      - clipboard_set_from_powershell
+      - clipboard_text_is_a_command
+    high_risk_when:
+      - clipboard_set_from_powershell
+      - clipboard_text_is_a_command
+      - started_by_browser_or_script
+
+  false_positive:
+    - condition: Administrators pipe output to Set-Clipboard.
+      explanation: >-
+        The text is command output, the parent is their terminal and nothing is pasted
+        into a Run dialog afterwards.
+    - condition: Automation tools set the clipboard for form filling.
+      explanation: >-
+        They are deployed software running under their own launcher.

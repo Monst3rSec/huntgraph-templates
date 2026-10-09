@@ -1,0 +1,395 @@
+# Converted from THORCollective/HEARTH Flames/H199.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h199-npm-postinstall-script-starting-shell-and-dropping-payload-t1195-001
+version: 1.0.0
+
+info:
+  name: npm postinstall script starting PowerShell, writing payloads outside node_modules and calling out
+  description: >-
+    Microsoft reported npm packages (easy-day-js, then mastra 1.13.1 and its scoped
+    packages) whose postinstall script, setup.cjs, runs when the package is installed.
+    On Windows it starts node with --no-warnings, starts PowerShell and cmd, writes
+    scripts and executables under ProgramData and Temp, adds a Run value and calls two
+    addresses that are not the npm registry. H087 and H173 hunt lifecycle scripts that
+    harvest credentials; this is the dropper form on a Windows developer or build host.
+    The sensor reports the child processes, the executables and scripts written, the Run
+    value and the connections. A script that does all its work inside node, without
+    starting a process or writing an executable, leaves only the connection.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - initial-access
+    - supply-chain
+    - npm
+    - postinstall
+    - lifecycle-script
+    - node
+    - dropper
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H199.md
+    - https://attack.mitre.org/techniques/T1195/001
+    - https://attack.mitre.org/detectionstrategies/DET0009
+    - https://www.microsoft.com/en-us/security/blog/2026/06/17/postinstall-payload-inside-mastra-npm-supply-chain-compromise/
+
+mitre:
+  tactics:
+    - TA0001
+  techniques:
+    - T1195
+  sub_techniques:
+    - T1195.001
+  detection_strategies:
+    - DET0009
+  analytics:
+    - AN0021
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    A poisoned npm package's postinstall lifecycle script (e.g., easy-day-js/setup.cjs)
+    executes during npm install on a developer or CI host, spawning shells/child
+    processes, beaconing to non-registry hosts, and dropping payloads.
+  attacker_behavior:
+    - Publishes a package, or a new version of a trusted one, with a postinstall script.
+    - The script starts node with warnings suppressed and then PowerShell or cmd.
+    - Writes a batch file, a PowerShell script or an executable under ProgramData or Temp.
+    - Adds a Run value that starts node against a file under ProgramData.
+    - Calls an address that is not the package registry.
+  legitimate_behavior:
+    - Packages with native code run node-gyp, which starts compilers and Python.
+    - Packages such as esbuild and electron download a binary during install.
+    - npm scripts run through cmd.exe by design.
+  risk_indicator:
+    - node or npm is the parent of PowerShell, curl or a proxy-execution binary during an install.
+    - node writes an executable or script outside node_modules and the npm cache.
+    - node runs setup.cjs or another install script with --no-warnings.
+    - A Run value names node.exe with a path under ProgramData.
+    - TLS verification is switched off on the command line.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+        - NewScriptWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: node-running-install-script-with-warnings-suppressed
+        name: node.exe running an install script with --no-warnings
+        purpose: >-
+          Return node runs that suppress warnings and name setup.cjs, the reported
+          package or a lifecycle script. The reported dropper relaunched itself this
+          way. Other packages will use other file names; the next case does not depend
+          on the name.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^node\.exe$/i
+          | CommandLine=/--no-warnings/i
+          | CommandLine=/setup\.c?js|easy-day-js|postinstall|preinstall/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: package-runtime-started-powershell-or-transfer-binary
+        name: node or a package manager starting PowerShell, a transfer tool or a proxy binary
+        purpose: >-
+          Return PowerShell, curl, certutil, bitsadmin, script hosts, proxy binaries,
+          schtasks and reg whose parent is node or a package manager. cmd.exe is left
+          out here because npm runs every script through it; the next case reads cmd by
+          its command line.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(node|npm|npx|yarn|pnpm|bun)(\.exe|\.cmd)?$/i
+          | FileName=/^(powershell|pwsh|curl|wget|certutil|bitsadmin|mshta|wscript|cscript|rundll32|regsvr32|schtasks|reg)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: package-runtime-started-cmd-with-dropper-command
+        name: cmd.exe under node or npm with a download, ProgramData or TLS-bypass command
+        purpose: >-
+          Return cmd.exe started by node or a package manager whose command line names
+          PowerShell, a transfer tool, a ProgramData path, a script in Temp or the
+          variable that turns TLS verification off. The variable shows only when it is
+          set inline on the command; set through the process environment it is not
+          visible.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(node|npm|npx|yarn|pnpm|bun)(\.exe|\.cmd)?$/i
+          | FileName=/^cmd\.exe$/i
+          | CommandLine=/powershell|pwsh|\bcurl\b|certutil|bitsadmin|\\ProgramData\\|\\Temp\\[^\s"]*\.ps1\b|NODE_TLS_REJECT_UNAUTHORIZED/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: executable-written-by-node-outside-node-modules
+        name: Executable written by node.exe outside node_modules and the npm cache
+        purpose: >-
+          Return executables node writes anywhere but a node_modules folder or the npm
+          cache, with the path. Packages that fetch a platform binary into their own
+          folder do not match; the ones that write to ProgramData or Temp do.
+        query: |
+          #event_simpleName=PeFileWritten
+          | ContextBaseFileName=/^node\.exe$/i
+          | TargetFileName!=/\\(node_modules|npm-cache|\.npm|\.cache|pnpm-store|Yarn\\Cache)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: script-written-to-programdata
+        name: Script written at the top of ProgramData or under ProgramData\NodePackages
+        purpose: >-
+          Return batch, PowerShell and script-host files written directly into
+          ProgramData or under the NodePackages folder the report names, with the
+          writing process id for the agent to resolve to node. The .pkg_history and
+          .pkg_logs markers in Temp are data files and are not reported.
+        query: |
+          #event_simpleName=NewScriptWritten
+          | TargetFileName=/\\ProgramData\\(NodePackages\\.+|[^\\]+\.(bat|cmd|ps1|vbs|js))$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: run-value-starting-node-from-programdata
+        name: Run value that starts node or a file under ProgramData\NodePackages
+        purpose: >-
+          Return Run key writes whose data names node.exe or the NodePackages folder.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\CurrentVersion\\Run\\?$/i
+          | RegStringValue=/\bnode(\.exe)?\b|\\ProgramData\\NodePackages\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: connection-to-reported-address
+        name: Connection to a reported address
+        purpose: >-
+          Return connections to the two addresses Microsoft reported, from any process.
+          These are point-in-time indicators.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | RemoteAddressIP4=/^23\.254\.164\.(92|123)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: reported-domain-resolved
+        name: DNS request for a reported domain
+        purpose: >-
+          Return requests for the two reported domains, with the requester.
+        query: |
+          #event_simpleName=DnsRequest
+          | DomainName=/(^|\.)(teams\.onweblive\.org|maskasd\.com)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: package_runtime_started_child
+      name: node or a package manager started a shell or utility
+      description: >-
+        The parent of PowerShell, cmd, a transfer tool or a relaunched node is node or a
+        package manager.
+      source: process_creation
+      field: parent_process
+      indicates: lifecycle_script_execution
+
+  supporting:
+    - id: child_command_fetches_or_drops
+      name: Child command downloads, drops or disables TLS checks
+      description: >-
+        The child's command line names a download, a ProgramData or Temp script, or
+        NODE_TLS_REJECT_UNAUTHORIZED.
+      source: process_creation
+      field: command_line
+      indicates: payload_delivery
+    - id: file_written_outside_package_tree
+      name: Executable or script written outside the package tree
+      description: >-
+        node wrote an executable outside node_modules, or a script appeared in
+        ProgramData at install time.
+      source: file_creation
+      field: file_path
+      indicates: payload_dropped
+    - id: run_value_added
+      name: Run value added for node
+      description: >-
+        A Run value names node.exe or the NodePackages folder.
+      source: registry
+      field: registry_data
+      indicates: persistence_added
+    - id: non_registry_host_contacted
+      name: Reported address contacted
+      description: >-
+        A process on the host connected to a reported address.
+      source: network_connection
+      field: remote_address
+      indicates: command_and_control
+    - id: reported_domain_resolved
+      name: Reported domain resolved
+      description: >-
+        A process on the host requested a reported domain.
+      source: dns_request
+      field: query_name
+      indicates: command_and_control
+
+  contradicting:
+    - id: package_known_to_run_native_build
+      name: Package is known to build or fetch a binary
+      description: >-
+        The project's lock file lists a package documented to compile native code or
+        download its own binary during install.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_install_behaviour
+
+  risk_logic:
+    required:
+      - package_runtime_started_child
+
+    supporting:
+      any:
+        - child_command_fetches_or_drops
+        - file_written_outside_package_tree
+        - run_value_added
+        - non_registry_host_contacted
+        - reported_domain_resolved
+      all:
+        - child_command_fetches_or_drops
+        - file_written_outside_package_tree
+
+    contradicting:
+      any:
+        - package_known_to_run_native_build
+      all: []
+
+  verdict:
+    low_risk_when:
+      - package_runtime_started_child
+      - package_known_to_run_native_build
+    suspicious_when:
+      - package_runtime_started_child
+      - child_command_fetches_or_drops
+    high_risk_when:
+      - package_runtime_started_child
+      - child_command_fetches_or_drops
+      - file_written_outside_package_tree
+      - run_value_added
+
+  false_positive:
+    - condition: node-gyp builds native modules.
+      explanation: >-
+        The children are compilers and Python, and the files written stay inside
+        node_modules.
+    - condition: Developer scripts call PowerShell from npm run.
+      explanation: >-
+        The script is in the project's own package.json and runs on demand, not during
+        install of a dependency.

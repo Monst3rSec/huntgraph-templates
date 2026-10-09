@@ -1,0 +1,330 @@
+# Converted from THORCollective/HEARTH Flames/H229.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h229-fake-onedrive-update-task-and-state-key-before-destructive-commands-t1053-005
+version: 1.0.0
+
+info:
+  name: Fake OneDrive Update task and state key ahead of destructive commands
+  description: >-
+    Microsoft describes GigaWiper as a Go backdoor used in destructive intrusions since
+    October 2025. Before it can receive a wipe command it has to keep itself running and
+    keep state: a scheduled task named OneDrive Update and a registry key at
+    HKCU\SOFTWARE\OneDrive\Environment. The real OneDrive client keeps its settings
+    under HKCU\Software\Microsoft\OneDrive and names its tasks OneDrive Standalone
+    Update Task and OneDrive Reporting Task, so neither artefact is the product's. The
+    destructive commands that follow include raw writes to physical drives, which are OS
+    API calls this deployment does not collect (see H222), and renames to a .candy
+    extension, which are not a collected event either. The boot and recovery sabotage
+    done through bcdedit, takeown, icacls and a forced restart is on process events and
+    is returned so the agent can place it after the persistence.
+  severity: critical
+  author: huntgraph
+  tags:
+    - hearth
+    - persistence
+    - scheduled-task
+    - registry
+    - gigawiper
+    - wiper
+    - onedrive-masquerade
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H229.md
+    - https://attack.mitre.org/techniques/T1053
+    - https://attack.mitre.org/techniques/T1053/005
+    - https://attack.mitre.org/detectionstrategies/DET0441
+    - https://www.microsoft.com/en-us/security/blog/2026/07/09/gigawiper-anatomy-of-a-destructive-backdoor-assembled-from-multiple-malware/
+
+mitre:
+  tactics:
+    - TA0002
+    - TA0003
+    - TA0004
+  techniques:
+    - T1053
+  sub_techniques:
+    - T1053.005
+  detection_strategies:
+    - DET0441
+  analytics:
+    - AN1221
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An adversary deploys GigaWiper as a post-compromise backdoor, keeps state under a
+    fake OneDrive registry key, and uses a recurring task to reach destructive disk,
+    boot, or fake-ransomware commands.
+  attacker_behavior:
+    - Registers a recurring scheduled task named OneDrive Update whose action is the backdoor.
+    - Writes its state under HKCU\SOFTWARE\OneDrive\Environment.
+    - Takes ownership of boot and kernel files and deletes them.
+    - Turns off boot recovery with bcdedit and forces an immediate restart.
+    - Overwrites physical drives or renames files to .candy on command.
+  legitimate_behavior:
+    - OneDrive registers its own update and reporting tasks under other names.
+    - OneDrive stores settings under HKCU\Software\Microsoft\OneDrive.
+    - Administrators run bcdedit, takeown and icacls during repair work.
+  risk_indicator:
+    - A task named exactly OneDrive Update runs a binary outside the OneDrive install paths.
+    - Values are written under HKCU\SOFTWARE\OneDrive\Environment.
+    - takeown or icacls is run against ntoskrnl.exe, winload or the boot manager.
+    - bcdedit turns recovery off and a forced zero-delay restart follows.
+    - These follow the task or the key on the same host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: schtasks-creating-onedrive-update-task
+        name: schtasks creating or changing a task named OneDrive Update
+        purpose: >-
+          Return schtasks commands that create or change a task named exactly OneDrive
+          Update, with the action on the command line. OneDrive's own tasks are named
+          OneDrive Standalone Update Task and OneDrive Reporting Task and do not match.
+          A task registered through the Task Scheduler API, as a Go binary can do,
+          starts no schtasks process and is not seen here; the registry case does not
+          depend on how the task was made.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^schtasks\.exe$/i
+          | CommandLine=/\/(create|change)\b/i
+          | CommandLine=/\/tn\s+["']?(\\)?OneDrive Update["']?(\s|$)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: fake-onedrive-environment-key-written
+        name: Value written under SOFTWARE\OneDrive\Environment
+        purpose: >-
+          Return writes under a OneDrive key that sits directly below SOFTWARE, without
+          the Microsoft level the real client uses. This case depends on the sensor
+          reporting writes under an arbitrary HKCU\Software key; confirm in the tenant.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\SOFTWARE\\OneDrive\\Environment(\\|$)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: command-naming-fake-onedrive-key-or-task
+        name: Command naming the fake OneDrive key or querying the task
+        purpose: >-
+          Return commands that name the state key or the task from reg.exe, PowerShell
+          or schtasks, for an implant or an operator working through commands.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/\\SOFTWARE\\OneDrive\\Environment\b|\/tn\s+["']?(\\)?OneDrive Update["']?(\s|$)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: boot-file-ownership-taken
+        name: takeown or icacls run against boot or kernel files
+        purpose: >-
+          Return takeown and icacls commands that name the kernel, the boot loader, the
+          boot manager or the hardware abstraction layer, the step that precedes their
+          deletion. The deletion itself is not a collected event.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(takeown|icacls|cacls)\.exe$/i
+          | CommandLine=/ntoskrnl\.exe|winload\.(exe|efi)|\bhal\.dll|bootmgr|\\Boot\\BCD|\\EFI\\Microsoft\\Boot/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: boot-recovery-disabled-or-forced-restart
+        name: bcdedit disabling recovery or a forced zero-delay restart
+        purpose: >-
+          Return bcdedit commands that turn recovery off or delete boot entries, and
+          shutdown commands that force an immediate restart. Each is run by
+          administrators too; the agent keeps those that follow the task or the key on
+          the same host. A restart requested through an API call starts no process.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(bcdedit|shutdown)\.exe$/i
+          | CommandLine=/recoveryenabled\s+no|bootstatuspolicy\s+ignoreallfailures|bcdedit(\.exe)?["']?\s+\/delete\b|\/r\b.*\/t\s+0+\b.*\/f\b|\/f\b.*\/r\b.*\/t\s+0+\b|\/r\b.*\/f\b.*\/t\s+0+\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: fake_onedrive_update_task_command
+      name: Task named OneDrive Update created or named by a command
+      description: >-
+        A schtasks command creates, changes or queries a task named exactly OneDrive
+        Update, or a command names the fake OneDrive state key.
+      source: process_creation
+      field: command_line
+      indicates: masqueraded_scheduled_task_persistence
+
+  supporting:
+    - id: fake_onedrive_state_key_written
+      name: State key written under SOFTWARE\OneDrive\Environment
+      description: >-
+        A value is written under HKCU\SOFTWARE\OneDrive\Environment.
+      source: registry
+      field: registry_path
+      indicates: implant_state_storage
+    - id: state_written_by_non_onedrive_process
+      name: Writer is not OneDrive
+      description: >-
+        The writing process id belongs to a process that is not the OneDrive client. The
+        agent resolves the process id against process events.
+      source: registry
+      field: writer_process_id
+      indicates: implant_writes_own_state
+    - id: task_action_outside_onedrive_paths
+      name: Task action is outside the OneDrive install paths
+      description: >-
+        The /tr value on the schtasks command names a binary outside the OneDrive
+        install directories.
+      source: process_creation
+      field: command_line
+      indicates: persistence_for_foreign_binary
+    - id: boot_or_recovery_sabotage
+      name: Boot or recovery sabotage command
+      description: >-
+        takeown or icacls is run against boot files, or bcdedit turns recovery off.
+      source: process_creation
+      field: image_name
+      indicates: host_rendered_unbootable
+    - id: sabotage_follows_persistence
+      name: Sabotage follows the task or key on the same host
+      description: >-
+        The boot or recovery commands occur on a host after the task or the state key
+        appeared there. The agent derives the order from the returned events.
+      source: process_creation
+      field: host
+      indicates: destructive_command_received
+
+  contradicting:
+    - id: task_action_is_onedrive_binary
+      name: Task runs a OneDrive binary
+      description: >-
+        The task's action is a signed OneDrive binary in the product's install
+        directory.
+      source: derived
+      field: CommandLine
+      indicates: product_task_under_unusual_name
+    - id: repair_or_reimage_in_progress
+      name: Host is being repaired or reimaged
+      description: >-
+        Change records show boot repair or reimaging on the host at the time.
+      source: asset_inventory
+      field: ComputerName
+      indicates: authorised_maintenance
+
+  risk_logic:
+    required:
+      - fake_onedrive_update_task_command
+
+    supporting:
+      any:
+        - fake_onedrive_state_key_written
+        - state_written_by_non_onedrive_process
+        - task_action_outside_onedrive_paths
+        - boot_or_recovery_sabotage
+        - sabotage_follows_persistence
+      all:
+        - fake_onedrive_state_key_written
+        - task_action_outside_onedrive_paths
+
+    contradicting:
+      any:
+        - task_action_is_onedrive_binary
+        - repair_or_reimage_in_progress
+      all: []
+
+  verdict:
+    low_risk_when:
+      - fake_onedrive_update_task_command
+      - task_action_is_onedrive_binary
+      - repair_or_reimage_in_progress
+    suspicious_when:
+      - fake_onedrive_update_task_command
+      - task_action_outside_onedrive_paths
+    high_risk_when:
+      - fake_onedrive_update_task_command
+      - fake_onedrive_state_key_written
+      - boot_or_recovery_sabotage
+
+  false_positive:
+    - condition: Deployment scripts that add a OneDrive update task.
+      explanation: >-
+        Some organisations schedule OneDriveSetup.exe themselves. The action is the
+        product's installer and the task comes from a management tool.
+    - condition: Boot repair by administrators.
+      explanation: >-
+        takeown, icacls and bcdedit are used when repairing a boot configuration. No
+        task or state key precedes them and the host is under repair.
+    - condition: Scripted restarts.
+      explanation: >-
+        shutdown /r /t 0 /f is common in patch scripts. It is returned only for the
+        agent to order against the other events.

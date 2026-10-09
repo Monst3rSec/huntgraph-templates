@@ -1,0 +1,303 @@
+# Converted from THORCollective/HEARTH Flames/H284.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-mac-hearth-h284-macos-wallet-application-bundle-rewritten-in-place-t1554
+version: 1.0.0
+
+info:
+  name: Installed cryptocurrency wallet application rewritten in place on macOS
+  description: >-
+    A macOS stealer persists by substitution: rather than adding a LaunchAgent, it
+    rewrites desktop wallet and hardware-wallet companion applications already in
+    /Applications or ~/Applications, so its code waits inside a bundle the user opens on
+    purpose and can ask for the recovery seed. For Electron wallets the change is
+    usually to the app.asar archive; for others the main executable is replaced. Either
+    way the original signature breaks, and the reported chains re-sign the bundle ad hoc
+    or strip the signature. The sensor here does not report generic file writes or
+    signature verdicts. It does report the commands the stealers run, cp, mv, ditto,
+    curl -o and codesign against the bundle path, and executables written into a bundle.
+    The hunt returns those for a list of wallet names, plus any ad hoc re-signing of an
+    installed application. An archive replaced by code calling the file API directly is
+    not seen.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - persistence
+    - macos
+    - infostealer
+    - cryptocurrency-wallet
+    - application-bundle
+    - codesign
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H284.md
+    - https://attack.mitre.org/techniques/T1554
+    - https://attack.mitre.org/detectionstrategies/DET0336
+
+mitre:
+  tactics:
+    - TA0003
+  techniques:
+    - T1554
+  sub_techniques: []
+  detection_strategies:
+    - DET0336
+  analytics:
+    - AN0951
+  platforms:
+    - macOS
+  data_sources:
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+    - File Modification
+
+hypothesis:
+  statement: >-
+    A macOS infostealer establishes persistence by substitution rather than by
+    autostart: it copies, rewrites and replaces desktop cryptocurrency wallets and
+    hardware-wallet companion applications already installed in /Applications and
+    ~/Applications, so malicious code waits inside a bundle the user launches
+    deliberately and can harvest recovery seed phrases.
+  attacker_behavior:
+    - Downloads a modified app.asar or executable to a temporary path.
+    - Copies it over the file inside the installed wallet's bundle with cp, mv or ditto.
+    - Re-signs the bundle ad hoc with codesign or removes its signature, and clears
+      quarantine attributes.
+    - Waits for the user to open the wallet and enter a seed phrase.
+  legitimate_behavior:
+    - Wallet applications update themselves through their own updater.
+    - Installers and MDM agents replace application bundles during deployment.
+    - Developers re-sign their own builds in /Applications while testing.
+  risk_indicator:
+    - A shell, osascript or curl-driven chain writes into a wallet's bundle.
+    - codesign is run with an ad hoc identity or --remove-signature against an installed
+      application.
+    - The source of the copied file is /tmp, /private/tmp or a hidden directory in the user's home.
+    - The writer is not the wallet's updater, installd or the MDM agent.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NewExecutableWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: command-writing-into-wallet-application-bundle
+        name: File tool or shell command naming a wallet application bundle
+        purpose: >-
+          Return copy, move, download, extract and delete commands, and shells carrying
+          them, whose command line names the bundle of a known wallet application. The
+          name list is a starting set and will need the wallets used locally. Opening
+          the application does not match, since launch does not go through these tools.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=/^(cp|mv|ditto|rsync|rm|unzip|tar|curl|install|bash|sh|zsh|osascript|python[0-9.]*|node|npx|asar)$/
+          | CommandLine=/\/Applications\/[^\/]*(Ledger|Trezor|Exodus|Electrum|Atomic|Wasabi|Sparrow|BlueWallet|Coinomi|Bitcoin|Monero|Guarda|Jaxx|Daedalus|Binance|Coinbase|Keystone|BitBox|Tangem|MetaMask|Phantom|Zengo|Tonkeeper)[^\/]*\.app(\/|\s|[\"']|$)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: installed-application-resigned-ad-hoc-or-stripped
+        name: codesign re-signing or stripping an installed application
+        purpose: >-
+          Return codesign runs that apply an ad hoc identity, force a new signature or
+          remove the signature of an application under /Applications or a user's
+          Applications folder, whatever the application. A vendor never needs to do this
+          to an installed bundle.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=/^codesign$/
+          | CommandLine=/\/Applications\/[^\/]+\.app/
+          | CommandLine=/\s(-s|--sign)\s+-(\s|$)|--remove-signature|\s-[a-zA-Z]*f[a-zA-Z]*\s|--force/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: asar-archive-replaced-by-command
+        name: Command naming an installed application's app.asar
+        purpose: >-
+          Return file tools and shells whose command line names app.asar inside an
+          installed application's Resources directory, the Electron form of the rewrite.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=/^(cp|mv|ditto|rsync|rm|curl|unzip|tar|bash|sh|zsh|osascript|python[0-9.]*|node|npx|asar)$/
+          | CommandLine=/\/Applications\/[^\/]+\.app\/Contents\/Resources\/[^\s"']*app\.asar/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: executable-written-into-wallet-application-bundle
+        name: Executable written inside a wallet application bundle
+        purpose: >-
+          Return executables written under the Contents directory of a known wallet
+          application, with the writing process id. The wallet's own updater produces
+          these too; the agent resolves the writer from the process events. Whether the
+          sensor reports an overwrite of an existing Mach-O this way should be confirmed
+          in the tenant.
+        query: |
+          #event_simpleName=NewExecutableWritten
+          | event_platform=Mac
+          | TargetFileName=/\/Applications\/[^\/]*(Ledger|Trezor|Exodus|Electrum|Atomic|Wasabi|Sparrow|BlueWallet|Coinomi|Bitcoin|Monero|Guarda|Jaxx|Daedalus|Binance|Coinbase|Keystone|BitBox|Tangem|MetaMask|Phantom|Zengo|Tonkeeper)[^\/]*\.app\/Contents\//i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: wallet_bundle_modified_by_command
+      name: Command modifies an installed wallet application
+      description: >-
+        A file tool, a shell or codesign names the bundle of an installed wallet
+        application in a copy, move, download, delete or re-sign operation.
+      source: process_creation
+      field: command_line
+      indicates: trusted_application_rewritten
+
+  supporting:
+    - id: ad_hoc_resign
+      name: Bundle re-signed ad hoc or signature removed
+      description: >-
+        codesign was run against the installed application with an ad hoc identity,
+        --force or --remove-signature.
+      source: process_creation
+      field: command_line
+      indicates: signature_replaced_after_tampering
+    - id: script_driven_writer
+      name: Writer is a shell, osascript or a download chain
+      description: >-
+        The parent of the modifying command is osascript, a shell started by curl output
+        or an unknown binary, not the wallet's updater, installd or an MDM agent.
+      source: process_creation
+      field: parent_process
+      indicates: stealer_driven_modification
+    - id: executable_written_in_bundle
+      name: Executable written inside the bundle
+      description: >-
+        An executable was written under the wallet application's Contents directory on
+        the same host.
+      source: file_creation
+      field: file_path
+      indicates: main_executable_replaced
+    - id: source_in_temporary_path
+      name: Replacement comes from a temporary or hidden path
+      description: >-
+        The file copied into the bundle comes from /tmp, /private/tmp, /var/folders or a
+        hidden directory under the user's home.
+      source: process_creation
+      field: command_line
+      indicates: staged_replacement_payload
+
+  contradicting:
+    - id: application_self_update
+      name: Wallet's own updater
+      description: >-
+        The modification is made by the application's updater or ShipIt helper
+        immediately after a published release.
+      source: baseline
+      field: CommandLine
+      indicates: routine_application_update
+    - id: mdm_or_installer_deployment
+      name: Installer or MDM deployment
+      description: >-
+        The bundle was replaced by installd, the App Store or the organisation's MDM
+        agent.
+      source: asset_inventory
+      field: ComputerName
+      indicates: managed_software_deployment
+
+  risk_logic:
+    required:
+      - wallet_bundle_modified_by_command
+
+    supporting:
+      any:
+        - ad_hoc_resign
+        - script_driven_writer
+        - executable_written_in_bundle
+        - source_in_temporary_path
+      all:
+        - ad_hoc_resign
+        - script_driven_writer
+
+    contradicting:
+      any:
+        - application_self_update
+        - mdm_or_installer_deployment
+      all: []
+
+  verdict:
+    low_risk_when:
+      - wallet_bundle_modified_by_command
+      - application_self_update
+      - mdm_or_installer_deployment
+    suspicious_when:
+      - wallet_bundle_modified_by_command
+      - script_driven_writer
+    high_risk_when:
+      - wallet_bundle_modified_by_command
+      - script_driven_writer
+      - ad_hoc_resign
+
+  false_positive:
+    - condition: Application updates.
+      explanation: >-
+        Electron updaters replace app.asar and the main executable on every release. The
+        writer is the application's own helper and the result is signed by the vendor,
+        not ad hoc.
+    - condition: Users moving or deleting applications.
+      explanation: >-
+        Dragging a wallet to the Trash or reinstalling it by hand names the bundle in rm
+        or cp. Nothing is re-signed and nothing comes from a temporary path.
+    - condition: Developers re-signing local builds.
+      explanation: >-
+        Ad hoc signing is normal for software a developer built. It is their own
+        application on a development machine, not a wallet.

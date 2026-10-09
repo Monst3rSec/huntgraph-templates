@@ -1,0 +1,374 @@
+# Converted from THORCollective/HEARTH Flames/H256.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-mac-hearth-h256-xcode-build-phase-and-git-hook-fetching-remote-payload-t1195-001
+version: 1.0.0
+
+info:
+  name: Xcode run-script phase or git hook that fetches a remote payload
+  description: >-
+    XCSSET v4.0 spreads through the developer's own workflow. One module finds Xcode
+    projects and adds a run-script build phase to project.pbxproj, another appends its
+    payload to .git/hooks/pre-commit in every repository it finds, and a third does the
+    same inside zipped projects. The code then runs under the developer's account on
+    every build or commit and calls out with curl. Writes to project.pbxproj are not
+    reported; a hook file is a script and its creation may be. The build service and git
+    start a shell for the phase or the hook, and the fetch runs under that shell, one
+    step below, so the hunt returns those shells and the fetch commands shells start,
+    and the agent joins the two on process id.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - supply-chain
+    - xcode
+    - git-hooks
+    - xcsset
+    - developer-workstation
+    - macos
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H256.md
+    - https://attack.mitre.org/techniques/T1195
+    - https://attack.mitre.org/techniques/T1195/001
+    - https://attack.mitre.org/detectionstrategies/DET0009
+
+mitre:
+  tactics:
+    - TA0001
+  techniques:
+    - T1195
+  sub_techniques:
+    - T1195.001
+  detection_strategies:
+    - DET0009
+  analytics:
+    - AN0023
+  platforms:
+    - macOS
+  data_sources:
+    - macos:endpointsecurity
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    XCSSET v4.0 propagates by injecting a malicious run-script build phase into Xcode
+    project files and appending a payload to .git/hooks/pre-commit in every repository
+    it finds, so that curl, osascript or shell processes run under Xcode's build system
+    or git whenever the developer builds or commits.
+  attacker_behavior:
+    - Walks the home directory for .xcodeproj bundles and .git directories.
+    - Adds a shell script phase to project.pbxproj.
+    - Appends to or creates .git/hooks/pre-commit and makes it executable.
+    - "Fetches a loader with curl when the phase or hook runs, then stages /tmp/r and /tmp/p.app."
+  legitimate_behavior:
+    - "CocoaPods, SwiftLint and code generators run as script phases on every build."
+    - Teams install lint and format hooks with pre-commit or husky.
+    - Script phases upload symbols and fetch dependencies.
+  risk_indicator:
+    - "A build-phase or hook shell starts curl to a host that is not a registry or the team's own."
+    - A hook shell starts osascript.
+    - One process writes hooks in many repositories within minutes.
+    - "A command edits project.pbxproj or a hook from outside git, Xcode and the project tools."
+    - /tmp/r or /tmp/p.app is run.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NewScriptWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: shell-started-for-build-script-phase
+        name: Shell started by the Xcode build service
+        purpose: >-
+          Return shells the build service or xcodebuild starts, one per script phase,
+          with their process ids. Projects with script phases produce these on every
+          build; the set exists to be matched against the parent process id of events
+          from the third case.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | ParentBaseFileName=/^(XCBBuildService|SWBBuildService|xcodebuild|Xcode)$/
+          | FileName=/^(sh|bash|zsh|dash)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: git-hook-started-by-git
+        name: Git hook started by git
+        purpose: >-
+          Return hook runs from a repository's own .git/hooks folder with git as the
+          parent. Hooks managed in another folder by husky are not XCSSET's target and
+          are not returned.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | ParentBaseFileName=git
+          | CommandLine=/\.git\/hooks\/(pre-commit|post-checkout|post-merge|prepare-commit-msg|commit-msg|pre-push)\b/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: fetch-or-applescript-started-by-shell
+        name: "curl, wget, osascript or netcat started by a shell"
+        purpose: >-
+          Return network fetches and AppleScript runs whose parent is a shell, leaving
+          out Homebrew's. The parent's process id is on each event; the agent keeps
+          those whose parent is a shell returned by the first two cases. On developer
+          machines this is a large set. A phase written in Python or Swift that fetches
+          through its own library starts none of these and is not seen.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | ParentBaseFileName=/^(sh|bash|zsh|dash)$/
+          | FileName=/^(curl|wget|osascript|nc|ncat)$/
+          | CommandLine!=/Homebrew|formulae\.brew\.sh|ghcr\.io/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: hook-or-project-file-edited-by-command
+        name: Command editing a git hook or project.pbxproj
+        purpose: >-
+          Return shells, stream editors and interpreters whose arguments name a hook in
+          .git/hooks or a project.pbxproj, when the parent is not git, Xcode or a
+          project tool. The malware's own modules may write the files without a command,
+          in which case only the next case and the run-time cases show it. The count of
+          repositories touched by one parent is derived by the agent.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | CommandLine=/\.git\/hooks\/[a-z-]+(\s|"|'|$)|project\.pbxproj/
+          | FileName=/^(sh|bash|zsh|tee|sed|awk|perl[\d.]*|python[\d.]*|ruby|cp|mv|chmod|osascript|cat|dd|install)$/
+          | ParentBaseFileName!=/^(git|(XCBBuildService|SWBBuildService|xcodebuild|Xcode)|pod|xcodegen|tuist|fastlane|pre-commit)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: git-hook-script-written
+        name: Script written as a git hook
+        purpose: >-
+          Return script files created in a .git/hooks folder under a hook name without
+          the .sample suffix, with the writing process id. Appending to an existing hook
+          is a modification and is not reported.
+        query: |
+          #event_simpleName=NewScriptWritten
+          | event_platform=Mac
+          | TargetFileName=/\/\.git\/hooks\/[a-z-]+$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: staging-loader-or-applet-run
+        name: Loader /tmp/r or applet /tmp/p.app on a command line
+        purpose: >-
+          Return commands that run or open the two staging paths the report names.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | CommandLine=/(^|\s|"|')\/(private\/)?tmp\/(p\.app|r)(\/|\s|"|'|$)/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: reported-controller-domain-resolved
+        name: DNS request for a reported controller domain
+        purpose: >-
+          Return requests for the six reported domains, with the requester. They will
+          age.
+        query: |
+          #event_simpleName=DnsRequest
+          | DomainName=/(^|\.)(accapple\.ru|amzndev\.in|applecdn\.ru|cdnapple\.in|chromeads\.ru|netcdnamz\.ru)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: fetch_under_build_or_hook
+      name: Fetch started by a build-phase or hook shell
+      description: >-
+        curl, wget, osascript or netcat was started by a shell whose own parent is the
+        Xcode build service or git. The agent makes the join on parent process id.
+      source: process_creation
+      field: parent_process_id
+      indicates: build_time_payload_fetch
+
+  supporting:
+    - id: build_or_git_parent
+      name: Shell belongs to a build or a commit
+      description: >-
+        The shell's parent is the Xcode build service, xcodebuild or git.
+      source: process_creation
+      field: parent_process
+      indicates: developer_workflow_trigger
+    - id: fetch_destination
+      name: Fetch goes to an unknown host
+      description: >-
+        The URL on the fetch command is not a package registry, a symbol server or the
+        team's own host.
+      source: process_creation
+      field: command_line
+      indicates: remote_payload_retrieval
+    - id: hook_written
+      name: Hook file created
+      description: >-
+        A script was created under a hook name in a .git/hooks folder.
+      source: file_creation
+      field: file_path
+      indicates: hook_implanted
+    - id: many_repositories
+      name: Hooks written in many repositories by one process
+      description: >-
+        The same writing process id created hooks in several repositories within
+        minutes. The agent counts repositories in the returned events.
+      source: file_creation
+      field: writer_process_id
+      indicates: mass_injection
+    - id: controller_domain
+      name: Reported controller domain resolved
+      description: >-
+        The host resolved one of the reported domains.
+      source: dns_request
+      field: query_name
+      indicates: known_infrastructure
+    - id: staging_path_used
+      name: Staging loader or applet run
+      description: >-
+        A command ran /tmp/r or opened /tmp/p.app.
+      source: process_creation
+      field: image_name
+      indicates: xcsset_staging
+
+  contradicting:
+    - id: project_declares_phase
+      name: Phase or hook is committed project tooling
+      description: >-
+        The script phase or hook is in the repository's committed history and reviewed.
+      source: baseline
+      field: CommandLine
+      indicates: project_build_tooling
+    - id: ci_runner_host
+      name: Host is a build runner with known phases
+      description: >-
+        The host is a CI runner whose builds fetch from an allowlisted set of hosts.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_build_fetch
+
+  risk_logic:
+    required:
+      - fetch_under_build_or_hook
+
+    supporting:
+      any:
+        - build_or_git_parent
+        - fetch_destination
+        - hook_written
+        - many_repositories
+        - controller_domain
+        - staging_path_used
+      all:
+        - build_or_git_parent
+        - fetch_destination
+
+    contradicting:
+      any:
+        - project_declares_phase
+        - ci_runner_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - fetch_under_build_or_hook
+      - project_declares_phase
+      - ci_runner_host
+    suspicious_when:
+      - fetch_under_build_or_hook
+      - fetch_destination
+    high_risk_when:
+      - fetch_under_build_or_hook
+      - fetch_destination
+      - hook_written
+
+  false_positive:
+    - condition: Dependency and symbol-upload phases.
+      explanation: >-
+        CocoaPods, Carthage, Sentry and Firebase phases fetch during builds. The hosts
+        are the vendors' and the phase is committed.
+    - condition: Lint and format hooks.
+      explanation: >-
+        pre-commit and similar tools install hooks and run local commands; few fetch at
+        commit time.
+    - condition: Project generators editing project.pbxproj.
+      explanation: >-
+        xcodegen, tuist and CocoaPods rewrite the project file; they are excluded by
+        parent name.

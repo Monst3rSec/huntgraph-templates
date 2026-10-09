@@ -1,0 +1,319 @@
+# Converted from THORCollective/HEARTH Flames/H279.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h279-rmm-agent-msi-installed-with-attacker-root-certificate-properties-t1553-004
+version: 1.0.0
+
+info:
+  name: RMM agent MSI installed from a user-writable path with root certificate properties
+  description: >-
+    An adversary with code execution installs a genuine, vendor-signed ManageEngine UEMS
+    (Endpoint Central) agent with msiexec /i from a user-writable directory, passing
+    TRANSFORMS= together with SERVER_ROOT_CRT= and DS_ROOT_CRT=. Those two properties
+    install root certificates the attacker wrote, so the endpoint trusts a management
+    server the attacker runs. Everything afterwards, inventory, domain enumeration,
+    remote control, a file-filter driver, is done by Zoho-signed binaries. The property
+    names are the detection, and they are on the msiexec command line. The hunt returns
+    those installs, transform-driven installs from writable paths, new certificates in
+    the machine Root store, and starts of the agent's services so the agent can compare
+    the hosts against the approved deployment. Which server the installed agent obeys is
+    held in a registry value and a JSON file this telemetry does not return.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-impairment
+    - root-certificate
+    - rmm-abuse
+    - manageengine
+    - msiexec
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H279.md
+    - https://attack.mitre.org/techniques/T1553
+    - https://attack.mitre.org/techniques/T1553/004
+    - https://attack.mitre.org/detectionstrategies/DET0056
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1553
+  sub_techniques:
+    - T1553.004
+  detection_strategies:
+    - DET0056
+  analytics:
+    - AN0153
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An adversary who already has code execution installs a legitimate, vendor-signed RMM
+    agent (ManageEngine UEMS / Endpoint Central) by invoking msiexec.exe /i against an
+    MSI staged in a user-writable directory, passing TRANSFORMS= alongside
+    SERVER_ROOT_CRT= and DS_ROOT_CRT= properties that install attacker-authored root CA
+    certificates, so the endpoint trusts an attacker-operated management server.
+  attacker_behavior:
+    - Stages the agent MSI, a transform and certificate files in C:\Users\Public, Temp
+      or ProgramData.
+    - Runs msiexec /i with TRANSFORMS=, SERVER_ROOT_CRT= and DS_ROOT_CRT= from a script host.
+    - Has the installer add the supplied certificates to the machine Root store.
+    - Operates the host through the agent's own signed services and remote-control component.
+  legitimate_behavior:
+    - Organisations that use Endpoint Central deploy the agent with the same properties
+      from their own server.
+    - Software deployment tools apply transforms to MSI packages routinely.
+    - Enterprise PKI rollouts add internal root certificates through Group Policy.
+  risk_indicator:
+    - msiexec carries SERVER_ROOT_CRT= or DS_ROOT_CRT= on a host where Endpoint Central
+      is not the approved management tool.
+    - The MSI, transform or certificate path is user-writable.
+    - The parent is wscript, cscript, PowerShell or cmd rather than a deployment agent.
+    - A certificate is added to the machine Root store at the same time.
+    - The agent's services start on a host outside the approved deployment.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: msiexec-with-root-certificate-property
+        name: msiexec passed a root certificate property
+        purpose: >-
+          Return every msiexec run that sets SERVER_ROOT_CRT or DS_ROOT_CRT. In an
+          estate that does not use Endpoint Central this should return nothing; in one
+          that does, the certificate path and the parent separate the organisation's
+          deployment from a foreign one.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^msiexec\.exe$/i
+          | CommandLine=/\b(SERVER_ROOT_CRT|DS_ROOT_CRT)\s*=/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: msiexec-transform-install-from-writable-path
+        name: msiexec installing with a transform from a user-writable path
+        purpose: >-
+          Return installs that apply a transform where the package or the transform sits
+          in Public, ProgramData, AppData or Temp. Wider than the first case, for an
+          agent whose property names differ.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^msiexec\.exe$/i
+          | CommandLine=/TRANSFORMS\s*=/i
+          | CommandLine=/\\(Users\\Public|ProgramData|AppData|Windows\\Temp|Temp)\\[^"]*\.(msi|mst)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: certificate-added-to-machine-root-store
+        name: Certificate written to the machine Root store
+        purpose: >-
+          Return new certificate blobs under the machine and policy Root stores, with
+          the writing process id for the agent to match against the msiexec events.
+          AuthRoot is left out because Windows fills it automatically. It depends on the
+          sensor reporting writes under SystemCertificates, which no other template
+          relies on; confirm in the tenant.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegValueName=/^Blob$/i
+          | RegObjectName=/\\SOFTWARE\\(Policies\\)?Microsoft\\SystemCertificates\\Root\\Certificates\\[0-9A-F]{40}/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: uems-agent-service-started
+        name: ManageEngine UEMS agent or remote-control service started
+        purpose: >-
+          Return starts of the agent service and the remote-control service. The result
+          is the list of hosts running the agent; the agent compares it with the hosts
+          the organisation manages that way.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(dcagentservice|dcrdservice)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: root_certificate_property_install
+      name: msiexec install supplying root certificates
+      description: >-
+        msiexec ran with SERVER_ROOT_CRT= or DS_ROOT_CRT=, or applied a transform from a
+        user-writable path, installing a management agent with certificates chosen by
+        whoever ran it.
+      source: process_creation
+      field: command_line
+      indicates: trust_anchor_supplied_at_install
+
+  supporting:
+    - id: package_in_writable_path
+      name: Package, transform or certificate in a user-writable path
+      description: >-
+        The MSI, the transform or the certificate named on the command line is under
+        Public, ProgramData, AppData or Temp.
+      source: process_creation
+      field: command_line
+      indicates: staged_installer
+    - id: script_host_parent
+      name: Install started by a script host or shell
+      description: >-
+        The parent of msiexec is wscript, cscript, PowerShell or cmd rather than a
+        software deployment agent.
+      source: process_creation
+      field: parent_process
+      indicates: scripted_install
+    - id: root_store_write
+      name: New certificate in the machine Root store
+      description: >-
+        A certificate blob was written under the machine Root store on the same host at
+        the time of the install.
+      source: registry
+      field: registry_path
+      indicates: new_trusted_root
+    - id: root_store_writer_is_installer
+      name: Certificate written by the installer process
+      description: >-
+        The process id on the registry write is that of the msiexec install or one of
+        its children. The agent derives this by matching process ids across the returned
+        events.
+      source: registry
+      field: writer_process_id
+      indicates: installer_added_trust_anchor
+    - id: agent_service_on_unmanaged_host
+      name: Agent service on a host outside the approved deployment
+      description: >-
+        The agent or remote-control service runs on a host the organisation does not
+        manage with Endpoint Central.
+      source: process_creation
+      field: image_name
+      indicates: unapproved_remote_management
+
+  contradicting:
+    - id: approved_endpoint_central_deployment
+      name: Approved Endpoint Central deployment
+      description: >-
+        The organisation manages this host with Endpoint Central and the certificate and
+        package paths match its own deployment share.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_remote_management
+    - id: deployment_tool_parent
+      name: Install driven by the deployment system
+      description: >-
+        The install was started by the organisation's software deployment agent with the
+        command line it always uses.
+      source: baseline
+      field: CommandLine
+      indicates: routine_software_deployment
+
+  risk_logic:
+    required:
+      - root_certificate_property_install
+
+    supporting:
+      any:
+        - package_in_writable_path
+        - script_host_parent
+        - root_store_write
+        - root_store_writer_is_installer
+        - agent_service_on_unmanaged_host
+      all:
+        - package_in_writable_path
+        - script_host_parent
+
+    contradicting:
+      any:
+        - approved_endpoint_central_deployment
+        - deployment_tool_parent
+      all: []
+
+  verdict:
+    low_risk_when:
+      - root_certificate_property_install
+      - approved_endpoint_central_deployment
+      - deployment_tool_parent
+    suspicious_when:
+      - root_certificate_property_install
+      - package_in_writable_path
+    high_risk_when:
+      - root_certificate_property_install
+      - package_in_writable_path
+      - script_host_parent
+      - root_store_write
+
+  false_positive:
+    - condition: Legitimate Endpoint Central rollout.
+      explanation: >-
+        The vendor's own deployment passes the same properties. The package comes from
+        the organisation's server share and the hosts are in the managed set.
+    - condition: Transforms applied by deployment tools.
+      explanation: >-
+        Many packages are installed with a transform. The paths are deployment caches,
+        not Public or a user's Temp, and no root certificate property is present.
+    - condition: Internal PKI rollout.
+      explanation: >-
+        New root certificates arrive through Group Policy and are written by the policy
+        client, not by an installer.

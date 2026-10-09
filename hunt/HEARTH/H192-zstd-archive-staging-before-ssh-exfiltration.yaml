@@ -1,0 +1,312 @@
+# Converted from THORCollective/HEARTH Flames/H192.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-lin-hearth-h192-zstd-archive-staging-before-ssh-exfiltration-t1560-001
+version: 1.0.0
+
+info:
+  name: Data compressed with zstd or tar in a staging directory and sent out over SSH
+  description: >-
+    In the PeopleSoft intrusions Mandiant reported, the harvested data was piped through
+    pv into zstd with all cores (zstd -3 -T0 -o exfil.tar.zst) and the archive was then
+    copied over SSH to an external host. On a production application server a
+    multi-threaded zstd run, the pv progress meter and an outbound SSH session to a
+    public address are each unusual, and together they describe the staging and the
+    transfer. The sensor reports the commands and the connection. It does not report the
+    archive being written, because a .zst or .tar file is not an executable or a script,
+    and it does not report how many bytes left. The size of the archive is on the
+    command line only when the operator put it there.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - collection
+    - archive
+    - zstd
+    - data-staging
+    - ssh
+    - peoplesoft
+    - shinyhunters
+    - linux
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H192.md
+    - https://attack.mitre.org/techniques/T1560/001
+    - https://attack.mitre.org/detectionstrategies/DET0298
+    - https://cloud.google.com/blog/topics/threat-intelligence/shinyhunters-targets-education-sector-oracle-exploit/
+
+mitre:
+  tactics:
+    - TA0009
+  techniques:
+    - T1560
+  sub_techniques:
+    - T1560.001
+  detection_strategies:
+    - DET0298
+  analytics:
+    - AN0832
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+  data_components:
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    An adversary archived/compressed harvested PeopleSoft data with zstd/tar in a
+    staging directory before exfiltrating it over SSH to an external leak-site mirror.
+  attacker_behavior:
+    - Collects application data into a directory named for the purpose, such as exfil.
+    - Pipes it through pv into zstd with -T0 to compress on every core.
+    - Writes the result as a .tar.zst or .tar.gz in a temporary or application directory.
+    - Copies the archive to an external address with scp, sftp, rsync or ssh.
+  legitimate_behavior:
+    - Nightly backup jobs run tar and gzip from cron as a backup account.
+    - Package builds and initramfs generation call zstd.
+    - Administrators copy files between managed hosts over SSH.
+  risk_indicator:
+    - zstd runs with all threads as a web or application service account.
+    - pv runs on a production server.
+    - The archive is written under /tmp, /var/tmp, /dev/shm or an application directory.
+    - An SSH client on the same host connects to a public address soon after.
+    - The run falls outside the backup schedule.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: zstd-compression-run
+        name: zstd run with a thread count, an output file or a tar archive
+        purpose: >-
+          Return zstd runs that set a thread count, name an output file or name a
+          .tar.zst. The reported command reads from a pipe, so the input does not
+          appear; the output name does. Runs that initramfs and package tooling start
+          match and are told apart by the parent.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | FileName=/^(zstd|zstdmt|pzstd)$/
+          | CommandLine=/\s-T\d+|--threads|\s-o\s|\.tar\.zst\b|\.tzst\b/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: pv-progress-meter-run
+        name: pv run on a Linux host
+        purpose: >-
+          Return every run of pv. It is an interactive progress meter with no place in a
+          scheduled job, and on a production server it is rare enough to return raw. The
+          size argument computed from du appears on its command line.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | FileName=pv
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: archive-written-into-scratch-directory
+        name: Archive utility writing into a temporary directory or naming an exfil path
+        purpose: >-
+          Return tar, gzip, xz, zip and 7z runs that write an archive under /tmp,
+          /var/tmp or /dev/shm, hand compression to zstd, or name a path containing
+          exfil. Backup jobs that write to a backup volume do not match.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | FileName=/^(tar|gzip|pigz|xz|zip|7z|7za|7zr)$/
+          | CommandLine=/\/(tmp|var\/tmp|dev\/shm)\/[^\s"']*\.(tar|tgz|tzst|zip|7z|gz|xz|zst)\b|--zstd|-I\s*'?"?(zstd|pzstd)|\bexfil/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: archive-named-on-transfer-command
+        name: scp, sftp, rsync or ssh command naming an archive file
+        purpose: >-
+          Return file transfer commands whose command line names an archive, with the
+          destination left on the command line for the agent to read. sshpass is
+          included because the same intrusions used it.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | FileName=/^(scp|sftp|rsync|ssh|sshpass)$/
+          | CommandLine=/\.(tar|tgz|tzst|zst|zip|7z|tar\.(gz|xz|bz2|zst))\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: ssh-client-connecting-to-public-address
+        name: SSH client on a Linux host connecting to port 22 on a public address
+        purpose: >-
+          Return outbound port 22 connections from ssh, scp, sftp and rsync to public
+          addresses. On a jump host or a developer machine this is routine; restrict the
+          run to application and database servers. The agent compares the time with the
+          compression runs on the same host. Bytes sent are not on the event.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | event_platform=Lin
+          | RemotePort=22
+          | ContextBaseFileName=/^(ssh|scp|sftp|rsync|sshpass)$/
+          | !cidr(RemoteAddressIP4, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: archive_utility_run
+      name: Archive or compression utility run
+      description: >-
+        zstd, pv or an archive utility ran with an output in a scratch directory or with
+        compression across all cores.
+      source: process_creation
+      field: command_line
+      indicates: data_staged_for_exfiltration
+
+  supporting:
+    - id: run_by_service_account
+      name: Run by a web or application service account
+      description: >-
+        The user is the account the application runs under, not a backup or
+        administrative account.
+      source: process_creation
+      field: user
+      indicates: staging_from_compromised_service
+    - id: started_from_service_or_remote_session
+      name: Started under a service process or a remote session
+      description: >-
+        The parent is java, a web server worker or a shell that itself descends from
+        one.
+      source: process_creation
+      field: parent_process
+      indicates: staging_through_intrusion_channel
+    - id: ssh_to_public_address
+      name: SSH client connected to a public address
+      description: >-
+        An SSH client on the host opened port 22 to a public address after the archive
+        was made. The agent derives the order from the event times.
+      source: network_connection
+      field: remote_address
+      indicates: exfiltration_channel
+    - id: ssh_client_process
+      name: Connection made by a file transfer client
+      description: >-
+        The connecting process is scp, sftp, rsync or ssh.
+      source: network_connection
+      field: process_name
+      indicates: file_transfer_over_ssh
+
+  contradicting:
+    - id: scheduled_backup_job
+      name: Run matches a scheduled backup
+      description: >-
+        The command, account, path and time match a recorded backup job on this host.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_backup
+    - id: destination_is_managed
+      name: Destination is a managed host
+      description: >-
+        The address the SSH client reached belongs to the organisation or a contracted
+        provider.
+      source: asset_inventory
+      field: ComputerName
+      indicates: authorised_transfer
+
+  risk_logic:
+    required:
+      - archive_utility_run
+
+    supporting:
+      any:
+        - run_by_service_account
+        - started_from_service_or_remote_session
+        - ssh_to_public_address
+        - ssh_client_process
+      all:
+        - run_by_service_account
+        - ssh_to_public_address
+
+    contradicting:
+      any:
+        - scheduled_backup_job
+        - destination_is_managed
+      all: []
+
+  verdict:
+    low_risk_when:
+      - archive_utility_run
+      - scheduled_backup_job
+      - destination_is_managed
+    suspicious_when:
+      - archive_utility_run
+      - run_by_service_account
+    high_risk_when:
+      - archive_utility_run
+      - run_by_service_account
+      - ssh_to_public_address
+
+  false_positive:
+    - condition: Backups compress with zstd.
+      explanation: >-
+        They run from cron or a backup agent as a backup account and write to a backup
+        path at the same time each day.
+    - condition: An administrator bundles logs for a vendor.
+      explanation: >-
+        The session is the administrator's own, a ticket covers it, and the destination
+        is the vendor's upload host.

@@ -1,0 +1,321 @@
+# Converted from THORCollective/HEARTH Flames/H245.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h245-ctfmon-started-by-loader-as-injection-host-t1055-002
+version: 1.0.0
+
+info:
+  name: ctfmon.exe created by a loader to host an injected payload
+  description: >-
+    PikaBot's second stage creates a new ctfmon.exe, writes the core module into it
+    section by section and redirects its main thread, all through direct system calls.
+    The memory writes and the thread-context change are process-access and API events
+    this deployment does not collect, and nothing here claims them. What the loader
+    cannot avoid is that it creates the host process: ctfmon.exe appears with a parent
+    that is not the logon chain, and afterwards a text-input helper resolves names,
+    opens outbound connections and starts children, none of which it does on its own.
+    The hunt returns those four things.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - process-injection
+    - pikabot
+    - ctfmon
+    - loader
+    - defense-evasion
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H245.md
+    - https://attack.mitre.org/techniques/T1055
+    - https://attack.mitre.org/techniques/T1055/002
+    - https://attack.mitre.org/detectionstrategies/DET0106
+
+mitre:
+  tactics:
+    - TA0005
+    - TA0004
+  techniques:
+    - T1055
+  sub_techniques:
+    - T1055.002
+  detection_strategies:
+    - DET0106
+  analytics:
+    - AN0297
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    A loader creates a new ctfmon.exe process, copies a decompressed payload into it and
+    redirects its thread, so that ctfmon.exe runs with a parent outside the normal logon
+    chain, from an unexpected path or command line, and makes outbound network
+    connections it should never make.
+  attacker_behavior:
+    - Creates ctfmon.exe from the loader process and not from the logon chain.
+    - Maps the payload into the new process and hijacks its thread with direct system calls.
+    - Beacons from ctfmon.exe to bare IP addresses on non-standard ports.
+    - Creates a second ctfmon.exe when the host is infected again.
+  legitimate_behavior:
+    - "Windows starts ctfmon.exe from svchost.exe, userinit.exe or winlogon.exe at logon."
+    - A leftover Run value on older builds starts ctfmon.exe from Explorer.
+    - Input-method editors restart it during a language change.
+  risk_indicator:
+    - "ctfmon.exe has rundll32, regsvr32, a script host or a user-path binary as its parent."
+    - ctfmon.exe opens a connection to a public address.
+    - ctfmon.exe resolves a domain name.
+    - ctfmon.exe starts a child process.
+    - Two ctfmon.exe processes run in one session.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: ctfmon-started-by-unexpected-parent
+        name: ctfmon.exe whose parent is outside the logon chain
+        purpose: >-
+          Return ctfmon.exe started by anything other than svchost.exe, userinit.exe or
+          winlogon.exe. A loader that spoofs the parent to one of those three is not
+          returned here and shows only through the cases below.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^ctfmon\.exe$/i
+          | ParentBaseFileName!=/^(svchost|userinit|winlogon)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: ctfmon-image-outside-system-directory
+        name: ctfmon.exe running from outside the system directories
+        purpose: >-
+          Return a ctfmon.exe whose image is not the one in System32 or SysWOW64.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^ctfmon\.exe$/i
+          | ImageFileName!=/\\Windows\\(System32|SysWOW64|WinSxS\\[^\\]+)\\ctfmon\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: ctfmon-outbound-connection
+        name: Outbound connection from ctfmon.exe
+        purpose: >-
+          Return connections ctfmon.exe opens to public addresses, with the address and
+          port.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | ContextBaseFileName=/^ctfmon\.exe$/i
+          | !cidr(RemoteAddressIP4, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: ctfmon-dns-request
+        name: DNS request from ctfmon.exe
+        purpose: >-
+          Return every name ctfmon.exe asks for. The genuine process resolves nothing.
+        query: |
+          #event_simpleName=DnsRequest
+          | ContextBaseFileName=/^ctfmon\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: process-started-by-ctfmon
+        name: Process started by ctfmon.exe
+        purpose: >-
+          Return children of ctfmon.exe, the commands an operator runs through the
+          injected module. Error reporting and console hosts are left out.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^ctfmon\.exe$/i
+          | FileName!=/^(WerFault|conhost)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: anomalous_ctfmon
+      name: ctfmon.exe behaves as an injection host
+      description: >-
+        A ctfmon.exe process has a parent outside the logon chain, or is the parent of
+        another process.
+      source: process_creation
+      field: parent_process
+      indicates: injected_host_process
+
+  supporting:
+    - id: ctfmon_public_connection
+      name: ctfmon.exe connects to a public address
+      description: >-
+        The process named on an outbound connection to a public address is ctfmon.exe.
+      source: network_connection
+      field: remote_address
+      indicates: command_and_control_from_injected_host
+    - id: ctfmon_non_standard_port
+      name: Connection uses a non-standard port
+      description: >-
+        The remote port is not 80 or 443.
+      source: network_connection
+      field: remote_port
+      indicates: loader_beacon
+    - id: ctfmon_name_resolution
+      name: ctfmon.exe resolves a domain
+      description: >-
+        A DNS request names ctfmon.exe as the requester.
+      source: dns_request
+      field: query_name
+      indicates: command_and_control_from_injected_host
+    - id: loader_parent_path
+      name: Creating process is a loader
+      description: >-
+        The parent of ctfmon.exe is rundll32, regsvr32 or a script host. The agent
+        follows the parent process id to the parent's image and command line.
+      source: process_creation
+      field: parent_process_id
+      indicates: loader_created_host
+    - id: multiple_instances
+      name: More than one ctfmon.exe in a session
+      description: >-
+        Two or more ctfmon.exe processes run for one user on one host at the same time,
+        which the agent derives from the returned events.
+      source: process_creation
+      field: user
+      indicates: reinfection_without_mutex
+
+  contradicting:
+    - id: explorer_run_value
+      name: Started from a legacy Run value
+      description: >-
+        The parent is explorer.exe on a host that carries the old ctfmon Run value, and
+        the process makes no connection.
+      source: baseline
+      field: ParentBaseFileName
+      indicates: legacy_startup_entry
+    - id: input_method_software
+      name: Parent is input-method software
+      description: >-
+        The parent is an installed input-method or accessibility product.
+      source: asset_inventory
+      field: ComputerName
+      indicates: input_method_restart
+
+  risk_logic:
+    required:
+      - anomalous_ctfmon
+
+    supporting:
+      any:
+        - ctfmon_public_connection
+        - ctfmon_non_standard_port
+        - ctfmon_name_resolution
+        - loader_parent_path
+        - multiple_instances
+      all:
+        - ctfmon_public_connection
+        - loader_parent_path
+
+    contradicting:
+      any:
+        - explorer_run_value
+        - input_method_software
+      all: []
+
+  verdict:
+    low_risk_when:
+      - anomalous_ctfmon
+      - explorer_run_value
+      - input_method_software
+    suspicious_when:
+      - anomalous_ctfmon
+      - loader_parent_path
+    high_risk_when:
+      - anomalous_ctfmon
+      - ctfmon_public_connection
+      - loader_parent_path
+
+  false_positive:
+    - condition: Legacy Run value for ctfmon.exe.
+      explanation: >-
+        Hosts upgraded from old builds start it from Explorer at logon. It makes no
+        connection and starts nothing.
+    - condition: Input-method and accessibility products.
+      explanation: >-
+        Some restart ctfmon.exe themselves. The parent is an installed product in
+        Program Files.
+    - condition: Proxy checks on the loopback address.
+      explanation: >-
+        Loopback and private ranges are excluded from the connection case.

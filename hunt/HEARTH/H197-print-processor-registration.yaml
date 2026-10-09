@@ -1,0 +1,300 @@
+# Converted from THORCollective/HEARTH Flames/H197.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h197-print-processor-registration-t1547-012
+version: 1.0.0
+
+info:
+  name: Print processor registered so the spooler loads a DLL at boot
+  description: >-
+    A print processor is a DLL the print spooler loads as SYSTEM when it starts.
+    Registering one takes a subkey under Control\Print\Environments\<arch>\Print
+    Processors with a Driver value, and the DLL placed in
+    System32\spool\prtprocs\<arch>. ESET reported FishMonger registering a processor
+    named VSPMsg with Driver=VSPMsg.dll. Windows ships one processor, winprint, and
+    printer vendors add a few; a new one outside a printer driver install is the hunt.
+    The sensor reports the registry write, the DLL being written and what the spooler
+    starts. The DLL being loaded by spoolsv.exe is a module load, which this deployment
+    does not collect, and the staged configuration file under spool\drivers\color is a
+    data file and is not reported.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - persistence
+    - privilege-escalation
+    - print-processor
+    - spooler
+    - registry
+    - fishmonger
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H197.md
+    - https://attack.mitre.org/techniques/T1547/012
+    - https://attack.mitre.org/detectionstrategies/DET0026
+    - https://www.welivesecurity.com/en/eset-research/fishmongers-arsenal-upgraded-sprysocks-windows/
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1547
+  sub_techniques:
+    - T1547.012
+  detection_strategies:
+    - DET0026
+  analytics:
+    - AN0074
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Windows Registry Key Modification
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary persists by registering a malicious print processor (Driver value under
+    Control\Print\Environments\*\Print Processors\*) so spoolsv.exe loads an attacker
+    DLL with SYSTEM privileges at boot.
+  attacker_behavior:
+    - Writes a DLL into System32\spool\prtprocs under the architecture folder.
+    - Creates a Print Processors subkey with a Driver value naming the DLL.
+    - Restarts the spooler or waits for a reboot so the DLL is loaded.
+    - Runs further code from inside spoolsv.exe, including starting other processes.
+  legitimate_behavior:
+    - Printer driver packages register the vendor's own print processor.
+    - Windows servicing rewrites winprint.dll.
+    - Print management software adds processors on print servers.
+  risk_indicator:
+    - A print processor appears on a host with no printer driver install at that time.
+    - The DLL is written by a process that is not an installer or the spooler's driver setup.
+    - The processor name imitates a vendor without matching an installed printer.
+    - spoolsv.exe starts svchost.exe, a shell or a script host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: print-processor-driver-value-written
+        name: Driver value written under a Print Processors subkey
+        purpose: >-
+          Return writes of the Driver value under any Print Processors subkey in any
+          control set, with the processor name in the path and the DLL in the data. This
+          depends on the sensor reporting writes under Control\Print; confirm in the
+          tenant.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\Control\\Print\\Environments\\[^\\]+\\Print Processors\\[^\\]+\\?$/i
+          | RegValueName=/^Driver$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: dll-written-to-print-processor-directory
+        name: DLL written into the spooler's print processor directory
+        purpose: >-
+          Return DLLs written under System32\spool\prtprocs, with the writing process.
+          Printer driver installs write here through the spooler and the driver
+          installer; the writer and the time separate them.
+        query: |
+          #event_simpleName=PeFileWritten
+          | TargetFileName=/\\Windows\\System32\\spool\\prtprocs\\([^\\]+\\)?[^\\]+\.dll$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: command-registering-print-processor
+        name: Command line naming the Print Processors key or directory
+        purpose: >-
+          Return any command that names the Print Processors key or the prtprocs
+          directory, which covers reg add, PowerShell and a copy into the directory. A
+          processor registered through the AddPrintProcessor API starts no process and
+          shows only in the registry and file cases.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/\\Print Processors\\|\\spool\\prtprocs\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: spooler-started-service-host-or-interpreter
+        name: spoolsv.exe starting svchost.exe, a shell or a script host
+        purpose: >-
+          Return service hosts, shells, script hosts and proxy binaries whose parent is
+          the spooler. FishMonger's loader ran inside spoolsv.exe and started
+          svchost.exe under a token it took from the spooler; the spooler starts none of
+          these in normal use. Printer exploits produce the same children.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^spoolsv\.exe$/i
+          | FileName=/^(svchost|cmd|powershell|pwsh|rundll32|regsvr32|mshta|wscript|cscript|net|net1|whoami)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: print_processor_registered
+      name: Print processor Driver value written
+      description: >-
+        A Driver value was written under a Print Processors subkey.
+      source: registry
+      field: registry_path
+      indicates: spooler_persistence_registered
+
+  supporting:
+    - id: driver_value_names_unknown_dll
+      name: Driver value names an unfamiliar DLL
+      description: >-
+        The value data is a DLL that is not winprint.dll or a processor of an installed
+        printer.
+      source: registry
+      field: registry_data
+      indicates: attacker_supplied_processor
+    - id: dll_written_to_prtprocs
+      name: DLL written into the print processor directory
+      description: >-
+        A DLL was written under spool\prtprocs on the same host.
+      source: file_creation
+      field: file_path
+      indicates: payload_placed_for_spooler
+    - id: dll_written_by_non_installer
+      name: DLL written by a process that is not an installer
+      description: >-
+        The writing process is not the spooler's driver setup, msiexec or a servicing
+        process.
+      source: file_creation
+      field: writer_process_name
+      indicates: manual_payload_placement
+    - id: spooler_started_unexpected_child
+      name: Spooler started a service host or interpreter
+      description: >-
+        spoolsv.exe is the parent of svchost.exe, a shell or a script host.
+      source: process_creation
+      field: parent_process
+      indicates: code_running_inside_spooler
+
+  contradicting:
+    - id: printer_driver_install
+      name: Printer driver installed at that time
+      description: >-
+        A change record or deployment log shows a printer driver package installed on
+        the host at the time of the write.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_driver_install
+    - id: processor_belongs_to_installed_printer
+      name: Processor belongs to an installed printer
+      description: >-
+        The processor name and DLL match the vendor of a printer deployed to this host.
+      source: asset_inventory
+      field: ComputerName
+      indicates: vendor_print_processor
+
+  risk_logic:
+    required:
+      - print_processor_registered
+
+    supporting:
+      any:
+        - driver_value_names_unknown_dll
+        - dll_written_to_prtprocs
+        - dll_written_by_non_installer
+        - spooler_started_unexpected_child
+      all:
+        - driver_value_names_unknown_dll
+        - dll_written_to_prtprocs
+
+    contradicting:
+      any:
+        - printer_driver_install
+        - processor_belongs_to_installed_printer
+      all: []
+
+  verdict:
+    low_risk_when:
+      - print_processor_registered
+      - printer_driver_install
+      - processor_belongs_to_installed_printer
+    suspicious_when:
+      - print_processor_registered
+      - driver_value_names_unknown_dll
+    high_risk_when:
+      - print_processor_registered
+      - driver_value_names_unknown_dll
+      - dll_written_by_non_installer
+      - spooler_started_unexpected_child
+
+  false_positive:
+    - condition: Printer driver packages add processors.
+      explanation: >-
+        The vendor matches a deployed printer and the install is recorded.
+    - condition: Print servers carry many processors.
+      explanation: >-
+        They are added when queues are created and are the same across the print server
+        estate.

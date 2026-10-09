@@ -1,0 +1,342 @@
+# Converted from THORCollective/HEARTH Flames/H252.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h252-executable-download-after-captive-portal-redirect-t1189
+version: 1.0.0
+
+info:
+  name: Executable downloaded by a browser minutes after a captive-portal redirect
+  description: >-
+    Storm-2945 controls captive-portal systems on hotel and conference networks. When a
+    laptop joins the Wi-Fi, Windows probes its connectivity-check host, finds a portal
+    and opens the default browser on the redirect page; the portal then shows a fake
+    browser, driver or Windows update and the user runs what it downloads. The
+    manipulated DNS and HTTP answers are on a network the organisation does not own and
+    are not visible. The host still records the browser asking for the
+    connectivity-check host, which it does only when a portal is detected, and the
+    executable the browser writes a moment later. The hunt returns both and the agent
+    joins them on host within two minutes.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - initial-access
+    - captive-portal
+    - fake-update
+    - midnight-blizzard
+    - cornflake
+    - travel
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H252.md
+    - https://attack.mitre.org/techniques/T1189
+    - https://attack.mitre.org/detectionstrategies/DET0176
+
+mitre:
+  tactics:
+    - TA0001
+  techniques:
+    - T1189
+  sub_techniques: []
+  detection_strategies:
+    - DET0176
+  analytics:
+    - AN0498
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary controlling a captive-portal network manipulates DNS and HTTP responses
+    so that the victim's own connectivity check becomes the delivery trigger, and a
+    portable executable or archive is created on disk by a browser, in a user-writable
+    path, within two minutes of the host contacting a connectivity-check endpoint.
+  attacker_behavior:
+    - Compromises the portal management system of a hospitality network.
+    - "Redirects the connectivity-check page to a fake update, driver-repair or security-scan page."
+    - Serves an executable the user is told to run to get online.
+    - Follows with CornFlake RAT and a PowerShell stealer.
+  legitimate_behavior:
+    - Hotel and airport portals redirect the same check to a login page.
+    - Users download software in a browser every day.
+    - Windows itself probes the connectivity-check host on every network change.
+  risk_indicator:
+    - A browser resolves the Windows connectivity-check host and writes an executable within two minutes.
+    - "The executable is named as an update, a driver or a browser installer."
+    - It runs from Downloads within minutes of being written.
+    - The host is a laptop that was travelling.
+    - The host later resolves one of the reported look-alike sign-in domains.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: browser-resolving-connectivity-check-host
+        name: Browser resolving the Windows connectivity-check host
+        purpose: >-
+          Return DNS requests for msftconnecttest.com made by a browser. Windows opens
+          the redirect page on that host in the default browser when it detects a
+          portal, so the event marks the moment a portal was shown. The probe itself
+          comes from svchost.exe on every network change and is left out for volume, as
+          are the check hosts browsers and other operating systems poll on their own
+          schedule.
+        query: |
+          #event_simpleName=DnsRequest
+          | DomainName=/^(www\.)?msftconnecttest\.com$/i
+          | ContextBaseFileName=/^(chrome|msedge|firefox|brave|opera|vivaldi|iexplore)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: executable-written-by-browser
+        name: Executable written by a browser into a user folder
+        purpose: >-
+          Return executables a browser writes under Downloads, Desktop, Documents or the
+          user's Temp folder. This is every browser download of an executable on the
+          fleet; the agent keeps those within two minutes after an event from the first
+          case on the same host. A browser may write under a temporary download name
+          first, so the extension is not tested. An MSI or an archive is not an
+          executable write and is not returned.
+        query: |
+          #event_simpleName=PeFileWritten
+          | ContextBaseFileName=/^(chrome|msedge|firefox|brave|opera|vivaldi)\.exe$/i
+          | TargetFileName=/\\Users\\[^\\]+\\(Downloads|Desktop|Documents|AppData\\Local\\Temp)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: downloaded-updater-executed
+        name: Update-named executable run from a download folder
+        purpose: >-
+          Return executables run from Downloads, Desktop or Temp whose name reads as an
+          update, a driver, a repair tool or a browser installer and whose parent is a
+          browser or Explorer.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(chrome|msedge|firefox|brave|opera|vivaldi|explorer)\.exe$/i
+          | ImageFileName=/\\Users\\[^\\]+\\(Downloads|Desktop|AppData\\Local\\Temp)\\[^\\]*\.exe$/i
+          | FileName=/update|upgrade|driver|repair|scan|secur|setup|install|chrome|edge|firefox|browser|windows/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: reported-lookalike-domain-resolved
+        name: DNS request for a reported look-alike sign-in domain
+        purpose: >-
+          Return requests for the four doppelganger domains the report lists. They will
+          age.
+        query: |
+          #event_simpleName=DnsRequest
+          | DomainName=/(^|\.)(ms365-device\.com|ms365-live\.com|m365-owa\.com|owa-ms365\.com)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: reported-infrastructure-address
+        name: Connection to a reported infrastructure address
+        purpose: >-
+          Return connections to the six addresses the report lists, with the connecting
+          process. They will age.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | RemoteAddressIP4=/^(31\.57\.243\.154|38\.146\.28\.75|38\.146\.28\.132|104\.194\.159\.150|107\.189\.26\.194|213\.145\.86\.112)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: browser_download_after_portal
+      name: Executable written by a browser after a portal redirect
+      description: >-
+        A browser wrote an executable into a user folder within two minutes after a
+        browser on the same host resolved the connectivity-check host. The agent makes
+        the join from the times of the returned events.
+      source: file_creation
+      field: file_path
+      indicates: captive_portal_delivery
+
+  supporting:
+    - id: portal_redirect_seen
+      name: Browser opened the portal redirect page
+      description: >-
+        A browser resolved msftconnecttest.com, which it does when Windows detects a
+        portal.
+      source: dns_request
+      field: query_name
+      indicates: captive_portal_presented
+    - id: writer_is_browser
+      name: Writing process is a browser
+      description: >-
+        The process named on the file write is a browser.
+      source: file_creation
+      field: writer_process_name
+      indicates: browser_download
+    - id: lure_named_executable_ran
+      name: Update-named executable ran
+      description: >-
+        An executable named as an update, a driver or a browser installer ran from a
+        download folder.
+      source: process_creation
+      field: image_name
+      indicates: fake_update_executed
+    - id: lookalike_domain
+      name: Look-alike sign-in domain resolved
+      description: >-
+        The host resolved one of the reported doppelganger domains.
+      source: dns_request
+      field: process_name
+      indicates: credential_theft_stage
+    - id: reported_address
+      name: Reported address contacted
+      description: >-
+        The host connected to one of the reported addresses.
+      source: network_connection
+      field: remote_address
+      indicates: known_infrastructure
+
+  contradicting:
+    - id: vendor_signed_download
+      name: "Download is the vendor's signed installer"
+      description: >-
+        The file's hash is a published vendor installer and the user asked for it.
+      source: baseline
+      field: TargetFileName
+      indicates: ordinary_software_download
+    - id: host_not_travelling
+      name: Host was on a corporate network
+      description: >-
+        The host is a desktop or was on a corporate network whose own guest portal
+        caused the redirect.
+      source: asset_inventory
+      field: ComputerName
+      indicates: internal_portal
+
+  risk_logic:
+    required:
+      - browser_download_after_portal
+
+    supporting:
+      any:
+        - portal_redirect_seen
+        - writer_is_browser
+        - lure_named_executable_ran
+        - lookalike_domain
+        - reported_address
+      all:
+        - portal_redirect_seen
+        - lure_named_executable_ran
+
+    contradicting:
+      any:
+        - vendor_signed_download
+        - host_not_travelling
+      all: []
+
+  verdict:
+    low_risk_when:
+      - browser_download_after_portal
+      - vendor_signed_download
+      - host_not_travelling
+    suspicious_when:
+      - browser_download_after_portal
+      - portal_redirect_seen
+    high_risk_when:
+      - browser_download_after_portal
+      - portal_redirect_seen
+      - lure_named_executable_ran
+
+  false_positive:
+    - condition: Ordinary portals followed by an ordinary download.
+      explanation: >-
+        A traveller logs in to hotel Wi-Fi and then downloads a meeting client. The file
+        is signed by its vendor.
+    - condition: Corporate guest networks.
+      explanation: >-
+        An office guest portal produces the same redirect on managed laptops.
+    - condition: Update-like names on genuine installers.
+      explanation: >-
+        Many real installers contain the word setup or update; the name case is support
+        and not proof.

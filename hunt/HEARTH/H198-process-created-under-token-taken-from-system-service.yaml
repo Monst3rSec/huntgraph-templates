@@ -1,0 +1,255 @@
+# Converted from THORCollective/HEARTH Flames/H198.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h198-process-created-under-token-taken-from-system-service-t1134-002
+version: 1.0.0
+
+info:
+  name: Service host started by a parent other than services.exe under a duplicated token
+  description: >-
+    ESET reported FishMonger's loader, running inside spoolsv.exe, taking the spooler's
+    token and calling CreateProcessAsUserW to start svchost.exe, into which it then
+    injected shellcode. The token duplication, the API calls and the injection are OS
+    API execution and process access, which this deployment does not collect, and the
+    special-privilege and logon events HEARTH lists come from the Windows Security log.
+    What the sensor does report is the result: a svchost.exe whose parent is not
+    services.exe, or one with no service group on its command line, and logons of type
+    9. The hunt reads those. A process created under a stolen token that looks ordinary
+    in every other respect is not found by it.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - privilege-escalation
+    - stealth
+    - access-token-manipulation
+    - create-process-with-token
+    - svchost
+    - fishmonger
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H198.md
+    - https://attack.mitre.org/techniques/T1134/002
+    - https://attack.mitre.org/detectionstrategies/DET0456
+    - https://www.welivesecurity.com/en/eset-research/fishmongers-arsenal-upgraded-sprysocks-windows/
+
+mitre:
+  tactics:
+    - TA0005
+    - TA0004
+  techniques:
+    - T1134
+  sub_techniques:
+    - T1134.002
+  detection_strategies:
+    - DET0456
+  analytics:
+    - AN1253
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+    - Logon Session Metadata
+
+hypothesis:
+  statement: >-
+    An adversary steals/duplicates a token (e.g., from spoolsv.exe) and spawns a process
+    under it via CreateProcessAsUserW/CreateProcessWithTokenW so the new process (e.g.,
+    svchost.exe) runs in a different/elevated security context than its real parent.
+  attacker_behavior:
+    - Opens a SYSTEM service process and duplicates its primary token.
+    - Starts svchost.exe or another trusted binary under that token.
+    - Injects code into the new process so it runs under a trusted name.
+    - Uses runas-style new-credential logons to act as another account on the network.
+  legitimate_behavior:
+    - services.exe starts every real service host with a -k service group.
+    - Administrators use runas /netonly, which records a type 9 logon.
+    - Management agents start helpers as the logged-on user from a SYSTEM service.
+  risk_indicator:
+    - svchost.exe has a parent other than services.exe.
+    - svchost.exe has no -k argument.
+    - The parent is the spooler or another service that never starts service hosts.
+    - The child's account differs from the account of the process that started it.
+    - A type 9 logon on the host is followed by SYSTEM activity from an odd parent.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: authentication
+      connector: crowdstrike-ngsiem
+      event_types:
+        - UserLogon
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        logon_type: LogonType
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: svchost-started-by-parent-other-than-services
+        name: svchost.exe whose parent is not services.exe
+        purpose: >-
+          Return service hosts with any other parent. The service control manager is the
+          only process that starts svchost.exe in normal operation, so this is a short
+          list. The event carries the child's account and the parent's name and process
+          id but not the parent's account; the agent looks the parent up by process id
+          to compare the two.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^svchost\.exe$/i
+          | ParentBaseFileName!=/^services\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: svchost-started-without-service-group
+        name: svchost.exe started with no -k service group
+        purpose: >-
+          Return service hosts whose command line carries no -k argument. A real service
+          host always has one; a host started only to receive injected code usually has
+          none.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^svchost\.exe$/i
+          | CommandLine!=/\s-k\s/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: new-credentials-logon
+        name: Logon of type 9 (new credentials)
+        purpose: >-
+          Return type 9 logons, which runas /netonly and token-creating tools both
+          produce. The agent compares the time and host with the first two cases. This
+          depends on the sensor reporting type 9 in its logon events; confirm in the
+          tenant.
+        query: |
+          #event_simpleName=UserLogon
+          | event_platform=Win
+          | LogonType=9
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: service_host_with_wrong_parent
+      name: Service host has an unexpected parent or no service group
+      description: >-
+        svchost.exe was started by a process other than services.exe, or with no -k
+        argument.
+      source: process_creation
+      field: parent_process
+      indicates: process_created_outside_service_manager
+
+  supporting:
+    - id: no_service_group_argument
+      name: No service group on the command line
+      description: >-
+        The service host's command line has no -k argument.
+      source: process_creation
+      field: command_line
+      indicates: injection_host
+    - id: child_account_differs_from_parent
+      name: Child runs as a different account from its parent
+      description: >-
+        The account on the child differs from the account on the parent process. The
+        agent derives this by looking up the parent's own process event.
+      source: process_creation
+      field: user
+      indicates: token_substitution
+    - id: new_credentials_logon_nearby
+      name: Type 9 logon on the same host
+      description: >-
+        A new-credentials logon was recorded on the host close to the process start. The
+        agent derives the interval from the event times.
+      source: authentication
+      field: logon_type
+      indicates: token_creation
+
+  contradicting:
+    - id: parent_is_known_management_agent
+      name: Parent is a known management or security agent
+      description: >-
+        The parent is a deployed product that is documented to start service hosts on
+        this host.
+      source: asset_inventory
+      field: ComputerName
+      indicates: sanctioned_software
+
+  risk_logic:
+    required:
+      - service_host_with_wrong_parent
+
+    supporting:
+      any:
+        - no_service_group_argument
+        - child_account_differs_from_parent
+        - new_credentials_logon_nearby
+      all:
+        - no_service_group_argument
+        - child_account_differs_from_parent
+
+    contradicting:
+      any:
+        - parent_is_known_management_agent
+      all: []
+
+  verdict:
+    low_risk_when:
+      - service_host_with_wrong_parent
+      - parent_is_known_management_agent
+    suspicious_when:
+      - service_host_with_wrong_parent
+      - no_service_group_argument
+    high_risk_when:
+      - service_host_with_wrong_parent
+      - no_service_group_argument
+      - child_account_differs_from_parent
+
+  false_positive:
+    - condition: Security products start svchost.exe for scanning or sandboxing.
+      explanation: >-
+        The parent is the product's own service, the same on every host that runs it.
+    - condition: Administrators use runas /netonly.
+      explanation: >-
+        The type 9 logon is by an administrator on their own workstation and no odd
+        service host follows.

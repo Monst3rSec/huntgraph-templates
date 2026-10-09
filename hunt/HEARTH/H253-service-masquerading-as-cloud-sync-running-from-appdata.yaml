@@ -1,0 +1,385 @@
+# Converted from THORCollective/HEARTH Flames/H253.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h253-service-masquerading-as-cloud-sync-running-from-appdata-t1543-003
+version: 1.0.0
+
+info:
+  name: Service named as cloud sync whose binary runs from a user AppData folder
+  description: >-
+    CornFlake RAT, the Go implant delivered behind the captive-portal lure in H252,
+    stays by registering a Windows service: key svchost32, display name Cloud Sync
+    Service, description Synchronizes files with the cloud storage provider, and an
+    image path of %APPDATA%\svchost32\svchost32.exe. No system service runs from a user
+    profile. A watchdog puts the service and its Run-key and scheduled-task siblings
+    back after removal. Service-install events 7045 and 4697 are not collected; the hunt
+    reads the service key values where the sensor reports them, the Service Control
+    Manager starting an image from a user profile, and the near-miss system names.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - persistence
+    - windows-service
+    - masquerading
+    - cornflake
+    - midnight-blizzard
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H253.md
+    - https://attack.mitre.org/techniques/T1543
+    - https://attack.mitre.org/techniques/T1036
+    - https://attack.mitre.org/techniques/T1543/003
+    - https://attack.mitre.org/techniques/T1036/004
+    - https://attack.mitre.org/detectionstrategies/DET0552
+    - https://attack.mitre.org/detectionstrategies/DET0117
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+    - TA0005
+  techniques:
+    - T1543
+    - T1036
+  sub_techniques:
+    - T1543.003
+    - T1036.004
+  detection_strategies:
+    - DET0552
+    - DET0117
+  analytics:
+    - AN1527
+    - AN0324
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    CornFlake RAT persists by registering a Windows service whose name and description
+    read as benign infrastructure, service key svchost32 and display name Cloud Sync
+    Service, while the image path points at %APPDATA%\svchost32\svchost32.exe, a
+    user-writable location no genuine system service runs from, and a watchdog
+    re-creates it after removal.
+  attacker_behavior:
+    - "Copies itself to %APPDATA%\\svchost32\\svchost32.exe."
+    - Registers the service svchost32 with the display name Cloud Sync Service.
+    - Adds Run-key and scheduled-task copies of the same persistence.
+    - Restores whichever mechanism is removed.
+  legitimate_behavior:
+    - A few per-user updaters register services that run from a profile.
+    - Cloud-storage clients register services from Program Files.
+    - Developers register test services from build directories.
+  risk_indicator:
+    - A service image path is under a user profile or a Temp folder.
+    - services.exe starts a process from AppData.
+    - A service or binary is named as a near miss of a system binary.
+    - "The display name claims a cloud or Microsoft identity the binary's location contradicts."
+    - The service key is written again shortly after it was deleted.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+        - AsepValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: reported-service-key-written
+        name: Value written under the svchost32 service key
+        purpose: >-
+          Return any value written under a service key named svchost32, with value name
+          and data.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\Services\\svchost32$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: reported-display-name-or-description
+        name: Service display name or description as reported
+        purpose: >-
+          Return service values whose data is the reported display name or description,
+          whatever the key is called.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\Services\\[^\\]+$/i
+          | RegStringValue=/^(Cloud Sync Service|Synchronizes files with the cloud storage provider)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: service-image-path-in-user-profile
+        name: Service image path set to a user profile or Temp path
+        purpose: >-
+          Return ImagePath values of any service that point under a user profile or a
+          Temp folder. Depends on the sensor reporting service key values as generic
+          registry updates; confirm in the tenant.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\(Current)?ControlSet\d*\\Services\\[^\\]+$/i
+          | RegValueName=/^ImagePath$/i
+          | RegStringValue=/\\Users\\|\\Windows\\Temp\\|%(APPDATA|LOCALAPPDATA|TEMP|PUBLIC)%/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: service-image-path-in-user-profile-autostart-event
+        name: "Service image path set to a user profile, autostart event"
+        purpose: >-
+          The same test on the sensor's autostart registry event, which is where a
+          service image path may be reported instead.
+        query: |
+          #event_simpleName=AsepValueUpdate
+          | RegObjectName=/\\(Current)?ControlSet\d*\\Services\\[^\\]+$/i
+          | RegValueName=/^ImagePath$/i
+          | RegStringValue=/\\Users\\|\\Windows\\Temp\\|%(APPDATA|LOCALAPPDATA|TEMP|PUBLIC)%/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: service-process-started-from-user-profile
+        name: Service Control Manager starting an image from a user profile
+        purpose: >-
+          Return processes whose parent is services.exe and whose image is under a
+          user's AppData, Documents, Downloads or Desktop, or under Users\Public. This
+          holds however the service was registered, including through the API, which the
+          Go implant uses and which leaves no command line.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^services\.exe$/i
+          | ImageFileName=/\\Users\\[^\\]+\\(AppData|Documents|Downloads|Desktop)\\|\\Users\\Public\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: near-miss-system-binary-name
+        name: Process named as a near miss of a system binary
+        purpose: >-
+          Return processes named svchost32, lsass32, svhost, svch0st, scvhost or csrsss,
+          wherever they run.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(svchost32|lsass32|svhost|svch0st|scvhost|csrsss)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: near-miss-system-binary-written-to-appdata
+        name: Near-miss system binary written under AppData
+        purpose: >-
+          Return executables with those names written under a user's AppData.
+        query: |
+          #event_simpleName=PeFileWritten
+          | TargetFileName=/\\AppData\\(Roaming|Local)\\([^\\]+\\)*(svchost32|lsass32|svhost|svch0st|scvhost|csrsss)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: service-created-by-command-with-user-path
+        name: Service created from a command line with a user-profile binary
+        purpose: >-
+          Return sc.exe and PowerShell commands that create a service whose binary path
+          is under a user profile or that carry the reported names.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(sc|powershell|pwsh|cmd)\.exe$/i
+          | CommandLine=/\bcreate\b.*binpath|New-Service/i
+          | CommandLine=/\\Users\\|%(APPDATA|LOCALAPPDATA|TEMP)%|\$env:(APPDATA|LOCALAPPDATA|TEMP)|svchost32|Cloud Sync Service/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: service_binary_in_user_profile
+      name: Service binary runs from a user profile
+      description: >-
+        The Service Control Manager started a process whose image is under a user
+        profile, or a process carries a near-miss system name.
+      source: process_creation
+      field: image_path
+      indicates: service_persistence_from_user_path
+
+  supporting:
+    - id: started_by_scm
+      name: Parent is services.exe
+      description: >-
+        The parent of the process is services.exe.
+      source: process_creation
+      field: parent_process
+      indicates: runs_as_service
+    - id: service_key_image_path
+      name: Service image path points at the profile
+      description: >-
+        The ImagePath data of a service key names a path under a user profile or Temp.
+      source: registry
+      field: registry_data
+      indicates: service_registered
+    - id: reported_service_key
+      name: Service key is svchost32
+      description: >-
+        The service key written is named svchost32.
+      source: registry
+      field: registry_path
+      indicates: cornflake_persistence
+    - id: binary_dropped
+      name: Near-miss binary written under AppData
+      description: >-
+        An executable with a near-miss system name was written under AppData.
+      source: file_creation
+      field: file_path
+      indicates: implant_installed
+    - id: key_rewritten_after_removal
+      name: Service key written repeatedly
+      description: >-
+        The same service key is written again after a gap, on one host. The agent
+        derives this from the times of the returned registry events.
+      source: registry
+      field: registry_value
+      indicates: persistence_watchdog
+
+  contradicting:
+    - id: per_user_updater
+      name: Service belongs to a known per-user product
+      description: >-
+        The image is a signed updater of an installed product that registers a service
+        from the profile.
+      source: baseline
+      field: ImageFileName
+      indicates: vendor_updater_service
+    - id: developer_test_service
+      name: Developer host running a test service
+      description: >-
+        The host is a developer workstation and the image is a build output.
+      source: asset_inventory
+      field: ComputerName
+      indicates: development_activity
+
+  risk_logic:
+    required:
+      - service_binary_in_user_profile
+
+    supporting:
+      any:
+        - started_by_scm
+        - service_key_image_path
+        - reported_service_key
+        - binary_dropped
+        - key_rewritten_after_removal
+      all:
+        - started_by_scm
+        - service_key_image_path
+
+    contradicting:
+      any:
+        - per_user_updater
+        - developer_test_service
+      all: []
+
+  verdict:
+    low_risk_when:
+      - service_binary_in_user_profile
+      - per_user_updater
+      - developer_test_service
+    suspicious_when:
+      - service_binary_in_user_profile
+      - started_by_scm
+    high_risk_when:
+      - service_binary_in_user_profile
+      - started_by_scm
+      - reported_service_key
+
+  false_positive:
+    - condition: Per-user updaters.
+      explanation: >-
+        A small number of products install a service from the profile. They are signed
+        and the same on every host.
+    - condition: Developers testing services.
+      explanation: >-
+        A service under a build directory in a profile on a developer machine.
+    - condition: Portable remote-support tools.
+      explanation: >-
+        Some support tools register a temporary service from Temp for one session; H182
+        covers those.

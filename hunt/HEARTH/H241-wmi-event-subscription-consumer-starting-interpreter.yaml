@@ -1,0 +1,339 @@
+# Converted from THORCollective/HEARTH Flames/H241.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h241-wmi-event-subscription-consumer-starting-interpreter-t1546-003
+version: 1.0.0
+
+info:
+  name: WMI permanent event subscription whose consumer starts a script interpreter
+  description: >-
+    A permanent WMI event subscription keeps its three objects, an event filter, a
+    consumer and the binding between them, in the WMI repository under
+    root\subscription, so nothing sits in a Run key, a task or a startup folder. When
+    the filter's condition is met, a CommandLineEventConsumer runs its command from
+    WmiPrvSE.exe and an ActiveScriptEventConsumer runs its script in scrcons.exe, both
+    as SYSTEM. Sysmon events 19 to 21 and the WMI-Activity log record the objects being
+    written; this deployment collects neither. What is left is the process side: the
+    consumer host starting an interpreter, scrcons.exe starting at all, and the command
+    that registered the subscription when it was typed or scripted with the class names
+    on it.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - persistence
+    - privilege-escalation
+    - wmi
+    - event-subscription
+    - fileless
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H241.md
+    - https://attack.mitre.org/techniques/T1546
+    - https://attack.mitre.org/techniques/T1546/003
+    - https://attack.mitre.org/detectionstrategies/DET0086
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1546
+  sub_techniques:
+    - T1546.003
+  detection_strategies:
+    - DET0086
+  analytics:
+    - AN0236
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An operator establishes fileless persistence by writing a permanent WMI event
+    subscription into root\subscription, an event filter with an uptime, logon or timer
+    trigger, a CommandLineEventConsumer or ActiveScriptEventConsumer whose action starts
+    a script interpreter or an unsigned binary from a user-writable path, and a binding
+    linking them, where the creator is not a sanctioned management tool.
+  attacker_behavior:
+    - "Registers an event filter, a consumer and a binding with PowerShell, wmic or a compiled MOF file."
+    - "Sets the consumer's action to PowerShell, cmd, mshta, wscript or a binary in a user-writable path."
+    - "Triggers on system uptime, on logon or on an interval timer."
+    - Relies on WmiPrvSE.exe or scrcons.exe to run the action as SYSTEM.
+  legitimate_behavior:
+    - "Configuration Manager, monitoring agents and some vendor installers keep permanent subscriptions."
+    - "Remote administration creates processes through WMI, which also start under WmiPrvSE.exe."
+    - Installers compile MOF files from their own program directory.
+  risk_indicator:
+    - scrcons.exe runs on a host with no management product that uses script consumers.
+    - WmiPrvSE.exe starts an interpreter as SYSTEM with an encoded or download command.
+    - "The same command starts again after each boot or logon, a few minutes in."
+    - "A command line names the subscription classes outside a management tool's install."
+    - A MOF file is compiled from a user or temporary directory.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: script-consumer-host-started
+        name: ActiveScript consumer host started
+        purpose: >-
+          Return every start of scrcons.exe. The process exists only to run the script
+          of an ActiveScriptEventConsumer, so on most hosts it never runs. A consumer
+          that does all its work inside the script starts no child, and this event is
+          then the only trace.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^scrcons\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: process-started-by-script-consumer-host
+        name: Process started by the ActiveScript consumer host
+        purpose: >-
+          Return whatever scrcons.exe starts, with the command line the script passed.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^scrcons\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: interpreter-started-by-wmi-provider-host
+        name: Interpreter or proxy binary started by WmiPrvSE.exe
+        purpose: >-
+          Return script interpreters and proxy binaries whose parent is WmiPrvSE.exe. A
+          CommandLineEventConsumer runs here, and so does a process created remotely
+          through Win32_Process, which H020 and H120 hunt. The two differ in the
+          account: a consumer runs as SYSTEM, a remote creation as the account that
+          connected. The user is on each event and the agent separates them.
+          Configuration Manager clients add volume on managed hosts.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^WmiPrvSE\.exe$/i
+          | FileName=/^(powershell|pwsh|cmd|mshta|wscript|cscript|rundll32|regsvr32|certutil|bitsadmin|msiexec)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: user-writable-binary-started-by-wmi-provider-host
+        name: Binary in a user-writable path started by WmiPrvSE.exe
+        purpose: >-
+          Return processes started by WmiPrvSE.exe whose image is under a user profile,
+          ProgramData or the Windows Temp folder, the consumer that points straight at a
+          dropped binary.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^WmiPrvSE\.exe$/i
+          | ImageFileName=/\\(Users|ProgramData|Windows\\Temp)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: subscription-classes-on-command-line
+        name: Subscription classes named on a command line
+        purpose: >-
+          Return PowerShell, wmic and script-host commands that name an event filter, a
+          consumer class, a binding or the root\subscription namespace. This is the
+          registration when it is typed or passed inline. A script file that registers
+          the subscription, or an implant that calls the WMI API itself, puts none of
+          these words on a command line and is seen only when the consumer fires.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh|wmic|cmd|cscript|wscript|mshta)\.exe$/i
+          | CommandLine=/__EventFilter|__FilterToConsumerBinding|CommandLineEventConsumer|ActiveScriptEventConsumer|root[\\\/]subscription/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: mof-compiled-from-outside-system-paths
+        name: MOF file compiled from outside system and program directories
+        purpose: >-
+          Return mofcomp.exe runs whose MOF file is not under the Windows or Program
+          Files trees. The content of the MOF is not visible; the path and the parent
+          are.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^mofcomp\.exe$/i
+          | CommandLine!=/\\(Windows|Program Files( \(x86\))?)\\[^"]*\.mof/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: subscription_command
+      name: Command registered or run by a WMI subscription
+      description: >-
+        A command line either registers subscription classes in root\subscription or is
+        the command a consumer host, WmiPrvSE.exe or scrcons.exe, started.
+      source: process_creation
+      field: command_line
+      indicates: wmi_subscription_persistence
+
+  supporting:
+    - id: consumer_host_parent
+      name: Parent is a WMI consumer host
+      description: >-
+        The parent of the process is scrcons.exe or WmiPrvSE.exe.
+      source: process_creation
+      field: parent_process
+      indicates: consumer_triggered_execution
+    - id: runs_as_system
+      name: Process runs as SYSTEM
+      description: >-
+        The process started by the consumer host runs as SYSTEM and not as an account
+        that connected remotely.
+      source: process_creation
+      field: user
+      indicates: subscription_not_remote_creation
+    - id: script_consumer_host_present
+      name: scrcons.exe ran
+      description: >-
+        scrcons.exe started on the host, which only a script consumer causes.
+      source: process_creation
+      field: image_name
+      indicates: active_script_consumer
+    - id: payload_in_user_writable_path
+      name: Started image is in a user-writable path
+      description: >-
+        The image the consumer host started is under a user profile, ProgramData or
+        Temp.
+      source: process_creation
+      field: image_path
+      indicates: dropped_payload_execution
+    - id: recurs_after_boot_or_logon
+      name: Same command recurs on a trigger
+      description: >-
+        The same command starts under the consumer host again after each boot or logon
+        or at a fixed interval. The agent derives this from the times of the returned
+        events for one host.
+      source: process_creation
+      field: host
+      indicates: timer_or_uptime_trigger
+
+  contradicting:
+    - id: management_product_subscription
+      name: Host runs a product that keeps subscriptions
+      description: >-
+        The host has Configuration Manager or a monitoring agent whose documented
+        subscriptions run the command returned.
+      source: asset_inventory
+      field: ComputerName
+      indicates: sanctioned_management_tooling
+    - id: command_in_subscription_baseline
+      name: Command is in the subscription baseline
+      description: >-
+        The command matches a consumer recorded in the estate's baseline of permanent
+        subscriptions.
+      source: baseline
+      field: CommandLine
+      indicates: known_subscription
+
+  risk_logic:
+    required:
+      - subscription_command
+
+    supporting:
+      any:
+        - consumer_host_parent
+        - runs_as_system
+        - script_consumer_host_present
+        - payload_in_user_writable_path
+        - recurs_after_boot_or_logon
+      all:
+        - consumer_host_parent
+        - runs_as_system
+
+    contradicting:
+      any:
+        - management_product_subscription
+        - command_in_subscription_baseline
+      all: []
+
+  verdict:
+    low_risk_when:
+      - subscription_command
+      - management_product_subscription
+      - command_in_subscription_baseline
+    suspicious_when:
+      - subscription_command
+      - consumer_host_parent
+      - runs_as_system
+    high_risk_when:
+      - subscription_command
+      - consumer_host_parent
+      - runs_as_system
+      - recurs_after_boot_or_logon
+
+  false_positive:
+    - condition: Configuration Manager and monitoring agents.
+      explanation: >-
+        Their consumers start the product's own signed binaries and do not change. A
+        baseline of subscriptions per host role settles them.
+    - condition: Remote administration through WMI.
+      explanation: >-
+        A process created with Win32_Process also has WmiPrvSE.exe as its parent. It
+        runs as the connecting account and does not recur on a trigger.
+    - condition: Installers compiling MOF files.
+      explanation: >-
+        Driver and agent installers run mofcomp from their install directory under an
+        installer parent.

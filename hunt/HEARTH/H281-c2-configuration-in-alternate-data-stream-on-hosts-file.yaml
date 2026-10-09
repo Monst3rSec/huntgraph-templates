@@ -1,0 +1,222 @@
+# Converted from THORCollective/HEARTH Flames/H281.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h281-c2-configuration-in-alternate-data-stream-on-hosts-file-t1564-004
+version: 1.0.0
+
+info:
+  name: Alternate data stream on the hosts file used to hold C2 configuration
+  description: >-
+    The SPECTRE implant keeps the C2 endpoint that overrides its built-in default in an
+    NTFS alternate data stream on C:\Windows\System32\drivers\etc\hosts, addressed as
+    hosts:cache. The hosts file itself is unchanged, so integrity monitoring that hashes
+    the main stream sees nothing, and the operator can repoint a compromised host by
+    rewriting the stream. Stream-creation events are the primary evidence and are not
+    collected here, and an implant that writes the stream through the file API leaves
+    nothing this telemetry can show. What remains is the operator's side: a shell
+    redirect, Set-Content -Stream or type command that names a stream on a file under
+    drivers\etc. The hosts file should carry no named stream at all, so any command that
+    addresses one is worth reading. An estate sweep with Get-Item -Stream is a
+    collection task, not something this hunt can do.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - stealth
+    - ntfs-alternate-data-stream
+    - hosts-file
+    - implant-configuration
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H281.md
+    - https://attack.mitre.org/techniques/T1564
+    - https://attack.mitre.org/techniques/T1564/004
+    - https://attack.mitre.org/detectionstrategies/DET0432
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1564
+  sub_techniques:
+    - T1564.004
+  detection_strategies:
+    - DET0432
+  analytics:
+    - AN1206
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary stores implant configuration, specifically the C2 endpoint that
+    overrides a hardcoded default, in an NTFS alternate data stream attached to
+    C:\Windows\System32\drivers\etc\hosts and referenced as hosts:cache, leaving the
+    hosts file itself unmodified.
+  attacker_behavior:
+    - Writes the C2 address into a stream named cache on the hosts file.
+    - Rewrites the stream on an already compromised host to rotate infrastructure.
+    - Leaves the main stream of the hosts file untouched so its hash and size do not change.
+  legitimate_behavior:
+    - Defenders sweep drivers\etc for named streams with Get-Item -Stream or dir /R.
+    - Almost nothing else addresses a stream on the hosts file.
+  risk_indicator:
+    - A command line names a stream on a file under drivers\etc.
+    - The command writes to the stream with a redirect, Set-Content or Add-Content.
+    - The command is issued by an unknown binary or a remote shell.
+    - The stream name is cache.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: command-naming-a-stream-on-a-drivers-etc-file
+        name: Command naming a stream on a file under drivers\etc
+        purpose: >-
+          Return any process whose command line addresses file:stream under drivers\etc
+          by full path. The hosts file has no extension, so stream patterns that expect
+          one miss it; this one does not. A command that changes into the directory
+          first and uses a relative name is not matched.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/\\drivers\\etc\\[^\\\s:"']+:[A-Za-z_$][A-Za-z0-9_.$-]*/i
+          | CommandLine!=/\\drivers\\etc\\[^\\\s:"']+:Zone\.Identifier/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: powershell-stream-parameter-on-drivers-etc
+        name: PowerShell -Stream parameter used on a file under drivers\etc
+        purpose: >-
+          Return PowerShell commands that pass -Stream while naming a path under
+          drivers\etc. Get-Item -Stream * is the defender's sweep and appears here too;
+          the cmdlet and the caller tell the two apart.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/\\drivers\\etc\\/i
+          | CommandLine=/\s-Stream\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: stream_on_hosts_addressed
+      name: Command addresses a named stream under drivers\etc
+      description: >-
+        A command line names a stream on the hosts file or another file under
+        drivers\etc, by file:stream syntax or the PowerShell -Stream parameter.
+      source: process_creation
+      field: command_line
+      indicates: hidden_stream_on_system_file
+
+  supporting:
+    - id: stream_written
+      name: Command writes to the stream
+      description: >-
+        The command uses a redirect, Set-Content, Add-Content, type or copy to put data
+        into the stream rather than only listing it.
+      source: process_creation
+      field: command_line
+      indicates: configuration_stored_in_stream
+    - id: issued_by_unknown_process
+      name: Issued by an unknown binary or remote shell
+      description: >-
+        The parent is not an administrator's console or the organisation's endpoint
+        management agent.
+      source: process_creation
+      field: parent_process
+      indicates: implant_driven_command
+    - id: non_administrative_context
+      name: Account has no reason to touch the hosts file
+      description: >-
+        The command runs as SYSTEM under an unexpected service or as an account with no
+        administrative role on the host.
+      source: process_creation
+      field: user
+      indicates: unexpected_actor
+
+  contradicting:
+    - id: defender_stream_sweep
+      name: Sweep for streams run by defenders
+      description: >-
+        The command is a read-only enumeration issued by the security team's collection
+        tooling across many hosts.
+      source: baseline
+      field: CommandLine
+      indicates: defensive_collection
+
+  risk_logic:
+    required:
+      - stream_on_hosts_addressed
+
+    supporting:
+      any:
+        - stream_written
+        - issued_by_unknown_process
+        - non_administrative_context
+      all:
+        - stream_written
+        - issued_by_unknown_process
+
+    contradicting:
+      any:
+        - defender_stream_sweep
+      all: []
+
+  verdict:
+    low_risk_when:
+      - stream_on_hosts_addressed
+      - defender_stream_sweep
+    suspicious_when:
+      - stream_on_hosts_addressed
+      - stream_written
+    high_risk_when:
+      - stream_on_hosts_addressed
+      - stream_written
+      - issued_by_unknown_process
+
+  false_positive:
+    - condition: Stream sweeps by the security team.
+      explanation: >-
+        Get-Item -Stream and dir /R against drivers\etc are how this is hunted on disk.
+        They read, they come from the management agent and they run on many hosts at
+        once.

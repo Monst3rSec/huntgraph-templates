@@ -1,0 +1,333 @@
+# Converted from THORCollective/HEARTH Flames/H280.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-lin-hearth-h280-kernel-module-posing-as-acpi-with-early-boot-systemd-unit-t1547-006
+version: 1.0.0
+
+info:
+  name: Kernel module posing as an ACPI component persisted by an early-boot systemd unit
+  description: >-
+    The SPECTRE rootkit is a loadable kernel module named acpi_pad.ko, after a stock
+    kernel component, kept across reboots by a systemd unit called
+    hardware-monitor.service whose Before=sysinit.target ordering starts it ahead of
+    security tooling. Once loaded it hooks kernel functions through ftrace, removes
+    itself from the module list and takes orders as real-time signals sent to PID 31337.
+    The module-load syscall, the kernel taint flag and the difference between lsmod and
+    /sys/module are the best evidence and none of it reaches this telemetry. The steps
+    that run as processes do: insmod or modprobe given a .ko outside the packaged module
+    tree, a module called acpi_pad loaded by hand, a command that writes or enables a
+    unit ordered before sysinit.target, and kill aimed at the magic PID. A loader that
+    calls finit_module itself, and signals sent by a shell builtin or from code, are not
+    seen.
+  severity: critical
+  author: huntgraph
+  tags:
+    - hearth
+    - persistence
+    - privilege-escalation
+    - rootkit
+    - kernel-module
+    - systemd
+    - linux
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H280.md
+    - https://attack.mitre.org/techniques/T1547
+    - https://attack.mitre.org/techniques/T1547/006
+    - https://attack.mitre.org/detectionstrategies/DET0450
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1547
+  sub_techniques:
+    - T1547.006
+  detection_strategies:
+    - DET0450
+  analytics:
+    - AN1243
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+  data_components:
+    - Command Execution
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary loads a loadable kernel module named to impersonate a stock kernel
+    component, acpi_pad.ko, and persists it with a systemd unit masquerading as
+    hardware-monitor.service whose Before=sysinit.target ordering initialises the
+    rootkit ahead of security tooling at every boot, then controls it with real-time
+    signals sent to the magic PID 31337.
+  attacker_behavior:
+    - Stages acpi_pad.ko outside /lib/modules and loads it with insmod.
+    - Writes hardware-monitor.service with Before=sysinit.target and enables it.
+    - Sends signals 35, 36, 37 and 62 to PID 31337 to hide processes, hide the module and gain root.
+    - Unlinks the module from the kernel's list so lsmod no longer shows it.
+  legitimate_behavior:
+    - DKMS and vendor installers build and load out-of-tree drivers for graphics,
+      storage and virtualisation.
+    - The genuine acpi_pad module is loaded from the distribution's module tree on some hardware.
+    - A few storage and encryption units are ordered before sysinit.target by their packages.
+  risk_indicator:
+    - insmod or modprobe is given a .ko file under /tmp, /dev/shm, /root, /home or /opt.
+    - A module with a stock kernel name is loaded from a path outside /lib/modules.
+    - The loading process descends from a web service, an implant or an interactive
+      shell rather than boot.
+    - A unit ordered before sysinit.target is created by a shell command.
+    - kill is run against PID 31337 with a real-time signal number.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NewExecutableWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: module-inserted-from-outside-packaged-tree
+        name: insmod or modprobe given a module file outside /lib/modules
+        purpose: >-
+          Return module loads that name a .ko file by a path outside the packaged module
+          tree and outside DKMS. modprobe by bare module name resolves inside the tree
+          and is not returned here.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | FileName=/^(insmod|modprobe|kmod)$/
+          | CommandLine=/\.ko(\.(xz|gz|zst))?(\s|$)/
+          | CommandLine!=/\/(usr\/)?lib\/modules\/|\/var\/lib\/dkms\//
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: acpi-pad-module-loaded-by-command
+        name: Module named acpi_pad loaded or removed by command
+        purpose: >-
+          Return insmod, modprobe and rmmod runs that name acpi_pad. The genuine module
+          is loaded by the kernel's own device matching, usually without a process, so a
+          command doing it deserves a look at its parent and at the path given.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | FileName=/^(insmod|modprobe|kmod|rmmod)$/
+          | CommandLine=/acpi_pad/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: early-boot-unit-written-or-enabled-by-command
+        name: Command writing or enabling a unit ordered before sysinit.target
+        purpose: >-
+          Return commands that carry the Before=sysinit.target directive, as a shell
+          writing the unit file does, or that name hardware-monitor.service, as
+          systemctl enabling it does. A unit file copied into place from an archive
+          shows neither; its contents are not visible to the sensor.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | CommandLine=/Before\s*=\s*sysinit\.target|hardware-monitor(\.service)?\b/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: signal-sent-to-rootkit-control-pid
+        name: kill run against PID 31337 with a real-time signal
+        purpose: >-
+          Return kill processes whose target is 31337 and whose signal number is in the
+          real-time range the rootkit listens on. Only the external kill binary is a
+          process; a shell builtin or a kill() call from the implant is not returned.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | FileName=/^kill$/
+          | CommandLine=/\s-(3[4-9]|[45][0-9]|6[0-4])\s+31337(\s|$)/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: kernel-object-written-outside-module-tree
+        name: Kernel object file written outside the module tree
+        purpose: >-
+          Return .ko files written anywhere other than the packaged module tree and
+          DKMS. Whether the sensor reports a relocatable kernel object as an executable
+          write is not established by any other template; confirm in the tenant.
+        query: |
+          #event_simpleName=NewExecutableWritten
+          | event_platform=Lin
+          | TargetFileName=/\.ko$/
+          | TargetFileName!=/^\/(usr\/)?lib\/modules\/|^\/var\/lib\/dkms\/|^\/usr\/src\//
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: module_loaded_from_unpackaged_path
+      name: Kernel module loaded from outside the packaged tree
+      description: >-
+        insmod or modprobe was given a module file outside /lib/modules and DKMS, or
+        loaded a module named acpi_pad by command.
+      source: process_creation
+      field: command_line
+      indicates: untrusted_kernel_module_load
+
+  supporting:
+    - id: stock_module_name
+      name: Module carries a stock kernel name
+      description: >-
+        The file is named after a component the kernel ships, such as acpi_pad, while
+        its path is not the distribution's.
+      source: process_creation
+      field: command_line
+      indicates: kernel_component_masquerade
+    - id: loader_not_boot_or_package
+      name: Load started outside boot and package management
+      description: >-
+        The parent of the loading process is a shell, a web service or an unknown
+        binary, not systemd, udev, dkms or a package manager.
+      source: process_creation
+      field: parent_process
+      indicates: post_exploitation_module_load
+    - id: early_boot_unit
+      name: Unit ordered before sysinit.target
+      description: >-
+        A command wrote or enabled a unit carrying Before=sysinit.target or named
+        hardware-monitor.service.
+      source: process_creation
+      field: command_line
+      indicates: boot_persistence_ahead_of_security_tooling
+    - id: magic_pid_signal
+      name: Real-time signal sent to PID 31337
+      description: >-
+        kill was run against PID 31337 with a signal in the real-time range, the
+        rootkit's control channel.
+      source: process_creation
+      field: command_line
+      indicates: rootkit_control_signal
+    - id: kernel_object_staged
+      name: Kernel object written outside the module tree
+      description: >-
+        A .ko file was written outside /lib/modules and DKMS on the same host before the
+        load.
+      source: file_creation
+      field: file_path
+      indicates: module_staged_on_host
+
+  contradicting:
+    - id: vendor_driver_installation
+      name: Vendor or DKMS driver installation
+      description: >-
+        The module belongs to a driver package installed on the host, such as a
+        graphics, storage or virtualisation driver, under a change record.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_driver_installation
+    - id: kernel_development_host
+      name: Kernel development or test host
+      description: >-
+        The host is used to build and test kernel modules and the user is a kernel
+        developer.
+      source: identity_context
+      field: UserName
+      indicates: development_activity
+
+  risk_logic:
+    required:
+      - module_loaded_from_unpackaged_path
+
+    supporting:
+      any:
+        - stock_module_name
+        - loader_not_boot_or_package
+        - early_boot_unit
+        - magic_pid_signal
+        - kernel_object_staged
+      all:
+        - stock_module_name
+        - loader_not_boot_or_package
+
+    contradicting:
+      any:
+        - vendor_driver_installation
+        - kernel_development_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - module_loaded_from_unpackaged_path
+      - vendor_driver_installation
+      - kernel_development_host
+    suspicious_when:
+      - module_loaded_from_unpackaged_path
+      - loader_not_boot_or_package
+    high_risk_when:
+      - module_loaded_from_unpackaged_path
+      - loader_not_boot_or_package
+      - early_boot_unit
+
+  false_positive:
+    - condition: Out-of-tree drivers.
+      explanation: >-
+        Graphics, ZFS, VirtualBox and security-agent modules are built and inserted on
+        the host. They come from a package, are built under DKMS and are named for what
+        they are.
+    - condition: Kernel developers.
+      explanation: >-
+        Loading a freshly built module from a home directory is the job. The host and
+        the account say so.
+    - condition: Monitoring units named hardware-monitor.
+      explanation: >-
+        The name is generic enough to exist legitimately. A genuine one has no reason to
+        be ordered before sysinit.target.

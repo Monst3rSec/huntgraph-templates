@@ -1,0 +1,290 @@
+# Converted from THORCollective/HEARTH Flames/H285.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-any-hearth-h285-cargo-build-script-fetching-and-starting-second-stage-t1195-001
+version: 1.0.0
+
+info:
+  name: Rust build script fetching and starting a second stage during cargo build
+  description: >-
+    A malicious crate needs none of its library code to be called. Its build.rs runs
+    automatically at compile time as the building user: it reassembles a URL from Base64
+    fragments, fetches a second-stage binary with certificate validation switched off,
+    and starts it detached so it outlives a build that finishes green. Cargo compiles
+    build.rs to a program named build-script-build under target/*/build/<crate>-<hash>/
+    and runs it, so the behaviour has a fixed place in the process tree. Build scripts
+    legitimately start compilers, linkers, cmake, pkg-config and shells; they do not
+    normally start anything else and they seldom resolve names. The hunt returns
+    children of a build script that are not toolchain programs, shells and fetch tools
+    under one that download or touch a scratch directory, and name lookups made by the
+    build script itself. The TLS settings and the contents of build.rs are not visible.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - initial-access
+    - supply-chain
+    - rust
+    - cargo
+    - build-script
+    - developer-tooling
+    - cross-platform
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H285.md
+    - https://attack.mitre.org/techniques/T1195
+    - https://attack.mitre.org/techniques/T1195/001
+    - https://attack.mitre.org/detectionstrategies/DET0009
+
+mitre:
+  tactics:
+    - TA0001
+  techniques:
+    - T1195
+  sub_techniques:
+    - T1195.001
+  detection_strategies:
+    - DET0009
+  analytics:
+    - AN0021
+    - AN0022
+    - AN0023
+  platforms:
+    - Windows
+    - Linux
+    - macOS
+  data_sources:
+    - WinEventLog:Sysmon
+    - auditd:SYSCALL
+    - macos:endpointsecurity
+    - NSM:Flow
+  data_components:
+    - Process Creation
+    - Network Traffic Flow
+
+hypothesis:
+  statement: >-
+    Threat actors are embedding malicious build.rs scripts in Rust crate dependencies
+    that decode Base64-fragmented URLs, disable TLS certificate validation and silently
+    fetch second-stage binaries during the cargo build compile-time process, achieving
+    code execution on developer and CI machines without any application code running.
+  attacker_behavior:
+    - Publishes a typosquatted helper crate whose build.rs carries the dropper.
+    - Has the compiled build script download a binary to a temporary directory.
+    - Starts the binary detached so it survives the end of the build.
+    - Leaves the build and the CI job reporting success.
+  legitimate_behavior:
+    - Build scripts start rustc, C compilers, cmake, make and pkg-config to build native code.
+    - A few -sys crates download prebuilt libraries from the vendor's release site at build time.
+    - Code generators such as protoc and bindgen are run from build scripts.
+  risk_indicator:
+    - A build script starts a program that is not part of a toolchain.
+    - The child's image is under a temporary directory or the user's home.
+    - The build script resolves a name that is not a known release host.
+    - The child is still running after the cargo process has exited.
+    - The crate is a new or renamed dependency.
+
+requires:
+  platforms:
+    - windows
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: non-toolchain-process-started-by-build-script
+        name: Process started by a cargo build script that is not a toolchain program
+        purpose: >-
+          Return children of build-script-build that are not compilers, linkers, build
+          drivers, code generators or shells. The reported dropper starts its payload
+          directly, so the payload is the child and its image path is on the event.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | ParentBaseFileName=/^build[-_]script[-_]/i
+          | FileName!=/^(rustc|rustdoc|rustfmt|cargo|cc|c\+\+|gcc|g\+\+|clang|clang\+\+|cl|link|lib|ar|ld|ld\.lld|lld-link|cmake|make|gmake|ninja|nmake|msbuild|pkg-config|pkgconf|git|nasm|yasm|perl|protoc|llvm-config|bindgen|sh|bash|dash|zsh|cmd|powershell|pwsh|python[0-9.]*|xcrun|xcodebuild|sw_vers|uname|which|vswhere|conhost)(\.exe)?$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: fetch-or-scratch-path-command-under-build-script
+        name: Shell or fetch tool under a build script downloading or using a scratch path
+        purpose: >-
+          Return shells, PowerShell and transfer tools started by a build script whose
+          command line carries a URL, a decode, a chmod or a temporary path.
+          Autotools-based crates run many shell commands; the content filter keeps the
+          ones that fetch or stage.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | ParentBaseFileName=/^build[-_]script[-_]/i
+          | FileName=/^(sh|bash|dash|zsh|cmd|powershell|pwsh|curl|wget|certutil|bitsadmin|python[0-9.]*)(\.exe)?$/i
+          | CommandLine=/https?:\/\/|base64\s+(-d|--decode)|FromBase64String|chmod\s+\+x|\/dev\/shm\/|\/var\/tmp\/|\bIEX\b|DownloadString|DownloadFile|-urlcache/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: name-lookup-by-build-script
+        name: DNS request made by a cargo build script
+        purpose: >-
+          Return name lookups whose requesting process is a build script. Few crates
+          need the network at build time and those that do go to a release host that can
+          be named. This relies on the requesting process name being present on DNS
+          events for Linux and macOS as it is for Windows; confirm in the tenant.
+        query: |
+          #event_simpleName=DnsRequest
+          | ContextBaseFileName=/^build[-_]script[-_]/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: build_script_started_foreign_process
+      name: Build script started a non-toolchain process
+      description: >-
+        A process whose parent is a cargo build script is not a compiler, linker, build
+        driver or code generator, or is a shell or fetch tool downloading content.
+      source: process_creation
+      field: parent_process
+      indicates: compile_time_code_execution
+
+  supporting:
+    - id: child_image_in_scratch_path
+      name: Child runs from a temporary or home directory
+      description: >-
+        The child's image is under a temporary directory, the user's home or a hidden
+        directory rather than a toolchain path.
+      source: process_creation
+      field: image_path
+      indicates: dropped_second_stage
+    - id: fetch_command_under_build_script
+      name: Download or decode command under the build script
+      description: >-
+        A shell or transfer tool under the build script carries a URL, a Base64 decode
+        or a chmod on its command line.
+      source: process_creation
+      field: command_line
+      indicates: payload_retrieval_at_build_time
+    - id: build_script_name_lookup
+      name: Build script resolved an external name
+      description: >-
+        The build script process itself made a DNS request for a host that is not a
+        known release site.
+      source: dns_request
+      field: query_name
+      indicates: build_time_egress
+    - id: lookup_requester_is_build_script
+      name: Requesting process is the build script
+      description: >-
+        The process named on the DNS event is build-script-build, so the lookup came
+        from compile-time code and not from cargo fetching crates.
+      source: dns_request
+      field: process_name
+      indicates: build_time_egress
+
+  contradicting:
+    - id: documented_build_time_download
+      name: Crate documented to download or generate at build time
+      description: >-
+        The crate is a known -sys or code-generation crate whose build script is
+        documented to fetch a prebuilt library or run the tool seen.
+      source: baseline
+      field: CommandLine
+      indicates: expected_build_behaviour
+    - id: child_is_project_tool
+      name: Child is a tool the project vendors
+      description: >-
+        The child program is built or vendored by the same workspace and invoked by its
+        own build script.
+      source: baseline
+      field: ImageFileName
+      indicates: project_build_tooling
+
+  risk_logic:
+    required:
+      - build_script_started_foreign_process
+
+    supporting:
+      any:
+        - child_image_in_scratch_path
+        - fetch_command_under_build_script
+        - build_script_name_lookup
+        - lookup_requester_is_build_script
+      all:
+        - child_image_in_scratch_path
+        - build_script_name_lookup
+
+    contradicting:
+      any:
+        - documented_build_time_download
+        - child_is_project_tool
+      all: []
+
+  verdict:
+    low_risk_when:
+      - build_script_started_foreign_process
+      - documented_build_time_download
+      - child_is_project_tool
+    suspicious_when:
+      - build_script_started_foreign_process
+      - child_image_in_scratch_path
+    high_risk_when:
+      - build_script_started_foreign_process
+      - child_image_in_scratch_path
+      - build_script_name_lookup
+
+  false_positive:
+    - condition: Native-library crates.
+      explanation: >-
+        Crates wrapping C libraries run configure scripts, cmake and vendored helpers.
+        The children are build tools and anything fetched comes from the library's
+        release host.
+    - condition: Code generators.
+      explanation: >-
+        protoc, bindgen, flatc and similar are started from build scripts. Add the ones
+        a project uses to the toolchain list.
+    - condition: Projects that run their own helper binaries.
+      explanation: >-
+        A workspace can build a helper and call it from another crate's build script.
+        The helper's path is inside the same target directory.

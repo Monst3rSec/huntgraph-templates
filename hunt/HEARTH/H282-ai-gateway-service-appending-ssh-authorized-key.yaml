@@ -1,0 +1,262 @@
+# Converted from THORCollective/HEARTH Flames/H282.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-lin-hearth-h282-ai-gateway-service-appending-ssh-authorized-key-t1098-004
+version: 1.0.0
+
+info:
+  name: AI inference gateway service appending an SSH key to authorized_keys
+  description: >-
+    After exploiting an exposed AI inference gateway such as LiteLLM, RAGFlow or Kestra,
+    an automated chain turns short-lived code execution into lasting access: a shell
+    started by the gateway process appends an attacker's public key to the service
+    account's ~/.ssh/authorized_keys with a >> redirect, adds crontab entries as a
+    second route, and marks its payload directories immutable with chattr +i. No
+    operator shell is involved. The redirect is performed by the shell, so the file
+    write has no event of its own here, but the whole command is on the command line of
+    the sh -c process the gateway starts. The hunt returns authorized_keys appends from
+    any process, commands touching .ssh that are direct children of a Python, Node or
+    Java service, and crontab or chattr +i commands under the same parents. A key
+    written by the service's own code through the file API, and anything inside a
+    container without a sensor, is not seen.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - persistence
+    - ssh-authorized-keys
+    - ai-gateway
+    - litellm
+    - cron
+    - linux
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H282.md
+    - https://attack.mitre.org/techniques/T1098
+    - https://attack.mitre.org/techniques/T1098/004
+    - https://attack.mitre.org/detectionstrategies/DET0126
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1098
+  sub_techniques:
+    - T1098.004
+  detection_strategies:
+    - DET0126
+  analytics:
+    - AN0350
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary who has exploited an exposed AI inference gateway (LiteLLM, RAGFlow,
+    Kestra) converts short-lived code execution into durable access by appending an
+    attacker-controlled public key to a service account's ~/.ssh/authorized_keys with a
+    shell append redirect executed as a child of the gateway process, pairs it with
+    crontab entries, and makes the payload directories immutable with chattr +i.
+  attacker_behavior:
+    - Runs sh -c from the gateway process to echo a public key into ~/.ssh/authorized_keys with >>.
+    - Creates the .ssh directory and fixes its permissions in the same command.
+    - Adds crontab entries that re-fetch the payload.
+    - Runs chattr +i on the payload directories so cleanup fails.
+  legitimate_behavior:
+    - Configuration management and cloud-init write authorized_keys when hosts are built.
+    - Administrators add their own keys from an interactive SSH session.
+    - ssh-copy-id appends a key through a remote shell.
+  risk_indicator:
+    - The appending shell is a child of a Python, Node or Java application service.
+    - The account is a service account that nobody logs in as.
+    - The key is written non-interactively in one command with mkdir and chmod.
+    - The same parent also runs crontab or chattr +i.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: authorized-keys-appended-by-command
+        name: Command redirecting or appending into authorized_keys
+        purpose: >-
+          Return any process whose command line names authorized_keys together with a
+          redirect or tee, the pattern the source report's own query uses. Configuration
+          management appears here too; the parent decides.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | CommandLine=/authorized_keys/
+          | CommandLine=/>>?\s*\S*authorized_keys|\btee\s+(-a\s+|--append\s+)?\S*authorized_keys/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: ssh-directory-touched-by-application-service-child
+        name: Child of an application service naming .ssh or authorized_keys
+        purpose: >-
+          Return direct children of Python, Node and Java services, and of the gateway
+          processes by name, whose command line names authorized_keys or an .ssh
+          directory. The child is usually sh -c carrying the whole command. The parent
+          list is a starting set; add the worker names used locally.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ParentBaseFileName=/^(python[0-9.]*|uvicorn|gunicorn|litellm|celery|node|java|supervisord|ragflow[^\/]*|kestra[^\/]*)$/
+          | CommandLine=/authorized_keys|\/\.ssh(\/|\s|$)/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: cron-or-immutable-flag-set-by-application-service-child
+        name: Child of an application service running crontab or chattr +i
+        purpose: >-
+          Return direct children of the same services that edit cron or set the
+          immutable flag, the redundancy and anti-cleanup steps of the chain.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ParentBaseFileName=/^(python[0-9.]*|uvicorn|gunicorn|litellm|celery|node|java|supervisord|ragflow[^\/]*|kestra[^\/]*)$/
+          | CommandLine=/\bcrontab\b|\/etc\/cron|\/var\/spool\/cron|\bchattr\s+(-[a-zA-Z]+\s+)*\+[a-zA-Z]*i\b/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: authorized_keys_append
+      name: Command appends to authorized_keys
+      description: >-
+        A command line writes into an authorized_keys file with a redirect or tee, or a
+        child of an application service names authorized_keys or an .ssh directory.
+      source: process_creation
+      field: command_line
+      indicates: ssh_key_persistence
+
+  supporting:
+    - id: application_service_parent
+      name: Parent is an application or worker service
+      description: >-
+        The process that issued the write is a direct child of a Python, Node or Java
+        service rather than of sshd, a login shell or a configuration-management agent.
+      source: process_creation
+      field: parent_process
+      indicates: post_exploitation_of_service
+    - id: service_account_target
+      name: Key added for a service account
+      description: >-
+        The command runs as the gateway's service account, which is not used for
+        interactive logins.
+      source: process_creation
+      field: user
+      indicates: non_interactive_account_persistence
+    - id: paired_cron_or_immutable_flag
+      name: Cron entry or immutable flag from the same parent
+      description: >-
+        The same parent process id also started crontab or chattr +i. The agent derives
+        this by grouping the returned events on parent process id.
+      source: process_creation
+      field: parent_process_id
+      indicates: redundant_persistence
+
+  contradicting:
+    - id: configuration_management_run
+      name: Configuration management or cloud-init
+      description: >-
+        The write is made by Ansible, Puppet, Chef, Salt or cloud-init while building or
+        converging the host.
+      source: baseline
+      field: CommandLine
+      indicates: routine_host_provisioning
+    - id: administrator_interactive_session
+      name: Administrator adding a key by hand
+      description: >-
+        The command runs under an sshd-parented login shell of an administrator who owns
+        the account.
+      source: identity_context
+      field: UserName
+      indicates: routine_administration
+
+  risk_logic:
+    required:
+      - authorized_keys_append
+
+    supporting:
+      any:
+        - application_service_parent
+        - service_account_target
+        - paired_cron_or_immutable_flag
+      all:
+        - application_service_parent
+        - service_account_target
+
+    contradicting:
+      any:
+        - configuration_management_run
+        - administrator_interactive_session
+      all: []
+
+  verdict:
+    low_risk_when:
+      - authorized_keys_append
+      - configuration_management_run
+      - administrator_interactive_session
+    suspicious_when:
+      - authorized_keys_append
+      - application_service_parent
+    high_risk_when:
+      - authorized_keys_append
+      - application_service_parent
+      - paired_cron_or_immutable_flag
+
+  false_positive:
+    - condition: Provisioning and configuration management.
+      explanation: >-
+        Keys are written when hosts are built and whenever the managed set changes. The
+        parent is the management agent and the key is one the organisation issued.
+    - condition: ssh-copy-id and manual key installs.
+      explanation: >-
+        Both append with the same redirect. They run under a login shell started by sshd
+        for a person, not under an application service.
+    - condition: Applications that manage SSH keys by design.
+      explanation: >-
+        Git hosting and deployment platforms rewrite authorized_keys for their own
+        users. The product and its account are known.

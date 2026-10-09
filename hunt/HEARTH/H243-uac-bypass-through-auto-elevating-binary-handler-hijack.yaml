@@ -1,0 +1,354 @@
+# Converted from THORCollective/HEARTH Flames/H243.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h243-uac-bypass-through-auto-elevating-binary-handler-hijack-t1548-002
+version: 1.0.0
+
+info:
+  name: UAC bypass through an auto-elevating binary and a hijacked per-user handler
+  description: >-
+    fodhelper.exe, computerdefaults.exe, eventvwr.exe, sdclt.exe and wsreset.exe start
+    at high integrity without a consent prompt and then open a handler they look up in
+    the registry. The per-user hive is consulted first and a medium-integrity process
+    can write it, so a command placed under
+    HKCU\Software\Classes\ms-settings\Shell\Open\command, or the mscfile, Folder and
+    exefile siblings, runs elevated as the child of the Microsoft binary. The same kit
+    elevates through COM, where dllhost.exe hosts an auto-approved elevation object. The
+    hunt returns the handler key being written, the commands that write it, the
+    auto-elevating binaries starting anything they do not normally start, and the
+    elevated COM surrogate with the interpreters it starts.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - privilege-escalation
+    - uac-bypass
+    - fodhelper
+    - registry
+    - com-elevation
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H243.md
+    - https://attack.mitre.org/techniques/T1548
+    - https://attack.mitre.org/techniques/T1548/002
+    - https://attack.mitre.org/detectionstrategies/DET0388
+
+mitre:
+  tactics:
+    - TA0004
+  techniques:
+    - T1548
+  sub_techniques:
+    - T1548.002
+  detection_strategies:
+    - DET0388
+  analytics:
+    - AN1094
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An operator running at medium integrity elevates without a UAC prompt by writing a
+    payload command to a per-user shell-open-command handler, with a DelegateExecute
+    value, and then starting fodhelper.exe, computerdefaults.exe, eventvwr.exe,
+    sdclt.exe or wsreset.exe, which auto-elevates and runs the hijacked command as its
+    child, or by COM auto-elevation that shows as an anomalous dllhost.exe child.
+  attacker_behavior:
+    - Writes a command under HKCU\Software\Classes\ms-settings\Shell\Open\command and adds a DelegateExecute value.
+    - "Uses the mscfile, Folder or exefile handler when the target binary is eventvwr or sdclt."
+    - Starts the auto-elevating binary from a script or a shell.
+    - Deletes the key straight after the elevated child has started.
+    - Calls an auto-approved COM elevation object hosted in dllhost.exe to start the payload.
+  legitimate_behavior:
+    - eventvwr.exe starts mmc.exe and sdclt.exe starts control.exe.
+    - "Users open the default-apps and optional-features pages, which start the binaries with no child."
+    - Application installers register their own file handlers under the per-user Classes hive.
+  risk_indicator:
+    - "An auto-elevating binary starts a shell, an interpreter or a binary from a user path."
+    - One of the named handler keys is written in a user hive minutes before that.
+    - The binary was started by a script host or a shell and not from the Start menu.
+    - The handler key is removed within seconds of being written.
+    - No consent.exe process precedes the elevated child.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: auto-elevating-binary-started-unexpected-child
+        name: Auto-elevating binary starting something it does not normally start
+        purpose: >-
+          Return children of the five binaries other than the ones Windows itself starts
+          from them: mmc.exe from eventvwr, control.exe from sdclt and the Store app
+          from wsreset. fodhelper and computerdefaults start nothing in normal use.
+          Integrity level is not read; the parent is the evidence of elevation.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(fodhelper|computerdefaults|eventvwr|sdclt|wsreset)\.exe$/i
+          | FileName!=/^(mmc|control|WerFault|conhost|WinStore\.App|SystemSettings)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: handler-key-written-in-user-hive
+        name: Shell handler command written in a user hive
+        purpose: >-
+          Return value writes under the open or runas command key of ms-settings,
+          mscfile, Folder, exefile or the Store handler wsreset reads, in a user hive.
+          The value name shows DelegateExecute and the data shows the command. Operators
+          delete the key afterwards, so only the write is evidence. Depends on the
+          sensor reporting these per-user Classes keys; confirm in the tenant. A
+          registry symbolic link pointed at another key, which UACME uses to avoid these
+          paths, is not seen.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\(ms-settings|mscfile|Folder|exefile|AppX82a6gwre4fdg3bt635tn5ctqjf8msdd2)\\shell\\(open|runas)\\command$/i
+          | RegObjectName=/\\REGISTRY\\USER\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: handler-key-named-on-command-line
+        name: Handler key or DelegateExecute named on a command line
+        purpose: >-
+          Return reg.exe, PowerShell and script-host commands that name one of the
+          handler keys or the DelegateExecute value. A process that writes the key
+          through the registry API shows only in the previous case.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(reg|powershell|pwsh|cmd|wscript|cscript|mshta)\.exe$/i
+          | CommandLine=/(ms-settings|mscfile|exefile|AppX82a6gwre4fdg3bt635tn5ctqjf8msdd2)\\shell\\(open|runas)\\command|Classes\\Folder\\shell\\open\\command|DelegateExecute/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: auto-elevating-binary-started-by-script-or-shell
+        name: "fodhelper, computerdefaults or wsreset started by a script host or shell"
+        purpose: >-
+          Return the three binaries that have no command-line use when a shell, a script
+          host or a proxy binary starts them. A user reaches them through Settings,
+          where the parent is Explorer or a system broker. eventvwr and sdclt are left
+          out here because administrators start them from prompts.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(fodhelper|computerdefaults|wsreset)\.exe$/i
+          | ParentBaseFileName=/^(cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|msbuild|python\d*w?)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: elevated-com-surrogate-started
+        name: dllhost.exe started for an auto-elevated COM object
+        purpose: >-
+          Return dllhost.exe started with the class id of CMSTPLUA or ColorDataProxy,
+          the two auto-approved elevation objects public bypasses use. The process id is
+          on each event for matching against the next case. Windows starts the same
+          surrogates for its own connection-manager and colour-management dialogs.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^dllhost\.exe$/i
+          | CommandLine=/\{3E5FC7F9-9A51-4367-9063-A120244FBEC7\}|\{D2E7041B-2927-42FB-8E9F-7CE93B6DC937\}/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: interpreter-started-by-com-surrogate
+        name: Shell or interpreter started by dllhost.exe
+        purpose: >-
+          Return shells, interpreters and proxy binaries whose parent is dllhost.exe.
+          The parent's command line is not on the child event; the agent matches the
+          parent process id to a surrogate returned by the previous case.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^dllhost\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh|mshta|wscript|cscript|rundll32|regsvr32)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: elevated_child_of_trusted_binary
+      name: Auto-elevating binary or COM surrogate started a payload
+      description: >-
+        An auto-elevating Microsoft binary or an elevated COM surrogate is the parent of
+        a shell, an interpreter or a binary it does not start in normal use.
+      source: process_creation
+      field: parent_process
+      indicates: uac_bypass_execution
+
+  supporting:
+    - id: handler_key_write
+      name: Per-user handler key written
+      description: >-
+        A value was written under one of the shell command keys the binary resolves, in
+        a user hive.
+      source: registry
+      field: registry_path
+      indicates: handler_hijack_staged
+    - id: delegate_execute_value
+      name: DelegateExecute value set
+      description: >-
+        The value written is DelegateExecute, which makes the shell run the command
+        value directly.
+      source: registry
+      field: registry_value
+      indicates: handler_hijack_staged
+    - id: handler_command_data
+      name: Handler data is a payload command
+      description: >-
+        The data written to the handler is a shell, an interpreter or a path under a
+        user profile.
+      source: registry
+      field: registry_data
+      indicates: payload_command
+    - id: write_precedes_launch
+      name: Key write precedes the launch by minutes
+      description: >-
+        The handler write and the start of the auto-elevating binary are on the same
+        host within about five minutes. The agent derives this from the times of the
+        returned events.
+      source: process_creation
+      field: host
+      indicates: bypass_sequence
+    - id: child_command_line
+      name: Elevated child runs an encoded or download command
+      description: >-
+        The child's command line is encoded, downloads content or points at a
+        user-writable path.
+      source: process_creation
+      field: command_line
+      indicates: payload_execution
+
+  contradicting:
+    - id: security_testing_host
+      name: Host is used for authorised testing
+      description: >-
+        The host belongs to a red team or a detection-engineering lab running bypass
+        tests.
+      source: asset_inventory
+      field: ComputerName
+      indicates: authorised_testing
+    - id: installer_registered_handler
+      name: Handler belongs to installed software
+      description: >-
+        The handler data points at an installed, signed application registering its own
+        protocol.
+      source: baseline
+      field: RegStringValue
+      indicates: application_handler_registration
+
+  risk_logic:
+    required:
+      - elevated_child_of_trusted_binary
+
+    supporting:
+      any:
+        - handler_key_write
+        - delegate_execute_value
+        - handler_command_data
+        - write_precedes_launch
+        - child_command_line
+      all:
+        - handler_key_write
+        - write_precedes_launch
+
+    contradicting:
+      any:
+        - security_testing_host
+        - installer_registered_handler
+      all: []
+
+  verdict:
+    low_risk_when:
+      - elevated_child_of_trusted_binary
+      - security_testing_host
+      - installer_registered_handler
+    suspicious_when:
+      - elevated_child_of_trusted_binary
+      - child_command_line
+    high_risk_when:
+      - elevated_child_of_trusted_binary
+      - handler_key_write
+      - write_precedes_launch
+
+  false_positive:
+    - condition: Administrators opening Event Viewer or Backup from a prompt.
+      explanation: >-
+        The children are mmc.exe and control.exe, which the first case leaves out.
+    - condition: Applications registering protocol handlers.
+      explanation: >-
+        Installers write shell command keys for their own protocols. They do not write
+        ms-settings or mscfile, which belong to Windows.
+    - condition: Windows colour-management and connection-manager dialogs.
+      explanation: >-
+        They start the same COM surrogates and those surrogates start no interpreter.

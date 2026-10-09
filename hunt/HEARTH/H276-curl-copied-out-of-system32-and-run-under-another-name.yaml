@@ -1,0 +1,310 @@
+# Converted from THORCollective/HEARTH Flames/H276.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h276-curl-copied-out-of-system32-and-run-under-another-name-t1036-003
+version: 1.0.0
+
+info:
+  name: In-box curl.exe copied to a user-writable directory and run, with or without a new name
+  description: >-
+    Two LNK campaign types seen against South Korean targets use Windows' own curl.exe
+    as the downloader. One copies it into %TEMP% first and fetches a decoy PDF and a BAT
+    downloader with the copy. Moving the utility out of System32 defeats rules scoped to
+    that path, and renaming it defeats rules scoped to the name. The source hunt reads
+    the PE OriginalFileName, which no template here relies on. What this telemetry does
+    carry is the copy command, the image path, the hash and curl's own argument style:
+    the hunt returns curl.exe running from a user-writable directory, shell commands
+    that copy it out of System32, binaries in those directories under another name that
+    take a URL with curl's output flags, and executables shells write there. A copy
+    hashes the same as the in-box file, so the agent can settle a renamed binary by
+    comparing hashes.
+  severity: medium
+  author: huntgraph
+  tags:
+    - hearth
+    - stealth
+    - masquerading
+    - renamed-utility
+    - curl
+    - lnk
+    - ingress-tool-transfer
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H276.md
+    - https://attack.mitre.org/techniques/T1036
+    - https://attack.mitre.org/techniques/T1036/003
+    - https://attack.mitre.org/detectionstrategies/DET0005
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1036
+  sub_techniques:
+    - T1036.003
+  detection_strategies:
+    - DET0005
+  analytics:
+    - AN0012
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An LNK-delivered chain copies Windows' own curl.exe out of System32 into %TEMP%,
+    %APPDATA% or C:\ProgramData and runs the copy, sometimes under a different name, to
+    fetch the next stage, so that detections scoped to the System32 path or to the file
+    name do not fire.
+  attacker_behavior:
+    - Copies C:\Windows\System32\curl.exe into %TEMP% from the LNK's command.
+    - Gives the copy another file name.
+    - Uses the copy to download a decoy PDF and a BAT or HTA next stage into %TEMP%.
+    - Runs the downloaded script and registers a scheduled task.
+  legitimate_behavior:
+    - Git for Windows, MSYS2 and SDKs ship their own curl in their install trees.
+    - Build and packaging systems stage tools into a working directory under a build account.
+    - Administrators run curl.exe from System32, which this hunt does not return.
+  risk_indicator:
+    - curl.exe runs from Temp, AppData, ProgramData or Public.
+    - A shell command copies curl.exe out of System32.
+    - A differently named binary in Temp takes a URL with -o or --output.
+    - Its hash equals the in-box curl.exe for that Windows build.
+    - The download target is an .hta, .bat, .vbs, .ps1 or .exe in Temp.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        image_hash: SHA256HashData
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        file_hash: SHA256HashData
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: curl-running-from-user-writable-directory
+        name: curl.exe running from a user-writable directory
+        purpose: >-
+          Return curl.exe under its own name where the image is in Temp, AppData,
+          ProgramData or Public. Package managers that keep tools under ProgramData are
+          excluded.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^curl\.exe$/i
+          | ImageFileName=/\\(AppData\\Local\\Temp|AppData\\Roaming|Windows\\Temp|ProgramData|Users\\Public)\\/i
+          | ImageFileName!=/\\ProgramData\\(chocolatey|scoop|Anaconda3|miniconda3|Git)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: command-copying-curl-out-of-system32
+        name: Shell command copying curl.exe out of System32
+        purpose: >-
+          Return copy commands that name the in-box curl.exe by its System32 or SysWOW64
+          path. A copy made with a relative path after a directory change is not
+          matched.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(cmd|powershell|pwsh|xcopy|robocopy)\.exe$/i
+          | CommandLine=/\\(System32|SysWOW64)\\curl\.exe/i
+          | CommandLine=/\b(copy|xcopy|robocopy|Copy-Item|cpi|cp|move|Move-Item)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: renamed-binary-with-curl-download-arguments
+        name: Differently named binary in a writable directory taking curl download arguments
+        purpose: >-
+          Return executables in the same directories that are not called curl.exe but
+          are given a URL together with curl's output flags. The hash on the event lets
+          the agent confirm a copy by comparing it with the hash of System32\curl.exe
+          seen elsewhere in the estate.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ImageFileName=/\\(AppData\\Local\\Temp|AppData\\Roaming|Windows\\Temp|ProgramData|Users\\Public)\\[^\\]+\.exe$/i
+          | FileName!=/^curl\.exe$/i
+          | CommandLine=/https?:\/\//i
+          | CommandLine=/\s(-[A-Za-z]*[oO]|--output|--remote-name|--create-dirs)(\s|$)/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: executable-written-to-writable-directory-by-shell
+        name: Executable written into a user-writable directory by a shell copy
+        purpose: >-
+          Return executables that cmd, PowerShell, xcopy or robocopy write directly into
+          those directories, with the hash. This sees the copy before anything runs and
+          whatever name it is given.
+        query: |
+          #event_simpleName=PeFileWritten
+          | ContextBaseFileName=/^(cmd|powershell|pwsh|xcopy|robocopy)\.exe$/i
+          | TargetFileName=/\\(AppData\\Local\\Temp|AppData\\Roaming|Windows\\Temp|ProgramData|Users\\Public)\\[^\\]+\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: curl_outside_system_path
+      name: curl or a curl-like binary run from a user-writable directory
+      description: >-
+        A process whose image is in Temp, AppData, ProgramData or Public is curl.exe by
+        name, or takes a URL with curl's output flags under another name.
+      source: process_creation
+      field: image_path
+      indicates: utility_run_from_copied_location
+
+  supporting:
+    - id: hash_matches_inbox_curl
+      name: Hash equals the in-box curl.exe
+      description: >-
+        The image hash equals that of System32\curl.exe on hosts of the same Windows
+        build, which makes the binary a copy rather than a vendored build. The agent
+        makes the comparison.
+      source: process_creation
+      field: image_hash
+      indicates: copied_system_utility
+    - id: copy_command_seen
+      name: Copy out of System32 on a command line
+      description: >-
+        A shell command on the same host copied curl.exe from System32 or SysWOW64
+        shortly before.
+      source: process_creation
+      field: command_line
+      indicates: deliberate_relocation
+    - id: written_by_shell
+      name: Executable written by a shell
+      description: >-
+        The executable was written into the directory by cmd, PowerShell, xcopy or
+        robocopy.
+      source: file_creation
+      field: writer_process_name
+      indicates: scripted_staging
+    - id: copy_hash_recorded
+      name: Hash of the written executable
+      description: >-
+        The hash on the file-write event equals the hash of the in-box curl.exe.
+      source: file_creation
+      field: file_hash
+      indicates: copied_system_utility
+    - id: shell_parent_from_explorer
+      name: Started by a shell
+      description: >-
+        The parent is cmd.exe or PowerShell rather than a build system or an installer.
+      source: process_creation
+      field: parent_process
+      indicates: lnk_delivery_chain
+
+  contradicting:
+    - id: vendored_curl_in_toolchain
+      name: curl shipped inside a toolchain
+      description: >-
+        The binary is the curl build bundled with Git, an SDK or a CI runner, has its
+        own hash and sits in that product's tree.
+      source: baseline
+      field: ImageFileName
+      indicates: bundled_developer_tool
+    - id: build_or_packaging_system
+      name: Build or packaging job
+      description: >-
+        The process runs under a build or deployment account from a consistent working
+        directory on a schedule or pipeline trigger.
+      source: identity_context
+      field: UserName
+      indicates: build_automation
+
+  risk_logic:
+    required:
+      - curl_outside_system_path
+
+    supporting:
+      any:
+        - hash_matches_inbox_curl
+        - copy_command_seen
+        - written_by_shell
+        - copy_hash_recorded
+        - shell_parent_from_explorer
+      all:
+        - hash_matches_inbox_curl
+        - shell_parent_from_explorer
+
+    contradicting:
+      any:
+        - vendored_curl_in_toolchain
+        - build_or_packaging_system
+      all: []
+
+  verdict:
+    low_risk_when:
+      - curl_outside_system_path
+      - vendored_curl_in_toolchain
+      - build_or_packaging_system
+    suspicious_when:
+      - curl_outside_system_path
+      - shell_parent_from_explorer
+    high_risk_when:
+      - curl_outside_system_path
+      - hash_matches_inbox_curl
+      - copy_command_seen
+
+  false_positive:
+    - condition: Bundled curl builds.
+      explanation: >-
+        Developer tools carry their own curl. It keeps its name, has a different hash
+        from the in-box file and lives in the tool's own tree.
+    - condition: Self-extracting installers.
+      explanation: >-
+        Setup programs unpack helper executables into Temp and pass them URLs. The
+        parent is the installer and the helper's hash is the vendor's.

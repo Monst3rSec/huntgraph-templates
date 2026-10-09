@@ -1,0 +1,265 @@
+# Converted from THORCollective/HEARTH Flames/H254.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-mac-hearth-h254-base64-payload-staged-in-preferences-domain-with-defaults-t1647
+version: 1.0.0
+
+info:
+  name: Base64 payload stored in a macOS preferences domain and read back with defaults
+  description: >-
+    XCSSET v4.0 keeps its staging payload in the preferences system and not in a file of
+    its own. It makes up a preferences domain per host, writes a Base64-encoded, gzipped
+    payload under random-looking keys with defaults write, and a zsh loader later reads
+    the value with defaults read, decodes it, decompresses it and passes it to eval. The
+    plist that cfprefsd writes is a data file the sensor does not report. The defaults
+    commands are processes with the domain, key and value on the command line, and the
+    shell that chains the read into a decoder carries the whole pipeline when it is
+    started with -c.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-evasion
+    - plist
+    - defaults
+    - xcsset
+    - fileless
+    - macos
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H254.md
+    - https://attack.mitre.org/techniques/T1647
+    - https://attack.mitre.org/detectionstrategies/DET0109
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1647
+  sub_techniques: []
+  detection_strategies:
+    - DET0109
+  analytics:
+    - AN0306
+  platforms:
+    - macOS
+  data_sources:
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    XCSSET v4.0 removes its disk footprint by storing a Base64-encoded, gzipped payload
+    under randomised keys in a per-host macOS preferences domain, written with the
+    defaults utility, and a loader reads the value back with defaults read, decodes it
+    and evals it in memory.
+  attacker_behavior:
+    - Generates a preferences domain that matches no installed application.
+    - Writes a long Base64 value under keys such as mpirv_eahpi_apm.
+    - Reads the value back from a shell and pipes it through base64 and gunzip into eval.
+    - Deletes the short-lived loader files after use.
+  legitimate_behavior:
+    - Management scripts set application preferences with defaults write.
+    - Applications store small Base64 data blobs such as bookmarks in their own domains.
+    - Administrators read preference values in inventory scripts.
+  risk_indicator:
+    - defaults write carries a Base64 value hundreds of characters long.
+    - "A shell pipes defaults read into base64, gunzip or eval."
+    - The key is three random lower-case words joined by underscores.
+    - The domain is not the bundle identifier of anything installed.
+    - The command descends from an Xcode build or a git hook.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: defaults-write-with-long-base64-value
+        name: defaults write carrying a long Base64 value
+        purpose: >-
+          Return defaults write commands whose value is an unbroken run of two hundred
+          or more Base64 characters. A loader that sets the preference through the
+          CFPreferences API starts no defaults process and is not seen.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=defaults
+          | CommandLine=/\swrite\s/
+          | CommandLine=/[A-Za-z0-9+\/]{200,}={0,2}/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: defaults-read-piped-into-decoder
+        name: Shell piping defaults read into a decoder or eval
+        purpose: >-
+          Return shells and osascript whose command line pipes defaults read into
+          base64, gunzip, openssl or an interpreter, or evals its output. The pipeline
+          is on a command line only when the shell was started with -c or from do shell
+          script. A loader run as a script file shows as a bare defaults read under that
+          shell, which the next case returns when the key has the reported shape.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=/^(sh|bash|zsh|dash|osascript)$/
+          | CommandLine=/defaults\s+read\s[^|;&]*\|\s*(base64|gunzip|zcat|gzip|openssl|xxd|sh|bash|zsh|osascript|python3?|perl)\b|eval\s+"?\$\(\s*defaults\s+read/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: defaults-key-with-random-triplet-shape
+        name: defaults reading or writing a key shaped like the reported ones
+        purpose: >-
+          Return defaults read and write commands whose key is three groups of
+          lower-case letters joined by underscores, the shape of mpirv_eahpi_apm and
+          ychax_muwch_ucy. The parent is on the event. Real preference keys in that form
+          exist and are returned too.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=defaults
+          | CommandLine=/\s(read|write)\s+\S+\s+[a-z]{4,6}_[a-z]{4,6}_[a-z]{3,6}(\s|$)/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: payload_in_preferences
+      name: Payload moved through the preferences system
+      description: >-
+        A defaults command writes a long Base64 value, or a shell command pipes a
+        defaults read into a decoder or eval.
+      source: process_creation
+      field: command_line
+      indicates: preferences_payload_staging
+
+  supporting:
+    - id: decoder_shell
+      name: Reading process is a shell or osascript
+      description: >-
+        The process carrying the read pipeline is a shell or osascript.
+      source: process_creation
+      field: image_name
+      indicates: in_memory_loader
+    - id: parent_of_defaults
+      name: defaults started by a script interpreter
+      description: >-
+        The parent of the defaults process is a shell, osascript, perl or python and not
+        a management agent.
+      source: process_creation
+      field: parent_process
+      indicates: scripted_preference_access
+    - id: write_then_read_same_domain
+      name: Same domain written then read
+      description: >-
+        The domain and key written with the long value are read back later on the same
+        host. The agent derives this from the returned command lines.
+      source: process_creation
+      field: host
+      indicates: stage_and_reload
+    - id: developer_account
+      name: User builds with Xcode
+      description: >-
+        The account is a developer's, the population XCSSET spreads through.
+      source: process_creation
+      field: user
+      indicates: targeted_population
+
+  contradicting:
+    - id: management_script
+      name: Command comes from device management
+      description: >-
+        The parent chain is the management agent and the domain belongs to a managed
+        application.
+      source: asset_inventory
+      field: ComputerName
+      indicates: managed_preference_setting
+    - id: known_application_domain
+      name: Domain belongs to an installed application
+      description: >-
+        The domain is the bundle identifier of an installed application that stores
+        encoded data there.
+      source: baseline
+      field: CommandLine
+      indicates: application_preference_data
+
+  risk_logic:
+    required:
+      - payload_in_preferences
+
+    supporting:
+      any:
+        - decoder_shell
+        - parent_of_defaults
+        - write_then_read_same_domain
+        - developer_account
+      all:
+        - decoder_shell
+        - write_then_read_same_domain
+
+    contradicting:
+      any:
+        - management_script
+        - known_application_domain
+      all: []
+
+  verdict:
+    low_risk_when:
+      - payload_in_preferences
+      - management_script
+      - known_application_domain
+    suspicious_when:
+      - payload_in_preferences
+      - parent_of_defaults
+    high_risk_when:
+      - payload_in_preferences
+      - decoder_shell
+      - write_then_read_same_domain
+
+  false_positive:
+    - condition: Management scripts writing encoded preferences.
+      explanation: >-
+        Some set certificate or bookmark data as Base64 with defaults write. The domain
+        is a real application's and the parent is the management agent.
+    - condition: Inventory scripts piping defaults read.
+      explanation: >-
+        They pipe into grep or awk, not into a decoder or a shell.
+    - condition: Preference keys with underscores.
+      explanation: >-
+        The third case matches by shape and returns genuine keys; it is support for the
+        other two.

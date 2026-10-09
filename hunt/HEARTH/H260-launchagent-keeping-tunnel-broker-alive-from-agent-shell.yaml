@@ -1,0 +1,338 @@
+# Converted from THORCollective/HEARTH Flames/H260.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-mac-hearth-h260-launchagent-keeping-tunnel-broker-alive-from-agent-shell-t1543-001
+version: 1.0.0
+
+info:
+  name: "LaunchAgent written from a coding agent's shell to keep a tunnel broker running"
+  description: >-
+    After getting execution through a coding agent on macOS, the intruder makes the
+    access last by writing a plist under ~/Library/LaunchAgents whose program is a free
+    tunnel broker: cloudflared tunnel --url http://localhost:<port>, ngrok, or an SSH
+    reverse tunnel to localhost.run. PlistBuddy sets StartInterval to 60 as a watchdog
+    and launchctl bootstrap loads it. The labels copy a vendor's naming and end in
+    .watchdog, .server, .ngrok, .lhr or .tunnel. A plist is not an executable and its
+    creation is not reported, so the hunt reads the plist tools and launchctl on their
+    command lines, launchd starting a tunnel broker, and the quick tunnel being started
+    by hand. H133 and H148 cover LaunchAgents by label and payload path; this one is
+    keyed on the tunnel.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - persistence
+    - launchagent
+    - tunnel
+    - cloudflared
+    - ngrok
+    - ai-coding-agent
+    - macos
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H260.md
+    - https://attack.mitre.org/techniques/T1543
+    - https://attack.mitre.org/techniques/T1572
+    - https://attack.mitre.org/techniques/T1543/001
+    - https://attack.mitre.org/detectionstrategies/DET0434
+    - https://attack.mitre.org/detectionstrategies/DET0538
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+    - TA0011
+  techniques:
+    - T1543
+    - T1572
+  sub_techniques:
+    - T1543.001
+  detection_strategies:
+    - DET0434
+    - DET0538
+  analytics:
+    - AN1485
+  platforms:
+    - macOS
+  data_sources:
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    After obtaining execution through an AI coding agent on macOS, an adversary writes a
+    LaunchAgent plist under ~/Library/LaunchAgents whose ProgramArguments start a free
+    tunnel broker, keeps it alive with a PlistBuddy StartInterval watchdog and loads it
+    with launchctl bootstrap, under labels that imitate vendor infrastructure.
+  attacker_behavior:
+    - "Downloads cloudflared or ngrok, or uses ssh to localhost.run."
+    - "Starts a quick tunnel to a local port from the agent's shell."
+    - "Writes a LaunchAgent whose label ends in .watchdog, .server, .ngrok, .lhr or .tunnel."
+    - Sets StartInterval with PlistBuddy and loads the agent with launchctl bootstrap.
+  legitimate_behavior:
+    - Developers run quick tunnels to test webhooks.
+    - Homebrew services installs a LaunchAgent for cloudflared on request.
+    - Installers set LaunchAgent keys with PlistBuddy.
+  risk_indicator:
+    - "launchd starts cloudflared, ngrok or an SSH reverse tunnel at login."
+    - A LaunchAgent label ends in a tunnel or watchdog word under a vendor prefix.
+    - PlistBuddy sets StartInterval on a LaunchAgent from a shell.
+    - The commands descend from a coding agent or an MCP server.
+    - The tunnel points at a local port nothing documented listens on.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: launch-agent-keys-set-with-plist-tool
+        name: "PlistBuddy, defaults or plutil setting LaunchAgent keys"
+        purpose: >-
+          Return the plist tools when their arguments name a LaunchAgents or
+          LaunchDaemons path together with StartInterval, KeepAlive, RunAtLoad or
+          ProgramArguments. A plist written whole by a shell redirect or by the agent's
+          file-write tool sets no key on a command line and is not seen here.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=/^(PlistBuddy|defaults|plutil)$/
+          | CommandLine=/Library\/Launch(Agents|Daemons)\//
+          | CommandLine=/StartInterval|KeepAlive|RunAtLoad|ProgramArguments/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: tunnel-or-watchdog-label-plist-named
+        name: Command naming a LaunchAgent plist with a tunnel or watchdog label
+        purpose: >-
+          Return any command whose arguments name a LaunchAgents plist ending in one of
+          the five reported label words.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | CommandLine=/Library\/LaunchAgents\/[^\s"']*\.(watchdog|server|ngrok|lhr|tunnel)\.plist/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: launchctl-loading-tunnel-or-watchdog-label
+        name: launchctl loading a tunnel or watchdog label
+        purpose: >-
+          Return launchctl bootstrap, load, enable and kickstart commands whose target
+          label or plist ends in one of the five words. Labels ending in .server are
+          common in real software and are returned too.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=launchctl
+          | CommandLine=/\s(bootstrap|load|enable|kickstart)\s/
+          | CommandLine=/\.(watchdog|server|ngrok|lhr|tunnel)(\.plist)?("|'|\s|$)/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: tunnel-broker-started-by-launchd
+        name: Tunnel broker started by launchd
+        purpose: >-
+          Return processes launchd starts whose command line is a cloudflared or ngrok
+          run or an SSH reverse tunnel to a localhost port. This is the LaunchAgent
+          working, at every login and every interval, however the plist was written.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | ParentBaseFileName=launchd
+          | CommandLine=/\b(cloudflared|ngrok)\b|localhost\.run|lhr\.life|\s-R\s*\S*:(localhost|127\.0\.0\.1):\d+/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: quick-tunnel-started-by-shell-or-runtime
+        name: Quick tunnel started by a shell or a script runtime
+        purpose: >-
+          Return quick-tunnel, ngrok and reverse-SSH commands whose parent is a shell,
+          node, bun or python, the first run before persistence. H062 returns tunnel
+          clients on every platform by name; this case keeps the parent test.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | ParentBaseFileName=/^(sh|bash|zsh|dash|node|bun|python[\d.]*)$/
+          | CommandLine=/\stunnel\s+(--\S+\s+)*--url\s+https?:\/\/(localhost|127\.0\.0\.1)|\bngrok\s+(http|tcp|tls)\s|\s-R\s*\S*:(localhost|127\.0\.0\.1):\d+\s+(\S+@)?(localhost\.run|serveo\.net)/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: tunnel-binary-downloaded
+        name: curl or wget downloading a tunnel broker
+        purpose: >-
+          Return downloads of cloudflared or ngrok release files.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=/^(curl|wget)$/
+          | CommandLine=/bin\.equinox\.io|cloudflared\/releases|cloudflared-darwin|ngrok-v3-stable/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: tunnel_broker_persisted
+      name: Tunnel broker tied to a LaunchAgent
+      description: >-
+        launchd starts a tunnel broker, or a plist tool or launchctl command sets up a
+        LaunchAgent under a tunnel or watchdog label.
+      source: process_creation
+      field: command_line
+      indicates: tunnel_persistence
+
+  supporting:
+    - id: launchd_parent
+      name: "Broker's parent is launchd"
+      description: >-
+        The tunnel broker process was started by launchd.
+      source: process_creation
+      field: parent_process
+      indicates: launch_agent_execution
+    - id: watchdog_interval
+      name: StartInterval set from a command
+      description: >-
+        PlistBuddy, defaults or plutil set StartInterval or KeepAlive on a LaunchAgent
+        plist.
+      source: process_creation
+      field: image_name
+      indicates: watchdog_configured
+    - id: agent_ancestry
+      name: Commands descend from a coding agent
+      description: >-
+        Following the parent process id upward from the plist or launchctl command
+        reaches a coding agent, an MCP server or their runtime.
+      source: process_creation
+      field: parent_process_id
+      indicates: agent_spawned_shell
+    - id: broker_restarts_on_interval
+      name: Broker restarts on a fixed interval
+      description: >-
+        launchd starts the broker again every minute or at each login. The agent derives
+        the interval from the times of the returned events.
+      source: process_creation
+      field: host
+      indicates: watchdog_active
+    - id: broker_image_path
+      name: Broker runs from a user or temporary path
+      description: >-
+        The broker's image is under the home directory or /tmp and not a package
+        manager's prefix.
+      source: process_creation
+      field: image_path
+      indicates: unmanaged_binary
+
+  contradicting:
+    - id: homebrew_service
+      name: Agent is a Homebrew service
+      description: >-
+        The label is homebrew.mxcl.cloudflared and the user installed it with brew
+        services.
+      source: baseline
+      field: CommandLine
+      indicates: user_installed_service
+    - id: sanctioned_tunnel
+      name: Tunnel is an approved named tunnel
+      description: >-
+        The host is recorded as running an approved, named tunnel with a credentials
+        file.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_tunnel
+
+  risk_logic:
+    required:
+      - tunnel_broker_persisted
+
+    supporting:
+      any:
+        - launchd_parent
+        - watchdog_interval
+        - agent_ancestry
+        - broker_restarts_on_interval
+        - broker_image_path
+      all:
+        - launchd_parent
+        - watchdog_interval
+
+    contradicting:
+      any:
+        - homebrew_service
+        - sanctioned_tunnel
+      all: []
+
+  verdict:
+    low_risk_when:
+      - tunnel_broker_persisted
+      - homebrew_service
+      - sanctioned_tunnel
+    suspicious_when:
+      - tunnel_broker_persisted
+      - launchd_parent
+    high_risk_when:
+      - tunnel_broker_persisted
+      - launchd_parent
+      - agent_ancestry
+
+  false_positive:
+    - condition: Developers testing webhooks.
+      explanation: >-
+        A quick tunnel run from a terminal for an hour. launchd is not the parent and
+        nothing persists.
+    - condition: Homebrew services for cloudflared.
+      explanation: >-
+        brew services writes a LaunchAgent under its own label for a named tunnel.
+    - condition: Labels ending in .server.
+      explanation: >-
+        Many real products use that suffix. The label cases are support for the launchd
+        case.

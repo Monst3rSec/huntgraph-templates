@@ -1,0 +1,377 @@
+# Converted from THORCollective/HEARTH Flames/H244.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h244-double-extension-payload-from-webdav-share-via-search-ms-t1036-007
+version: 1.0.0
+
+info:
+  name: Double-extension payload opened from a WebDAV share surfaced through search-ms
+  description: >-
+    A page triggers a search-ms URI that opens an Explorer search window over a remote
+    WebDAV share, filtered to one file type, so the visitor sees what looks like a local
+    search result. The file shown carries a document extension in front of its real one,
+    padded with spaces or reversed with a right-to-left override, and is a shortcut, a
+    screensaver or an executable. On the host this leaves the WebClient service
+    starting, rundll32.exe calling DavSetCookie in davclnt.dll for the remote host, and
+    a process whose image or arguments sit on a \\host@port\DavWWWRoot path or carry two
+    extensions. H186 hunts the override character itself; this template hunts the WebDAV
+    delivery and the double extension.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - masquerading
+    - double-extension
+    - webdav
+    - search-ms
+    - purerat
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H244.md
+    - https://attack.mitre.org/techniques/T1036
+    - https://attack.mitre.org/techniques/T1036/007
+    - https://attack.mitre.org/detectionstrategies/DET0366
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1036
+  sub_techniques:
+    - T1036.007
+  detection_strategies:
+    - DET0366
+  analytics:
+    - AN1033
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An operator lures a user to a search-ms results window that surfaces a remote WebDAV
+    share, where the payload's true extension, .lnk, .scr or .exe, is hidden behind a
+    spoofed document extension built from a double extension, a right-to-left override
+    and whitespace padding, and the user runs it from the share.
+  attacker_behavior:
+    - Serves a page whose script opens a search-ms URI pointing at an attacker WebDAV share.
+    - Filters the search to one extension so only the lure is listed.
+    - Names the payload with a document extension ahead of the real one.
+    - "Runs the payload, or a batch file beside it, straight from the DavWWWRoot path."
+  legitimate_behavior:
+    - SharePoint and document-management clients open files over WebDAV and call DavSetCookie.
+    - Users map WebDAV drives to internal servers.
+    - Self-extracting archives are sometimes named after the document they contain.
+  risk_indicator:
+    - "DavSetCookie names a host outside the organisation, on a non-standard port."
+    - The WebClient service starts on a host that never used WebDAV.
+    - A process image or a script argument is on a DavWWWRoot path.
+    - An executable or script has a document extension before its real extension.
+    - The WebDAV fetch and the execution are seconds apart on one host.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: webdav-client-cookie-call
+        name: rundll32 calling DavSetCookie for a remote host
+        purpose: >-
+          Return the WebDAV redirector's cookie call, which carries the remote host and
+          port on its command line. It runs whenever Windows opens a WebDAV location, so
+          internal SharePoint use appears too; the agent keeps the hosts that are not
+          the organisation's.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^rundll32\.exe$/i
+          | CommandLine=/davclnt\.dll\s*,\s*DavSetCookie/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: webclient-service-host-started
+        name: WebClient service host started
+        purpose: >-
+          Return the svchost.exe instance that hosts the WebClient service, which gives
+          the time WebDAV was first used on the host. Where the service shares a host
+          process with others the argument is absent and nothing is returned.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^svchost\.exe$/i
+          | CommandLine=/-s\s+WebClient\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: process-image-on-webdav-share
+        name: Process whose image is on a WebDAV share
+        purpose: >-
+          Return processes started directly from a host@port or DavWWWRoot path. A
+          shortcut does not appear as a process; its target does, and when the target is
+          a local interpreter the next case carries it.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ImageFileName=/@(SSL|\d{1,5})(@\d{1,5})?\\|\\DavWWWRoot\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: webdav-path-on-command-line
+        name: Command line naming a file on a WebDAV share
+        purpose: >-
+          Return commands whose arguments name a \\host@port\ or DavWWWRoot path, such
+          as cmd.exe running a batch file from the share or a viewer opening the decoy
+          document beside the payload. Every Windows process event is tested against the
+          regex.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/\\\\[^\\\s"]+@(SSL|\d{1,5})(@\d{1,5})?\\|\\DavWWWRoot\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: double-extension-process
+        name: Process whose file name has a document extension before the real one
+        purpose: >-
+          Return running images named like report.pdf.exe or report.pdf .scr. The
+          override character is H186's; a name the override reverses still ends in its
+          real extension and can match here.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/\.(pdf|docx?|xlsx?|pptx?|rtf|txt|jpe?g|png|rcs)\s*\.(exe|scr|com|pif|bat|cmd)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: double-extension-script-or-shortcut-argument
+        name: Script host or shell opening a double-extension script or shortcut
+        purpose: >-
+          Return interpreters whose arguments name a file with a document extension
+          ahead of a script, shortcut or HTA extension. A shortcut opened from Explorer
+          starts its target with the target's own arguments, so the .lnk name is seen
+          only when a command passes it.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(wscript|cscript|mshta|cmd|powershell|pwsh)\.exe$/i
+          | CommandLine=/\.(pdf|docx?|xlsx?|pptx?|rtf|txt|jpe?g|png)\s*\.(lnk|js|jse|vbs|vbe|wsf|hta|bat|cmd|url)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: double-extension-executable-written
+        name: Executable written with a document extension before the real one
+        purpose: >-
+          Return executables written to disk under a double-extension name, with the
+          writing process. A file run from the share without being copied is not written
+          locally.
+        query: |
+          #event_simpleName=PeFileWritten
+          | TargetFileName=/\.(pdf|docx?|xlsx?|pptx?|rtf|txt|jpe?g|png|rcs)\s*\.(exe|scr|com|pif)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: search-ms-uri-on-command-line
+        name: search-ms URI with a remote location on a command line
+        purpose: >-
+          Return command lines carrying a search-ms URI that sets a location or a
+          display name. The protocol is usually handed to the running Explorer without a
+          new process, so an empty result does not mean the lure was not opened.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/search-ms:\S*(crumb=location|displayname=)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: payload_from_webdav_or_double_extension
+      name: Execution from a WebDAV path or under a double extension
+      description: >-
+        A process image, or the file an interpreter was given, is on a WebDAV share path
+        or has a document extension ahead of its real one.
+      source: process_creation
+      field: command_line
+      indicates: masqueraded_payload_execution
+
+  supporting:
+    - id: webdav_fetch_to_external_host
+      name: DavSetCookie names an external host
+      description: >-
+        rundll32.exe called DavSetCookie for a host that is not one of the
+        organisation's WebDAV servers. The agent reads the host from the returned
+        command line.
+      source: process_creation
+      field: image_name
+      indicates: remote_webdav_share_opened
+    - id: image_on_share
+      name: Image path is on the share
+      description: >-
+        The image path of the process contains a host@port or DavWWWRoot component.
+      source: process_creation
+      field: image_path
+      indicates: execution_from_remote_share
+    - id: explorer_parent
+      name: Started from Explorer
+      description: >-
+        The parent is explorer.exe, consistent with a double-click in a search window.
+      source: process_creation
+      field: parent_process
+      indicates: user_initiated_execution
+    - id: double_extension_file_on_disk
+      name: Double-extension executable written
+      description: >-
+        An executable with a document extension ahead of its real one was written to
+        disk.
+      source: file_creation
+      field: file_path
+      indicates: masqueraded_file_dropped
+    - id: fetch_then_execute
+      name: WebDAV fetch and execution are seconds apart
+      description: >-
+        The cookie call and the execution are on one host within a minute. The agent
+        derives this from the times of the returned events.
+      source: process_creation
+      field: host
+      indicates: delivery_sequence
+
+  contradicting:
+    - id: internal_webdav_server
+      name: Host is an internal WebDAV server
+      description: >-
+        The host named on the command line is the organisation's SharePoint or file
+        server.
+      source: asset_inventory
+      field: ComputerName
+      indicates: internal_document_access
+    - id: known_self_extractor
+      name: File is a known packaged document
+      description: >-
+        The double-extension file is a signed self-extractor the organisation
+        distributes.
+      source: baseline
+      field: ImageFileName
+      indicates: approved_packaging
+
+  risk_logic:
+    required:
+      - payload_from_webdav_or_double_extension
+
+    supporting:
+      any:
+        - webdav_fetch_to_external_host
+        - image_on_share
+        - explorer_parent
+        - double_extension_file_on_disk
+        - fetch_then_execute
+      all:
+        - webdav_fetch_to_external_host
+        - fetch_then_execute
+
+    contradicting:
+      any:
+        - internal_webdav_server
+        - known_self_extractor
+      all: []
+
+  verdict:
+    low_risk_when:
+      - payload_from_webdav_or_double_extension
+      - internal_webdav_server
+      - known_self_extractor
+    suspicious_when:
+      - payload_from_webdav_or_double_extension
+      - webdav_fetch_to_external_host
+    high_risk_when:
+      - payload_from_webdav_or_double_extension
+      - webdav_fetch_to_external_host
+      - fetch_then_execute
+
+  false_positive:
+    - condition: SharePoint and mapped WebDAV drives.
+      explanation: >-
+        Office opens documents over WebDAV all day. The host is internal and no
+        executable runs from the path.
+    - condition: Self-extracting archives named after a document.
+      explanation: >-
+        Some vendors ship name.pdf.exe. They are signed and arrive through software
+        distribution.
+    - condition: Scripts kept on an internal WebDAV share.
+      explanation: >-
+        Administrators run batch files from intranet shares; the host is known and the
+        pattern repeats.

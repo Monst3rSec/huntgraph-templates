@@ -1,0 +1,279 @@
+# Converted from THORCollective/HEARTH Flames/H207.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h207-script-host-resolving-dead-drop-platform-t1102-001
+version: 1.0.0
+
+info:
+  name: Script interpreter requesting a publishing platform used as a dead-drop resolver
+  description: >-
+    Gamaredon's loaders read their next server address from a page on a public
+    publishing platform: telegra.ph, teletype.in, a Telegram channel, rentry.co,
+    write.as and others. The address they read is often a Cloudflare tunnel, a Workers
+    subdomain or a dev tunnel. From a browser these sites mean nothing. From
+    powershell.exe, wscript.exe or mshta.exe they are the resolver step. The sensor
+    attributes each DNS request to the process that made it, which is the whole test.
+    The page content and the address decoded from it are inside TLS and are not visible,
+    and PowerShell script block logging is not collected, so a platform named only
+    inside a script file is seen as the DNS request and not as text.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - command-and-control
+    - web-service
+    - dead-drop-resolver
+    - telegraph
+    - cloudflare-tunnel
+    - gamaredon
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H207.md
+    - https://attack.mitre.org/techniques/T1102/001
+    - https://attack.mitre.org/detectionstrategies/DET0058
+    - https://www.welivesecurity.com/en/eset-research/gamaredon-2025-leveraging-tunnels-workers-dead-drops-new-alliances/
+    - https://harfanglab.io/insidethelab/gamaredons-pterolnk-analysis/
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1102
+  sub_techniques:
+    - T1102.001
+  detection_strategies:
+    - DET0058
+  analytics:
+    - AN0158
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    A Windows scripting interpreter (powershell.exe, wscript.exe, cscript.exe,
+    mshta.exe, or other non-browser binary) makes an outbound DNS/HTTPS request to a
+    known dead-drop platform (telegra.ph, teletype.in, t.me, rentry.co, write.as,
+    nopaste.net, pastee.dev, lesma.eu, dev.to, mastodon.social) to resolve a next-stage
+    C2 address — often chained to a Cloudflare Tunnel/Worker, devtunnels, or Loophole
+    domain — indicating Gamaredon dead-drop resolver activity.
+  attacker_behavior:
+    - Publishes the current server address on a page of a public publishing platform.
+    - A script on the victim fetches the page and decodes the address from it.
+    - The script then connects to a tunnel or worker subdomain taken from the page.
+    - Starts the script at logon from an HTA or shortcut in the Startup folder.
+  legitimate_behavior:
+    - Browsers request these sites when users read them.
+    - Developers run cloudflared and dev tunnels from a terminal.
+    - Chat-ops scripts post to Telegram from a server.
+  risk_indicator:
+    - The requesting process is a script host or a transfer utility, not a browser.
+    - The same process requests a tunnel or worker subdomain seconds later.
+    - The host is a user workstation with no development role.
+    - The request repeats at each logon.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: script-host-requesting-dead-drop-platform
+        name: Script host or transfer utility requesting a publishing platform
+        purpose: >-
+          Return DNS requests for the listed platforms made by a script host, a transfer
+          utility or a proxy binary. The process test is anchored and runs first, so
+          browsers never reach the domain test.
+        query: |
+          #event_simpleName=DnsRequest
+          | ContextBaseFileName=/^(powershell|pwsh|wscript|cscript|mshta|curl|bitsadmin|certutil|rundll32|regsvr32|cmd)\.exe$/i
+          | DomainName=/(^|\.)(telegra\.ph|teletype\.in|t\.me|telegram\.me|rentry\.co|write\.as|nopaste\.net|pastee\.dev|paste\.ee|lesma\.eu|dev\.to|mastodon\.social)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: script-host-requesting-tunnel-or-worker-domain
+        name: Script host or transfer utility requesting a tunnel or worker subdomain
+        purpose: >-
+          Return requests from the same processes for tunnel and worker hosting domains,
+          the second step of the chain. The agent pairs them with the first case by
+          host, process id and time. Developer use of these services from PowerShell
+          matches; H062 covers the tunnel clients themselves.
+        query: |
+          #event_simpleName=DnsRequest
+          | ContextBaseFileName=/^(powershell|pwsh|wscript|cscript|mshta|curl|bitsadmin|certutil|rundll32|regsvr32|cmd)\.exe$/i
+          | DomainName=/\.(trycloudflare\.com|workers\.dev|devtunnels\.ms|loophole\.site|cleverapps\.io|supabase\.co)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: command-line-naming-dead-drop-platform
+        name: Script host command line naming a publishing platform
+        purpose: >-
+          Return script host and transfer utility commands that name one of the
+          platforms. This is the case that carries the URL path, which the DNS request
+          does not. A platform named only inside a script file does not appear.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh|wscript|cscript|mshta|curl|bitsadmin|certutil|rundll32|regsvr32|cmd)\.exe$/i
+          | CommandLine=/telegra\.ph|teletype\.in|\/\/t\.me\/|telegram\.me|rentry\.co|write\.as\/|nopaste\.net|pastee\.dev|paste\.ee|lesma\.eu|\/\/dev\.to\/|mastodon\.social/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: mshta-running-hta-from-startup-folder
+        name: mshta.exe running an HTA from a Startup folder
+        purpose: >-
+          Return mshta runs whose argument is an HTA in a Startup folder, the delivery
+          the report describes after a crafted archive drops it there.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^mshta\.exe$/i
+          | CommandLine=/\\Start Menu\\Programs\\Startup\\[^"]*\.hta\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: script_host_requested_platform
+      name: Script host requested a dead-drop platform
+      description: >-
+        The process that requested a listed publishing platform is a script host or a
+        transfer utility.
+      source: dns_request
+      field: process_name
+      indicates: dead_drop_resolver_lookup
+
+  supporting:
+    - id: platform_domain
+      name: Requested name is a listed platform
+      description: >-
+        The requested name is one of the platforms the reports list.
+      source: dns_request
+      field: query_name
+      indicates: public_resolver_page
+    - id: tunnel_domain_followed
+      name: Tunnel or worker subdomain requested by the same process
+      description: >-
+        The same process id requested a tunnel or worker subdomain after the platform.
+        The agent derives the order from the event times.
+      source: dns_request
+      field: process_id
+      indicates: resolved_c2_contacted
+    - id: platform_on_command_line
+      name: Platform named on a command line
+      description: >-
+        A script host's command line names the platform.
+      source: process_creation
+      field: command_line
+      indicates: scripted_fetch
+    - id: started_from_startup_or_script_parent
+      name: Requester started from a Startup item or another script host
+      description: >-
+        The requesting process was started by mshta, wscript or explorer at logon.
+      source: process_creation
+      field: parent_process
+      indicates: logon_persistence_chain
+
+  contradicting:
+    - id: host_runs_chat_automation
+      name: Host runs sanctioned chat or publishing automation
+      description: >-
+        Inventory shows a scheduled job on this host that posts to or reads from the
+        platform for business use.
+      source: asset_inventory
+      field: ComputerName
+      indicates: sanctioned_automation
+
+  risk_logic:
+    required:
+      - script_host_requested_platform
+
+    supporting:
+      any:
+        - platform_domain
+        - tunnel_domain_followed
+        - platform_on_command_line
+        - started_from_startup_or_script_parent
+      all:
+        - tunnel_domain_followed
+        - platform_domain
+
+    contradicting:
+      any:
+        - host_runs_chat_automation
+      all: []
+
+  verdict:
+    low_risk_when:
+      - script_host_requested_platform
+      - host_runs_chat_automation
+    suspicious_when:
+      - script_host_requested_platform
+      - platform_domain
+    high_risk_when:
+      - script_host_requested_platform
+      - platform_domain
+      - tunnel_domain_followed
+
+  false_positive:
+    - condition: Monitoring scripts send alerts to Telegram.
+      explanation: >-
+        They call api.telegram.org, which is not on the list, and run on servers as a
+        service account.
+    - condition: Developers test webhooks through tunnels from PowerShell.
+      explanation: >-
+        The host is a developer machine and no publishing platform is requested first.

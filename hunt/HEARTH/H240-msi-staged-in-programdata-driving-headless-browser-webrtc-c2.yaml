@@ -1,0 +1,344 @@
+# Converted from THORCollective/HEARTH Flames/H240.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h240-msi-staged-in-programdata-driving-headless-browser-webrtc-c2-t1071-001
+version: 1.0.0
+
+info:
+  name: MSI staged in ProgramData followed by a headless browser driven over remote debugging
+  description: >-
+    Cisco Talos describes msaRAT, a Rust RAT attributed to the Chaos ransomware group.
+    curl.exe saves update_ms.msi into C:\ProgramData, msiexec runs it, and a custom
+    action loads the embedded lib.dll. The RAT finds Chrome or Edge, starts it headless
+    with a remote debugging port, attaches over the Chrome DevTools Protocol and injects
+    JavaScript, so that signalling through Cloudflare Workers and a WebRTC data channel
+    relayed by Twilio TURN leave the host as the browser's own traffic while the RAT
+    talks only to localhost. The DLL load is a module-load event and the DevTools
+    traffic is loopback content; neither is collected here. The download, the install,
+    the browser's switches and its parent, and the names the browser resolves are. H126
+    returns headless and remote-debugging browsers started by non-browser parents for
+    credential theft; this template adds the MSI staging in front and the browser's
+    signalling and relay lookups behind.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - command-and-control
+    - headless-browser
+    - chrome-devtools-protocol
+    - webrtc
+    - msi
+    - msarat
+    - chaos-ransomware
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H240.md
+    - https://attack.mitre.org/techniques/T1071
+    - https://attack.mitre.org/techniques/T1071/001
+    - https://attack.mitre.org/techniques/T1218/007
+    - https://attack.mitre.org/detectionstrategies/DET0027
+    - https://attack.mitre.org/detectionstrategies/DET0158
+    - https://blog.talosintelligence.com/chaos-msarat-living-off-the-browser-to-build-covert-c2-channel/
+
+mitre:
+  tactics:
+    - TA0011
+    - TA0005
+  techniques:
+    - T1071
+    - T1218
+  sub_techniques:
+    - T1071.001
+    - T1218.007
+  detection_strategies:
+    - DET0027
+    - DET0158
+  analytics:
+    - AN0075
+    - AN0445
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    Chaos operators stage update_ms.msi under ProgramData, load lib.dll, then launch
+    Chrome or Edge in headless mode with remote debugging so WebRTC C2 runs through the
+    browser.
+  attacker_behavior:
+    - Downloads update_ms.msi to C:\ProgramData with curl.exe, over plain HTTP on port 443.
+    - Runs the MSI with msiexec so a custom action loads lib.dll.
+    - Starts Chrome or Edge with --headless and --remote-debugging-port.
+    - Connects to the debugging port on 127.0.0.1 and injects JavaScript through DevTools.
+    - Signals through a workers.dev host and relays a WebRTC data channel through Twilio TURN.
+  legitimate_behavior:
+    - Software deployment tools copy MSI files to ProgramData and install them.
+    - Test automation and PDF rendering start headless browsers with remote debugging.
+    - Web conferencing in a browser resolves Twilio TURN hosts.
+  risk_indicator:
+    - curl.exe writes an .msi directly into ProgramData.
+    - msiexec installs an MSI from the root of ProgramData.
+    - A browser is started headless with a debugging port by msiexec, rundll32 or an unknown process.
+    - That browser process resolves a workers.dev host and a TURN relay.
+    - The host is an ordinary workstation with no browser automation.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: curl-saving-msi-into-programdata
+        name: curl saving an MSI into ProgramData
+        purpose: >-
+          Return curl.exe commands whose output path is an .msi under ProgramData. The
+          MSI is not a PE file and its write is not reported as a file event; the curl
+          command line is where the path shows.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^curl\.exe$/i
+          | CommandLine=/\\ProgramData\\[^"']*\.msi\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: msiexec-installing-msi-from-programdata-root
+        name: msiexec installing an MSI that sits directly in ProgramData
+        purpose: >-
+          Return msiexec commands that name an .msi in the root of ProgramData, not in a
+          product's sub-directory such as Package Cache. update_ms.msi matches. H115
+          holds msiexec proxy execution in general.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^msiexec\.exe$/i
+          | CommandLine=/\\ProgramData\\[^\\"'\s]+\.msi\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: headless-browser-with-remote-debugging-from-non-browser-parent
+        name: Browser started headless with remote debugging by a non-browser parent
+        purpose: >-
+          Return Chrome and Edge starts that carry both --headless and a remote
+          debugging switch where the parent is not a browser. The custom action runs
+          inside msiexec.exe, so msiexec is the expected parent here; a RAT that has
+          moved into another process shows that process. The browser's own children
+          inherit the switches and are removed by the parent test.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(chrome|msedge|brave|opera|vivaldi|msedgewebview2)\.exe$/i
+          | ParentBaseFileName!=/^(chrome|msedge|brave|opera|vivaldi|msedgewebview2)\.exe$/i
+          | CommandLine=/--headless/i
+          | CommandLine=/--remote-debugging-(port|address|pipe)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: browser-started-by-msiexec-or-rundll32
+        name: Browser started by msiexec or rundll32
+        purpose: >-
+          Return any browser start whose parent is msiexec.exe or rundll32.exe, whatever
+          the switches. Installers do open a web page at the end of setup; that start
+          carries a URL and no headless or debugging switch.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(chrome|msedge|brave|opera|vivaldi|msedgewebview2)\.exe$/i
+          | ParentBaseFileName=/^(msiexec|rundll32)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: browser-resolving-turn-relay-or-workers-signalling-host
+        name: Browser resolving a Twilio TURN relay or a workers.dev host
+        purpose: >-
+          Return DNS requests from Chrome or Edge for Twilio's TURN relays and for
+          workers.dev hosts, with the requesting process id. Ordinary browsing produces
+          both, so the case does not stand alone: the agent keeps the requests whose
+          process id is a headless browser returned above, or a child of it. The
+          signalling and the data channel are inside TLS and DTLS and not visible, and
+          the RAT's loopback connection to the debugging port is not relied on.
+        query: |
+          #event_simpleName=DnsRequest
+          | ContextBaseFileName=/^(chrome|msedge)\.exe$/i
+          | DomainName=/(^|\.)turn\.twilio\.com$|\.workers\.dev$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: headless_browser_with_remote_debugging
+      name: Browser started headless with remote debugging by a non-browser parent
+      description: >-
+        Chrome or Edge was started with --headless and a remote debugging switch, and
+        its parent is not a browser.
+      source: process_creation
+      field: command_line
+      indicates: browser_used_as_command_and_control_proxy
+
+  supporting:
+    - id: parent_is_installer_or_proxy_binary
+      name: Parent is msiexec or rundll32
+      description: >-
+        The browser's parent is msiexec.exe or rundll32.exe.
+      source: process_creation
+      field: parent_process
+      indicates: installer_custom_action_origin
+    - id: msi_staged_in_programdata
+      name: MSI downloaded to or installed from ProgramData
+      description: >-
+        curl saved an .msi into ProgramData or msiexec installed one from its root,
+        before the browser started on the same host. The agent derives the order from
+        the returned events.
+      source: process_creation
+      field: image_name
+      indicates: payload_staging
+    - id: turn_or_workers_host_resolved
+      name: Browser resolved a TURN relay or workers.dev host
+      description: >-
+        The browser requested a Twilio TURN relay or a workers.dev name.
+      source: dns_request
+      field: query_name
+      indicates: webrtc_signalling_and_relay
+    - id: resolver_is_the_headless_browser
+      name: Requesting process is the headless browser
+      description: >-
+        The process id on the DNS request is the headless browser's or a child's. The
+        agent matches it against the process events.
+      source: dns_request
+      field: process_id
+      indicates: browser_owned_command_and_control
+    - id: ordinary_workstation_user
+      name: Runs in an ordinary user's session
+      description: >-
+        The user is not a developer or a test service account.
+      source: process_creation
+      field: user
+      indicates: activity_outside_user_role
+
+  contradicting:
+    - id: test_or_rendering_host
+      name: Host runs browser automation
+      description: >-
+        Asset records class the host as a build agent, test machine or rendering
+        service.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_browser_automation
+    - id: recurring_automation_parent
+      name: Parent is a known automation product
+      description: >-
+        The same parent and command line recur on the host from a test framework or a
+        reporting product.
+      source: baseline
+      field: ParentBaseFileName
+      indicates: routine_automation
+
+  risk_logic:
+    required:
+      - headless_browser_with_remote_debugging
+
+    supporting:
+      any:
+        - parent_is_installer_or_proxy_binary
+        - msi_staged_in_programdata
+        - turn_or_workers_host_resolved
+        - resolver_is_the_headless_browser
+        - ordinary_workstation_user
+      all:
+        - parent_is_installer_or_proxy_binary
+        - msi_staged_in_programdata
+
+    contradicting:
+      any:
+        - test_or_rendering_host
+        - recurring_automation_parent
+      all: []
+
+  verdict:
+    low_risk_when:
+      - headless_browser_with_remote_debugging
+      - test_or_rendering_host
+      - recurring_automation_parent
+    suspicious_when:
+      - headless_browser_with_remote_debugging
+      - ordinary_workstation_user
+    high_risk_when:
+      - headless_browser_with_remote_debugging
+      - parent_is_installer_or_proxy_binary
+      - msi_staged_in_programdata
+
+  false_positive:
+    - condition: Selenium, Puppeteer and Playwright.
+      explanation: >-
+        Test frameworks start browsers headless with a debugging port or pipe. The
+        parent is a driver or a language runtime on a build or developer machine, and no
+        MSI was staged.
+    - condition: Applications that render through a headless browser.
+      explanation: >-
+        Reporting tools call Edge headless to make a PDF. The parent is that application
+        and the command names a local file.
+    - condition: Deployment tools that stage MSI files in ProgramData.
+      explanation: >-
+        Some management agents cache installers there. The download is by the agent, not
+        by curl, and no browser follows.

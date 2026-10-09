@@ -1,0 +1,328 @@
+# Converted from THORCollective/HEARTH Flames/H257.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h257-openssh-client-proxycommand-launching-interpreter-t1202
+version: 1.0.0
+
+info:
+  name: OpenSSH client option used to launch an interpreter with no SSH server
+  description: >-
+    The OpenSSH client that ships with Windows runs whatever its ProxyCommand option
+    names before it tries to connect. A shortcut in a phishing archive ran scp.exe -o
+    ProxyCommand="powershell -ep bypass -file .\$Recycle.Bin\setup.ps1" . localhost:. so
+    that PowerShell started under a Microsoft-signed parent; the transfer then failed,
+    which did not matter. The script sat in the Recycle Bin folder, which is hidden and
+    which tools skip. Script block logging is not collected, so the script's content is
+    not read. The option on the client's command line, whatever the client starts, and
+    files written to or run from the Recycle Bin folder are.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-evasion
+    - execution
+    - openssh
+    - scp
+    - proxycommand
+    - lolbin
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H257.md
+    - https://attack.mitre.org/techniques/T1202
+    - https://attack.mitre.org/detectionstrategies/DET0200
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1202
+  sub_techniques: []
+  detection_strategies:
+    - DET0200
+  analytics:
+    - AN0576
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary uses the OpenSSH client shipped with Windows as an execution proxy,
+    passing an interpreter as the ProxyCommand of scp.exe or ssh.exe so the payload runs
+    under a Microsoft-signed parent even though no SSH server exists, with the script
+    hidden inside $Recycle.Bin.
+  attacker_behavior:
+    - Delivers a shortcut with a document name that runs scp.exe with a ProxyCommand option.
+    - Names PowerShell with an execution-policy bypass as the proxy command.
+    - Keeps the script under the Recycle Bin folder of the extracted archive.
+    - "Follows with packed loaders, a remote-access MSI and beacons."
+  legitimate_behavior:
+    - Administrators set ProxyCommand to reach hosts through a jump server or a cloud tunnel helper.
+    - Git and developer tools start ssh.exe with options from a configuration file.
+    - Deleted executables sit in the Recycle Bin under renamed files.
+  risk_indicator:
+    - ProxyCommand or LocalCommand names an interpreter and not a tunnel helper.
+    - The target is localhost with nothing to copy.
+    - "ssh.exe or scp.exe is the ancestor of PowerShell, mshta or a script host."
+    - A script or executable under its original name is written to or run from $Recycle.Bin.
+    - "The parent of scp.exe is Explorer, from a shortcut."
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NewScriptWritten
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: ssh-client-with-command-option
+        name: "ssh, scp or sftp started with a command-running option"
+        purpose: >-
+          Return the three clients when their command line carries ProxyCommand,
+          LocalCommand, PermitLocalCommand, ProxyUseFdpass or KnownHostsCommand. An
+          option set in an ssh_config file is not on the command line and is missed; the
+          next case still returns what the client starts.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(ssh|scp|sftp)\.exe$/i
+          | CommandLine=/ProxyCommand|LocalCommand|PermitLocalCommand|ProxyUseFdpass|KnownHostsCommand/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: process-started-by-ssh-client
+        name: Process started by an OpenSSH client
+        purpose: >-
+          Return children of ssh.exe, scp.exe and sftp.exe other than the clients
+          themselves and their helpers. The Windows client runs a proxy command through
+          cmd.exe, so the interpreter may be one step further down; the agent follows
+          the process id of a returned cmd.exe to its children.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(ssh|scp|sftp)\.exe$/i
+          | FileName!=/^(ssh|scp|sftp|conhost|ssh-sk-helper|ssh-pkcs11-helper|ssh-askpass)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: recycle-bin-file-on-command-line
+        name: Script or executable in the Recycle Bin folder named on a command line
+        purpose: >-
+          Return commands whose arguments name a script, library or executable under
+          $Recycle.Bin.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/\$Recycle\.Bin[\\\/][^"\s]*\.(ps1|bat|cmd|vbs|js|hta|exe|dll)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: process-image-in-recycle-bin
+        name: Process running from the Recycle Bin folder
+        purpose: >-
+          Return processes whose image is under $Recycle.Bin.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ImageFileName=/\\\$Recycle\.Bin\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: script-written-to-recycle-bin
+        name: Script written under the Recycle Bin folder
+        purpose: >-
+          Return scripts created under $Recycle.Bin under a name that is not the $R or
+          $I name Windows gives a deleted file.
+        query: |
+          #event_simpleName=NewScriptWritten
+          | TargetFileName=/\\\$Recycle\.Bin\\/i
+          | TargetFileName!=/\\\$[RI][A-Z0-9]{6}(\.[^\\]*)?$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: executable-written-to-recycle-bin
+        name: Executable written under the Recycle Bin folder
+        purpose: >-
+          The same test for executables.
+        query: |
+          #event_simpleName=PeFileWritten
+          | TargetFileName=/\\\$Recycle\.Bin\\/i
+          | TargetFileName!=/\\\$[RI][A-Z0-9]{6}(\.[^\\]*)?$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: ssh_client_ran_command
+      name: OpenSSH client used to run a command
+      description: >-
+        An OpenSSH client was started with a command-running option, or is the parent of
+        a process that is not an SSH component.
+      source: process_creation
+      field: command_line
+      indicates: indirect_command_execution
+
+  supporting:
+    - id: interpreter_named
+      name: Option names an interpreter
+      description: >-
+        The process the client started, directly or through cmd.exe, is PowerShell,
+        mshta, a script host or rundll32.
+      source: process_creation
+      field: image_name
+      indicates: proxy_execution_of_interpreter
+    - id: ssh_parent
+      name: Parent is an OpenSSH client
+      description: >-
+        The parent of the started process is ssh.exe, scp.exe or sftp.exe.
+      source: process_creation
+      field: parent_process
+      indicates: trusted_parent_abuse
+    - id: recycle_bin_file
+      name: File staged in the Recycle Bin folder
+      description: >-
+        A script or executable was written under $Recycle.Bin under its original name.
+      source: file_creation
+      field: file_path
+      indicates: hidden_staging
+    - id: image_in_recycle_bin
+      name: Process ran from the Recycle Bin folder
+      description: >-
+        A process image is under $Recycle.Bin.
+      source: process_creation
+      field: image_path
+      indicates: hidden_staging
+    - id: shortcut_origin
+      name: Client started from Explorer
+      description: >-
+        The client's own parent is explorer.exe, which a shortcut produces. The agent
+        follows the parent process id.
+      source: process_creation
+      field: parent_process_id
+      indicates: user_opened_lure
+
+  contradicting:
+    - id: jump_host_configuration
+      name: Proxy command is a jump or tunnel helper
+      description: >-
+        The option runs ssh -W, a cloud provider's tunnel helper or a corporate proxy
+        tool for a real remote host.
+      source: baseline
+      field: CommandLine
+      indicates: administrative_ssh_use
+    - id: administrator_account
+      name: User administers remote systems
+      description: >-
+        The account belongs to staff who use SSH through bastions daily.
+      source: identity_context
+      field: UserName
+      indicates: routine_administration
+
+  risk_logic:
+    required:
+      - ssh_client_ran_command
+
+    supporting:
+      any:
+        - interpreter_named
+        - ssh_parent
+        - recycle_bin_file
+        - image_in_recycle_bin
+        - shortcut_origin
+      all:
+        - interpreter_named
+        - ssh_parent
+
+    contradicting:
+      any:
+        - jump_host_configuration
+        - administrator_account
+      all: []
+
+  verdict:
+    low_risk_when:
+      - ssh_client_ran_command
+      - jump_host_configuration
+      - administrator_account
+    suspicious_when:
+      - ssh_client_ran_command
+      - interpreter_named
+    high_risk_when:
+      - ssh_client_ran_command
+      - interpreter_named
+      - recycle_bin_file
+
+  false_positive:
+    - condition: Jump hosts and cloud tunnel helpers.
+      explanation: >-
+        ProxyCommand with ssh -W, the AWS session-manager plugin, cloudflared access or
+        a corporate proxy tool. The target is a real remote host.
+    - condition: Git and developer tools connecting over SSH.
+      explanation: >-
+        Git starts ssh.exe with options and ssh starts nothing but its helpers.
+    - condition: Deleted files in the Recycle Bin.
+      explanation: >-
+        Windows renames them to $R names, which the file cases leave out.

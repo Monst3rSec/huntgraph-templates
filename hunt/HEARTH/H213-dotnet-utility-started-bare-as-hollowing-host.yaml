@@ -1,0 +1,287 @@
+# Converted from THORCollective/HEARTH Flames/H213.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h213-dotnet-utility-started-bare-as-hollowing-host-t1055-012
+version: 1.0.0
+
+info:
+  name: Signed .NET utility started with no arguments by a script host and then connecting out
+  description: >-
+    Kaspersky described a ScreenConnect campaign in which PowerShell and wscript,
+    started from the ScreenConnect client, create RegAsm.exe suspended, replace its
+    image with AsyncRAT and resume it. The hollowing itself is process access and image
+    tampering, which this deployment does not collect. What is left is how the host
+    process looks from outside: RegAsm.exe, InstallUtil.exe, aspnet_compiler.exe,
+    MSBuild.exe or jsc.exe started with nothing on the command line but its own path, by
+    a script host, and then opening connections to the internet. These utilities do
+    nothing useful without arguments and none of them has a reason to connect out. The
+    hunt returns those three things and does not claim to see the injection.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - stealth
+    - privilege-escalation
+    - process-hollowing
+    - regasm
+    - asyncrat
+    - screenconnect
+    - dotnet
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H213.md
+    - https://attack.mitre.org/techniques/T1055/012
+    - https://attack.mitre.org/detectionstrategies/DET0382
+    - https://securelist.com/tr/the-soc-files-screenconnect-campaign-with-asyncrat/120472/
+
+mitre:
+  tactics:
+    - TA0005
+    - TA0004
+  techniques:
+    - T1055
+  sub_techniques:
+    - T1055.012
+  detection_strategies:
+    - DET0382
+  analytics:
+    - AN1076
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    A signed .NET host process (RegAsm.exe, and by extension
+    InstallUtil.exe/aspnet_compiler.exe/MSBuild.exe/jsc.exe) is spawned suspended and
+    hollowed to run AsyncRAT, with the parent lineage tracing back to
+    ScreenConnect.ClientService.exe → powershell.exe/wscript.exe; the hollowed binary
+    runs with an empty/absent command line and then beacons to C2.
+  attacker_behavior:
+    - Runs a PowerShell or VBScript loader through a ScreenConnect session.
+    - Starts a signed .NET utility suspended with no arguments.
+    - Replaces its image in memory with a remote access trojan and resumes it.
+    - The utility's process then connects to the operator's server.
+  legitimate_behavior:
+    - Installers call RegAsm and InstallUtil with an assembly path and switches.
+    - Developers run MSBuild with no arguments in a project folder.
+    - ASP.NET precompilation runs aspnet_compiler with a target path.
+  risk_indicator:
+    - The utility's command line is only its own path.
+    - Its parent is PowerShell, a script host or a remote support client.
+    - The utility opens a connection to a public address.
+    - The connection persists or repeats, as a remote access tool's does.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: dotnet-utility-started-with-no-arguments
+        name: RegAsm, InstallUtil, aspnet_compiler, MSBuild or jsc started with no arguments
+        purpose: >-
+          Return the listed .NET utilities when the command line is nothing but the
+          image path. MSBuild is in this case because HEARTH lists it; a developer
+          building in the current folder matches and the parent tells them apart.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(RegAsm|RegSvcs|InstallUtil|aspnet_compiler|MSBuild|jsc|AddInProcess32|AppLaunch)\.exe$/i
+          | CommandLine=/^\s*"?[^"\s]+\.exe"?\s*$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: dotnet-utility-started-by-script-host-or-remote-support-client
+        name: .NET utility started by PowerShell, a script host or ScreenConnect
+        purpose: >-
+          Return the utilities, without MSBuild, when the parent is PowerShell, a script
+          host or the ScreenConnect client, whatever the command line. This finds a
+          hollowing host that was given decoy arguments.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(powershell|pwsh|wscript|cscript|mshta|ScreenConnect\.ClientService|ScreenConnect\.WindowsClient)\.exe$/i
+          | FileName=/^(RegAsm|RegSvcs|InstallUtil|aspnet_compiler|jsc|AddInProcess32|AppLaunch)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: dotnet-utility-connecting-to-public-address
+        name: .NET utility opening a connection to a public address
+        purpose: >-
+          Return outbound connections made by the utilities to public addresses, with
+          the process id for the agent to match against the first two cases. None of
+          these programs fetches anything from the internet in normal use.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | ContextBaseFileName=/^(RegAsm|RegSvcs|InstallUtil|aspnet_compiler|jsc|AddInProcess32|AppLaunch)\.exe$/i
+          | !cidr(RemoteAddressIP4, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: reported-c2-domain-resolved
+        name: DNS request for the reported server name
+        purpose: >-
+          Return requests for the server name Kaspersky reported, with the requester. A
+          point-in-time indicator.
+        query: |
+          #event_simpleName=DnsRequest
+          | DomainName=/^mora1987\.work\.gd$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: dotnet_utility_bare_or_script_parent
+      name: .NET utility started bare or by a script host
+      description: >-
+        A signed .NET utility ran with no arguments, or with PowerShell, a script host
+        or ScreenConnect as its parent.
+      source: process_creation
+      field: command_line
+      indicates: hollowing_host_created
+
+  supporting:
+    - id: parent_is_script_or_remote_support
+      name: Parent is a script host or remote support client
+      description: >-
+        The parent is PowerShell, wscript, cscript, mshta or the ScreenConnect client.
+      source: process_creation
+      field: parent_process
+      indicates: loader_lineage
+    - id: utility_connected_out
+      name: Utility connected to a public address
+      description: >-
+        The same process opened a connection to a public address.
+      source: network_connection
+      field: remote_address
+      indicates: implant_command_and_control
+    - id: connection_from_same_process
+      name: Connection belongs to the returned process
+      description: >-
+        The process id on the connection is the utility the process case returned.
+      source: network_connection
+      field: process_id
+      indicates: implant_running_in_host_process
+    - id: reported_domain_resolved
+      name: Reported server name resolved
+      description: >-
+        A process on the host requested the reported name.
+      source: dns_request
+      field: query_name
+      indicates: known_campaign_infrastructure
+
+  contradicting:
+    - id: developer_build_host
+      name: Host is a developer or build machine
+      description: >-
+        Inventory shows the host builds .NET software and the parent is a build tool or
+        an IDE.
+      source: asset_inventory
+      field: ComputerName
+      indicates: development_activity
+
+  risk_logic:
+    required:
+      - dotnet_utility_bare_or_script_parent
+
+    supporting:
+      any:
+        - parent_is_script_or_remote_support
+        - utility_connected_out
+        - connection_from_same_process
+        - reported_domain_resolved
+      all:
+        - parent_is_script_or_remote_support
+        - utility_connected_out
+
+    contradicting:
+      any:
+        - developer_build_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - dotnet_utility_bare_or_script_parent
+      - developer_build_host
+    suspicious_when:
+      - dotnet_utility_bare_or_script_parent
+      - parent_is_script_or_remote_support
+    high_risk_when:
+      - dotnet_utility_bare_or_script_parent
+      - parent_is_script_or_remote_support
+      - utility_connected_out
+
+  false_positive:
+    - condition: Developers run MSBuild with no arguments.
+      explanation: >-
+        The parent is a terminal or IDE in a project folder and the process makes no
+        outbound connection.
+    - condition: A user double-clicks RegAsm or InstallUtil.
+      explanation: >-
+        The parent is explorer.exe, the process exits at once and connects nowhere.

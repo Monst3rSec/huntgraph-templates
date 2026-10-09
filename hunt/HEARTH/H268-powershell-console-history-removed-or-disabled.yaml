@@ -1,0 +1,246 @@
+# Converted from THORCollective/HEARTH Flames/H268.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h268-powershell-console-history-removed-or-disabled-t1070-003
+version: 1.0.0
+
+info:
+  name: PowerShell console history file removed, emptied or switched off
+  description: >-
+    PSReadLine keeps every command typed into PowerShell in ConsoleHost_history.txt
+    under the user's profile. An operator who has been working at the prompt removes the
+    file, empties it, clears the session with Clear-History, or sets HistorySaveStyle to
+    SaveNothing so that nothing is written and no deletion is left to find. The sensor
+    here reports neither file deletions nor script blocks, so the deletion itself and a
+    cmdlet typed at an open prompt are not visible. The hunt returns the forms that do
+    start a process: cmd.exe del against the history path, and PowerShell started with a
+    command that removes the file or changes the PSReadLine option, which is how an
+    implant or a remote shell issues it. A history file that quietly stops growing
+    cannot be seen from this telemetry.
+  severity: medium
+  author: huntgraph
+  tags:
+    - hearth
+    - stealth
+    - indicator-removal
+    - powershell
+    - psreadline
+    - command-history
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H268.md
+    - https://attack.mitre.org/techniques/T1070
+    - https://attack.mitre.org/techniques/T1070/003
+    - https://attack.mitre.org/detectionstrategies/DET0165
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1070
+  sub_techniques:
+    - T1070.003
+  detection_strategies:
+    - DET0165
+  analytics:
+    - AN0469
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:PowerShell
+  data_components:
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    A hands-on-keyboard operator who has been typing into PowerShell removes the
+    plaintext transcript it leaves in ConsoleHost_history.txt before leaving the host,
+    by deleting or truncating the file, by running Clear-History, or by setting
+    Set-PSReadLineOption -HistorySaveStyle SaveNothing so that the file is never
+    written.
+  attacker_behavior:
+    - Deletes ConsoleHost_history.txt with Remove-Item or del.
+    - Empties the file with Clear-Content or an output redirect.
+    - Sets HistorySaveStyle to SaveNothing or points HistorySavePath elsewhere.
+    - Removes the PSReadLine module from the session so nothing is recorded.
+  legitimate_behavior:
+    - Profile management on VDI and RDS hosts deletes the whole profile at logoff.
+    - A developer clears history after pasting a secret at the prompt.
+    - Privacy and disk-cleanup tools remove the file with many others.
+    - Some organisations set SaveNothing centrally in a profile script.
+  risk_indicator:
+    - The command runs on a domain controller, file server or hypervisor host.
+    - Only the history file is touched, not the rest of the profile.
+    - The parent is a shell, a remote-management host process or an unknown binary.
+    - Event logs are cleared or staged tools are deleted on the same host around the same time.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: history-file-named-in-removal-command
+        name: Command removing or emptying the PSReadLine history file
+        purpose: >-
+          Return shells whose command line names the PSReadLine history file or its
+          save-path property together with a delete, truncate or overwrite. This is the
+          form an implant, a scheduled command or cmd.exe produces. Remove-Item typed at
+          an open PowerShell prompt and a deletion made through Explorer start no
+          process and are not returned.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh|cmd)\.exe$/i
+          | CommandLine=/ConsoleHost_history|HistorySavePath|\\PowerShell\\PSReadLine\\/i
+          | CommandLine=/Remove-Item|\b(del|erase|rm|ri|rd|rmdir)\s|Clear-Content|\bclc\s|Set-Content|Out-File|>\s*\S*(history|PSReadLine)|sdelete|::Delete\(|::WriteAllText\(/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: history-saving-disabled-on-command-line
+        name: PowerShell started with history saving switched off or cleared
+        purpose: >-
+          Return PowerShell and cmd processes whose command line sets HistorySaveStyle
+          to SaveNothing, redirects the save path, unloads PSReadLine or runs
+          Clear-History. The quiet variant leaves no file event anywhere; the command
+          line is the only place this telemetry can show it, and only when it is passed
+          as an argument.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh|cmd)\.exe$/i
+          | CommandLine=/SaveNothing|Set-PSReadLineOption\s[^|;]*-HistorySavePath|Remove-Module\s+(-Name\s+)?PSReadLine|\bClear-History\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: history_removal_command
+      name: Command removes or disables PowerShell history
+      description: >-
+        A shell command line deletes or empties the PSReadLine history file, or switches
+        history saving off for the session.
+      source: process_creation
+      field: command_line
+      indicates: command_history_removed
+
+  supporting:
+    - id: non_interactive_parent
+      name: Command issued by another process
+      description: >-
+        The parent is a remote-management host, a script host, a service or an unknown
+        binary, so the command was passed in rather than typed by the profile's owner.
+      source: process_creation
+      field: parent_process
+      indicates: tool_driven_cleanup
+    - id: privileged_account
+      name: Account is privileged or a service account
+      description: >-
+        The history belongs to an administrator or service account whose commands on
+        this host would be of interest.
+      source: process_creation
+      field: user
+      indicates: privileged_session_concealed
+    - id: server_role_host
+      name: Host is a server
+      description: >-
+        The host is a domain controller, file server or hypervisor host, where profile
+        cleanup tooling does not run.
+      source: asset_inventory
+      field: ComputerName
+      indicates: cleanup_unexpected_on_host
+
+  contradicting:
+    - id: profile_management_tooling
+      name: Profile management or cleanup tooling
+      description: >-
+        The command is issued by the profile-management or disk-cleanup agent deployed
+        on the host and repeats at logoff across many users.
+      source: baseline
+      field: CommandLine
+      indicates: routine_profile_cleanup
+    - id: central_psreadline_setting
+      name: SaveNothing is set centrally
+      description: >-
+        The organisation sets HistorySaveStyle in a managed profile script on this class
+        of host.
+      source: baseline
+      field: CommandLine
+      indicates: organisation_wide_preference
+
+  risk_logic:
+    required:
+      - history_removal_command
+
+    supporting:
+      any:
+        - non_interactive_parent
+        - privileged_account
+        - server_role_host
+      all:
+        - non_interactive_parent
+        - server_role_host
+
+    contradicting:
+      any:
+        - profile_management_tooling
+        - central_psreadline_setting
+      all: []
+
+  verdict:
+    low_risk_when:
+      - history_removal_command
+      - profile_management_tooling
+      - central_psreadline_setting
+    suspicious_when:
+      - history_removal_command
+      - server_role_host
+    high_risk_when:
+      - history_removal_command
+      - server_role_host
+      - non_interactive_parent
+
+  false_positive:
+    - condition: VDI and RDS profile cleanup.
+      explanation: >-
+        Profile tools remove the file with thousands of others at logoff, from a named
+        signed agent. They rarely do it through a shell command line.
+    - condition: Developers clearing a pasted secret.
+      explanation: >-
+        Common on workstations and reasonable. It is one user on their own machine, not
+        a server.
+    - condition: Hardening scripts that set SaveNothing.
+      explanation: >-
+        A managed profile can set it for everyone. The same line then appears on every
+        host of that class.

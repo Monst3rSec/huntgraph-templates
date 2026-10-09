@@ -1,0 +1,264 @@
+# Converted from THORCollective/HEARTH Flames/H255.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-mac-hearth-h255-xprotect-database-lock-and-update-telemetry-disable-t1685
+version: 1.0.0
+
+info:
+  name: XProtect database held by an interpreter while updates and telemetry are switched off
+  description: >-
+    XCSSET v4.0 leaves macOS security components installed and stops them working. A
+    long-lived Perl process takes an exclusive lock on the XProtect signature database
+    so updates cannot be written, defaults write sets the SoftwareUpdate configuration
+    values to false, and CloudTelemetryService is terminated. The lock is a file open
+    and the termination is a signal; the sensor reports neither as an event here. The
+    commands that do the work are processes: an interpreter with the XProtect path in
+    its arguments, defaults writing false into com.apple.SoftwareUpdate, and killall or
+    launchctl naming the daemons.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-impairment
+    - xprotect
+    - software-update
+    - xcsset
+    - macos
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H255.md
+    - https://attack.mitre.org/techniques/T1685
+    - https://attack.mitre.org/detectionstrategies/DET0497
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1685
+  sub_techniques: []
+  detection_strategies:
+    - DET0497
+  analytics:
+    - AN1371
+  platforms:
+    - macOS
+  data_sources:
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    XCSSET v4.0 neuters macOS security components in place: it holds an exclusive file
+    lock on the XProtect signature database with a long-lived Perl process so signature
+    updates cannot be written, sets the SoftwareUpdate configuration values to false,
+    and terminates CloudTelemetryService.
+  attacker_behavior:
+    - Starts perl with code that opens the XProtect database and holds a lock on it.
+    - Runs defaults write against com.apple.SoftwareUpdate with false values.
+    - Kills CloudTelemetryService.
+    - Leaves every component installed and reported as enabled.
+  legitimate_behavior:
+    - Device management defers or schedules updates through profiles and scripts.
+    - Inventory scripts read the XProtect bundle version.
+    - "Apple's own services open the XProtect database."
+  risk_indicator:
+    - "perl, python or a shell names the XProtect database path in its arguments."
+    - That process stays alive for hours with no terminal.
+    - SoftwareUpdate values are set to false outside device management.
+    - A kill or unload names a telemetry or XProtect daemon.
+    - "The host's XProtect version falls behind the fleet."
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: interpreter-naming-xprotect-database
+        name: Interpreter or lock utility naming an XProtect path
+        purpose: >-
+          Return perl, python, ruby, shells, osascript and the lock utilities when their
+          arguments name the protected XProtect folder, the XProtect bundle or the
+          database. The lock call is inside the interpreter and is not seen; the path in
+          the inline code is. Code read from a script file puts no path on the command
+          line and is missed. Inventory scripts that read the bundle version through a
+          shell match and are told apart by reading the command.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | CommandLine=/\/var\/protected\/xprotect|XProtect\.bundle|\bXPdb\b/
+          | FileName=/^(perl[\d.]*|python[\d.]*|ruby|sh|bash|zsh|dash|osascript|lockf|shlock)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: software-update-values-set-false
+        name: defaults write setting SoftwareUpdate values to false
+        purpose: >-
+          Return defaults write commands against com.apple.SoftwareUpdate that set a
+          value to false, NO or 0. Whether the change came from device management is
+          read from the parent.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=defaults
+          | CommandLine=/\swrite\s+\S*com\.apple\.SoftwareUpdate\S*\s+\S+\s+(-bool(ean)?\s+|-int(eger)?\s+)?(false|NO|0)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: security-daemon-terminated-by-name
+        name: Telemetry or XProtect daemon killed or unloaded by name
+        purpose: >-
+          Return killall, pkill and launchctl commands that name CloudTelemetryService,
+          syspolicyd or an XProtect service. kill with a numeric process id names
+          nothing and is not seen, and neither is a signal sent from inside a process.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=/^(killall|pkill|launchctl)$/
+          | CommandLine=/CloudTelemetryService|XProtectBehaviorService|XProtectRemediator|XProtectPluginService|syspolicyd|com\.apple\.XProtect/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: security_component_impaired_by_command
+      name: Command that freezes or silences a security component
+      description: >-
+        A command names the XProtect database from an interpreter, sets SoftwareUpdate
+        values to false, or kills a telemetry or XProtect daemon.
+      source: process_creation
+      field: command_line
+      indicates: security_tool_impairment
+
+  supporting:
+    - id: interpreter_holds_database
+      name: Process naming the database is an interpreter
+      description: >-
+        The process whose arguments name the XProtect database is perl, python or a
+        shell.
+      source: process_creation
+      field: image_name
+      indicates: signature_database_lock
+    - id: not_management_parent
+      name: Parent is not device management
+      description: >-
+        The parent is a shell, osascript or an unknown binary and not the management
+        agent or softwareupdated.
+      source: process_creation
+      field: parent_process
+      indicates: unsanctioned_change
+    - id: several_impairments_together
+      name: "Lock, update disable and kill on one host"
+      description: >-
+        Two or more of the three actions occur on one host within the same hour. The
+        agent derives this from the returned events.
+      source: process_creation
+      field: host
+      indicates: coordinated_impairment
+    - id: long_lived_lock_holder
+      name: Lock holder has no matching exit
+      description: >-
+        The interpreter's process id is not followed by an early exit and no child or
+        terminal is attached. The agent follows the process id.
+      source: process_creation
+      field: process_id
+      indicates: persistent_lock
+
+  contradicting:
+    - id: management_update_policy
+      name: Update deferral is policy
+      description: >-
+        The host is under a device-management policy that defers updates with these
+        keys.
+      source: asset_inventory
+      field: ComputerName
+      indicates: managed_update_deferral
+    - id: inventory_version_read
+      name: Command only reads the XProtect version
+      description: >-
+        The command reads the bundle's version string for inventory and holds nothing
+        open.
+      source: baseline
+      field: CommandLine
+      indicates: inventory_collection
+
+  risk_logic:
+    required:
+      - security_component_impaired_by_command
+
+    supporting:
+      any:
+        - interpreter_holds_database
+        - not_management_parent
+        - several_impairments_together
+        - long_lived_lock_holder
+      all:
+        - interpreter_holds_database
+        - not_management_parent
+
+    contradicting:
+      any:
+        - management_update_policy
+        - inventory_version_read
+      all: []
+
+  verdict:
+    low_risk_when:
+      - security_component_impaired_by_command
+      - management_update_policy
+      - inventory_version_read
+    suspicious_when:
+      - security_component_impaired_by_command
+      - not_management_parent
+    high_risk_when:
+      - security_component_impaired_by_command
+      - interpreter_holds_database
+      - several_impairments_together
+
+  false_positive:
+    - condition: Device management deferring updates.
+      explanation: >-
+        Management scripts set the same SoftwareUpdate keys. The parent is the
+        management agent and the policy is documented.
+    - condition: Inventory of the XProtect version.
+      explanation: >-
+        Scripts read Info.plist in the bundle through a shell and exit at once.
+    - condition: Support staff restarting a hung daemon.
+      explanation: >-
+        A killall of syspolicyd during troubleshooting, from a terminal, once.

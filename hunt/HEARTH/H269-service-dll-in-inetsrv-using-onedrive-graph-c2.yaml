@@ -1,0 +1,330 @@
+# Converted from THORCollective/HEARTH Flames/H269.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h269-service-dll-in-inetsrv-using-onedrive-graph-c2-t1102-002
+version: 1.0.0
+
+info:
+  name: Service DLL dropped in System32\inetsrv talking to Microsoft Graph
+  description: >-
+    A backdoor split across two service DLLs, one fetching commands and one running
+    them, talks only to Microsoft: it signs in at login.microsoftonline.com with a
+    hardcoded refresh token and reads and writes files on an attacker's OneDrive through
+    graph.microsoft.com. Nothing on the network distinguishes it from Office. The host
+    does: an unsigned DLL appears in C:\Windows\System32\inetsrv on a machine that is
+    not a web server and is registered as a service by a Base64-encoded PowerShell
+    command. The hunt returns DLLs written into inetsrv by anything other than Windows
+    servicing, the service registrations that point there, and Graph lookups made by
+    service-host processes. The encoded command hides the registration from the command
+    line, so the ServiceDll registry write is read as well. Signature state and the
+    module load itself are not visible to this telemetry.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - command-and-control
+    - web-service
+    - microsoft-graph
+    - onedrive
+    - windows-service
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H269.md
+    - https://attack.mitre.org/techniques/T1102
+    - https://attack.mitre.org/techniques/T1102/002
+    - https://attack.mitre.org/detectionstrategies/DET0035
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1102
+  sub_techniques:
+    - T1102.002
+  detection_strategies:
+    - DET0035
+  analytics:
+    - AN0100
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    A backdoor made of two DLLs registered as Windows services in
+    C:\Windows\System32\inetsrv never contacts an attacker-owned domain: it
+    authenticates to login.microsoftonline.com with a hardcoded refresh token and reads
+    and writes files on an attacker-controlled OneDrive account through
+    graph.microsoft.com, on a host that is not an IIS web server.
+  attacker_behavior:
+    - Drops two DLLs into C:\Windows\System32\inetsrv on a host without IIS.
+    - Registers each as a service with a Base64-encoded PowerShell command.
+    - Has svchost load the DLLs, which then poll OneDrive through Microsoft Graph.
+    - Writes command output back to the same OneDrive folder.
+  legitimate_behavior:
+    - IIS feature installation and Windows servicing write Microsoft-signed modules to inetsrv.
+    - URL Rewrite, ARR, WebDeploy and monitoring agents install modules there on web servers.
+    - Windows services hosted in svchost resolve Microsoft Graph for account and licensing work.
+  risk_indicator:
+    - A DLL is written to inetsrv by a process that is not an installer or Windows servicing.
+    - The host does not run IIS.
+    - A ServiceDll value or sc create command points at a DLL in inetsrv.
+    - svchost on that host resolves graph.microsoft.com at a regular interval.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: dll-written-to-inetsrv-outside-servicing
+        name: DLL written to System32\inetsrv by a non-servicing process
+        purpose: >-
+          Return DLLs written into the IIS directory whose writer is not Windows
+          servicing or an installer. On a host without IIS the directory should gain
+          nothing at all.
+        query: |
+          #event_simpleName=PeFileWritten
+          | TargetFileName=/\\Windows\\System32\\inetsrv\\[^\\]+\.dll$/i
+          | ContextBaseFileName!=/^(TiWorker|TrustedInstaller|msiexec|dism|DismHost|poqexec|wusa|ServerManager)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: service-registration-naming-inetsrv-dll
+        name: Service created or configured with a DLL in inetsrv
+        purpose: >-
+          Return sc, reg and PowerShell commands that create or configure a service and
+          name a DLL under inetsrv in clear text. The reported registration was
+          Base64-encoded, which this case cannot read; the next case catches its effect.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(sc|reg|powershell|pwsh|cmd)\.exe$/i
+          | CommandLine=/\\inetsrv\\[^\\\s"']+\.dll/i
+          | CommandLine=/\bcreate\b|\bconfig\b|New-Service|ServiceDll|\\Services\\|binPath/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: servicedll-value-pointing-into-inetsrv
+        name: ServiceDll registry value set to a path in inetsrv
+        purpose: >-
+          Return writes of a service's ServiceDll value whose data is a path under
+          inetsrv, whatever wrote it. This is what an encoded registration leaves
+          behind. It depends on the sensor reporting writes under Services\*\Parameters;
+          confirm in the tenant.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegValueName=/^ServiceDll$/i
+          | RegObjectName=/\\Services\\[^\\]+\\Parameters\\?$/i
+          | RegStringValue=/\\inetsrv\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: graph-lookup-by-service-host
+        name: Microsoft Graph resolved by a service-host process
+        purpose: >-
+          Return lookups of graph.microsoft.com made by svchost, rundll32 and dllhost.
+          Some Windows services do this legitimately, so the result is an inventory
+          rather than a finding: the agent keeps the hosts that an earlier case also
+          returned and checks whether the lookups repeat at a fixed interval. Browsers,
+          Office and the OneDrive client are left out because their volume is too large
+          to return raw.
+        query: |
+          #event_simpleName=DnsRequest
+          | DomainName=/^graph\.microsoft\.com$/i
+          | ContextBaseFileName=/^(svchost|rundll32|dllhost)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: dll_written_to_inetsrv
+      name: DLL written into the IIS directory
+      description: >-
+        A DLL was written to C:\Windows\System32\inetsrv by a process that is not
+        Windows servicing or an installer.
+      source: file_creation
+      field: file_path
+      indicates: payload_placed_in_system_directory
+
+  supporting:
+    - id: writer_is_shell_or_web_process
+      name: Writer is a shell, script host or web application
+      description: >-
+        The process that wrote the DLL is PowerShell, cmd, a script host or a web
+        application's worker rather than an installer.
+      source: file_creation
+      field: writer_process_name
+      indicates: non_installer_file_drop
+    - id: service_dll_registered
+      name: Service registered with the DLL
+      description: >-
+        A ServiceDll value was written with a path under inetsrv, registering the DLL to
+        be loaded by svchost.
+      source: registry
+      field: registry_data
+      indicates: service_persistence
+    - id: service_registration_command
+      name: Service registration on a command line
+      description: >-
+        sc, reg or PowerShell created or configured a service naming a DLL under
+        inetsrv.
+      source: process_creation
+      field: command_line
+      indicates: service_persistence
+    - id: host_does_not_run_iis
+      name: Host is not a web server
+      description: >-
+        The inventory shows no IIS role on the host, so nothing should be installing
+        modules into inetsrv.
+      source: asset_inventory
+      field: ComputerName
+      indicates: directory_misused_as_cover
+    - id: graph_lookup_from_service_host
+      name: Service host resolves Microsoft Graph
+      description: >-
+        svchost, rundll32 or dllhost on the same host resolves graph.microsoft.com. The
+        agent derives the interval between lookups from the returned events.
+      source: dns_request
+      field: process_name
+      indicates: web_service_command_channel
+
+  contradicting:
+    - id: iis_module_installation
+      name: Module installed on a web server
+      description: >-
+        The host serves IIS and the DLL belongs to a module or monitoring agent
+        installed under a change record.
+      source: asset_inventory
+      field: ComputerName
+      indicates: legitimate_iis_module
+    - id: known_vendor_module
+      name: File is a known vendor module
+      description: >-
+        The file name and path match a module shipped by Microsoft or an approved vendor
+        for this host.
+      source: baseline
+      field: TargetFileName
+      indicates: approved_software
+
+  risk_logic:
+    required:
+      - dll_written_to_inetsrv
+
+    supporting:
+      any:
+        - writer_is_shell_or_web_process
+        - service_dll_registered
+        - service_registration_command
+        - host_does_not_run_iis
+        - graph_lookup_from_service_host
+      all:
+        - service_dll_registered
+        - host_does_not_run_iis
+
+    contradicting:
+      any:
+        - iis_module_installation
+        - known_vendor_module
+      all: []
+
+  verdict:
+    low_risk_when:
+      - dll_written_to_inetsrv
+      - iis_module_installation
+      - known_vendor_module
+    suspicious_when:
+      - dll_written_to_inetsrv
+      - host_does_not_run_iis
+    high_risk_when:
+      - dll_written_to_inetsrv
+      - host_does_not_run_iis
+      - service_dll_registered
+
+  false_positive:
+    - condition: IIS feature and module installation.
+      explanation: >-
+        Real web servers gain DLLs in inetsrv during feature installs, .NET servicing
+        and third-party module setup. The writer is an installer and the host is on the
+        web-server list.
+    - condition: Windows services using Microsoft Graph.
+      explanation: >-
+        Account, licensing and device-management services in svchost resolve
+        graph.microsoft.com. The lookups are bursty, and the host shows no new DLL in
+        inetsrv.
