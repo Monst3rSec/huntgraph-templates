@@ -307,8 +307,9 @@ def main() -> int:
         for dp, dirs, fs in os.walk(os.path.join(ROOT, "hunt")):
             if os.path.basename(dp) == "hunt":
                 # hunt/keyword/ is a generated, unvalidated staging area keyed by tool
-                # name rather than by technique; it is not part of the corpus.
-                dirs[:] = [d for d in dirs if d != "keyword"]
+                # name rather than by technique, and hunt/HEARTH/ is keyed by HEARTH
+                # hypothesis number; neither is part of the corpus.
+                dirs[:] = [d for d in dirs if d not in ("keyword", "HEARTH")]
             paths += [os.path.join(dp, f) for f in fs if f.endswith(".yaml")]
         paths.sort()
 

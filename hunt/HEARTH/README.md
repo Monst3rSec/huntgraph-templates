@@ -43,10 +43,10 @@ python3 tools/validate.py hunt/HEARTH/*.yaml
 Expect exactly one L5 layout error per file and nothing else, apart from the L2 "decomposes
 into sub-techniques" error on a file listed below as kept at its parent technique.
 
-**`tools/validate.py --strict` with no path still walks this folder and fails on those L5
-errors.** `validate.py`, `coverage.py` and `add_wazuh_block.py` need the same prune they
-apply to `hunt/keyword/` before this tree can be committed without breaking CI. That change
-has not been made.
+`validate.py`, `coverage.py` and `add_wazuh_block.py` prune this folder the way they prune
+`hunt/keyword/`, so `tools/validate.py --strict` with no path does not walk it and nothing
+here counts toward coverage. Passing the paths, as above, is the only way these files are
+checked.
 
 Most of these behaviours already have a template under a category folder. The ledger names
 it, so the two can be compared and the better case moved across.

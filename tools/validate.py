@@ -703,8 +703,9 @@ def collect(paths: list[str]) -> list[str]:
         for dirpath, dirs, files in os.walk(root):
             if os.path.basename(dirpath) == "hunt":
                 # hunt/keyword/ is a generated, unvalidated staging area keyed by tool
-                # name rather than by technique; it is not part of the corpus.
-                dirs[:] = [d for d in dirs if d != "keyword"]
+                # name rather than by technique, and hunt/HEARTH/ is keyed by HEARTH
+                # hypothesis number; neither is part of the corpus.
+                dirs[:] = [d for d in dirs if d not in ("keyword", "HEARTH")]
             for f in sorted(files):
                 if f.endswith((".yaml", ".yml")):
                     found.append(os.path.join(dirpath, f))
