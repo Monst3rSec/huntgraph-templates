@@ -1,0 +1,304 @@
+# Converted from THORCollective/HEARTH Flames/H355.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+# HEARTH cites T1685, T1112 and T1564. T1685 decomposes into sub-techniques and
+# none describes hiding a tool's configuration, so the template is filed under
+# T1112, which is what the sensor observes. The disagreement between the Defender
+# API and the raw registry is a host-side comparison and is not hunted.
+type: detection
+
+id: hg-win-hearth-h355-defender-exclusions-hidden-from-administrators-t1112
+version: 1.0.0
+
+info:
+  name: HideExclusionsFromLocalAdmins set to conceal Microsoft Defender exclusions
+  description: >-
+    Huntress showed that setting HideExclusionsFromLocalAdmins under
+    HKLM\SOFTWARE\Policies\Microsoft\Windows Defender stops Get-MpPreference from
+    listing exclusions, for local administrators and for SYSTEM alike. A script or agent
+    that reads exclusions through the Defender interface then reports none on a host
+    that has them. Exclusions set by PowerShell or WMI are written by MsMpEng.exe under
+    the Defender key; exclusions set by policy, or directly with reg.exe, go under the
+    Policies key, which is the one an attacker can write. The hunt returns the hiding
+    value being written, commands that name it, and exclusion values written under the
+    Policies key. Organisations that set the value by policy on purpose will see it
+    everywhere at once.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-evasion
+    - modify-registry
+    - microsoft-defender
+    - exclusions
+    - hide-exclusions
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H355.md
+    - https://attack.mitre.org/techniques/T1112
+    - https://attack.mitre.org/detectionstrategies/DET0280
+
+mitre:
+  tactics:
+    - TA0112
+    - TA0003
+  techniques:
+    - T1112
+  sub_techniques: []
+  detection_strategies:
+    - DET0280
+  analytics:
+    - AN0781
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Windows Registry Key Modification
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An operator who has added Microsoft Defender Antivirus exclusions sets
+    HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\HideExclusionsFromLocalAdmins,
+    which suppresses the exclusion list from every query path an investigator would
+    normally reach for, blocking Get-MpPreference enumeration for local administrators
+    and SYSTEM alike, so an EDR agent or script that reads exclusions through the
+    Defender API returns an incomplete or empty list on a host that is in fact carved
+    wide open.
+  attacker_behavior:
+    - Adds path, extension or process exclusions for the directories tooling will run from.
+    - Writes exclusions under the Policies key with reg.exe where the Defender key is locked.
+    - Sets HideExclusionsFromLocalAdmins so the exclusions cannot be listed.
+    - Runs payloads from the excluded path.
+  legitimate_behavior:
+    - Group Policy and Intune write exclusions under the Policies key through the policy service.
+    - Some organisations enable the hiding setting estate-wide through policy.
+    - Database, backup and development products document exclusions for their directories.
+  risk_indicator:
+    - The hiding value is written on one or a few hosts and not across the estate.
+    - The writer is reg.exe, PowerShell or a script and not the policy service.
+    - An exclusion under the Policies key covers Temp, ProgramData, Users\Public or a whole drive.
+    - The exclusion and the hiding value are written minutes apart.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: hide-exclusions-value-written
+        name: HideExclusionsFromLocalAdmins value written
+        purpose: >-
+          Return registry writes of the value by name, with the key path and the
+          writer's process id. The data is a number and is not tested; any write is
+          returned, including one that turns the setting off. Whether the sensor reports
+          writes under the Defender policy key should be confirmed in the tenant.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegValueName=/^HideExclusionsFromLocalAdmins$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: command-line-naming-hide-exclusions
+        name: Command line naming HideExclusionsFromLocalAdmins
+        purpose: >-
+          Return any process whose command line names the value: reg add, a PowerShell
+          registry cmdlet, or a script argument. A write made through the registry API
+          or by policy processing starts no such process.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/HideExclusionsFromLocalAdmins/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: exclusion-written-under-policy-key
+        name: Exclusion written under the Defender policy key
+        purpose: >-
+          Return values written under the Policies copy of the Exclusions key. The value
+          name is the excluded path, extension or process. Policy-delivered exclusions
+          are returned and repeat across hosts.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Exclusions\\(Paths|Extensions|Processes|IpAddresses)\\?$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: command-adding-defender-exclusion
+        name: Command adding a Defender exclusion
+        purpose: >-
+          Return PowerShell, reg, cmd and WMI commands that add or set an exclusion, so
+          the agent can pair a hiding write with the exclusion it conceals.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh|reg|cmd|wmic)\.exe$/i
+          | CommandLine=/(Add|Set)-MpPreference|MSFT_MpPreference|Windows Defender\\Exclusions/i
+          | CommandLine=/Exclusion/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: hide_exclusions_set
+      name: Exclusion hiding value written
+      description: >-
+        HideExclusionsFromLocalAdmins was written under the Defender policy key, or a
+        command line set it.
+      source: registry
+      field: registry_value
+      indicates: security_configuration_concealed
+
+  supporting:
+    - id: hide_exclusions_command
+      name: Value set by a command
+      description: >-
+        reg.exe, PowerShell or a script named the value on its command line.
+      source: process_creation
+      field: command_line
+      indicates: manual_configuration_change
+    - id: policy_hive_exclusion
+      name: Exclusion written under the policy key
+      description: >-
+        An exclusion value was written under the Policies copy of the Exclusions key on
+        the same host.
+      source: registry
+      field: registry_path
+      indicates: defender_exclusion_added
+    - id: broad_exclusion
+      name: Exclusion covers a staging directory or a drive
+      description: >-
+        The excluded path is Temp, ProgramData, Users\Public, PerfLogs, a profile or a
+        drive root, or the extension is .exe, .dll or .ps1.
+      source: registry
+      field: registry_value
+      indicates: scanning_disabled_for_staging_area
+    - id: hide_value_rare
+      name: Hiding value written on few hosts
+      description: >-
+        The write appears on one or a few hosts, which the agent counts from the
+        returned events.
+      source: registry
+      field: host
+      indicates: host_specific_tampering
+    - id: exclusion_and_hiding_close_together
+      name: Exclusion and hiding value written close together
+      description: >-
+        The two writes fall within minutes on one host, by the agent's comparison of
+        event times.
+      source: registry
+      field: writer_process_id
+      indicates: exclusion_then_concealment
+
+  contradicting:
+    - id: hiding_set_by_policy
+      name: Organisation enables the setting by policy
+      description: >-
+        The setting is part of the organisation's Defender policy and the write lands on
+        every managed host.
+      source: asset_inventory
+      field: ComputerName
+      indicates: managed_security_policy
+    - id: documented_product_exclusion
+      name: Exclusion is a documented product requirement
+      description: >-
+        The excluded path belongs to an installed product whose vendor documents the
+        exclusion.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_exclusion
+
+  risk_logic:
+    required:
+      - hide_exclusions_set
+
+    supporting:
+      any:
+        - hide_exclusions_command
+        - policy_hive_exclusion
+        - broad_exclusion
+        - hide_value_rare
+        - exclusion_and_hiding_close_together
+      all:
+        - policy_hive_exclusion
+        - hide_value_rare
+
+    contradicting:
+      any:
+        - hiding_set_by_policy
+        - documented_product_exclusion
+      all: []
+
+  verdict:
+    low_risk_when:
+      - hide_exclusions_set
+      - hiding_set_by_policy
+      - documented_product_exclusion
+    suspicious_when:
+      - hide_exclusions_set
+      - hide_value_rare
+    high_risk_when:
+      - hide_exclusions_set
+      - hide_exclusions_command
+      - broad_exclusion
+
+  false_positive:
+    - condition: The security team hides exclusions from local administrators on purpose.
+      explanation: >-
+        Microsoft offers the setting for that. It arrives through policy on every host
+        and the writer is the policy service.
+    - condition: An administrator audits the setting.
+      explanation: >-
+        A reg query or a script that reads the value is returned by the command-line
+        case and writes nothing.

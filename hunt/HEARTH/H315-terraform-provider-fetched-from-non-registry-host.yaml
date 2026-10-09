@@ -1,0 +1,366 @@
+# Converted from THORCollective/HEARTH Flames/H315.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-any-hearth-h315-terraform-provider-fetched-from-non-registry-host-t1195-001
+version: 1.0.0
+
+info:
+  name: terraform init pulling and running a provider from a non-registry host
+  description: >-
+    A fake-recruitment lure delivers a coding project containing a .terraform.lock.hcl
+    that declares a custom provider hosted on an attacker-controlled domain. The
+    developer runs terraform init, the first step of any Terraform workflow, and the
+    provider is fetched and executed with no prompt of any kind. The lock file's
+    contents are not visible to the sensor, but Terraform stores each provider under
+    .terraform/providers/<registry host>/<namespace>/<type>/, so the host a provider
+    came from is in the path of the plugin binary when it is written and when it runs.
+    The hunt returns provider plugins written or started from a directory that is not
+    registry.terraform.io, names terraform resolves outside the usual registries,
+    children of provider plugins, which talk to Terraform over gRPC and have no reason
+    to start shells, and the two macOS backdoors reported at the end of the chain.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - initial-access
+    - supply-chain
+    - terraform
+    - developer-tooling
+    - fake-recruitment
+    - macos
+    - linux
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H315.md
+    - https://attack.mitre.org/techniques/T1195/001
+    - https://attack.mitre.org/detectionstrategies/DET0009
+
+mitre:
+  tactics:
+    - TA0001
+  techniques:
+    - T1195
+  sub_techniques:
+    - T1195.001
+  detection_strategies:
+    - DET0009
+  analytics:
+    - AN0021
+    - AN0022
+    - AN0023
+  platforms:
+    - Windows
+    - Linux
+    - macOS
+  data_sources:
+    - WinEventLog:Sysmon
+    - auditd:SYSCALL
+    - macos:endpointsecurity
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    An adversary running a fake-recruitment lure is delivering a project whose Terraform
+    lock file names a provider on an attacker-controlled host, so that terraform init on
+    the developer's machine fetches and runs attacker code inside a trusted toolchain.
+  attacker_behavior:
+    - Plants a .terraform.lock.hcl that sources a provider from a custom host.
+    - Relies on the developer running terraform init from the IDE's terminal.
+    - Has the provider binary start shells, curl, osascript or nohup.
+    - Removes the quarantine attribute and installs a LaunchAgent named loginwindow.plist.
+    - Runs backdoors from ~/Library directories named like Apple components with --type=renderer.
+  legitimate_behavior:
+    - Organisations host private providers on an internal registry or network mirror.
+    - Provider developers build and install plugins from local paths.
+    - The external and local providers run programs by design.
+    - Terraform contacts cloud APIs and state backends during init.
+  risk_indicator:
+    - A provider plugin's path names a host that is neither registry.terraform.io nor an internal registry.
+    - terraform resolves a domain with no relation to HashiCorp, a cloud provider or the organisation.
+    - A provider plugin starts a shell, curl, osascript, nohup, chmod or xattr.
+    - The project was cloned or unpacked minutes before init.
+
+requires:
+  platforms:
+    - windows
+    - linux
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NewExecutableWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: provider-plugin-running-from-non-registry-directory
+        name: Provider plugin running from a non-registry provider directory
+        purpose: >-
+          Return processes whose image is under a .terraform/providers directory for a
+          host other than registry.terraform.io or registry.opentofu.org. Terraform
+          names the directory after the host the provider was fetched from, so the path
+          states the source. An internal registry appears here by its own name.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | ImageFileName=/[\\\/]\.terraform[\\\/]providers[\\\/]/i
+          | ImageFileName!=/[\\\/]\.terraform[\\\/]providers[\\\/]registry\.(terraform\.io|opentofu\.org)[\\\/]/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: child-of-provider-plugin
+        name: Process started by a provider plugin
+        purpose: >-
+          Return every process whose parent is a terraform-provider binary. Plugins
+          serve gRPC to Terraform core and do not start interpreters; local-exec
+          provisioners run under terraform itself, not under a provider. The external
+          provider is the known exception.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | ParentBaseFileName=/^terraform-provider-/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: terraform-resolving-unfamiliar-host
+        name: terraform resolving a host outside the usual registries and clouds
+        purpose: >-
+          Return DNS requests made by the terraform process for names outside HashiCorp,
+          the major code hosts and the major cloud providers. Backends and private
+          registries outside that list will appear and repeat. This case depends on the
+          sensor attributing DNS requests to a process on the platform in question.
+        query: |
+          #event_simpleName=DnsRequest
+          | ContextBaseFileName=/^(terraform|tofu)(\.exe)?$/i
+          | DomainName!=/(^|\.)(terraform\.io|hashicorp\.com|opentofu\.org|github\.com|githubusercontent\.com|amazonaws\.com|googleapis\.com|azure\.com|windows\.net|microsoftonline\.com|microsoft\.com|gitlab\.com)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: provider-plugin-written-to-non-registry-directory
+        name: Provider plugin written into a non-registry provider directory
+        purpose: >-
+          Return executables written under a .terraform/providers directory for a host
+          other than the public registries, with the writing process. Windows plugins
+          are PE files and are reported by a different event; on Windows the process
+          case is the one that applies.
+        query: |
+          #event_simpleName=NewExecutableWritten
+          | TargetFileName=/\/\.terraform\/providers\//
+          | TargetFileName!=/\/\.terraform\/providers\/registry\.(terraform\.io|opentofu\.org)\//
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: reported-macos-backdoor-paths
+        name: Process running from the reported backdoor directories
+        purpose: >-
+          Return processes on macOS whose image is under ~/Library/com.apple.iTunesCloud
+          or ~/Library/com.apple.internal.ck, where the two reported backdoors were
+          placed. Indicators of this campaign only.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | ImageFileName=/\/Library\/com\.apple\.(iTunesCloud|internal\.ck)\//
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: provider_from_non_registry_host
+      name: Provider plugin from a non-registry host
+      description: >-
+        A Terraform provider plugin ran from, or was written to, a provider directory
+        named for a host that is not the public registry.
+      source: process_creation
+      field: image_path
+      indicates: untrusted_provider_execution
+
+  supporting:
+    - id: provider_spawned_process
+      name: Provider plugin started a process
+      description: >-
+        A terraform-provider binary is the parent of a shell, curl, osascript, nohup,
+        chmod or xattr.
+      source: process_creation
+      field: parent_process
+      indicates: payload_execution_from_plugin
+    - id: provider_child_command
+      name: Child command fetches, persists or strips quarantine
+      description: >-
+        The child's command line downloads a file, writes a LaunchAgent, removes the
+        quarantine attribute or starts a background process.
+      source: process_creation
+      field: command_line
+      indicates: post_install_payload
+    - id: init_chain
+      name: Plugin descends from terraform init
+      description: >-
+        The plugin's parent process id is a terraform process started with init, and the
+        agent follows the chain up to an IDE's terminal where present.
+      source: process_creation
+      field: parent_process_id
+      indicates: developer_toolchain_origin
+    - id: unfamiliar_registry_resolved
+      name: terraform resolved an unfamiliar host
+      description: >-
+        The terraform process resolved a domain outside the usual registries and clouds.
+      source: dns_request
+      field: query_name
+      indicates: provider_source_host
+    - id: resolver_is_terraform
+      name: Requester is terraform
+      description: >-
+        The requesting process is terraform or tofu.
+      source: dns_request
+      field: process_name
+      indicates: provider_source_host
+    - id: plugin_written_before_run
+      name: Plugin written moments before it ran
+      description: >-
+        The plugin binary was written into the provider directory shortly before its
+        first execution.
+      source: file_creation
+      field: file_path
+      indicates: fresh_provider_install
+    - id: plugin_writer
+      name: Plugin written by terraform
+      description: >-
+        The writer of the plugin binary is the terraform process.
+      source: file_creation
+      field: writer_process_name
+      indicates: provider_installation
+    - id: developer_user
+      name: Runs under a developer's account
+      description: >-
+        The user is an engineer with cloud and source-control access.
+      source: process_creation
+      field: user
+      indicates: high_value_target
+
+  contradicting:
+    - id: internal_registry
+      name: Host is the organisation's registry or mirror
+      description: >-
+        The directory or domain is the organisation's private registry or network
+        mirror.
+      source: asset_inventory
+      field: ComputerName
+      indicates: sanctioned_registry
+    - id: provider_development
+      name: Provider development
+      description: >-
+        The user develops Terraform providers and the plugin was built locally.
+      source: identity_context
+      field: UserName
+      indicates: development_activity
+
+  risk_logic:
+    required:
+      - provider_from_non_registry_host
+
+    supporting:
+      any:
+        - provider_spawned_process
+        - provider_child_command
+        - init_chain
+        - unfamiliar_registry_resolved
+        - resolver_is_terraform
+        - plugin_written_before_run
+        - plugin_writer
+        - developer_user
+      all:
+        - provider_spawned_process
+        - init_chain
+
+    contradicting:
+      any:
+        - internal_registry
+        - provider_development
+      all: []
+
+  verdict:
+    low_risk_when:
+      - provider_from_non_registry_host
+      - internal_registry
+      - provider_development
+    suspicious_when:
+      - provider_from_non_registry_host
+      - unfamiliar_registry_resolved
+    high_risk_when:
+      - provider_from_non_registry_host
+      - provider_spawned_process
+      - provider_child_command
+
+  false_positive:
+    - condition: Private registries and mirrors.
+      explanation: >-
+        Enterprises host providers internally. The host name is the organisation's and
+        the same directory appears on every engineer's machine and CI runner.
+    - condition: The external provider.
+      explanation: >-
+        terraform-provider-external exists to run a program and return its output. Its
+        children are the scripts the configuration names.
+    - condition: Third-party registries.
+      explanation: >-
+        A few vendors publish providers from their own registry host. The name is the
+        vendor's and is documented.

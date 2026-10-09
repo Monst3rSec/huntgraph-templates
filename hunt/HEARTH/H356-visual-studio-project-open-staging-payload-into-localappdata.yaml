@@ -1,0 +1,322 @@
+# Converted from THORCollective/HEARTH Flames/H356.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+# HEARTH cites T1127, T1204.002 and T1036.005. T1127 decomposes into
+# sub-techniques and the build target is MSBuild's, so the template is filed under
+# T1127.001. Distinct from H238, where MSBuild is started from a command line
+# against a project in Temp. The project file's content is not visible.
+type: detection
+
+id: hg-win-hearth-h356-visual-studio-project-open-staging-payload-into-localappdata-t1127-001
+version: 1.0.0
+
+info:
+  name: Visual Studio project that stages and starts a payload under LocalAppData when it is opened
+  description: >-
+    A hiring-test lure reported by Unit 42 delivers a Visual Studio solution whose
+    FlightManager.csproj redefines the GetFrameworkPaths target. Visual Studio evaluates
+    that target in its design-time build as soon as the solution loads, so before the
+    developer builds anything the project copies files from its Resources folder into
+    %LOCALAPPDATA%\Microsoft\RuntimeBrokers and starts RuntimeBroker.exe, a renamed copy
+    of the signed vshost.exe. Nobody runs MSBuild and there is no command line to read.
+    The copy is done inside the build host, and a target that launches a program through
+    MSBuild's Exec task does so through a cmd.exe it starts, so the payload's parent can
+    be devenv.exe, MSBuild.exe or that cmd.exe. The hunt returns executables the
+    toolchain writes under AppData outside build and package directories, processes
+    started from AppData Microsoft folders by the toolchain or its shell, and a process
+    named RuntimeBroker.exe outside System32.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-evasion
+    - execution
+    - msbuild
+    - visual-studio
+    - design-time-build
+    - developer-workstation
+    - fake-job-assessment
+    - shelbyloader
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H356.md
+    - https://attack.mitre.org/techniques/T1127
+    - https://attack.mitre.org/techniques/T1127/001
+    - https://attack.mitre.org/detectionstrategies/DET0556
+
+mitre:
+  tactics:
+    - TA0005
+    - TA0002
+  techniques:
+    - T1127
+  sub_techniques:
+    - T1127.001
+  detection_strategies:
+    - DET0556
+  analytics:
+    - AN1535
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    A developer workstation is being compromised by opening a trojanized Visual Studio
+    project rather than by running anything: the attacker-supplied .csproj carries a
+    custom build target that Visual Studio evaluates during its automatic design-time
+    build the moment the solution is loaded, copying a payload out of the project's own
+    Resources folder into %LOCALAPPDATA%\Microsoft\RuntimeBrokers\ and launching it, so
+    the execution appears as a child of devenv.exe or an MSBuild.exe worker and the only
+    user action in the timeline is opening a file.
+  attacker_behavior:
+    - Sends an archive presented as a coding assessment, with a bug to fix.
+    - Overrides a standard build target in the project file so it runs on load.
+    - Copies executables from the project folder into a LocalAppData folder named after a Microsoft component.
+    - Starts a signed Microsoft binary under a system process name from that folder.
+  legitimate_behavior:
+    - Builds write executables into bin and obj folders under the solution.
+    - Package restore writes into the NuGet cache.
+    - Projects run pre-build and post-build commands through cmd.exe.
+    - Visual Studio keeps its own data under AppData\Local\Microsoft\VisualStudio.
+  risk_indicator:
+    - devenv.exe or MSBuild.exe writes an executable under AppData outside Temp, build and package folders.
+    - A process starts from an AppData Microsoft folder with the toolchain or its cmd.exe as parent.
+    - The process has a system binary's name and runs outside System32.
+    - The write and the start come seconds after the IDE opened a solution from Downloads or an extracted archive.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: toolchain-writing-executable-under-appdata
+        name: Visual Studio or MSBuild writing an executable under AppData
+        purpose: >-
+          Return PE files written by devenv.exe or MSBuild.exe below AppData, leaving
+          out Temp, Visual Studio's own data and the NuGet cache. A build's output goes
+          under the solution, not here.
+        query: |
+          #event_simpleName=PeFileWritten
+          | ContextBaseFileName=/^(devenv|MSBuild)\.exe$/i
+          | TargetFileName=/\\AppData\\(Local|Roaming)\\/i
+          | TargetFileName!=/\\AppData\\Local\\(Temp|NuGet|Microsoft\\VisualStudio|Microsoft\\MSBuild|Microsoft\\dotnet)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: process-started-from-appdata-microsoft-by-toolchain
+        name: Process started from an AppData Microsoft folder by the build toolchain or its shell
+        purpose: >-
+          Return processes whose image is under AppData Microsoft folders and whose
+          parent is devenv.exe, MSBuild.exe, the compiler server or cmd.exe. cmd.exe is
+          included because MSBuild's Exec task runs its command through one; with it the
+          case also returns per-user Microsoft applications started from a command
+          prompt.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(devenv|MSBuild|VBCSCompiler|dotnet|cmd)\.exe$/i
+          | ImageFileName=/\\AppData\\(Local|Roaming)\\Microsoft\\/i
+          | ImageFileName!=/\\AppData\\Local\\Microsoft\\(VisualStudio|WindowsApps|dotnet|Teams|OneDrive|Edge|EdgeWebView)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: runtime-broker-outside-system-directory
+        name: RuntimeBroker.exe running outside the Windows system directory
+        purpose: >-
+          Return processes named RuntimeBroker.exe whose image is not in System32, the
+          name the reported payload took.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^RuntimeBroker\.exe$/i
+          | ImageFileName!=/\\Windows\\(System32|SysWOW64|WinSxS\\[^\\]+)\\RuntimeBroker\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: toolchain-exec-task-shell-fetching-or-hiding
+        name: Build-task shell with a download, hidden window or AppData path
+        purpose: >-
+          Return cmd.exe, PowerShell and script hosts started by devenv.exe or
+          MSBuild.exe whose command line carries a URL, a hidden-window or encoded
+          switch, or an AppData path. Ordinary build events start shells all day on a
+          developer machine and are left out by the last test; an Exec task that runs a
+          temporary .cmd file shows only that file's name, and its content is not seen.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(devenv|MSBuild)\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|curl|certutil|bitsadmin)\.exe$/i
+          | CommandLine=/https?:\/\/|\s-w(indowstyle)?\s+h|\s-e(nc|ncodedcommand)?\s+[A-Za-z0-9+\/=]{40,}|\\AppData\\(Local|Roaming)\\Microsoft\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: toolchain_staged_executable
+      name: Build toolchain wrote or started an executable under AppData
+      description: >-
+        devenv.exe or MSBuild.exe wrote a PE below AppData outside build and package
+        folders, or a process started from an AppData Microsoft folder under the
+        toolchain.
+      source: file_creation
+      field: file_path
+      indicates: payload_staged_by_project_load
+
+  supporting:
+    - id: writer_is_ide_or_build_host
+      name: Writer is the IDE or its build host
+      description: >-
+        The process named on the file write is devenv.exe or MSBuild.exe.
+      source: file_creation
+      field: writer_process_name
+      indicates: build_target_copy
+    - id: child_runs_from_appdata_microsoft
+      name: Process runs from an AppData Microsoft folder under the toolchain
+      description: >-
+        A process whose parent is the IDE, a build worker or its cmd.exe has an image
+        below AppData\Local\Microsoft or AppData\Roaming\Microsoft.
+      source: process_creation
+      field: image_path
+      indicates: payload_launched_by_build
+    - id: system_name_outside_system32
+      name: Process has a system binary's name outside System32
+      description: >-
+        The process is called RuntimeBroker.exe or another Windows component name and
+        its image is not in the system directory.
+      source: process_creation
+      field: image_name
+      indicates: masqueraded_system_process
+    - id: write_then_start_within_seconds
+      name: Write and start follow each other within seconds
+      description: >-
+        The file write and the process start for the same path are seconds apart, by the
+        agent's comparison of event times.
+      source: process_creation
+      field: process_id
+      indicates: copy_and_launch_target
+    - id: solution_from_download_path
+      name: Solution was opened from a download or extracted archive
+      description: >-
+        The devenv.exe command line names a solution or project under Downloads, Desktop
+        or a Temp extraction folder.
+      source: process_creation
+      field: command_line
+      indicates: untrusted_project_opened
+
+  contradicting:
+    - id: known_project_tooling
+      name: Organisation's own projects stage tools under AppData
+      description: >-
+        A repository the organisation owns has a build step that installs a tool under
+        the user's AppData, and the same path appears for every developer on the team.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_build_tooling
+    - id: path_common_among_developers
+      name: Same path is written on many developer hosts
+      description: >-
+        Earlier activity shows the same file written by the toolchain across developer
+        workstations for a long period.
+      source: baseline
+      field: TargetFileName
+      indicates: established_build_behaviour
+
+  risk_logic:
+    required:
+      - toolchain_staged_executable
+
+    supporting:
+      any:
+        - writer_is_ide_or_build_host
+        - child_runs_from_appdata_microsoft
+        - system_name_outside_system32
+        - write_then_start_within_seconds
+        - solution_from_download_path
+      all:
+        - child_runs_from_appdata_microsoft
+        - write_then_start_within_seconds
+
+    contradicting:
+      any:
+        - known_project_tooling
+        - path_common_among_developers
+      all: []
+
+  verdict:
+    low_risk_when:
+      - toolchain_staged_executable
+      - known_project_tooling
+      - path_common_among_developers
+    suspicious_when:
+      - toolchain_staged_executable
+      - child_runs_from_appdata_microsoft
+    high_risk_when:
+      - toolchain_staged_executable
+      - child_runs_from_appdata_microsoft
+      - system_name_outside_system32
+
+  false_positive:
+    - condition: A Visual Studio extension or workload installs a component under AppData.
+      explanation: >-
+        The writer is devenv.exe and the path is the extension's. It is the same on
+        every host with the extension and nothing is started under a system name.
+    - condition: A project's build restores a local tool.
+      explanation: >-
+        dotnet tool and similar restores write under the user profile. The tool is named
+        in the repository and signed by its publisher.

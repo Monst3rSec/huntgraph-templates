@@ -1,0 +1,339 @@
+# Converted from THORCollective/HEARTH Flames/H340.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h340-s5cmd-upload-to-s3-with-extension-filters-t1567-002
+version: 1.0.0
+
+info:
+  name: s5cmd uploading documents to S3 by extension filter with a staged credentials file
+  description: >-
+    A ransomware affiliate drops s5cmd, a parallel S3 client written in Go, on a file
+    server or backup host beside a plain-text AWS credentials file, and runs cp
+    operations with --include filters for documents, spreadsheets, databases, mail
+    stores and archives. The data goes straight to the attacker's bucket over HTTPS to
+    amazonaws.com. The tool needs no configuration file, task or service, so nothing is
+    left to inspect afterwards except the binary. The bucket name and the filters are on
+    the command line and are returned. Bytes sent are not on any sensor event, the
+    credentials file is a data file whose creation is not reported, and credentials
+    passed in the environment of an open shell are not seen. A renamed s5cmd is caught
+    by the shape of its arguments, not its name.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - exfiltration
+    - s5cmd
+    - s3
+    - cloud-storage
+    - ransomware
+    - data-theft
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H340.md
+    - https://attack.mitre.org/techniques/T1567
+    - https://attack.mitre.org/techniques/T1567/002
+    - https://attack.mitre.org/detectionstrategies/DET0570
+
+mitre:
+  tactics:
+    - TA0010
+  techniques:
+    - T1567
+  sub_techniques:
+    - T1567.002
+  detection_strategies:
+    - DET0570
+  analytics:
+    - AN1571
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    A ransomware affiliate has dropped s5cmd alongside a plaintext AWS credentials file
+    on a file server or backup host and is running cp operations with extension filters
+    that select documents, spreadsheets, databases, mail stores and archives, uploading
+    them directly to an attacker-controlled S3 bucket over HTTPS to amazonaws.com.
+  attacker_behavior:
+    - Copies s5cmd.exe and a credentials file into ProgramData, PerfLogs, Public or Temp.
+    - Points the tool at the file with --credentials-file or an environment variable.
+    - Runs cp or sync with --include patterns such as *.pdf, *.xls*, *.pst and *.kdbx.
+    - Raises --numworkers to move the data quickly.
+    - Lists the bucket with ls or du to confirm the upload.
+  legitimate_behavior:
+    - Data engineers and backup jobs use s5cmd against the organisation's own buckets.
+    - Administrators use the AWS CLI for the same transfers.
+    - Build pipelines publish artefacts to S3.
+  risk_indicator:
+    - s5cmd runs on a file server or backup host that has no cloud workload.
+    - The destination bucket is not one the organisation owns.
+    - The include filters select office documents, mail stores and password databases.
+    - The binary and its credentials file sit in a staging folder.
+    - The parent is a remote-management agent or a remote shell.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: s5cmd-run-by-name
+        name: s5cmd run under its own name
+        purpose: >-
+          Return every process named s5cmd, with its command line, parent and image
+          path. On most estates the tool is not installed at all and any hit is read.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^s5cmd[^\\]*\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: s5cmd-argument-shape-under-any-name
+        name: Process command line with an S3 destination and s5cmd transfer options
+        purpose: >-
+          Return processes of any name whose command line carries an s3:// address
+          together with options s5cmd uses for a filtered transfer. The AWS CLI shares
+          --include and --exclude, so its s3 cp and sync runs are returned as well and
+          the agent separates them by image name.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/s3:\/\//i
+          | CommandLine=/--numworkers|--credentials-file|--include|--exclude|--concurrency|--endpoint-url/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: aws-credentials-passed-on-command-line
+        name: Shell command that sets AWS credentials inline
+        purpose: >-
+          Return cmd and PowerShell command lines that name the AWS credential
+          environment variables, which is how a key is supplied without a profile. A
+          variable set in an already open shell starts no process and is not seen.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(cmd|powershell|pwsh)\.exe$/i
+          | CommandLine=/AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SHARED_CREDENTIALS_FILE|AWS_SESSION_TOKEN/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: s5cmd-binary-written
+        name: s5cmd executable written to disk
+        purpose: >-
+          Return PE files written under the s5cmd name, with the writing process. A copy
+          renamed before it is written is not matched.
+        query: |
+          #event_simpleName=PeFileWritten
+          | TargetFileName=/\\s5cmd[^\\]*\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: s3-endpoint-resolved-by-s5cmd
+        name: S3 endpoint resolved by s5cmd
+        purpose: >-
+          Return DNS requests from a process named s5cmd for amazonaws.com names. With
+          virtual-hosted addressing the bucket is the left-most label. A renamed copy is
+          not matched here; its process id from the argument-shape case can be looked up
+          instead.
+        query: |
+          #event_simpleName=DnsRequest
+          | event_platform=Win
+          | ContextBaseFileName=/^s5cmd[^\\]*\.exe$/i
+          | DomainName=/amazonaws\.com$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: s3_bulk_transfer_command
+      name: S3 bulk transfer command run
+      description: >-
+        A process named s5cmd runs, or a command line carries an s3:// address with
+        filtered-transfer options.
+      source: process_creation
+      field: command_line
+      indicates: cloud_storage_upload
+
+  supporting:
+    - id: document_extension_filters
+      name: Filters select documents, mail stores and archives
+      description: >-
+        The command line includes patterns such as *.pdf, *.doc*, *.xls*, *.pst, *.kdbx,
+        *.sql or *.zip.
+      source: process_creation
+      field: command_line
+      indicates: targeted_data_selection
+    - id: tool_in_staging_folder
+      name: Tool runs from a staging folder
+      description: >-
+        The image path is under ProgramData, PerfLogs, Users\Public or Temp.
+      source: process_creation
+      field: image_path
+      indicates: staged_exfiltration_tool
+    - id: remote_management_parent
+      name: Parent is a remote-management agent or remote shell
+      description: >-
+        The parent is an RMM agent, a remote shell service or cmd started by one.
+      source: process_creation
+      field: parent_process
+      indicates: hands_on_keyboard_activity
+    - id: tool_dropped_recently
+      name: s5cmd binary written to the host
+      description: >-
+        A PE file named s5cmd was written, and the event names the process that wrote
+        it.
+      source: file_creation
+      field: writer_process_name
+      indicates: tool_ingress
+    - id: tool_written_path
+      name: Path the tool was written to
+      description: >-
+        The written file's path is a staging folder and not a software install location.
+      source: file_creation
+      field: file_path
+      indicates: staging_location
+    - id: foreign_bucket_resolved
+      name: Bucket endpoint resolved
+      description: >-
+        A DNS request from the tool names an S3 endpoint whose bucket the organisation
+        does not own.
+      source: dns_request
+      field: query_name
+      indicates: external_bucket_contact
+
+  contradicting:
+    - id: organisation_owned_bucket
+      name: Bucket belongs to the organisation
+      description: >-
+        The bucket on the command line is in the organisation's AWS inventory.
+      source: asset_inventory
+      field: CommandLine
+      indicates: owned_cloud_resource
+    - id: scheduled_data_job
+      name: Transfer is a known data or backup job
+      description: >-
+        The command matches a scheduled job documented for the host.
+      source: change_management
+      field: ComputerName
+      indicates: authorised_data_transfer
+
+  risk_logic:
+    required:
+      - s3_bulk_transfer_command
+
+    supporting:
+      any:
+        - document_extension_filters
+        - tool_in_staging_folder
+        - remote_management_parent
+        - tool_dropped_recently
+        - tool_written_path
+        - foreign_bucket_resolved
+      all:
+        - document_extension_filters
+        - tool_in_staging_folder
+
+    contradicting:
+      any:
+        - organisation_owned_bucket
+        - scheduled_data_job
+      all: []
+
+  verdict:
+    low_risk_when:
+      - s3_bulk_transfer_command
+      - organisation_owned_bucket
+      - scheduled_data_job
+    suspicious_when:
+      - s3_bulk_transfer_command
+      - tool_in_staging_folder
+    high_risk_when:
+      - s3_bulk_transfer_command
+      - document_extension_filters
+      - tool_in_staging_folder
+      - remote_management_parent
+
+  false_positive:
+    - condition: Data engineering and backup jobs.
+      explanation: >-
+        s5cmd is popular for large S3 transfers. The host has a data role, the bucket is
+        owned and the job runs on a schedule under a service account.
+    - condition: AWS CLI transfers with filters.
+      explanation: >-
+        aws s3 cp and sync use the same --include and --exclude options. The image is
+        aws.exe and the user is an administrator.
+    - condition: Build pipelines publishing artefacts.
+      explanation: >-
+        CI agents upload build output to S3; the parent is the build runner.

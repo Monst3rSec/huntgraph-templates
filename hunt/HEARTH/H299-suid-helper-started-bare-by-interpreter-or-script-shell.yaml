@@ -1,0 +1,313 @@
+# Converted from THORCollective/HEARTH Flames/H299.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-lin-hearth-h299-suid-helper-started-bare-by-interpreter-or-script-shell-t1548-001
+version: 1.0.0
+
+info:
+  name: SUID helper started with almost no arguments by an interpreter or a script shell
+  description: >-
+    A Linux privilege escalation ends the same way whichever bug started it: a process
+    with effective UID 0 whose real UID is not 0. Elastic Security Labs argue that this
+    outcome, joined to what surrounds it, outlasts any per-exploit signature. The shape
+    is a SUID helper such as pkexec, su, sudo, passwd, newgrp or mount started with one
+    argument or none by a language interpreter, a shell running -c, or a binary in a
+    world-writable directory. An administrator typing sudo systemctl restart nginx
+    produces several arguments from an interactive shell; an exploit calling pkexec bare
+    from a freshly compiled binary in /tmp does not. The sensor's process event carries
+    the user and the parent's name, not real and effective UIDs or the parent's path, so
+    the hunt returns the bare helper, root processes whose image sits in a writable
+    directory, and the compile step before them, and the agent links them by process id.
+    H146 covers su from an anomalous parent for one named exploit; this is the general
+    form.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - privilege-escalation
+    - setuid
+    - pkexec
+    - sudo
+    - local-exploit
+    - linux
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H299.md
+    - https://attack.mitre.org/techniques/T1548/001
+    - https://attack.mitre.org/detectionstrategies/DET0110
+
+mitre:
+  tactics:
+    - TA0004
+  techniques:
+    - T1548
+  sub_techniques:
+    - T1548.001
+  detection_strategies:
+    - DET0110
+  analytics:
+    - AN0307
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+  data_components:
+    - Process Creation
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    An adversary with an unprivileged foothold on a Linux host is crossing into root in
+    one step by invoking a SUID helper with almost no arguments from an interpreter, a
+    shell command string or a binary staged in a world-writable directory.
+  attacker_behavior:
+    - Compiles or drops an exploit binary in /tmp, /dev/shm, /var/tmp or /run/user.
+    - Starts pkexec, su, sudo, passwd, newgrp or mount with one argument or none.
+    - Launches the helper from python, perl or sh -c, not from an interactive shell.
+    - Obtains a root shell or a root-owned process running from the staging directory.
+  legitimate_behavior:
+    - Administrators run su - and sudo -i from interactive shells.
+    - Desktop sessions start pkexec from a policy agent or a graphical front end.
+    - Provisioning scripts and Ansible call sudo and su from Python.
+    - Build systems compile in /tmp.
+  risk_indicator:
+    - The helper's command line is the helper's name alone or with a single argument.
+    - The parent is an interpreter or sh, and the user is a service account.
+    - A process owned by root runs from a world-writable directory.
+    - A compiler wrote into the same directory under the same user shortly before.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: suid-helper-with-at-most-one-argument
+        name: SUID helper started with one argument or none
+        purpose: >-
+          Return pkexec, su, sudo, passwd, newgrp, mount and their kin whose command
+          line is the helper and at most one further token, where the parent is not an
+          interactive login shell. sh and dash are kept as parents because sh -c is one
+          of the launch forms the hypothesis names. su - and sudo -i typed at bash or
+          zsh are left out by the parent test.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ImageFileName=/\/(pkexec|su|sudo|passwd|newgrp|mount|umount|chsh|chfn|gpasswd|fusermount3?)$/
+          | CommandLine=/^\S+(\s+\S+)?\s*$/
+          | ParentBaseFileName!=/^(bash|zsh|fish|ksh|tcsh|csh|login|sshd|sudo|su|systemd)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: suid-helper-started-by-interpreter
+        name: SUID helper started by a language interpreter
+        purpose: >-
+          Return the same helpers when the parent is Python, Perl, Ruby, Node, PHP or
+          Lua, whatever the argument count. H146 carries a narrower form of this case
+          without sudo.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ParentBaseFileName=/^(python[0-9.]*|perl|ruby|node|php[0-9.]*|lua[0-9.]*)$/
+          | ImageFileName=/\/(pkexec|su|sudo|passwd|newgrp|mount|umount|chsh|chfn|gpasswd|fusermount3?)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: root-process-from-world-writable-directory
+        name: Root process whose image is in a world-writable directory
+        purpose: >-
+          Return processes running as root from /tmp, /dev/shm, /var/tmp or /run/user.
+          This is the outcome side: the sensor does not report real against effective
+          UID, so a root-owned process in a staging directory stands in for the
+          transition, and its process and parent ids let the agent place it under a
+          helper returned above.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ImageFileName=/^\/(tmp|dev\/shm|var\/tmp|run\/user\/\d+)\//
+          | UserName=root
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: compiler-output-into-world-writable-directory
+        name: Compiler building in a world-writable directory as a non-root user
+        purpose: >-
+          Return gcc, cc, clang and tcc run by a non-root user with a path under /tmp,
+          /dev/shm or /var/tmp in the arguments: the precursor to an exploit compiled on
+          the host.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ImageFileName=/\/(gcc|cc|clang|tcc|g\+\+)(-\d+)?$/
+          | CommandLine=/\/(tmp|dev\/shm|var\/tmp)\//
+          | UserName!=root
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: bare_suid_helper_from_non_interactive_parent
+      name: SUID helper started bare or by an interpreter
+      description: >-
+        A SUID helper ran with at most one argument from a parent that is not an
+        interactive shell, or under a language interpreter.
+      source: process_creation
+      field: command_line
+      indicates: setuid_abuse
+
+  supporting:
+    - id: parent_is_interpreter_or_script_shell
+      name: Parent is an interpreter or sh
+      description: >-
+        The parent's name is an interpreter, sh or dash, or an unfamiliar binary. The
+        parent's path is not on the event; the agent finds it by matching the parent
+        process id to a process event on the host.
+      source: process_creation
+      field: parent_process
+      indicates: scripted_escalation
+    - id: root_process_in_staging_directory
+      name: Root process running from a staging directory
+      description: >-
+        A process owned by root has its image under /tmp, /dev/shm, /var/tmp or
+        /run/user.
+      source: process_creation
+      field: image_path
+      indicates: root_obtained
+    - id: root_process_descends_from_helper
+      name: Root process descends from the helper
+      description: >-
+        The root process's parent id leads back to the helper or to the process that
+        started it, which the agent derives from the returned events.
+      source: process_creation
+      field: parent_process_id
+      indicates: privilege_transition
+    - id: exploit_compiled_on_host
+      name: Exploit compiled on the host
+      description: >-
+        A compiler wrote into a world-writable directory under the same user before the
+        helper ran.
+      source: process_creation
+      field: image_name
+      indicates: local_exploit_build
+    - id: service_or_low_privilege_user
+      name: User is a service or low-privilege account
+      description: >-
+        The helper ran as www-data, a container user or another account that does not
+        administer the host.
+      source: process_creation
+      field: user
+      indicates: non_administrative_origin
+    - id: helper_process_identity
+      name: Helper process id
+      description: >-
+        The helper's process id, for matching against the parent id of what ran next.
+      source: process_creation
+      field: process_id
+      indicates: privilege_transition
+
+  contradicting:
+    - id: provisioning_tool
+      name: Provisioning or configuration tool
+      description: >-
+        The parent is Ansible, a cloud agent or another provisioning tool that calls
+        sudo or su from Python on that host on a schedule.
+      source: baseline
+      field: ComputerName
+      indicates: routine_administration
+    - id: build_host
+      name: Build or developer host
+      description: >-
+        The host is a build server or developer machine where compiling in /tmp and
+        running the result is normal.
+      source: asset_inventory
+      field: ComputerName
+      indicates: development_activity
+
+  risk_logic:
+    required:
+      - bare_suid_helper_from_non_interactive_parent
+
+    supporting:
+      any:
+        - parent_is_interpreter_or_script_shell
+        - root_process_in_staging_directory
+        - root_process_descends_from_helper
+        - exploit_compiled_on_host
+        - service_or_low_privilege_user
+        - helper_process_identity
+      all:
+        - parent_is_interpreter_or_script_shell
+        - service_or_low_privilege_user
+
+    contradicting:
+      any:
+        - provisioning_tool
+        - build_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - bare_suid_helper_from_non_interactive_parent
+      - provisioning_tool
+      - build_host
+    suspicious_when:
+      - bare_suid_helper_from_non_interactive_parent
+      - service_or_low_privilege_user
+    high_risk_when:
+      - bare_suid_helper_from_non_interactive_parent
+      - root_process_in_staging_directory
+      - root_process_descends_from_helper
+
+  false_positive:
+    - condition: Configuration management calling sudo from Python.
+      explanation: >-
+        Ansible and cloud-init do this on every run. The parent chain leads to the agent
+        and the pattern repeats across the fleet.
+    - condition: Desktop pkexec prompts.
+      explanation: >-
+        A graphical session starts pkexec from a front end with a program to run as its
+        argument. Servers have no such sessions.
+    - condition: Installers that unpack into /tmp and run as root.
+      explanation: >-
+        Vendor installers started with sudo run from /tmp as root. Their parent is the
+        administrator's sudo, with a full command line.

@@ -1,0 +1,339 @@
+# Converted from THORCollective/HEARTH Flames/H319.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-lin-hearth-h319-system-daemon-names-in-usr-local-bin-and-bracketed-process-names-t1036-005
+version: 1.0.0
+
+info:
+  name: Linux implants named after system daemons in /usr/local/bin and as kernel threads
+  description: >-
+    Implants left on compromised Linux web servers hide at two levels. On disk they are
+    placed in /usr/local/bin under the names of real system binaries, such as
+    systemd-udevd, whose genuine copy lives under /lib/systemd; without root they fall
+    back to /tmp/php_sess_<32 hex> and /tmp/private-tmp-<5 characters>. At run time they
+    take bracketed kernel-thread names such as [kworker/1:2] or the title sshd:
+    root@pts/0. Their commands are wrapped in /bin/sh -c with HISTFILE=/dev/null in
+    front. HEARTH's invariant is a bracketed process with a userspace parent or a
+    readable /proc/<pid>/exe. The sensor records a process once, when it is executed, so
+    a name the implant gives itself afterwards with prctl or by overwriting its
+    arguments is not seen, and /proc is not read. The bracketed name is returned only
+    when it is already in the arguments at execution. The path half is fully visible.
+    The comment line the oRAT agent appends to /etc/protocols and the timestamp changes
+    are file modifications, which are not reported.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-evasion
+    - masquerading
+    - kernel-thread
+    - histfile
+    - web-server
+    - orat
+    - linux
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H319.md
+    - https://attack.mitre.org/techniques/T1036
+    - https://attack.mitre.org/techniques/T1036/005
+    - https://attack.mitre.org/techniques/T1070/003
+    - https://attack.mitre.org/detectionstrategies/DET0347
+    - https://attack.mitre.org/detectionstrategies/DET0165
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1036
+    - T1070
+  sub_techniques:
+    - T1036.005
+    - T1070.003
+  detection_strategies:
+    - DET0347
+    - DET0165
+  analytics:
+    - AN0984
+    - AN0467
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    Post-exploitation implants on a compromised Linux web server masquerade as system
+    components: they are dropped into /usr/local/bin under the names of real system
+    binaries or into /tmp as fake PHP session files, rename themselves to bracketed
+    kernel-thread names at run time, and run their commands through /bin/sh -c with
+    HISTFILE=/dev/null prepended.
+  attacker_behavior:
+    - Drops implants into /usr/local/bin as systemd-udevd, rsync-tsl, tcp-tsl, snapd-ext, fsck-disk, nftables-init or xtables-addons.
+    - Falls back to /tmp/php_sess_<32 hex> or /tmp/private-tmp-<5 characters> without root.
+    - "Presents the process as [kworker/1:2], [ksoftirqd/0], [watchdog/0] or sshd: root@pts/0."
+    - Prefixes shell commands with HISTFILE=/dev/null.
+    - Sets file timestamps back after the drop and appends an identifier to /etc/protocols.
+  legitimate_behavior:
+    - Administrators install their own tools and wrappers in /usr/local/bin.
+    - Software built from source installs into /usr/local.
+    - PHP writes session data files, which are never executed.
+    - Some hardening and automation scripts unset or redirect the history file.
+  risk_indicator:
+    - A file in /usr/local/bin carries the name of a daemon that the distribution ships elsewhere.
+    - A process image is a file under /tmp named like a PHP session or a private-tmp directory.
+    - A process is executed with a bracketed kernel-thread name as its first argument.
+    - A shell command begins with HISTFILE=/dev/null and its parent is a web worker.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NewExecutableWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: system-daemon-name-running-from-usr-local-bin
+        name: Process running from /usr/local/bin under a system daemon's name
+        purpose: >-
+          Return processes whose image is in /usr/local/bin and whose name is, or begins
+          like, a daemon or system tool that distributions ship under /usr/lib,
+          /usr/sbin or /lib/systemd. The seven reported names match, as do close
+          variants. The path is the test; a locally built tool with an unrelated name is
+          not returned.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ImageFileName=/^\/usr\/local\/bin\/(systemd[^\/]*|udevd|rsync-[^\/]+|tcp-[^\/]+|snapd[^\/]*|fsck[^\/]*|nftables[^\/]*|xtables[^\/]*|iptables[^\/]*|sshd[^\/]*|crond?|atd|dbus-daemon|journald|rsyslogd|auditd|agetty|polkitd|kworker[^\/]*|ksoftirqd[^\/]*|kthreadd|networkd[^\/]*|irqbalance)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: process-running-from-fake-session-or-private-tmp-file
+        name: Process whose image is /tmp/php_sess_<hex> or /tmp/private-tmp-<id>
+        purpose: >-
+          Return processes executed from the two fallback names. PHP session files are
+          data and are named sess_<id> in the session directory; a file that is executed
+          under the php_sess_ name has no benign reading.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ImageFileName=/^\/tmp\/(php_sess_[0-9a-f]{32}|private-tmp-[A-Za-z0-9]{5})$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: bracketed-or-sshd-session-name-in-arguments-at-execution
+        name: Process executed with a kernel-thread or sshd session name as its first argument
+        purpose: >-
+          Return process events whose command line begins with a bracketed name or with
+          the sshd session title, when the image is not sshd. A real kernel thread is
+          never executed and produces no process event, so any hit has a backing binary,
+          which the image path on the event names. This sees only a name supplied at
+          execution, for example through exec -a. An implant that renames itself after
+          it starts is not returned; that check needs /proc.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | FileName!=/^sshd/
+          | CommandLine=/^(\[[a-z][a-z0-9_\-]*(\/[0-9:a-zA-Z\-]+)?\]|sshd: \S+@(pts\/[0-9]+|notty))/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: shell-command-with-history-file-set-to-dev-null
+        name: Shell command carrying HISTFILE=/dev/null
+        purpose: >-
+          Return shells whose command line sets the history file to /dev/null, the
+          wrapper the implants put in front of every command. The parent name on the
+          event shows whether a web worker or an implant started it.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | FileName=/^(sh|bash|dash|ash|zsh|ksh)$/
+          | CommandLine=/HISTFILE=\/dev\/null/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: executable-written-to-usr-local-bin-or-fallback-name
+        name: Executable written into /usr/local/bin or under a fallback name in /tmp
+        purpose: >-
+          Return executables created directly in /usr/local/bin and under the two /tmp
+          names. Local installs write to /usr/local/bin as well; the agent compares the
+          file name with the daemon names above and resolves the writer from its process
+          id.
+        query: |
+          #event_simpleName=NewExecutableWritten
+          | event_platform=Lin
+          | TargetFileName=/^\/(usr\/local\/bin\/[^\/]+|tmp\/php_sess_[0-9a-f]{32}|tmp\/private-tmp-[A-Za-z0-9]{5})$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: masqueraded_process_path_or_name
+      name: Process masquerades as a system component
+      description: >-
+        The image is a system daemon's name under /usr/local/bin or a fallback name
+        under /tmp, or the process was executed with a kernel-thread or sshd session
+        name in its arguments.
+      source: process_creation
+      field: image_path
+      indicates: system_component_masquerade
+
+  supporting:
+    - id: kernel_thread_name_with_backing_binary
+      name: Bracketed name on a process that has an image
+      description: >-
+        The command line begins with a bracketed kernel-thread name while the event
+        names an image path, which a real kernel thread never has.
+      source: process_creation
+      field: command_line
+      indicates: fake_kernel_thread
+    - id: history_file_nulled
+      name: Shell command sets HISTFILE to /dev/null
+      description: >-
+        A shell command line contains HISTFILE=/dev/null.
+      source: process_creation
+      field: command_line
+      indicates: command_history_suppressed
+    - id: web_worker_or_implant_parent
+      name: Parent is a web worker or the masqueraded process
+      description: >-
+        The parent is apache2, httpd, nginx, php-fpm or a process returned by the path
+        cases.
+      source: process_creation
+      field: parent_process
+      indicates: post_exploitation_activity
+    - id: implant_file_written
+      name: Executable written under a masqueraded name
+      description: >-
+        An executable was created in /usr/local/bin under a daemon's name or in /tmp
+        under a fallback name.
+      source: file_creation
+      field: file_path
+      indicates: implant_dropped
+    - id: writer_is_web_worker_child
+      name: Writer descends from a web worker
+      description: >-
+        The writing process id belongs to a shell or transfer utility started under the
+        web server. The agent resolves it against the process events.
+      source: file_creation
+      field: writer_process_id
+      indicates: drop_through_web_compromise
+
+  contradicting:
+    - id: locally_installed_tool
+      name: File is a known local installation
+      description: >-
+        The file in /usr/local/bin was installed by the administrators or by a source
+        build recorded for the host.
+      source: asset_inventory
+      field: ComputerName
+      indicates: known_local_software
+    - id: hardening_script_history_setting
+      name: History setting comes from a known script
+      description: >-
+        The command belongs to automation that is documented to disable shell history.
+      source: baseline
+      field: CommandLine
+      indicates: routine_automation
+
+  risk_logic:
+    required:
+      - masqueraded_process_path_or_name
+
+    supporting:
+      any:
+        - kernel_thread_name_with_backing_binary
+        - history_file_nulled
+        - web_worker_or_implant_parent
+        - implant_file_written
+        - writer_is_web_worker_child
+      all:
+        - history_file_nulled
+        - web_worker_or_implant_parent
+
+    contradicting:
+      any:
+        - locally_installed_tool
+        - hardening_script_history_setting
+      all: []
+
+  verdict:
+    low_risk_when:
+      - masqueraded_process_path_or_name
+      - locally_installed_tool
+    suspicious_when:
+      - masqueraded_process_path_or_name
+      - web_worker_or_implant_parent
+    high_risk_when:
+      - masqueraded_process_path_or_name
+      - history_file_nulled
+      - implant_file_written
+
+  false_positive:
+    - condition: Wrappers and local builds in /usr/local/bin.
+      explanation: >-
+        An administrator may keep a wrapper named after the tool it wraps, such as an
+        rsync or iptables helper. It is a script, it is recorded, and it does not run
+        under a web worker.
+    - condition: Automation that disables history.
+      explanation: >-
+        Provisioning and backup scripts sometimes set HISTFILE=/dev/null. The parent is
+        cron, a configuration agent or an SSH session from a management host, and the
+        command repeats unchanged.
+    - condition: Programs that set a descriptive title at start.
+      explanation: >-
+        A few daemons are started with a custom first argument. The name is not a kernel
+        thread's and the image path is the packaged one.

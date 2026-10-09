@@ -1,0 +1,327 @@
+# Converted from THORCollective/HEARTH Flames/H293.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h293-programdata-interpreter-smb-sweep-and-efsrpc-coercion-t1187
+version: 1.0.0
+
+info:
+  name: Interpreter staged in ProgramData sweeping SMB before coercing a domain controller
+  description: >-
+    After a Teams voice-phishing call gets a tailored executable run, the payload drops
+    a Python interpreter at C:\ProgramData\IntegrityData\python.exe, sweeps internal
+    servers on TCP 445 for relay targets and runs PetitPotam against a domain
+    controller: an EfsRpcOpenFileRaw call over the lsarpc pipe on IPC$ that makes the
+    controller authenticate outward with its machine account, which is relayed for
+    domain escalation. HEARTH's primary evidence is Security event 5145 on the
+    controller and the pipe itself, and the relayed logon lands on the operator's
+    machine; none of that is collected here. Its second half needs no audit policy and
+    is what this template hunts: a language interpreter running from ProgramData, the
+    SMB connections that interpreter opens across internal hosts, and coercion or relay
+    tooling named in its arguments.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - credential-access
+    - discovery
+    - forced-authentication
+    - petitpotam
+    - ntlm-relay
+    - smb-sweep
+    - python
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H293.md
+    - https://attack.mitre.org/techniques/T1187
+    - https://attack.mitre.org/techniques/T1046
+    - https://attack.mitre.org/detectionstrategies/DET0376
+
+mitre:
+  tactics:
+    - TA0006
+    - TA0007
+  techniques:
+    - T1187
+    - T1046
+  sub_techniques: []
+  detection_strategies:
+    - DET0022
+    - DET0376
+  analytics:
+    - AN1057
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary who gained execution on a workstation through voice phishing is running
+    a privately staged Python interpreter from ProgramData to sweep internal hosts on
+    SMB and coerce a domain controller into authenticating to a relay, to escalate to
+    domain level without stealing a password.
+  attacker_behavior:
+    - Drops python.exe into a new directory under ProgramData.
+    - Connects to TCP 445 on many internal hosts to find servers without SMB signing.
+    - Runs PetitPotam or a similar coercion script against a domain controller.
+    - Relays the controller's machine-account authentication with ntlmrelayx.
+  legitimate_behavior:
+    - Python distributions and vendor products install an interpreter under ProgramData.
+    - Inventory and backup agents written in Python connect to file servers.
+    - Authorised penetration tests run the same tooling.
+  risk_indicator:
+    - The interpreter's directory under ProgramData belongs to no installed product.
+    - One interpreter process connects to port 445 on many internal addresses.
+    - A command line names PetitPotam, DFSCoerce, Coercer or ntlmrelayx.
+    - The host is a user workstation and a remote support tool ran shortly before.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: interpreter-running-from-programdata
+        name: Language interpreter running from ProgramData
+        purpose: >-
+          Return Python, Perl, Ruby, Node and PHP interpreters whose image is under
+          ProgramData, leaving out the common distribution directories. The process id
+          on each event is what the connection case is matched against.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(python\d*w?|perl|ruby|node|php)\.exe$/i
+          | ImageFileName=/\\ProgramData\\/i
+          | ImageFileName!=/\\ProgramData\\(anaconda3|miniconda3|chocolatey|Microsoft\\VisualStudio)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: smb-connection-from-interpreter
+        name: SMB connection opened by an interpreter process
+        purpose: >-
+          Return connections to TCP 445 on private addresses made by an interpreter
+          process. The connection event carries the process name and id, not its path;
+          the agent keeps those whose process id belongs to an interpreter the first
+          case returned and counts distinct destinations per process. Every SMB
+          connection on the estate is not returned.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | RemotePort=445
+          | ContextBaseFileName=/^(python\d*w?|perl|ruby|node|php)\.exe$/i
+          | cidr(RemoteAddressIP4, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: coercion-or-relay-tool-arguments
+        name: Coercion or relay tooling named in interpreter arguments
+        purpose: >-
+          Return interpreter and shell command lines that name a coercion or relay tool
+          or the EFSRPC call. This matches names, so a renamed script is missed; the
+          coercion itself is an RPC call over a named pipe and leaves no process event.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(python\d*w?|cmd|powershell|pwsh)\.exe$/i
+          | CommandLine=/PetitPotam|EfsRpcOpenFileRaw|DFSCoerce|\bCoercer\b|printerbug|SpoolSample|dementor\.py|ntlmrelayx|krbrelayx/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: interpreter-written-to-programdata
+        name: Interpreter binary written under ProgramData
+        purpose: >-
+          Return python.exe or pythonw.exe written directly into a first-level directory
+          under ProgramData, with the writing process, to tie the interpreter to the
+          executable that dropped it.
+        query: |
+          #event_simpleName=PeFileWritten
+          | TargetFileName=/\\ProgramData\\[^\\]+\\python\d*w?\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: interpreter_from_programdata
+      name: Interpreter running from ProgramData
+      description: >-
+        A language interpreter's image path is under ProgramData in a directory no
+        installed product accounts for; the reported path is
+        ProgramData\IntegrityData\python.exe.
+      source: process_creation
+      field: image_path
+      indicates: privately_staged_interpreter
+
+  supporting:
+    - id: smb_fan_out_from_interpreter
+      name: Interpreter connects to SMB on many hosts
+      description: >-
+        The interpreter's process id opens connections to port 445 on many internal
+        addresses. The agent derives the count of distinct destinations from the
+        returned events.
+      source: network_connection
+      field: remote_address
+      indicates: relay_target_sweep
+    - id: connection_process_matches
+      name: Connections belong to the staged interpreter
+      description: >-
+        The process id on the connection events equals that of an interpreter the first
+        case returned on the same host.
+      source: network_connection
+      field: process_id
+      indicates: same_process_activity
+    - id: coercion_tool_named
+      name: Coercion or relay tool named
+      description: >-
+        A command line names PetitPotam, another coercion tool or an NTLM relay tool.
+      source: process_creation
+      field: command_line
+      indicates: forced_authentication_tooling
+    - id: interpreter_dropped_by_executable
+      name: Interpreter dropped by another executable
+      description: >-
+        The file-write event shows the interpreter was written by a process that is not
+        an installer.
+      source: file_creation
+      field: writer_process_name
+      indicates: payload_staging
+    - id: interpreter_drop_path
+      name: Interpreter written to a new ProgramData directory
+      description: >-
+        The path of the written interpreter is a first-level ProgramData directory that
+        did not exist on the host before.
+      source: file_creation
+      field: file_path
+      indicates: payload_staging
+    - id: workstation_user_context
+      name: Runs under a workstation user
+      description: >-
+        The interpreter runs as an ordinary user on a workstation.
+      source: process_creation
+      field: user
+      indicates: non_administrative_origin
+
+  contradicting:
+    - id: packaged_interpreter
+      name: Interpreter belongs to an installed product
+      description: >-
+        Software inventory lists a product that ships its own interpreter in that
+        directory.
+      source: asset_inventory
+      field: ComputerName
+      indicates: vendor_software
+    - id: authorised_assessment
+      name: Authorised security assessment
+      description: >-
+        A penetration test is recorded for the host and period.
+      source: change_management
+      field: ComputerName
+      indicates: approved_testing
+
+  risk_logic:
+    required:
+      - interpreter_from_programdata
+
+    supporting:
+      any:
+        - smb_fan_out_from_interpreter
+        - connection_process_matches
+        - coercion_tool_named
+        - interpreter_dropped_by_executable
+        - interpreter_drop_path
+        - workstation_user_context
+      all:
+        - smb_fan_out_from_interpreter
+        - connection_process_matches
+
+    contradicting:
+      any:
+        - packaged_interpreter
+        - authorised_assessment
+      all: []
+
+  verdict:
+    low_risk_when:
+      - interpreter_from_programdata
+      - packaged_interpreter
+      - authorised_assessment
+    suspicious_when:
+      - interpreter_from_programdata
+      - smb_fan_out_from_interpreter
+    high_risk_when:
+      - interpreter_from_programdata
+      - smb_fan_out_from_interpreter
+      - coercion_tool_named
+
+  false_positive:
+    - condition: Products that bundle Python under ProgramData.
+      explanation: >-
+        Several agents do. Their directory is named for the vendor, the interpreter is
+        started by the product's service, and it does not walk the address space on port
+        445.
+    - condition: Python backup or inventory scripts.
+      explanation: >-
+        They connect to a fixed set of file servers on a schedule, not to a range.

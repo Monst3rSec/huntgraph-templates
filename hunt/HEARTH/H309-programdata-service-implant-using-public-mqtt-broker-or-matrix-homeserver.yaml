@@ -1,0 +1,420 @@
+# Converted from THORCollective/HEARTH Flames/H309.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+# Also holds H310 (Matrix homeserver used as bidirectional C2). HEARTH describes the
+# two as one cluster sharing host tradecraft and differing only in transport; the
+# Matrix transport has its own case below.
+type: detection
+
+id: hg-win-hearth-h309-programdata-service-implant-using-public-mqtt-broker-or-matrix-homeserver-t1102-002
+version: 1.0.0
+
+info:
+  name: Service implant in ProgramData commanded through a public MQTT broker or a Matrix homeserver
+  description: >-
+    A Rust implant installs itself as a Windows service whose display name imitates a
+    stock component ("Problem Reports Control Panel", "Windows Telemetry Aggregator
+    Service") and takes its orders over a public messaging service. One build speaks
+    MQTT to broker.hivemq.com on TCP 8883, a free broker that needs no attacker-owned
+    infrastructure; its sibling joins a Matrix homeserver, meet.element[.]tw, as a chat
+    client and reads commands from custom room events over TLS 443. Reputation, domain
+    age and DGA controls score both clean. The host side is the same for both: a service
+    binary directly under a ProgramData directory, started once with an install
+    argument, reading config.toml beside itself and sealing it into
+    HKLM\Software\synapse\Config\SealedConfig. The service display name, the MQTT topics
+    and the Matrix event types are not visible to the sensor; the binary's location, its
+    parent, the registry value and the names it resolves are.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - command-and-control
+    - persistence
+    - mqtt
+    - matrix
+    - web-service
+    - windows-service
+    - programdata
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H309.md
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H310.md
+    - https://attack.mitre.org/techniques/T1102/002
+    - https://attack.mitre.org/techniques/T1543/003
+    - https://attack.mitre.org/detectionstrategies/DET0035
+
+mitre:
+  tactics:
+    - TA0011
+    - TA0003
+    - TA0004
+  techniques:
+    - T1102
+    - T1543
+  sub_techniques:
+    - T1102.002
+    - T1543.003
+  detection_strategies:
+    - DET0035
+    - DET0552
+  analytics:
+    - AN0100
+    - AN1527
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Network Connection Creation
+    - Process Creation
+    - Windows Registry Key Modification
+
+hypothesis:
+  statement: >-
+    An adversary is running an implant as a Windows service from ProgramData under a
+    name imitating a Microsoft component and commanding it through a public messaging
+    service, either an MQTT broker on TCP 8883 or a Matrix homeserver, so that the
+    channel is a well-known hostname carrying ordinary TLS.
+  attacker_behavior:
+    - Places the service binary and config.toml in a new directory under ProgramData.
+    - Runs the binary once with an install argument to register the service.
+    - Seals the configuration into HKLM\Software\synapse\Config\SealedConfig.
+    - Holds a long-lived session to a public MQTT broker on 8883 or long-polls a Matrix homeserver.
+    - Looks up the host's external address at ip-api.com on first run.
+  legitimate_behavior:
+    - IoT, building-management and OT gateway software uses MQTT, usually to a private broker.
+    - Developers test against public brokers.
+    - Element and other Matrix clients are used for chat where the organisation permits them.
+    - Some vendor agents run a service from a ProgramData directory.
+  risk_indicator:
+    - A service process under ProgramData connects to TCP 8883 or resolves a public broker.
+    - A Matrix homeserver is resolved by a process that is not a browser or a chat client.
+    - The binary was started once with install as its only argument.
+    - A value is written under HKLM\Software\synapse or SynapseAgent.
+    - The host is a server or workstation with no IoT or chat role.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: public-mqtt-broker-name-resolved
+        name: Public MQTT broker name resolved
+        purpose: >-
+          Return DNS requests for the well-known public MQTT brokers, with the
+          requesting process.
+        query: |
+          #event_simpleName=DnsRequest
+          | DomainName=/^(broker\.hivemq\.com|broker\.emqx\.io|test\.mosquitto\.org|broker\.mqttdashboard\.com)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: outbound-connection-on-mqtt-port
+        name: Outbound connection on an MQTT port
+        purpose: >-
+          Return connections to TCP 8883 or 1883 on public addresses, with the process
+          name and id. The connection event has no path; the agent matches the process
+          id to the service-binary case.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | RemotePort=8883 or RemotePort=1883
+          | event_platform=Win
+          | !cidr(RemoteAddressIP4, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: matrix-homeserver-resolved-by-non-chat-process
+        name: Matrix homeserver resolved by a process that is not a browser or chat client
+        purpose: >-
+          Return DNS requests for the reported homeserver, for matrix.org hosts and for
+          names that begin with matrix, from processes other than browsers and Element.
+          This is the H310 transport. The client-server API paths and the custom m.bird
+          event types are inside TLS and are not visible; a homeserver under an
+          unrelated name is found only through the service-binary case.
+        query: |
+          #event_simpleName=DnsRequest
+          | DomainName=/^meet\.element\.tw$|(^|\.)matrix\.org$|^matrix(-client)?\./i
+          | ContextBaseFileName!=/^((chrome|msedge|brave|opera|vivaldi|chromium|firefox)|element|element-desktop|fluffychat|nheko|thunderbird)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: service-binary-directly-under-programdata
+        name: Service process running from a first-level ProgramData directory
+        purpose: >-
+          Return processes started by services.exe whose image is an executable directly
+          inside a first-level ProgramData directory. No in-box Windows service runs
+          from there. Vendor agents that do will appear and repeat across the estate.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^services\.exe$/i
+          | ImageFileName=/\\ProgramData\\[^\\]+\\[^\\]+\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: programdata-binary-run-with-install-argument
+        name: ProgramData binary run with an install argument
+        purpose: >-
+          Return an executable in a first-level ProgramData directory started with
+          install or --install as its only argument, the one interactive run that
+          registers the service, with whatever started it as the parent.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ImageFileName=/\\ProgramData\\[^\\]+\\[^\\]+\.exe$/i
+          | CommandLine=/\.exe"?\s+(--)?install\s*$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: sealed-configuration-registry-value-written
+        name: Sealed configuration value written under the synapse key
+        purpose: >-
+          Return writes under HKLM\Software\synapse and SynapseAgent. The value is
+          machine-bound ciphertext; the write is the artefact.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\Software\\(synapse\\Config|SynapseAgent)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: external-address-lookup-by-non-browser
+        name: External address lookup service resolved by a non-browser process
+        purpose: >-
+          Return DNS requests for ip-api.com from processes that are not browsers, the
+          first-run lookup reported for the MQTT build. Many unrelated programs use the
+          service; it corroborates and does not stand alone.
+        query: |
+          #event_simpleName=DnsRequest
+          | DomainName=/^(www\.|pro\.)?ip-api\.com$/i
+          | ContextBaseFileName!=/^(chrome|msedge|brave|opera|vivaldi|chromium|firefox)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: messaging_service_contact
+      name: Public messaging service contacted
+      description: >-
+        The host resolved a public MQTT broker or a Matrix homeserver from a process
+        that is not a browser or chat client.
+      source: dns_request
+      field: query_name
+      indicates: web_service_command_channel
+
+  supporting:
+    - id: requesting_process_is_service_binary
+      name: Requester is the ProgramData service binary
+      description: >-
+        The requesting process name and id belong to a service process running from
+        ProgramData.
+      source: dns_request
+      field: process_name
+      indicates: implant_network_activity
+    - id: mqtt_port_connection
+      name: Connection on TCP 8883 or 1883
+      description: >-
+        A process on the host connected to a public address on an MQTT port.
+      source: network_connection
+      field: remote_port
+      indicates: mqtt_session
+    - id: mqtt_connection_process
+      name: MQTT connection made by the service binary
+      description: >-
+        The connecting process id is that of the ProgramData service process.
+      source: network_connection
+      field: process_id
+      indicates: implant_network_activity
+    - id: service_binary_in_programdata
+      name: Service runs from ProgramData
+      description: >-
+        services.exe started an executable directly under a ProgramData directory; the
+        reported names are cplsupport.exe and wtass.exe.
+      source: process_creation
+      field: image_path
+      indicates: masqueraded_service
+    - id: installed_with_install_argument
+      name: Binary run once with an install argument
+      description: >-
+        The binary was started with install as its only argument before the service
+        appeared.
+      source: process_creation
+      field: command_line
+      indicates: service_registration
+    - id: installer_parent
+      name: What ran the install
+      description: >-
+        The parent of the install run is wsmprovhost.exe or another remote-execution
+        host; the reported delivery was over WinRM.
+      source: process_creation
+      field: parent_process
+      indicates: remote_delivery
+    - id: sealed_config_written
+      name: Sealed configuration written
+      description: >-
+        A value was written under HKLM\Software\synapse\Config or SynapseAgent.
+      source: registry
+      field: registry_path
+      indicates: implant_configuration
+    - id: sealed_config_value_name
+      name: Value is SealedConfig or metrics_interval
+      description: >-
+        The value name is one of the two reported.
+      source: registry
+      field: registry_value
+      indicates: implant_configuration
+
+  contradicting:
+    - id: iot_or_ot_gateway
+      name: IoT or OT gateway software
+      description: >-
+        The host runs building-management, telemetry or OT gateway software that uses
+        MQTT.
+      source: asset_inventory
+      field: ComputerName
+      indicates: sanctioned_mqtt_use
+    - id: sanctioned_chat_client
+      name: Sanctioned Matrix use
+      description: >-
+        The organisation runs or permits Matrix and the requester is its client or
+        bridge.
+      source: asset_inventory
+      field: ComputerName
+      indicates: sanctioned_chat_use
+
+  risk_logic:
+    required:
+      - messaging_service_contact
+
+    supporting:
+      any:
+        - requesting_process_is_service_binary
+        - mqtt_port_connection
+        - mqtt_connection_process
+        - service_binary_in_programdata
+        - installed_with_install_argument
+        - installer_parent
+        - sealed_config_written
+        - sealed_config_value_name
+      all:
+        - requesting_process_is_service_binary
+        - service_binary_in_programdata
+
+    contradicting:
+      any:
+        - iot_or_ot_gateway
+        - sanctioned_chat_client
+      all: []
+
+  verdict:
+    low_risk_when:
+      - messaging_service_contact
+      - iot_or_ot_gateway
+      - sanctioned_chat_client
+    suspicious_when:
+      - messaging_service_contact
+      - requesting_process_is_service_binary
+    high_risk_when:
+      - messaging_service_contact
+      - service_binary_in_programdata
+      - sealed_config_written
+
+  false_positive:
+    - condition: Developers and makers testing against public brokers.
+      explanation: >-
+        HiveMQ, EMQX and Mosquitto run public brokers for testing. The requester is a
+        development tool or an interpreter on a developer's machine, not a service.
+    - condition: Matrix clients other than Element.
+      explanation: >-
+        Unlisted chat clients and bridges resolve homeservers too. They are user
+        applications, not services under ProgramData.
+    - condition: Vendor agents installed in ProgramData.
+      explanation: >-
+        A few products run their service from ProgramData. They are in software
+        inventory and present on many hosts.

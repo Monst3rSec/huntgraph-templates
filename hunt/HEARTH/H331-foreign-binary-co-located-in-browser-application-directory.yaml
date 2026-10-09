@@ -1,0 +1,277 @@
+# Converted from THORCollective/HEARTH Flames/H331.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h331-foreign-binary-co-located-in-browser-application-directory-t1555-003
+version: 1.0.0
+
+info:
+  name: Foreign binary placed in a browser's Application directory to pass the elevation service path check
+  description: >-
+    Since Chrome 127 the cookie and credential stores are sealed with an app-bound key
+    that a SYSTEM service releases over COM only after comparing the caller's image path
+    with the browser's. HEARTH lists five ways round the comparison that do not touch
+    browser memory: calling the IElevator COM interface directly, writing a binary into
+    the browser's own Application directory so that co-location satisfies the check,
+    overriding a CLSID the browser loads through a per-user InprocServer32 key, driving
+    the browser over a remote debugging port, and a padding oracle against the service's
+    error responses. The COM call and the oracle are in-process API use and leave
+    nothing the sensor reports. The per-user InprocServer32 write is what H177 returns
+    and the remote debugging start is a case in H126; neither is repeated here. This
+    template holds the remaining route, co-location: an executable written into the
+    Application directory by something that is not the browser's installer or updater,
+    and a process running from that directory under a name the browser does not ship.
+    The read of the key and of the Cookies and Login Data files is file access and is
+    not seen.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - credential-access
+    - app-bound-encryption
+    - chrome
+    - elevation-service
+    - infostealer
+    - browser-credentials
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H331.md
+    - https://attack.mitre.org/techniques/T1555
+    - https://attack.mitre.org/techniques/T1555/003
+    - https://attack.mitre.org/detectionstrategies/DET0037
+
+mitre:
+  tactics:
+    - TA0006
+  techniques:
+    - T1555
+  sub_techniques:
+    - T1555.003
+  detection_strategies:
+    - DET0037
+  analytics:
+    - AN0105
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An infostealer defeats Chromium app-bound encryption without injecting into the
+    browser, by satisfying the elevation service's caller path check another way:
+    instantiating the IElevator COM interface directly, writing a binary into the
+    browser's Application directory, hijacking a CLSID through a per-user InprocServer32
+    override, driving the browser through --remote-debugging-port, or using the
+    elevation service as a padding oracle.
+  attacker_behavior:
+    - Copies its own executable or DLL into the browser's Application folder or a version subfolder.
+    - Runs from that folder so the elevation service sees a path that matches the browser's.
+    - Requests the app-bound key over COM and decrypts cookies and saved passwords.
+    - Registers a per-user COM server override for a CLSID the browser loads.
+    - Starts the browser with a remote debugging port and reads cookies over the DevTools protocol.
+  legitimate_behavior:
+    - The browser's installer and updater write new versions into the Application directory.
+    - Enterprise deployment tools install or repair the browser.
+    - Security and management agents drop policy or helper files beside the browser.
+  risk_indicator:
+    - The writer of an executable in the Application directory is not an installer or updater.
+    - The writer's own image is under AppData, Temp or Downloads.
+    - A process runs from the Application directory under a name the browser does not ship.
+    - The directory is the per-user install under LocalAppData, which needs no elevation to write.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: executable-written-into-browser-application-directory
+        name: Executable written into a browser Application directory by a process that is not its installer
+        purpose: >-
+          Return PE files created under the Chrome, Edge and Brave Application
+          directories, per-machine or per-user, leaving out the writers the browsers'
+          own installers and updaters use. The exclusion is by process name, so a
+          stealer that names itself setup.exe or updater.exe is not returned; a
+          deployment tool that is not on the list is.
+        query: |
+          #event_simpleName=PeFileWritten
+          | TargetFileName=/\\(Google\\Chrome|Microsoft\\Edge|BraveSoftware\\Brave-Browser)\\Application\\/i
+          | ContextBaseFileName!=/^(setup|chrome|msedge|brave|GoogleUpdate|GoogleUpdater|updater|MicrosoftEdgeUpdate|MicrosoftEdge_[^\\]*|MicrosoftEdgeUpdateSetup[^\\]*|BraveUpdate|BraveUpdateSetup[^\\]*|ChromeSetup|chrome_installer|mini_installer|elevation_service|msiexec|TrustedInstaller|TiWorker)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: unshipped-image-running-from-browser-application-directory
+        name: Process running from a browser Application directory under a name the browser does not ship
+        purpose: >-
+          Return processes whose image is inside an Application directory and whose name
+          is not one of the binaries Chrome, Edge and Brave install there. The list is
+          drawn from current releases; a new helper a browser adds later appears until
+          the list is updated.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ImageFileName=/\\(Google\\Chrome|Microsoft\\Edge|BraveSoftware\\Brave-Browser)\\Application\\/i
+          | FileName!=/^(chrome|msedge|brave|chrome_proxy|msedge_proxy|brave_proxy|chrome_pwa_launcher|msedge_pwa_launcher|pwahelper|elevation_service|elevated_tracing_service|notification_helper|notification_click_helper|identity_helper|cookie_exporter|ie_to_edge_stub|msedgewebview2|setup|chrmstp|os_update_handler|chrome_wer|new_chrome|new_msedge|new_brave|brave_vpn_helper|brave_vpn_wireguard_service|installer|mini_installer)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: foreign_binary_in_browser_directory
+      name: Foreign binary placed in the browser's Application directory
+      description: >-
+        A PE file was written under a browser's Application directory by a process that
+        is not the browser's installer or updater.
+      source: file_creation
+      field: file_path
+      indicates: path_check_co_location
+
+  supporting:
+    - id: writer_not_installer
+      name: Writer is not an installer or updater
+      description: >-
+        The process named on the file-write event is not a browser installer, updater or
+        Windows servicing process.
+      source: file_creation
+      field: writer_process_name
+      indicates: unexpected_writer
+    - id: writer_runs_from_user_path
+      name: Writer runs from a user-writable path
+      description: >-
+        The process event for the writing process id shows an image under AppData, Temp
+        or Downloads. The agent resolves it by process id.
+      source: file_creation
+      field: writer_process_id
+      indicates: dropper_activity
+    - id: unshipped_image_ran_from_directory
+      name: Unshipped image ran from the Application directory
+      description: >-
+        A process runs from the Application directory under a name the browser does not
+        install.
+      source: process_creation
+      field: image_path
+      indicates: impersonated_caller_path
+    - id: co_located_process_name
+      name: Name of the co-located process
+      description: >-
+        The image name is not a browser, helper or updater binary.
+      source: process_creation
+      field: image_name
+      indicates: foreign_executable
+    - id: started_by_dropper
+      name: Co-located process started by the writer
+      description: >-
+        The parent of the co-located process is the process that wrote it. The agent
+        matches the parent process id to the writer's id.
+      source: process_creation
+      field: parent_process_id
+      indicates: drop_and_run_chain
+
+  contradicting:
+    - id: browser_deployment_in_progress
+      name: Browser was being installed or repaired
+      description: >-
+        A deployment or repair of the browser by the management platform covers the
+        time.
+      source: change_management
+      field: ComputerName
+      indicates: managed_software_deployment
+    - id: known_helper_beside_browser
+      name: File is a known vendor or management helper
+      description: >-
+        The file belongs to a security or management product documented to place it
+        there.
+      source: asset_inventory
+      field: TargetFileName
+      indicates: known_software_component
+
+  risk_logic:
+    required:
+      - foreign_binary_in_browser_directory
+
+    supporting:
+      any:
+        - writer_not_installer
+        - writer_runs_from_user_path
+        - unshipped_image_ran_from_directory
+        - co_located_process_name
+        - started_by_dropper
+      all:
+        - writer_not_installer
+        - unshipped_image_ran_from_directory
+
+    contradicting:
+      any:
+        - browser_deployment_in_progress
+        - known_helper_beside_browser
+      all: []
+
+  verdict:
+    low_risk_when:
+      - foreign_binary_in_browser_directory
+      - browser_deployment_in_progress
+      - known_helper_beside_browser
+    suspicious_when:
+      - foreign_binary_in_browser_directory
+      - writer_not_installer
+    high_risk_when:
+      - foreign_binary_in_browser_directory
+      - writer_runs_from_user_path
+      - unshipped_image_ran_from_directory
+
+  false_positive:
+    - condition: Deployment tools installing the browser.
+      explanation: >-
+        SCCM, Intune and third-party patchers unpack the browser with their own process.
+        The files are the browser's signed binaries and a deployment is recorded.
+    - condition: New browser helpers.
+      explanation: >-
+        A release adds a binary the name list does not hold. It is written by the
+        updater and appears fleet-wide on the same day.
+    - condition: Portable or repackaged browsers.
+      explanation: >-
+        Repackaged builds are unpacked by an archive tool. The folder is not the
+        standard install path of a managed browser.

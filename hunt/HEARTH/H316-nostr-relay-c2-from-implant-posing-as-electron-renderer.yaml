@@ -1,0 +1,361 @@
+# Converted from THORCollective/HEARTH Flames/H316.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-mac-hearth-h316-nostr-relay-c2-from-implant-posing-as-electron-renderer-t1102-002
+version: 1.0.0
+
+info:
+  name: macOS implant taking commands from Nostr relays while posing as an Electron renderer
+  description: >-
+    ROOFDECK, a TraderTraitor backdoor for macOS, has no command server of its own. It
+    reads the list of live Nostr relays from api.nostr.watch, adds a built-in set of
+    public relays, opens WebSocket sessions to them and looks up its operator by public
+    key. Commands are signed, so the relay is only a carrier and blocking one relay
+    costs the operator nothing. On the host the binary sits directly inside a folder
+    under ~/Library named like an Apple component or beginning with a dot, is started
+    through nohup with --type=renderer so that it reads as an Electron helper, and is
+    kept by a LaunchAgent called loginwindow.plist. The sensor does not see the
+    WebSocket session, its duration or the signed events, and it does not report
+    code-signing state or the plist's contents. It does report the relay names being
+    resolved, with the requesting process, and the process command lines and image
+    paths, and those are what the hunt returns.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - command-and-control
+    - nostr
+    - web-service
+    - masquerading
+    - launch-agent
+    - tradertraitor
+    - macos
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H316.md
+    - https://attack.mitre.org/techniques/T1102
+    - https://attack.mitre.org/techniques/T1102/002
+    - https://attack.mitre.org/detectionstrategies/DET0035
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1102
+  sub_techniques:
+    - T1102.002
+  detection_strategies:
+    - DET0035
+  analytics:
+    - AN0102
+  platforms:
+    - macOS
+  data_sources:
+    - macos:unifiedlog
+    - NSM:Connections
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    A macOS backdoor discovers its operator through the Nostr decentralised relay
+    network instead of a command server: it fetches the live relay list from
+    api.nostr.watch, connects to public relays over WebSocket and takes signed commands,
+    while running as an unsigned binary in an Apple-named or hidden folder under
+    ~/Library, started with nohup and --type=renderer and persisted by a LaunchAgent
+    named loginwindow.plist.
+  attacker_behavior:
+    - Requests api.nostr.watch for the list of relays that are online.
+    - Resolves and connects to several public Nostr relays from one process.
+    - Places a Mach-O binary directly inside ~/Library/com.apple.<name>/ or a dot-prefixed folder.
+    - Starts the binary through nohup with --type=renderer on its command line.
+    - Persists with ~/Library/LaunchAgents/loginwindow.plist.
+    - Removes the quarantine attribute from the dropped binary with xattr.
+  legitimate_behavior:
+    - A user runs a personal Nostr client such as Damus on a corporate Mac.
+    - Security researchers study the protocol from analysis hosts.
+    - Every Electron application starts helper processes with --type=renderer from inside its bundle.
+  risk_indicator:
+    - The process resolving the relay names is not a Nostr client application.
+    - One process resolves the relay directory and then several relays.
+    - A process carries --type=renderer and its image is not inside an application bundle.
+    - An executable runs from directly inside an Apple-named folder under ~/Library.
+    - A command names loginwindow.plist under LaunchAgents.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: nostr-relay-directory-or-public-relay-resolved
+        name: DNS request for the Nostr relay directory or a public relay
+        purpose: >-
+          Return every lookup of api.nostr.watch and of the public relays the report
+          lists, with the requesting process. The relay list is the reported one and is
+          not exhaustive; an implant that has been given other relays shows only through
+          the directory lookup. The agent counts distinct relays per process id, since a
+          client or an implant talks to several.
+        query: |
+          #event_simpleName=DnsRequest
+          | event_platform=Mac
+          | DomainName=/(^|\.)(nostr\.watch|relay\.damus\.io|nos\.lol|nostr\.mom|nostr\.wine|offchain\.pub|relay\.nostr\.band|relay\.snort\.social|nostr\.oxtr\.dev)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: renderer-argument-on-process-outside-application-bundle
+        name: Process with --type=renderer whose image is not inside an application bundle
+        purpose: >-
+          Return processes that carry the Electron renderer argument and do not run from
+          inside a .app bundle. A real renderer is a helper inside its application's
+          Contents folder, so the image path removes them. Signing state and team id are
+          not on the event; the path is the only test.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | ImageFileName!=/\.app\/Contents\//
+          | CommandLine=/--type=renderer/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: nohup-starting-renderer-named-process
+        name: nohup given a command line that carries --type=renderer
+        purpose: >-
+          Return the nohup step itself. No Electron application starts its helpers
+          through nohup, so this needs no path test. The process nohup becomes is
+          returned by the previous case.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=nohup
+          | CommandLine=/--type=renderer/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: executable-directly-inside-apple-named-or-hidden-library-folder
+        name: Executable running from directly inside ~/Library/com.apple.* or a hidden Library folder
+        purpose: >-
+          Return processes whose image is a file one level below a folder in ~/Library
+          that is named com.apple.<something> or begins with a dot. Apple keeps data in
+          such folders, not programs. The three reported paths match; so does any
+          renamed copy that keeps the placement.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | ImageFileName=/^\/Users\/[^\/]+\/Library\/(com\.apple\.[^\/]+|\.[^\/]+)\/[^\/]+$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: loginwindow-plist-in-launchagents-named-by-command
+        name: Command naming loginwindow.plist under LaunchAgents
+        purpose: >-
+          Return commands that write, load or inspect a LaunchAgent called
+          loginwindow.plist. The plist being written is not reported as a file event, so
+          an implant that creates it from its own code and never calls launchctl is not
+          returned here; its binary still appears in the cases above.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | CommandLine=/\/LaunchAgents\/loginwindow\.plist/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: quarantine-attribute-removed-under-user-library
+        name: xattr removing the quarantine attribute from a path under ~/Library
+        purpose: >-
+          Return xattr runs that delete com.apple.quarantine from something under a
+          user's Library folder, the step that lets the dropped binary start without a
+          Gatekeeper prompt. An attribute removed through the API starts no process and
+          is not seen.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=xattr
+          | CommandLine=/com\.apple\.quarantine/
+          | CommandLine=/\/Users\/[^\/]+\/Library\//
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: nostr_host_resolved
+      name: Nostr relay directory or public relay resolved
+      description: >-
+        A DNS request names api.nostr.watch or one of the public Nostr relays.
+      source: dns_request
+      field: query_name
+      indicates: nostr_relay_contact
+
+  supporting:
+    - id: requester_not_nostr_client
+      name: Requesting process is not a Nostr client
+      description: >-
+        The process named on the DNS event is not a browser or a Nostr client
+        application; a bare binary name or a system-sounding name is the reported form.
+      source: dns_request
+      field: process_name
+      indicates: non_client_relay_traffic
+    - id: several_relays_from_one_process
+      name: One process resolves several relays
+      description: >-
+        The same process id resolves the relay directory and more than one relay. The
+        agent derives the count from the returned events.
+      source: dns_request
+      field: process_id
+      indicates: relay_fan_out
+    - id: renderer_argument_outside_bundle
+      name: Renderer argument on a process outside any bundle
+      description: >-
+        A command line carries --type=renderer and the image is not inside an
+        application's Contents folder, or the process was started through nohup.
+      source: process_creation
+      field: command_line
+      indicates: electron_helper_masquerade
+    - id: binary_in_apple_named_library_folder
+      name: Executable inside an Apple-named Library folder
+      description: >-
+        The image path is a file directly inside ~/Library/com.apple.<name>/ or a
+        dot-prefixed folder under ~/Library.
+      source: process_creation
+      field: image_path
+      indicates: masqueraded_install_location
+    - id: loginwindow_launchagent_command
+      name: LaunchAgent named loginwindow.plist handled by a command
+      description: >-
+        A command names loginwindow.plist under a LaunchAgents folder.
+      source: process_creation
+      field: command_line
+      indicates: launch_agent_persistence
+    - id: quarantine_removed
+      name: Quarantine attribute removed from a Library path
+      description: >-
+        xattr deleted com.apple.quarantine from a path under the user's Library folder.
+      source: process_creation
+      field: command_line
+      indicates: gatekeeper_check_avoided
+
+  contradicting:
+    - id: personal_nostr_client_installed
+      name: A Nostr client is installed on the host
+      description: >-
+        The host has a Nostr client application and the requesting process is that
+        application.
+      source: asset_inventory
+      field: ComputerName
+      indicates: personal_application_use
+    - id: protocol_research_host
+      name: Host belongs to security research
+      description: >-
+        The user studies the protocol or its malware as part of their role.
+      source: identity_context
+      field: UserName
+      indicates: sanctioned_research
+
+  risk_logic:
+    required:
+      - nostr_host_resolved
+
+    supporting:
+      any:
+        - requester_not_nostr_client
+        - several_relays_from_one_process
+        - renderer_argument_outside_bundle
+        - binary_in_apple_named_library_folder
+        - loginwindow_launchagent_command
+        - quarantine_removed
+      all:
+        - requester_not_nostr_client
+        - renderer_argument_outside_bundle
+
+    contradicting:
+      any:
+        - personal_nostr_client_installed
+        - protocol_research_host
+      all: []
+
+  verdict:
+    low_risk_when:
+      - nostr_host_resolved
+      - personal_nostr_client_installed
+    suspicious_when:
+      - nostr_host_resolved
+      - requester_not_nostr_client
+    high_risk_when:
+      - nostr_host_resolved
+      - requester_not_nostr_client
+      - binary_in_apple_named_library_folder
+
+  false_positive:
+    - condition: Personal Nostr clients on corporate Macs.
+      explanation: >-
+        Damus and similar clients resolve the same relays. The requesting process is the
+        client application and the user confirms it when asked.
+    - condition: Electron applications run from unusual places.
+      explanation: >-
+        A development build started from a build directory can carry the renderer
+        argument outside a packaged bundle. The path is a source tree and the account is
+        a developer's.
+    - condition: Researchers analysing the protocol.
+      explanation: >-
+        Lookups come from analysis hosts and tooling the team recognises.

@@ -1,0 +1,279 @@
+# Converted from THORCollective/HEARTH Flames/H298.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h298-self-deleting-batch-file-removing-implant-and-its-persistence-t1070-009
+version: 1.0.0
+
+info:
+  name: Operator-commanded uninstall through a self-deleting batch file
+  description: >-
+    SparroWocky, the FamousSparrow backdoor ESET analysed, accepts a command that
+    removes its persistence and exits. A running executable cannot delete itself, so the
+    removal is done by a dropped batch file that deletes the legitimate host executable,
+    the side-loaded DLL, the .dat payload and finally itself. The same sequence fires
+    when a second instance starts from another path. HEARTH starts from registry-delete
+    and file-delete events; this deployment collects neither, and a service removed
+    through the service control API leaves no process. What remains is the process side:
+    cmd.exe started to run a batch file from a temporary or data directory by a parent
+    that is not an installer, the wait-then-delete idiom when it is written on one line,
+    and sc, reg or schtasks deleting a service, a Run value or a task under the same
+    kind of parent.
+  severity: medium
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-evasion
+    - clear-persistence
+    - self-delete
+    - uninstall
+    - famoussparrow
+    - sparrowocky
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H298.md
+    - https://attack.mitre.org/techniques/T1070/009
+    - https://attack.mitre.org/detectionstrategies/DET0040
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1070
+  sub_techniques:
+    - T1070.009
+  detection_strategies:
+    - DET0040
+  analytics:
+    - AN0113
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary is removing an implant from a Windows host on command: its service or
+    Run value is deleted and a batch file then erases the host executable, the loader
+    DLL and the payload before deleting itself.
+  attacker_behavior:
+    - Deletes the implant's service or Run value.
+    - Writes a batch file to a temporary directory and starts it with cmd.exe.
+    - Waits for the implant process to exit with ping, timeout or choice.
+    - Deletes the signed host executable, the adjacent DLL and the .dat payload.
+    - Ends the batch file with a line that deletes the batch file.
+  legitimate_behavior:
+    - Uninstallers remove services, Run values and program files.
+    - Installers and updaters run batch files from Temp.
+    - Applications that update themselves use a wait-then-replace batch file.
+  risk_indicator:
+    - cmd runs a batch file from Temp or ProgramData and its parent then exits.
+    - The parent is an application with no reason to uninstall anything, not msiexec or a vendor uninstaller.
+    - A command line pairs a loopback ping or timeout with del.
+    - A service created hours or days earlier is deleted by sc from a non-installer parent.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: batch-file-run-from-writable-directory
+        name: cmd running a batch file from a temporary or data directory
+        purpose: >-
+          Return cmd.exe started with /c on a .bat or .cmd file under Temp, ProgramData
+          or AppData, leaving out parents that are installers by name. The del lines
+          inside the batch file are cmd built-ins and produce no events, so this start
+          is the only process record of the cleanup. Installers the name filter does not
+          recognise will appear; the agent keeps the events whose parent process stops
+          appearing on the host afterwards.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^cmd\.exe$/i
+          | CommandLine=/\/c\s+"?[^"]*\\(AppData\\Local\\Temp|Windows\\Temp|ProgramData|AppData\\Roaming)\\[^"]*\.(bat|cmd)\b/i
+          | ParentBaseFileName!=/^(msiexec|explorer)\.exe$|unins|setup|install|update/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: wait-then-delete-command-line
+        name: Wait-then-delete idiom on one command line
+        purpose: >-
+          Return cmd.exe command lines that pair a sleep primitive with a delete, or
+          that delete the running script with %~f0. This is the self-delete written
+          inline instead of in a dropped file.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^cmd\.exe$/i
+          | CommandLine=/\b(ping\s+(-n\s+\d+\s+)?(127\.0\.0\.1|localhost)|timeout\s+(\/t\s+)?\d+|choice\s+[^&|]*\/t)\b[^\n]*[&|]\s*(del|erase|rd|rmdir)\b|\b(del|erase)\b[^&|]*%~f0/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: persistence-deleted-by-command
+        name: Service, Run value or task deleted by command
+        purpose: >-
+          Return sc delete, reg delete on a Run key and schtasks /delete where the
+          parent is not an installer by name. An implant that removes its own service
+          through the service control API does not appear here.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(sc|reg|schtasks)\.exe$/i
+          | CommandLine=/\bsc(\.exe)?"?\s+(\\\\\S+\s+)?delete\b|\bdelete\b[^\n]*\\CurrentVersion\\Run|schtasks(\.exe)?"?\s[^\n]*\/delete\b/i
+          | ParentBaseFileName!=/^msiexec\.exe$|unins|setup|install|update/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: cleanup_command_from_non_installer
+      name: Cleanup command from a non-installer parent
+      description: >-
+        cmd ran a batch file from a temporary or data directory, a wait-then-delete
+        line, or a persistence deletion, and the parent is not an installer or
+        uninstaller.
+      source: process_creation
+      field: command_line
+      indicates: implant_self_removal
+
+  supporting:
+    - id: parent_exits_after_cleanup
+      name: Parent process disappears after the cleanup
+      description: >-
+        The parent process id on the cleanup event starts nothing further and its image
+        no longer runs on the host. The agent derives this from later process events for
+        that host.
+      source: process_creation
+      field: parent_process_id
+      indicates: self_removal
+    - id: parent_is_unrelated_application
+      name: Parent has no business uninstalling
+      description: >-
+        The parent is a signed application running from a user-writable directory, the
+        shape of a side-loading host, not a setup program.
+      source: process_creation
+      field: parent_process
+      indicates: sideload_host_cleanup
+    - id: persistence_removed_first
+      name: Persistence deleted shortly before
+      description: >-
+        sc, reg or schtasks deleted a service, Run value or task on the host within
+        moments of the batch file starting.
+      source: process_creation
+      field: image_name
+      indicates: clear_persistence
+    - id: reported_service_name
+      name: Reported service name
+      description: >-
+        The deleted service is ProcAuditManager, the name ESET reported.
+      source: process_creation
+      field: image_path
+      indicates: known_implant_artifact
+    - id: system_or_service_context
+      name: Runs under the implant's account
+      description: >-
+        The cleanup runs as SYSTEM or the account the removed service ran under.
+      source: process_creation
+      field: user
+      indicates: service_context_cleanup
+
+  contradicting:
+    - id: software_removal_recorded
+      name: Software removal recorded
+      description: >-
+        A deployment or change record shows the product being uninstalled or updated on
+        the host at that time.
+      source: change_management
+      field: ComputerName
+      indicates: approved_change
+    - id: self_updating_application
+      name: Application updates itself this way
+      description: >-
+        The same parent and batch pattern recurs on many hosts at each release of a
+        known product.
+      source: baseline
+      field: ComputerName
+      indicates: routine_software_update
+
+  risk_logic:
+    required:
+      - cleanup_command_from_non_installer
+
+    supporting:
+      any:
+        - parent_exits_after_cleanup
+        - parent_is_unrelated_application
+        - persistence_removed_first
+        - reported_service_name
+        - system_or_service_context
+      all:
+        - parent_exits_after_cleanup
+        - parent_is_unrelated_application
+
+    contradicting:
+      any:
+        - software_removal_recorded
+        - self_updating_application
+      all: []
+
+  verdict:
+    low_risk_when:
+      - cleanup_command_from_non_installer
+      - software_removal_recorded
+      - self_updating_application
+    suspicious_when:
+      - cleanup_command_from_non_installer
+      - parent_is_unrelated_application
+    high_risk_when:
+      - cleanup_command_from_non_installer
+      - parent_exits_after_cleanup
+      - persistence_removed_first
+
+  false_positive:
+    - condition: Uninstallers and self-updaters.
+      explanation: >-
+        Deleting a service, a Run value and program files is what an uninstaller does,
+        and many updaters use a wait-then-delete batch file. They recur across hosts at
+        a release and are driven by a setup program or a deployment agent.
+    - condition: A completed cleanup is not a clean host.
+      explanation: >-
+        The implant runs this sequence by itself when a second copy starts from another
+        path, so a hit is a reason to look for the relocated instance.

@@ -1,0 +1,297 @@
+# Converted from THORCollective/HEARTH Flames/H344.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+# HEARTH also cites T1546.015 and T1112. The DLL load itself is module-load
+# telemetry and is not collected; the DLL is named only by the registry write.
+type: detection
+
+id: hg-win-hearth-h344-rundll32-sta-clsid-with-no-dll-argument-t1218-011
+version: 1.0.0
+
+info:
+  name: rundll32 started with /sta and a CLSID and no DLL or export
+  description: >-
+    DarkMe registers a COM class under the user's Classes hive with an InprocServer32
+    pointing at a DLL in AppData, and runs it as rundll32.exe /sta {CLSID}. The form is
+    documented and seldom used. It names no DLL, no export and no path, so rules that
+    look at rundll32's DLL argument have nothing to read; the DLL is resolved through
+    the registry when rundll32 loads it. Huntress reports the form in every DarkMe
+    generation. The hunt returns the invocation, the per-user class registration that
+    names the DLL, and reg.exe importing a registration from a file that is not a .reg
+    file, which is how the class was written.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-evasion
+    - rundll32
+    - com
+    - clsid
+    - darkme
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H344.md
+    - https://attack.mitre.org/techniques/T1218
+    - https://attack.mitre.org/techniques/T1218/011
+    - https://attack.mitre.org/detectionstrategies/DET0475
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1218
+  sub_techniques:
+    - T1218.011
+  detection_strategies:
+    - DET0475
+  analytics:
+    - AN1308
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    A loader has registered its own COM object under
+    HKCU\Software\Classes\CLSID\{GUID}\InprocServer32 pointing at a DLL in %AppData%,
+    and is executing it with rundll32.exe /sta {GUID}, a documented but rarely-used
+    invocation form that takes a class identifier instead of the usual
+    dllname,ExportName pair, so the malicious DLL path never appears on the command line
+    and every process-creation rule keyed on rundll32 plus a DLL argument sees nothing
+    to match.
+  attacker_behavior:
+    - Writes a class registration under the user's Classes hive with reg.exe import or the registry API.
+    - Points InprocServer32 at a DLL under AppData.
+    - Starts rundll32.exe with /sta or -sta and the class identifier.
+    - Triggers the command from a custom URL protocol handler or an autorun.
+  legitimate_behavior:
+    - A few Windows components start rundll32 -sta with a system class identifier.
+    - Applications installed per user register COM classes under the user's hive.
+    - Administrators import .reg files with reg.exe.
+  risk_indicator:
+    - The rundll32 command line has /sta and a GUID and no .dll and no comma.
+    - The same GUID is registered under a user hive with a server path in AppData or ProgramData.
+    - The parent is explorer.exe, a script host or a loader, not a system component.
+    - reg.exe imports a file with a .txt or other non-.reg extension.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: rundll32-sta-clsid-without-dll
+        name: rundll32 /sta {CLSID} with no DLL argument
+        purpose: >-
+          Return rundll32 started with /sta or -sta followed by a braced GUID, where the
+          command line has no .dll and no comma. Both switch prefixes are matched.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^rundll32\.exe$/i
+          | CommandLine=/\s[\/-]sta\s+"?\{[0-9a-f-]{36}\}/i
+          | CommandLine!=/\.dll|,/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: rundll32-sta-any-form
+        name: rundll32 started with the sta switch in any form
+        purpose: >-
+          Return every rundll32 with the sta switch, including a ProgID in place of a
+          GUID and the forms Windows itself uses, so the agent sees how common the
+          switch is on the estate and which class identifiers recur.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^rundll32\.exe$/i
+          | CommandLine=/\s[\/-]sta\s/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: per-user-inprocserver-in-user-writable-path
+        name: Per-user InprocServer32 registered to a user-writable path
+        purpose: >-
+          Return InprocServer32 values written under a user hive whose data is a path in
+          AppData, ProgramData, Users\Public or a Temp folder. The GUID in the key path
+          is what the agent matches against the rundll32 command line. A value written
+          and later deleted is still returned; the deletion is not.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\REGISTRY\\USER\\S-1-5-21-[^\\]+(\\Software\\Classes|_Classes)\\CLSID\\\{[0-9A-F-]{36}\}\\InprocServer32\\?$/i
+          | RegStringValue=/\\(AppData|ProgramData|Users\\Public|Temp)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: reg-import-of-non-reg-file
+        name: reg.exe importing a file that is not a .reg file
+        purpose: >-
+          Return reg.exe import commands whose file has another extension, the route
+          DarkMe's staging script used with a generated text file. A registration made
+          through the registry API starts no process and appears only in the registry
+          case.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^reg\.exe$/i
+          | CommandLine=/\simport\s/i
+          | CommandLine!=/\.reg("|\s|$)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: rundll32_clsid_invocation
+      name: rundll32 invoked with a class identifier only
+      description: >-
+        rundll32.exe was started with the sta switch and a braced GUID, with no DLL path
+        and no export name on the command line.
+      source: process_creation
+      field: command_line
+      indicates: com_object_proxy_execution
+
+  supporting:
+    - id: class_registered_to_user_path
+      name: Class is registered per user to a user-writable DLL
+      description: >-
+        An InprocServer32 value under a user hive carries the same GUID in its key path
+        and a DLL path in AppData, ProgramData, Public or Temp, by the agent's
+        comparison with the command line.
+      source: registry
+      field: registry_path
+      indicates: attacker_registered_com_server
+    - id: server_dll_path
+      name: Server DLL sits in a user-writable directory
+      description: >-
+        The value data names a DLL in a directory any user can write to.
+      source: registry
+      field: registry_data
+      indicates: unsigned_payload_location
+    - id: registration_imported_from_text_file
+      name: Registration imported from a file that is not a .reg file
+      description: >-
+        reg.exe import ran against a .txt or other file, started by a script host.
+      source: process_creation
+      field: parent_process
+      indicates: scripted_registry_staging
+    - id: class_identifier_rare
+      name: Class identifier is seen on few hosts
+      description: >-
+        The GUID appears with rundll32 on one or a few hosts, which the agent counts
+        from the second case's events.
+      source: process_creation
+      field: host
+      indicates: rare_class_identifier
+
+  contradicting:
+    - id: system_class_identifier
+      name: Class identifier belongs to a Windows component
+      description: >-
+        Earlier activity shows the same GUID started the same way on most hosts by a
+        system parent.
+      source: baseline
+      field: CommandLine
+      indicates: operating_system_behaviour
+    - id: vendor_per_user_com
+      name: Class belongs to an installed per-user application
+      description: >-
+        An approved application installed for the user registers the class and its DLL
+        sits in that application's folder.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_software
+
+  risk_logic:
+    required:
+      - rundll32_clsid_invocation
+
+    supporting:
+      any:
+        - class_registered_to_user_path
+        - server_dll_path
+        - registration_imported_from_text_file
+        - class_identifier_rare
+      all:
+        - class_registered_to_user_path
+        - class_identifier_rare
+
+    contradicting:
+      any:
+        - system_class_identifier
+        - vendor_per_user_com
+      all: []
+
+  verdict:
+    low_risk_when:
+      - rundll32_clsid_invocation
+      - system_class_identifier
+      - vendor_per_user_com
+    suspicious_when:
+      - rundll32_clsid_invocation
+      - class_identifier_rare
+    high_risk_when:
+      - rundll32_clsid_invocation
+      - class_registered_to_user_path
+      - class_identifier_rare
+
+  false_positive:
+    - condition: Windows starts rundll32 -sta for a shell component.
+      explanation: >-
+        The GUID is the same everywhere, the parent is a system process and no user hive
+        registers it.
+    - condition: A per-user application registers COM servers under AppData.
+      explanation: >-
+        Teams add-ins, sync clients and updaters do this. They are not started through
+        rundll32 /sta.

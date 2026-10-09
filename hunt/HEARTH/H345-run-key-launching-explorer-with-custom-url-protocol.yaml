@@ -1,0 +1,318 @@
+# Converted from THORCollective/HEARTH Flames/H345.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+# HEARTH also cites T1112 and T1036.005. H344 holds the rundll32 /sta command the
+# handler ran in the reported chain.
+type: detection
+
+id: hg-win-hearth-h345-run-key-launching-explorer-with-custom-url-protocol-t1547-001
+version: 1.0.0
+
+info:
+  name: Run key starting explorer.exe against a self-registered URL protocol
+  description: >-
+    DarkMe's loader sets a Run value to explorer.exe "Locked://Newest" and registers the
+    Locked scheme under the user's Classes hive, with shell\open\command holding the
+    real payload command. Someone reviewing autoruns sees a signed Windows binary and a
+    string that looks like a deep link; the payload is one key away, and when it runs
+    its parent is Explorer, as if the user had clicked something. The two halves are
+    separate registry writes and either can exist alone. The hunt returns autorun values
+    whose command is a URI and not a path, per-user protocol handler registrations, and
+    explorer.exe started with a custom scheme as its argument.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - persistence
+    - run-key
+    - url-protocol-handler
+    - explorer
+    - darkme
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H345.md
+    - https://attack.mitre.org/techniques/T1547
+    - https://attack.mitre.org/techniques/T1547/001
+    - https://attack.mitre.org/detectionstrategies/DET0365
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1547
+  sub_techniques:
+    - T1547.001
+  detection_strategies:
+    - DET0365
+  analytics:
+    - AN1032
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Windows Registry Key Modification
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    A loader has registered a custom URL protocol handler under
+    HKCU\Software\Classes\<scheme> whose shell\open\command runs the malicious payload,
+    and set a Run key value to explorer.exe "<scheme>://<anything>", so the autorun
+    entry a responder inspects contains nothing but a signed Windows binary and an
+    opaque URI, the payload command lives in a second registry location nobody
+    enumerates, and the resulting process is parented by explorer.exe as though a user
+    had clicked something.
+  attacker_behavior:
+    - Registers a new scheme under the user's Classes hive with a URL Protocol value.
+    - Sets the scheme's shell\open\command to rundll32, a script host or a payload path.
+    - Writes a Run value that starts explorer.exe, cmd /c start or url.dll with scheme://text.
+    - Names the Run value after the scheme.
+  legitimate_behavior:
+    - Desktop applications register their own schemes for deep links, some per user.
+    - A few applications autostart through a URI such as a store app's protocol.
+    - Explorer is started with web URLs by programs that open the default browser.
+  risk_indicator:
+    - A Run or RunOnce value's data is a URI with a scheme no installed product owns.
+    - The scheme was registered under a user hive on the same host around the same time.
+    - The handler command is rundll32, regsvr32, mshta, a script host or a file in AppData.
+    - explorer.exe starts at logon with that scheme as its only argument.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - AsepValueUpdate
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: autorun-value-launching-uri-scheme
+        name: Run value whose command opens a URI scheme
+        purpose: >-
+          Return Run and RunOnce values, reported as autostart entries, whose data
+          starts explorer.exe, start, or url.dll against scheme://. Web and file URLs
+          are left out. The scheme name is in the data.
+        query: |
+          #event_simpleName=AsepValueUpdate
+          | RegObjectName=/\\CurrentVersion\\Run(Once)?\\?$/i
+          | RegStringValue=/(explorer(\.exe)?"?|\bstart|FileProtocolHandler|OpenURL)\s+"{0,2}[a-z][a-z0-9+.-]{1,30}:\/\//i
+          | RegStringValue!=/\s"{0,2}(https?|file|ftp):\/\//i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: autorun-value-launching-uri-scheme-generic-event
+        name: The same Run value reported as a generic registry update
+        purpose: >-
+          The sensor reports some autostart locations under a separate event name. This
+          case reads the same keys there, so the hunt does not depend on which of the
+          two the tenant emits.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\CurrentVersion\\Run(Once)?\\?$/i
+          | RegStringValue=/(explorer(\.exe)?"?|\bstart|FileProtocolHandler|OpenURL)\s+"{0,2}[a-z][a-z0-9+.-]{1,30}:\/\//i
+          | RegStringValue!=/\s"{0,2}(https?|file|ftp):\/\//i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: per-user-url-protocol-registered
+        name: URL Protocol value written under a user hive
+        purpose: >-
+          Return the URL Protocol marker value written under a user's Classes hive,
+          which is what makes a key a scheme. The scheme is the key name. Per-user
+          application installs produce these too. Whether the sensor reports writes
+          under per-user Classes keys should be confirmed in the tenant.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegValueName=/^URL Protocol$/i
+          | RegObjectName=/\\REGISTRY\\USER\\S-1-5-21-/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: per-user-handler-command-running-proxy-binary
+        name: Per-user open command that runs a proxy binary or a user-writable path
+        purpose: >-
+          Return shell\open\command values under a user's Classes hive whose command is
+          rundll32, regsvr32, mshta, a script host or an interpreter, or a path in
+          AppData, ProgramData or Users\Public. Per-user applications installed in
+          AppData register handlers that match the path half.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\REGISTRY\\USER\\S-1-5-21-[^\\]+(\\Software\\Classes|_Classes)\\[^\\]+\\shell\\open\\command\\?$/i
+          | RegStringValue=/\b(rundll32|regsvr32|mshta|wscript|cscript|powershell|pwsh|cmd)(\.exe)?\b|\\(AppData|ProgramData|Users\\Public)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: explorer-started-with-custom-scheme
+        name: explorer.exe started with a custom scheme as its argument
+        purpose: >-
+          Return explorer.exe processes whose command line is a URI with a scheme other
+          than http, https, file or ftp. This is the autorun firing. The handler's
+          command then starts under Explorer, so the payload is found as a child of
+          explorer.exe at the same time and not as a child of this process alone.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^explorer\.exe$/i
+          | CommandLine=/explorer(\.exe)?"?\s+"{0,2}[a-z][a-z0-9+.-]{1,30}:\/\//i
+          | CommandLine!=/\s"{0,2}(https?|file|ftp):\/\//i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: autorun_opens_uri_scheme
+      name: Autorun value opens a URI scheme
+      description: >-
+        A Run or RunOnce value's data starts explorer.exe or another shell launcher with
+        a URI whose scheme is not a web or file scheme.
+      source: registry
+      field: registry_data
+      indicates: indirect_autorun_through_protocol_handler
+
+  supporting:
+    - id: scheme_registered_per_user
+      name: Scheme registered under the user's hive
+      description: >-
+        A URL Protocol value was written under a key in the user's Classes hive whose
+        name is the scheme in the autorun value, by the agent's comparison.
+      source: registry
+      field: registry_path
+      indicates: attacker_registered_scheme
+    - id: handler_runs_proxy_binary
+      name: Handler command runs a proxy binary or user-writable file
+      description: >-
+        The scheme's open command is rundll32, a script host or a file in AppData,
+        ProgramData or Public.
+      source: registry
+      field: registry_data
+      indicates: payload_command_in_handler
+    - id: explorer_launched_scheme
+      name: Explorer started with the scheme
+      description: >-
+        explorer.exe was started with the scheme URI as its argument, at logon.
+      source: process_creation
+      field: command_line
+      indicates: autorun_fired
+    - id: value_name_matches_scheme
+      name: Autorun value is named after the scheme
+      description: >-
+        The Run value name and the scheme are the same string.
+      source: registry
+      field: registry_value
+      indicates: generator_artifact
+
+  contradicting:
+    - id: scheme_owned_by_installed_product
+      name: Scheme belongs to an installed product
+      description: >-
+        The scheme is registered by an approved application on the host and its handler
+        is that application's executable.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_software
+    - id: autorun_common_in_estate
+      name: Same autorun value is present on many hosts
+      description: >-
+        Earlier activity shows the same value and scheme written on most hosts by a
+        deployed application.
+      source: baseline
+      field: RegStringValue
+      indicates: established_autorun
+
+  risk_logic:
+    required:
+      - autorun_opens_uri_scheme
+
+    supporting:
+      any:
+        - scheme_registered_per_user
+        - handler_runs_proxy_binary
+        - explorer_launched_scheme
+        - value_name_matches_scheme
+      all:
+        - scheme_registered_per_user
+        - handler_runs_proxy_binary
+
+    contradicting:
+      any:
+        - scheme_owned_by_installed_product
+        - autorun_common_in_estate
+      all: []
+
+  verdict:
+    low_risk_when:
+      - autorun_opens_uri_scheme
+      - scheme_owned_by_installed_product
+      - autorun_common_in_estate
+    suspicious_when:
+      - autorun_opens_uri_scheme
+      - scheme_registered_per_user
+    high_risk_when:
+      - autorun_opens_uri_scheme
+      - scheme_registered_per_user
+      - handler_runs_proxy_binary
+
+  false_positive:
+    - condition: An application autostarts through its own deep link.
+      explanation: >-
+        The scheme is the product's, the handler is its signed executable and the same
+        value is on every host with the product.
+    - condition: Per-user chat and meeting clients register schemes from AppData.
+      explanation: >-
+        The protocol and handler cases return them. They have no Run value that opens
+        the scheme through Explorer.

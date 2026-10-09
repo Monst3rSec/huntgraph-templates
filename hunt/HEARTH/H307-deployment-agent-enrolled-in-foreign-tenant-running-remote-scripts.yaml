@@ -1,0 +1,325 @@
+# Converted from THORCollective/HEARTH Flames/H307.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h307-deployment-agent-enrolled-in-foreign-tenant-running-remote-scripts-t1072
+version: 1.0.0
+
+info:
+  name: Endpoint-management agent from an unowned tenant running remote scripts
+  description: >-
+    An adversary does not need the organisation's deployment server. They deliver a
+    genuine, signed endpoint-management agent as a fake invoice or document and enrol
+    the machine into a tenant they control, which gives them a vendor-operated channel
+    for SYSTEM-level PowerShell. Huntress documented this with Faronics Deploy: the
+    installer arrived as Adobe.exe, DocuSignView.exe or Invoice_*.exe, the agent checked
+    in to deploy.faronics.com with the attacker's tenant identifier, ran PowerShell
+    fetched from raw.githubusercontent.com and installed ScreenConnect. HEARTH's
+    deciding evidence is the tenant identifier in the check-in URL and the agent's
+    ScriptRunner.log; the first is inside TLS and the second is a file the sensor does
+    not read. The hunt returns what places the agent on a host: its processes, the
+    check-in name being resolved, a document-named installer written to disk, and
+    PowerShell fetching from a code-hosting domain, for comparison with the list of
+    management products the organisation uses.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - execution
+    - lateral-movement
+    - software-deployment-tools
+    - faronics-deploy
+    - rmm
+    - tenant-abuse
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H307.md
+    - https://attack.mitre.org/techniques/T1072
+    - https://attack.mitre.org/detectionstrategies/DET0223
+
+mitre:
+  tactics:
+    - TA0002
+    - TA0008
+  techniques:
+    - T1072
+  sub_techniques: []
+  detection_strategies:
+    - DET0223
+  analytics:
+    - AN0623
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary is installing a legitimate endpoint-management agent on a victim's
+    machine, enrolled into a deployment tenant the adversary controls, and using that
+    vendor channel to run SYSTEM-level scripts on the host.
+  attacker_behavior:
+    - Sends the signed agent installer under a document or invoice name.
+    - Enrols the host into the adversary's own deployment tenant.
+    - Pushes PowerShell from the vendor console that fetches a script from a code-hosting domain.
+    - Installs a second remote-access tool for durable interactive access.
+  legitimate_behavior:
+    - The organisation's own deployment product runs PowerShell as SYSTEM all day.
+    - An MSP or a business unit runs a management tenant security was not told about.
+    - Vendor support installs a management agent for the length of an engagement.
+  risk_indicator:
+    - A deployment agent runs on a host and the product is not on the approved list.
+    - The agent's installer was written under a document-like name in Downloads or a mail cache.
+    - PowerShell under the agent fetches from raw.githubusercontent.com or a paste site.
+    - A second remote-access product is installed soon after.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: faronics-deploy-agent-process
+        name: Process running from a Faronics directory
+        purpose: >-
+          Return processes whose image is under a Faronics directory. On an estate that
+          does not use the product, any event is the finding; where it is used, the
+          process ids are what the script case is matched against. Other products in
+          this class are not listed here; H181 and H182 return RMM installs and
+          sessions.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ImageFileName=/\\Faronics\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: deployment-cloud-name-resolved
+        name: Faronics Deploy cloud name resolved
+        purpose: >-
+          Return DNS requests for the Deploy check-in host. The tenant identifier
+          travels as a query parameter inside TLS and is not visible, so the name shows
+          that an agent is enrolled somewhere, not where.
+        query: |
+          #event_simpleName=DnsRequest
+          | DomainName=/(^|\.)deploy\.faronics\.com$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: powershell-fetching-script-from-code-host
+        name: PowerShell fetching a script from a code-hosting or paste domain
+        purpose: >-
+          Return PowerShell whose command line names a raw code-hosting or paste URL.
+          The parent's path is not on the event; the agent keeps events whose parent
+          process id is a process the first case returned. A script the agent downloads
+          itself and passes as a file shows only the file name.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/raw\.githubusercontent\.com|gist\.githubusercontent\.com|pastebin\.com|paste\.ee|rentry\.co|hastebin\.com/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: document-named-installer-written
+        name: Installer written under a document-like name
+        purpose: >-
+          Return executables written to a download, mail-cache or temporary path under
+          the names the campaign used. The binary is the vendor's own signed installer;
+          the signer is not on the file event, so the mismatch between name and
+          publisher is for the agent to establish from the hash.
+        query: |
+          #event_simpleName=PeFileWritten
+          | TargetFileName=/\\(Downloads|Temp|INetCache|Content\.Outlook)\\([^\\]+\\)*(Adobe|DocuSignView|Invoice[_-][^\\]*)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: deployment_agent_on_host
+      name: Deployment agent present on the host
+      description: >-
+        A process runs from the deployment product's directory on the host.
+      source: process_creation
+      field: image_path
+      indicates: management_agent_present
+
+  supporting:
+    - id: agent_checks_in
+      name: Agent resolves the vendor's check-in host
+      description: >-
+        The host resolves deploy.faronics.com.
+      source: dns_request
+      field: query_name
+      indicates: tenant_enrolment
+    - id: check_in_process
+      name: Check-in comes from the agent process
+      description: >-
+        The requesting process is the agent's service, not a browser.
+      source: dns_request
+      field: process_name
+      indicates: tenant_enrolment
+    - id: script_from_code_host
+      name: Script fetched from a code-hosting domain
+      description: >-
+        PowerShell on the host fetches from raw.githubusercontent.com or a paste
+        service.
+      source: process_creation
+      field: command_line
+      indicates: remote_script_execution
+    - id: script_parent_is_agent
+      name: PowerShell's parent is the agent
+      description: >-
+        The parent process id of the PowerShell event is a process running from the
+        agent's directory.
+      source: process_creation
+      field: parent_process_id
+      indicates: deployment_channel_execution
+    - id: system_context
+      name: Script runs as SYSTEM
+      description: >-
+        The PowerShell runs under the SYSTEM account.
+      source: process_creation
+      field: user
+      indicates: privileged_execution
+    - id: masqueraded_installer
+      name: Installer arrived under a document name
+      description: >-
+        An executable named like a document or another vendor's product was written to a
+        download or mail path before the agent appeared.
+      source: file_creation
+      field: file_path
+      indicates: masqueraded_delivery
+    - id: installer_writer
+      name: Installer written by a browser or mail client
+      description: >-
+        The writer of the installer is a browser, a mail client or an archive tool.
+      source: file_creation
+      field: writer_process_name
+      indicates: user_delivered_file
+
+  contradicting:
+    - id: approved_management_product
+      name: Product and tenant are approved
+      description: >-
+        The product is on the organisation's register of management tools and the host
+        is one it manages.
+      source: asset_inventory
+      field: ComputerName
+      indicates: sanctioned_management
+    - id: recorded_vendor_engagement
+      name: Recorded vendor or MSP engagement
+      description: >-
+        A record covers a vendor or MSP installing the agent on the host.
+      source: change_management
+      field: ComputerName
+      indicates: approved_change
+
+  risk_logic:
+    required:
+      - deployment_agent_on_host
+
+    supporting:
+      any:
+        - agent_checks_in
+        - check_in_process
+        - script_from_code_host
+        - script_parent_is_agent
+        - system_context
+        - masqueraded_installer
+        - installer_writer
+      all:
+        - agent_checks_in
+        - script_from_code_host
+
+    contradicting:
+      any:
+        - approved_management_product
+        - recorded_vendor_engagement
+      all: []
+
+  verdict:
+    low_risk_when:
+      - deployment_agent_on_host
+      - approved_management_product
+      - recorded_vendor_engagement
+    suspicious_when:
+      - deployment_agent_on_host
+      - masqueraded_installer
+    high_risk_when:
+      - deployment_agent_on_host
+      - script_from_code_host
+      - script_parent_is_agent
+
+  false_positive:
+    - condition: Estates that use the product.
+      explanation: >-
+        Where Faronics Deploy is the organisation's tool, every case returns normal
+        activity and the tenant cannot be told apart from here. Reconcile against the
+        vendor console's device list.
+    - condition: Unregistered but benign tenants.
+      explanation: >-
+        An MSP, a subsidiary or a trial may run a tenant security does not know. It is
+        still a management channel into the estate and should be documented.

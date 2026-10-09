@@ -1,0 +1,394 @@
+# Converted from THORCollective/HEARTH Flames/H314.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h314-rogue-root-certificate-with-hosts-redirect-and-local-proxy-firewall-rule-t1553-004
+version: 1.0.0
+
+info:
+  name: Rogue root CA installed with a hosts-file redirect and a LocalProxy firewall rule
+  description: >-
+    An adversary sets up durable TLS interception on a Windows endpoint by installing a
+    self-signed certificate authority into the machine Trusted Root store, presented as
+    Google Trust Services with CN=WR3, and issuing itself a leaf for www.virustotal.com
+    whose SAN also covers localhost. A hosts-file entry sends the target domain to
+    loopback and a firewall rule named LocalProxy admits the intercepting listener. The
+    payload arrives as a fake Lenovo driver package signed with a stolen certificate and
+    runs by hollowing MSBuild.exe. The three artefacts are configuration, so they
+    survive reboot and removal of the malware. The certificate's subject and SAN and the
+    contents of the hosts file are not visible to the sensor, and a certificate added
+    through the CryptoAPI shows only as a registry write. The hunt returns that write,
+    the command forms of each of the three changes, and MSBuild started bare.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-impairment
+    - root-certificate
+    - tls-interception
+    - hosts-file
+    - firewall-rule
+    - msbuild
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H314.md
+    - https://attack.mitre.org/techniques/T1553/004
+    - https://attack.mitre.org/detectionstrategies/DET0056
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1553
+  sub_techniques:
+    - T1553.004
+  detection_strategies:
+    - DET0056
+  analytics:
+    - AN0153
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+    - WinEventLog:Security
+  data_components:
+    - Windows Registry Key Modification
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary is installing a self-signed root certificate authority that
+    impersonates a public CA into the machine trust store, together with a hosts-file
+    entry pointing a target domain at loopback and a firewall rule for a local proxy, to
+    intercept TLS traffic durably.
+  attacker_behavior:
+    - Adds a self-signed CA to the LocalMachine Root store.
+    - Appends a hosts entry mapping a public domain to 127.0.0.1.
+    - Adds a firewall rule named LocalProxy for the listener.
+    - Runs the payload inside a hollowed MSBuild.exe started with no project.
+  legitimate_behavior:
+    - Group Policy, Intune and deployment agents distribute the organisation's root certificates.
+    - TLS-inspecting security products and developer proxies install their own root.
+    - Windows updates the AuthRoot store automatically.
+    - Developers add hosts entries and firewall rules for local services.
+  risk_indicator:
+    - A root-store write comes from a process that is not a management agent or the system.
+    - A hosts-file edit and a root-store write occur on one host close together.
+    - A firewall rule named LocalProxy is added.
+    - MSBuild runs with no arguments on a machine that is not a developer's.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: root-store-certificate-registry-write
+        name: Certificate written to the machine Root store
+        purpose: >-
+          Return writes of a certificate blob under the Root store's Certificates key,
+          in the local-machine and policy locations. Each event carries the thumbprint
+          in the key path and the writing process id. The subject and SAN are inside the
+          blob and are not readable from the event. AuthRoot, which Windows updates by
+          itself, is left out.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegValueName=/^Blob$/i
+          | RegObjectName=/\\SystemCertificates\\Root\\Certificates\\[0-9A-F]{40}$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: root-certificate-install-command
+        name: Root certificate installed by command
+        purpose: >-
+          Return certutil -addstore Root, Import-Certificate into LocalMachine\Root and
+          certmgr /add to Root. A certificate added through the CryptoAPI by the payload
+          itself starts no process and is seen only in the registry case.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/-addstore\s+(-\w+\s+)*"?(Root|AuthRoot)\b|Import-Certificate\b[^|;]*LocalMachine\\Root|certmgr(\.exe)?"?\s[^\n]*[\/-]add\b[^\n]*\bRoot\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: hosts-file-edited-by-command
+        name: hosts file edited by command
+        purpose: >-
+          Return command lines that name the hosts file together with a write verb or a
+          redirection. A program that writes the file directly leaves nothing: the hosts
+          file is not a PE file or script, so its modification is not reported.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/drivers\\etc\\hosts\b/i
+          | CommandLine=/>>?|\b(Add-Content|Set-Content|Out-File|copy|move|echo|type)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: local-proxy-firewall-rule-added
+        name: Firewall rule named LocalProxy added by command
+        purpose: >-
+          Return netsh and PowerShell commands adding a firewall rule whose name is
+          LocalProxy. The name is this campaign's.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/firewall\s+add\s+rule|New-NetFirewallRule/i
+          | CommandLine=/LocalProxy/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: local-proxy-firewall-rule-registry-write
+        name: Firewall rule named LocalProxy written to the registry
+        purpose: >-
+          Return firewall rule values whose data names LocalProxy, for a rule added
+          through the firewall API instead of a command.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\FirewallPolicy\\FirewallRules$/i
+          | RegStringValue=/\|Name=LocalProxy\|/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: msbuild-started-with-no-arguments
+        name: MSBuild started with no arguments
+        purpose: >-
+          Return MSBuild.exe whose command line is only its own path, the hollowing host
+          in the reported chain. H213 hunts this for the family of .NET utilities; it is
+          repeated here so the three trust changes can be tied to it.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^MSBuild\.exe$/i
+          | CommandLine=/^\s*"?[^"]*msbuild(\.exe)?"?\s*$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: reported-payload-host-resolved
+        name: Reported payload host resolved
+        purpose: >-
+          Return DNS requests for the host the encoded PowerShell stage fetched payloads
+          from. An indicator of this campaign only.
+        query: |
+          #event_simpleName=DnsRequest
+          | DomainName=/(^|\.)eu03hub\.com$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: root_store_addition
+      name: Certificate added to the machine Root store
+      description: >-
+        A certificate blob was written under the Root store's Certificates key.
+      source: registry
+      field: registry_path
+      indicates: trust_store_modification
+
+  supporting:
+    - id: root_store_writer_not_management
+      name: Writer is not a management agent
+      description: >-
+        The writing process id resolves to a process other than the Group Policy client,
+        the management extension or a deployment agent.
+      source: registry
+      field: writer_process_id
+      indicates: unmanaged_trust_change
+    - id: root_store_value
+      name: Value written is the certificate blob
+      description: >-
+        The value name is Blob, a new certificate and not a property update.
+      source: registry
+      field: registry_value
+      indicates: trust_store_modification
+    - id: local_proxy_rule_in_registry
+      name: LocalProxy rule present in firewall rules
+      description: >-
+        A firewall rule value names LocalProxy.
+      source: registry
+      field: registry_data
+      indicates: interception_listener_allowed
+    - id: install_or_redirect_command
+      name: Certificate, hosts or firewall command
+      description: >-
+        A command installs a root certificate, edits the hosts file or adds the
+        LocalProxy rule.
+      source: process_creation
+      field: command_line
+      indicates: interception_setup
+    - id: msbuild_bare_start
+      name: MSBuild started bare
+      description: >-
+        MSBuild ran with no project argument on the host.
+      source: process_creation
+      field: image_name
+      indicates: hollowing_host
+    - id: msbuild_parent
+      name: MSBuild's parent is not a build tool
+      description: >-
+        The parent of the bare MSBuild is a dropper, a script host or a Run-key launch,
+        not Visual Studio or a build agent.
+      source: process_creation
+      field: parent_process
+      indicates: non_developer_origin
+    - id: changes_share_a_process
+      name: Changes trace to one process
+      description: >-
+        The agent matches the registry writer's process id to the process events and
+        finds the same process or its children behind more than one of the three
+        changes.
+      source: process_creation
+      field: process_id
+      indicates: single_actor_configuration
+    - id: payload_host_resolved
+      name: Reported payload host resolved
+      description: >-
+        The host resolved eu03hub.com.
+      source: dns_request
+      field: query_name
+      indicates: known_infrastructure
+
+  contradicting:
+    - id: managed_root_distribution
+      name: Root distributed by management
+      description: >-
+        The thumbprint is one the organisation or an installed inspection product
+        distributes, present across the estate.
+      source: asset_inventory
+      field: ComputerName
+      indicates: sanctioned_certificate
+    - id: developer_proxy_tool
+      name: Developer proxy tool
+      description: >-
+        The host is a developer's and the root belongs to Fiddler, mitmproxy, Charles or
+        a local development CA.
+      source: identity_context
+      field: UserName
+      indicates: development_activity
+
+  risk_logic:
+    required:
+      - root_store_addition
+
+    supporting:
+      any:
+        - root_store_writer_not_management
+        - root_store_value
+        - local_proxy_rule_in_registry
+        - install_or_redirect_command
+        - msbuild_bare_start
+        - msbuild_parent
+        - changes_share_a_process
+        - payload_host_resolved
+      all:
+        - root_store_writer_not_management
+        - install_or_redirect_command
+
+    contradicting:
+      any:
+        - managed_root_distribution
+        - developer_proxy_tool
+      all: []
+
+  verdict:
+    low_risk_when:
+      - root_store_addition
+      - managed_root_distribution
+      - developer_proxy_tool
+    suspicious_when:
+      - root_store_addition
+      - root_store_writer_not_management
+    high_risk_when:
+      - root_store_addition
+      - root_store_writer_not_management
+      - local_proxy_rule_in_registry
+
+  false_positive:
+    - condition: Root certificates pushed by policy.
+      explanation: >-
+        Every enterprise root arrives this way. The thumbprint is known and the writer
+        is the policy client or a management agent.
+    - condition: TLS inspection and developer proxies.
+      explanation: >-
+        Security agents and debugging proxies install a root so they can intercept. They
+        are inventoried products or developer tools.
+    - condition: Removing the malware does not remove the trust.
+      explanation: >-
+        A host cleaned of the payload still trusts the root. A historic hit should be
+        checked against the store's current contents.

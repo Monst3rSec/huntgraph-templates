@@ -1,0 +1,339 @@
+# Converted from THORCollective/HEARTH Flames/H292.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h292-takeown-and-icacls-seizing-windows-update-service-dlls-t1222-001
+version: 1.0.0
+
+info:
+  name: takeown and icacls used to seize and rename Windows Update service DLLs
+  description: >-
+    Stopping wuauserv is reversible because Windows Update Medic Service repairs it. An
+    operator who wants patching to stay off removes the repair mechanism at the file
+    layer: takeown seizes C:\Windows\System32\WaaSMedicSvc.dll from TrustedInstaller,
+    icacls grants Everyone (*S-1-1-0) full control, the DLL is renamed with a _BAK
+    suffix, and icacls then hands ownership back to TrustedInstaller and removes the
+    grant so a later permissions audit finds nothing. Microsoft saw this run in a for
+    loop over WaaSMedicSvc and wuauserv in a counterfeit-installer campaign, beside
+    service disablement, NoAutoUpdate policy writes and deletion of the
+    SoftwareDistribution cache. The rename is a file rename and the missing DLL is an
+    absence, neither of which the sensor reports; takeown and icacls are processes and
+    their arguments are.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-impairment
+    - file-permissions
+    - takeown
+    - icacls
+    - windows-update
+    - patch-suppression
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H292.md
+    - https://attack.mitre.org/techniques/T1222/001
+    - https://attack.mitre.org/detectionstrategies/DET0418
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1222
+  sub_techniques:
+    - T1222.001
+  detection_strategies:
+    - DET0418
+  analytics:
+    - AN1177
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Security
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary is taking ownership of Windows Update service DLLs under System32 with
+    takeown and icacls, renaming them out of their expected path and restoring the
+    original owner and ACL, to keep the host unpatched in a way service repair cannot
+    undo.
+  attacker_behavior:
+    - Runs takeown /f against WaaSMedicSvc.dll or wuaueng.dll in System32.
+    - Grants the Everyone SID full control with icacls /grant *S-1-1-0:F.
+    - Renames the DLL with a _BAK suffix so the service host cannot load it.
+    - Restores TrustedInstaller ownership with icacls /setowner and removes the Everyone grant.
+    - Disables wuauserv, UsoSvc and WaaSMedicSvc and writes NoAutoUpdate.
+  legitimate_behavior:
+    - Servicing and in-place upgrade tooling adjusts ACLs under System32 as TrustedInstaller.
+    - Administrators take ownership of a damaged system file during a repair.
+    - Management agents disable automatic updates by policy where patching is orchestrated elsewhere.
+  risk_indicator:
+    - takeown or icacls names a file under System32.
+    - An icacls command line carries *S-1-1-0 with a full-control grant on a system file.
+    - icacls /setowner names NT SERVICE\TrustedInstaller, which only a cover-up needs.
+    - The parent is a binary under Users\Public, a temporary directory or a scheduled task.
+    - Update services are disabled on the same host in the same minutes.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: takeown-on-system-directory-file
+        name: takeown run against a file under the Windows directory
+        purpose: >-
+          Return takeown.exe whose arguments name a path under System32 or SysWOW64. cmd
+          expands a for-loop variable before it starts the process, so each DLL in the
+          reported loop is its own event with the full path.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^takeown\.exe$/i
+          | CommandLine=/\\Windows\\(System32|SysWOW64)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: icacls-grant-or-owner-change-on-system-file
+        name: icacls granting Everyone or setting an owner on a system file
+        purpose: >-
+          Return icacls.exe on a System32 or SysWOW64 path that grants or removes the
+          Everyone SID or sets an owner. The grant, the owner reset to TrustedInstaller
+          and the grant's removal are three events; the agent reads them in order per
+          file.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^icacls\.exe$/i
+          | CommandLine=/\\Windows\\(System32|SysWOW64)\\/i
+          | CommandLine=/\*S-1-1-0|\bEveryone\b|\/setowner/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: update-service-dll-named-in-file-command
+        name: Update service DLL named in a rename, move or delete command
+        purpose: >-
+          Return command lines that name an update service DLL together with a rename,
+          move, delete or ACL verb. ren and del are cmd built-ins: they are seen only
+          when the whole line was passed to cmd /c or PowerShell, and not when a batch
+          file runs them line by line. The _BAK name is this campaign's and is not
+          relied on.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/\b(WaaSMedicSvc|wuaueng|wuauserv|usosvc|usocoreworker)[^\\\s"]*\.dll/i
+          | CommandLine=/\b(ren|rename|move|del|erase|takeown|icacls|Rename-Item|Move-Item|Remove-Item|Set-Acl)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: update-service-disabled-by-command
+        name: Update service disabled or update cache removed by command
+        purpose: >-
+          Return the commands reported beside the ACL change: sc config or stop against
+          the update services, a NoAutoUpdate policy write, and removal of
+          SoftwareDistribution.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(sc|reg|net|net1|cmd|powershell|pwsh)\.exe$/i
+          | CommandLine=/\b(config|stop)\s+"?(wuauserv|UsoSvc|uhssvc|WaaSMedicSvc)\b|\bNoAutoUpdate\b|Services\\WaaSMedicSvc|\b(rd|rmdir|del|Remove-Item)\b[^&|]*SoftwareDistribution/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: update-policy-or-service-start-value-written
+        name: NoAutoUpdate or update service Start value written
+        purpose: >-
+          Return registry writes of NoAutoUpdate under the Windows Update policy key and
+          of Start under the update services, whichever process made them.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegValueName=/^(NoAutoUpdate|Start)$/i
+          | RegObjectName=/\\WindowsUpdate\\AU$|\\Services\\(WaaSMedicSvc|wuauserv|UsoSvc|uhssvc)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: ownership_or_acl_change_on_system_file
+      name: Ownership or ACL change on a System32 file
+      description: >-
+        takeown or icacls ran against a file under System32 or SysWOW64, taking
+        ownership, granting Everyone or setting an owner.
+      source: process_creation
+      field: command_line
+      indicates: system_file_permission_seizure
+
+  supporting:
+    - id: update_service_dll_targeted
+      name: Target is an update service DLL
+      description: >-
+        The file named is WaaSMedicSvc.dll, wuaueng.dll or another Windows Update
+        service component.
+      source: process_creation
+      field: image_name
+      indicates: patch_mechanism_targeted
+    - id: ownership_restored
+      name: Ownership handed back to TrustedInstaller
+      description: >-
+        A later icacls on the same file sets the owner to TrustedInstaller or removes
+        the Everyone grant. The agent orders the returned events per file.
+      source: process_creation
+      field: process_id
+      indicates: acl_cover_up
+    - id: parent_is_unmanaged_binary
+      name: Parent is not a management agent
+      description: >-
+        The parent is cmd under a binary in Users\Public or a temporary path, or a
+        scheduled task host, not servicing or a signed management agent.
+      source: process_creation
+      field: parent_process
+      indicates: non_administrative_origin
+    - id: update_services_disabled
+      name: Update services disabled alongside
+      description: >-
+        sc config, a NoAutoUpdate write or removal of SoftwareDistribution occurs on the
+        host near the ACL change.
+      source: process_creation
+      field: parent_process_id
+      indicates: update_suppression_cluster
+    - id: update_policy_registry_write
+      name: Update policy or service start value changed
+      description: >-
+        NoAutoUpdate was written, or Start was set on an update service.
+      source: registry
+      field: registry_value
+      indicates: update_disabled_in_registry
+    - id: update_policy_value_data
+      name: Value disables the service or updates
+      description: >-
+        The data written is 1 for NoAutoUpdate or 4 for a service Start value.
+      source: registry
+      field: registry_data
+      indicates: update_disabled_in_registry
+
+  contradicting:
+    - id: recorded_repair
+      name: Recorded repair of a system file
+      description: >-
+        A change or support record covers taking ownership of the named file on that
+        host.
+      source: change_management
+      field: ComputerName
+      indicates: approved_change
+    - id: managed_update_policy
+      name: Updates are managed centrally
+      description: >-
+        The host belongs to a group whose updates are disabled by policy and applied by
+        another tool, and only the policy write is present.
+      source: asset_inventory
+      field: ComputerName
+      indicates: sanctioned_configuration
+
+  risk_logic:
+    required:
+      - ownership_or_acl_change_on_system_file
+
+    supporting:
+      any:
+        - update_service_dll_targeted
+        - ownership_restored
+        - parent_is_unmanaged_binary
+        - update_services_disabled
+        - update_policy_registry_write
+        - update_policy_value_data
+      all:
+        - update_service_dll_targeted
+        - parent_is_unmanaged_binary
+
+    contradicting:
+      any:
+        - recorded_repair
+        - managed_update_policy
+      all: []
+
+  verdict:
+    low_risk_when:
+      - ownership_or_acl_change_on_system_file
+      - recorded_repair
+      - managed_update_policy
+    suspicious_when:
+      - ownership_or_acl_change_on_system_file
+      - parent_is_unmanaged_binary
+    high_risk_when:
+      - ownership_or_acl_change_on_system_file
+      - update_service_dll_targeted
+      - ownership_restored
+
+  false_positive:
+    - condition: An administrator takes ownership of a corrupted system file.
+      explanation: >-
+        It happens during repairs, usually on one file on one host from an interactive
+        elevated prompt, and ownership is not handed back afterwards.
+    - condition: Update suppression by policy.
+      explanation: >-
+        Server estates patched by orchestration set NoAutoUpdate through Group Policy.
+        That shows as the registry case alone, written by the policy client, with no
+        takeown or icacls.
+    - condition: Debloating and tweak scripts.
+      explanation: >-
+        Scripts that 'disable Windows Update permanently' run this same sequence. The
+        effect on the host is the same and it is still a finding, though not an
+        intrusion.

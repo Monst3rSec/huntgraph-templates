@@ -1,0 +1,312 @@
+# Converted from THORCollective/HEARTH Flames/H336.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+# Kept at parent T1218: no sub-technique describes WWAHost.exe. It fails the L2 leaf
+# check by design.
+type: detection
+
+id: hg-win-hearth-h336-sideloaded-appx-running-remote-script-in-wwahost-t1218
+version: 1.0.0
+
+info:
+  name: Sideloaded AppX package running remote JavaScript inside WWAHost.exe
+  description: >-
+    An adversary after Microsoft 365 tokens can borrow Microsoft's own sign-in dialog. A
+    sideloaded AppX package whose manifest lists a remote address under ContentUriRules
+    with WindowsRuntimeAccess set to all has that address's JavaScript loaded by
+    WWAHost.exe, a signed Windows binary, with the whole WinRT surface available. The
+    script calls WebAuthenticationBroker with Office's client id, the user signs in at
+    the real login.microsoftonline.com prompt, and the authorization code is returned to
+    the attacker's script. The manifest's contents, the broker call and the sign-in
+    record are not visible to the sensor. The endpoint mechanics HEARTH names are: the
+    package registered from a user-writable path, which is seen when Add-AppxPackage is
+    on a command line, and the AppX host resolving a name Microsoft does not own. A
+    package registered from an open PowerShell session or through the deployment API
+    starts no process, and then only WWAHost and its lookups are returned.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-evasion
+    - appx
+    - wwahost
+    - sideloading
+    - oauth-token-theft
+    - system-binary-proxy-execution
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H336.md
+    - https://attack.mitre.org/techniques/T1218
+    - https://attack.mitre.org/detectionstrategies/DET0081
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1218
+  sub_techniques: []
+  detection_strategies:
+    - DET0081
+  analytics:
+    - AN0226
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary sideloads an AppX package whose manifest grants full Windows Runtime
+    access to a remote URL, so that attacker JavaScript runs inside the signed
+    WWAHost.exe and drives a genuine Microsoft OAuth prompt through
+    WebAuthenticationBroker to obtain Microsoft 365 tokens; the package is registered
+    from a user-writable path and the AppX host connects to a destination Microsoft does
+    not own.
+  attacker_behavior:
+    - Drops an unpacked package folder with an AppxManifest.xml into a user-writable path.
+    - Registers it with Add-AppxPackage -Register, which needs sideloading or developer mode.
+    - Starts the application so WWAHost.exe loads the remote page named in the manifest.
+    - Has the page's script call WebAuthenticationBroker with a first-party client id.
+    - Sends the authorization code to its own server from inside WWAHost.exe.
+  legitimate_behavior:
+    - Developers register their own packages from a build output folder.
+    - A few older Store applications are hosted web applications that run in WWAHost.exe.
+    - Deployment tools sideload line-of-business packages.
+  risk_indicator:
+    - Add-AppxPackage registers a manifest under AppData, Temp, Downloads or ProgramData.
+    - The registering PowerShell was started by a script host, an Office program or a browser.
+    - WWAHost.exe resolves a domain outside Microsoft's.
+    - WWAHost.exe appears on a host that has never run it before.
+    - Developer mode or sideloading is switched on shortly before the registration.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: appx-package-registered-from-user-writable-path
+        name: Add-AppxPackage registering a loose manifest or a package from a user-writable path
+        purpose: >-
+          Return PowerShell commands that add an AppX package with -Register, name an
+          AppxManifest.xml, allow an unsigned package or take the package from a
+          user-writable folder. A cmdlet typed into an open session is not seen.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/Add-App(x)?Package|Add-AppxProvisionedPackage/i
+          | CommandLine=/-Register|AppxManifest\.xml|-AllowUnsigned|\\(AppData|Temp|Downloads|ProgramData|Users\\Public)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: sideloading-or-developer-mode-enabled-by-command
+        name: Command switching on AppX sideloading or developer mode
+        purpose: >-
+          Return commands that name the AppModelUnlock policy values. Registering a
+          loose, unsigned manifest needs one of them set, so this is the step before the
+          registration when the host did not already allow it. HEARTH does not list this
+          step; it is included as the precondition of the one it does.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/AppModelUnlock|AllowAllTrustedApps|AllowDevelopmentWithoutDevLicense/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: wwahost-started
+        name: WWAHost.exe started
+        purpose: >-
+          Return every start of the hosted-web-application host with its command line,
+          which names the package it is serving. Few current applications use it, so on
+          most hosts any start is worth reading; where an estate does run such an
+          application the agent sets it aside by package name.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^WWAHost\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: wwahost-resolving-domain-outside-microsoft
+        name: WWAHost.exe resolving a domain that is not Microsoft's
+        purpose: >-
+          Return DNS requests from WWAHost.exe for names outside Microsoft's own
+          domains. The page that carries the script and the server that receives the
+          code both have to be resolved. The sign-in itself goes to Microsoft and is
+          removed by the exclusion.
+        query: |
+          #event_simpleName=DnsRequest
+          | event_platform=Win
+          | ContextBaseFileName=/^WWAHost\.exe$/i
+          | DomainName!=/(^|\.)(microsoft\.com|microsoftonline\.com|microsoftonline-p\.com|msftauth\.net|msauth\.net|msftauthimages\.net|live\.com|live\.net|windows\.net|windows\.com|office\.com|office\.net|office365\.com|msn\.com|bing\.com|azureedge\.net|msedge\.net|xboxlive\.com|skype\.com|msftncsi\.com|msftconnecttest\.com|akamaized\.net)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: appx_host_or_registration_activity
+      name: AppX package registered or hosted web application started
+      description: >-
+        A command registers an AppX package from a loose manifest or a user-writable
+        path, or WWAHost.exe starts for a package.
+      source: process_creation
+      field: command_line
+      indicates: sideloaded_hosted_web_app
+
+  supporting:
+    - id: package_from_user_writable_path
+      name: Package path is user-writable
+      description: >-
+        The registration command names a path under AppData, Temp, Downloads,
+        ProgramData or Public.
+      source: process_creation
+      field: command_line
+      indicates: untrusted_package_source
+    - id: registration_parent
+      name: Registration started by a script host, Office or a browser
+      description: >-
+        The parent of the registering PowerShell is not a deployment tool or an
+        interactive developer shell.
+      source: process_creation
+      field: parent_process
+      indicates: delivery_chain
+    - id: wwahost_non_microsoft_domain
+      name: WWAHost.exe resolved a non-Microsoft domain
+      description: >-
+        A DNS request from WWAHost.exe names a domain outside Microsoft's.
+      source: dns_request
+      field: query_name
+      indicates: remote_script_origin
+    - id: wwahost_requester
+      name: The requester is the AppX host
+      description: >-
+        The process named on the DNS event is WWAHost.exe.
+      source: dns_request
+      field: process_name
+      indicates: signed_host_carrying_foreign_script
+    - id: sideloading_enabled_first
+      name: Sideloading or developer mode enabled beforehand
+      description: >-
+        A command set an AppModelUnlock value on the host before the registration.
+      source: process_creation
+      field: command_line
+      indicates: sideloading_precondition_set
+
+  contradicting:
+    - id: developer_package_testing
+      name: User develops AppX packages
+      description: >-
+        The account is a developer's and the package is registered from a build output
+        folder.
+      source: identity_context
+      field: UserName
+      indicates: developer_workflow
+    - id: known_hosted_web_application
+      name: Package is a known hosted web application
+      description: >-
+        The package named on the WWAHost command line is one the organisation deploys.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_application
+
+  risk_logic:
+    required:
+      - appx_host_or_registration_activity
+
+    supporting:
+      any:
+        - package_from_user_writable_path
+        - registration_parent
+        - wwahost_non_microsoft_domain
+        - wwahost_requester
+        - sideloading_enabled_first
+      all:
+        - package_from_user_writable_path
+        - wwahost_non_microsoft_domain
+
+    contradicting:
+      any:
+        - developer_package_testing
+        - known_hosted_web_application
+      all: []
+
+  verdict:
+    low_risk_when:
+      - appx_host_or_registration_activity
+      - developer_package_testing
+      - known_hosted_web_application
+    suspicious_when:
+      - appx_host_or_registration_activity
+      - wwahost_non_microsoft_domain
+    high_risk_when:
+      - appx_host_or_registration_activity
+      - package_from_user_writable_path
+      - wwahost_non_microsoft_domain
+
+  false_positive:
+    - condition: Developers deploying their own packages.
+      explanation: >-
+        Visual Studio and manual testing register loose manifests from bin and
+        AppPackages folders. The account is a developer's and developer mode has long
+        been on.
+    - condition: Hosted web applications from the Store.
+      explanation: >-
+        Their pages load third-party content, so WWAHost resolves non-Microsoft names.
+        The package is a published one.
+    - condition: Line-of-business sideloading.
+      explanation: >-
+        Deployment tools run Add-AppxPackage from their cache folder; the parent is the
+        management agent.

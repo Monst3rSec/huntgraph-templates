@@ -1,0 +1,292 @@
+# Converted from THORCollective/HEARTH Flames/H300.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h300-windows-firewall-disabled-through-group-policy-registry-write-t1686-003
+version: 1.0.0
+
+info:
+  name: Windows Firewall disabled across the estate by a Group Policy registry write
+  description: >-
+    An adversary with rights to create and link Group Policy creates a new policy
+    object, links it at the domain root and uses the Registry client-side extension to
+    write EnableFirewall = 0 into the Domain, Standard and Public firewall profiles on
+    every domain member. netsh and Set-NetFirewallProfile never run on an endpoint, so
+    detections built on process creation stay silent. The authoritative evidence is on
+    the domain controller in directory-service change events 5136 and 5137, which this
+    deployment does not collect. The endpoint side is a registry write made by the Group
+    Policy client: EnableFirewall under SOFTWARE\Policies\Microsoft\WindowsFirewall, the
+    path that marks the change as policy-delivered. The template returns those writes,
+    the same value under the local firewall policy key, and the command forms as a
+    control; the agent counts hosts per refresh interval.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-impairment
+    - windows-firewall
+    - group-policy
+    - registry
+    - estate-wide-change
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H300.md
+    - https://attack.mitre.org/techniques/T1686/003
+    - https://attack.mitre.org/detectionstrategies/DET0901
+
+mitre:
+  tactics:
+    - TA0112
+  techniques:
+    - T1686
+  sub_techniques:
+    - T1686.003
+  detection_strategies:
+    - DET0901
+  analytics:
+    - AN2043
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Windows Registry Key Modification
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary holding Group Policy creation and linking rights is disabling Windows
+    Firewall on every domain-joined host at once through a newly linked domain-root
+    policy that writes EnableFirewall = 0, without netsh or PowerShell running on any
+    endpoint.
+  attacker_behavior:
+    - Creates a Group Policy object and links it at the domain root.
+    - Sets EnableFirewall to 0 for the Domain, Standard and Public profiles through the Registry extension.
+    - Lets the normal policy refresh deliver the change to every member within two hours.
+    - Follows with lateral movement or ransomware deployment over the opened hosts.
+  legitimate_behavior:
+    - Organisations that run a third-party host firewall disable Windows Firewall by policy.
+    - Administrators turn a profile off on a server during troubleshooting.
+    - Security baselines write EnableFirewall = 1 through the same keys.
+  risk_indicator:
+    - EnableFirewall is written under the Policies path with data 0.
+    - The same write appears on many hosts inside one policy refresh interval.
+    - The hosts had no such policy value before.
+    - No netsh or Set-NetFirewallProfile command ran on the hosts.
+    - All three profiles are written together.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: firewall-policy-enablefirewall-written
+        name: EnableFirewall written under the firewall policy key
+        purpose: >-
+          Return writes of EnableFirewall under
+          SOFTWARE\Policies\Microsoft\WindowsFirewall for any profile. Only Group Policy
+          and tools that imitate it write here. The value is a DWORD; the case does not
+          filter on the data because how the sensor reports a numeric value is
+          tenant-dependent, so writes of 1 from a hardening baseline are returned too
+          and the agent reads the data.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegValueName=/^EnableFirewall$/i
+          | RegObjectName=/\\Policies\\Microsoft\\WindowsFirewall\\(Domain|Standard|Public|Private)Profile$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: local-firewall-profile-enablefirewall-written
+        name: EnableFirewall written under the local firewall policy key
+        purpose: >-
+          Return writes of EnableFirewall under the SharedAccess FirewallPolicy
+          profiles, where a local change by netsh, the control panel or an API call
+          lands. A host with this write and no policy-path write was changed locally.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegValueName=/^EnableFirewall$/i
+          | RegObjectName=/\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\(Domain|Standard|Public)Profile$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: firewall-disabled-by-command
+        name: Firewall profile disabled by command
+        purpose: >-
+          Return netsh and PowerShell commands that turn a profile off. This is the
+          control: where the registry cases return hosts and this one returns none for
+          them, the change arrived as policy. H060 hunts the command route in its own
+          right.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(netsh|powershell|pwsh|cmd)\.exe$/i
+          | CommandLine=/advfirewall\s+set\s+\S+\s+state\s+off|firewall\s+set\s+opmode\s+(mode\s*=\s*)?disable|Set-NetFirewallProfile\b[^|;]*-Enabled\s+(\$?false|0)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: firewall_enable_value_written
+      name: EnableFirewall value written
+      description: >-
+        EnableFirewall was written under a firewall profile key on the host.
+      source: registry
+      field: registry_value
+      indicates: firewall_state_change
+
+  supporting:
+    - id: policy_path_write
+      name: Write is under the Policies path
+      description: >-
+        The key is SOFTWARE\Policies\Microsoft\WindowsFirewall, which shows the value
+        was delivered as policy and not set locally.
+      source: registry
+      field: registry_path
+      indicates: group_policy_delivery
+    - id: value_disables_firewall
+      name: Data written is 0
+      description: >-
+        The data on the event is 0. Where the sensor does not populate the data field
+        for a DWORD, the agent confirms the state another way.
+      source: registry
+      field: registry_data
+      indicates: firewall_disabled
+    - id: written_by_policy_client
+      name: Writer is the Group Policy client
+      description: >-
+        The writing process id resolves to the svchost instance hosting gpsvc, not to
+        netsh, mmc or PowerShell.
+      source: registry
+      field: writer_process_id
+      indicates: group_policy_delivery
+    - id: many_hosts_in_one_refresh
+      name: Many hosts within one refresh interval
+      description: >-
+        The agent counts distinct hosts with the write per hour. Dozens or hundreds
+        inside one 90 to 120 minute policy refresh is not something a local
+        administrator produces.
+      source: registry
+      field: host
+      indicates: estate_wide_change
+    - id: no_local_disable_command
+      name: No disabling command on the host
+      description: >-
+        The command case returned nothing for the host in the same window.
+      source: process_creation
+      field: command_line
+      indicates: policy_not_command_origin
+
+  contradicting:
+    - id: approved_firewall_policy
+      name: Approved policy change
+      description: >-
+        A change record covers a Group Policy that disables Windows Firewall, for
+        example where another host firewall is deployed.
+      source: change_management
+      field: ComputerName
+      indicates: approved_change
+    - id: long_standing_policy_value
+      name: Value has long been present
+      description: >-
+        The hosts have carried the same policy value since they were built and the
+        events are policy re-application.
+      source: baseline
+      field: ComputerName
+      indicates: established_configuration
+
+  risk_logic:
+    required:
+      - firewall_enable_value_written
+
+    supporting:
+      any:
+        - policy_path_write
+        - value_disables_firewall
+        - written_by_policy_client
+        - many_hosts_in_one_refresh
+        - no_local_disable_command
+      all:
+        - policy_path_write
+        - many_hosts_in_one_refresh
+
+    contradicting:
+      any:
+        - approved_firewall_policy
+        - long_standing_policy_value
+      all: []
+
+  verdict:
+    low_risk_when:
+      - firewall_enable_value_written
+      - approved_firewall_policy
+      - long_standing_policy_value
+    suspicious_when:
+      - firewall_enable_value_written
+      - policy_path_write
+      - value_disables_firewall
+    high_risk_when:
+      - firewall_enable_value_written
+      - policy_path_write
+      - value_disables_firewall
+      - many_hosts_in_one_refresh
+
+  false_positive:
+    - condition: Third-party host firewall deployments.
+      explanation: >-
+        Estates with another firewall product disable the Windows one by policy. The
+        value is old, documented and present from build.
+    - condition: Hardening baselines.
+      explanation: >-
+        Baselines write EnableFirewall = 1 through the same key and are returned by the
+        first case. The data distinguishes them.
+    - condition: Policy re-application.
+      explanation: >-
+        Some sensors report the value each time policy is re-applied. A host that has
+        always had the value is not a new change.

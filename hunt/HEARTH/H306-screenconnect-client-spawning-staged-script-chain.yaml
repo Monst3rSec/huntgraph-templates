@@ -1,0 +1,376 @@
+# Converted from THORCollective/HEARTH Flames/H306.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h306-screenconnect-client-spawning-staged-script-chain-t1059-005
+version: 1.0.0
+
+info:
+  name: ScreenConnect client spawning a staged VBScript and PowerShell chain
+  description: >-
+    An operator who controls a ScreenConnect instance needs no exploit to run code on
+    the machines connected to it: the product's file-transfer and command features
+    deliver and execute with the client service's privileges. What it leaves is a
+    process lineage. ScreenConnect.ClientService.exe or ScreenConnect.WindowsClient.exe
+    starts wscript.exe or cscript.exe on a numbered sequence of scripts (1.vbs to 4.vbs
+    in the campaign Huntress documented) from a user-writable path, and PowerShell
+    follows with an execution-policy bypass. The client is signed and legitimately
+    installed, so the only thing wrong is what it started. The instance identifier and
+    relay that would show whose ScreenConnect it is are in the client's configuration
+    and service name, which the hunt does not read; the relay names resolved are
+    returned as seeds.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - execution
+    - visual-basic
+    - screenconnect
+    - remote-support
+    - rmm
+    - script-chain
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H306.md
+    - https://attack.mitre.org/techniques/T1059/005
+    - https://attack.mitre.org/detectionstrategies/DET0076
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1059
+  sub_techniques:
+    - T1059.005
+  detection_strategies:
+    - DET0076
+  analytics:
+    - AN0209
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary operating a ScreenConnect instance is using the remote-support client
+    on enrolled hosts to run a staged VBScript chain followed by PowerShell with an
+    execution-policy bypass, executing as a child of the signed client.
+  attacker_behavior:
+    - Enrols the host into a ScreenConnect instance the adversary controls.
+    - Transfers numbered VBScript files and runs them through the client.
+    - Writes an encrypted payload and a small PowerShell decryptor to Temp.
+    - Starts powershell.exe with -ExecutionPolicy Bypass from the script host.
+    - Adds a Run value pointing at a .vbs file in AppData.
+  legitimate_behavior:
+    - Help desks run scripts and commands through ScreenConnect during support sessions.
+    - MSPs push maintenance scripts through their own ScreenConnect instance.
+    - The client starts cmd.exe for its command feature as a matter of course.
+  risk_indicator:
+    - The script host's parent is a ScreenConnect client process.
+    - Scripts are numbered and run in order from Temp or the public profile.
+    - PowerShell under the script host uses a bypass, hidden window or encoded command.
+    - The ScreenConnect instance or relay is not the organisation's.
+    - A Run value ending in .vbs appears afterwards.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NewScriptWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: interpreter-started-by-screenconnect-client
+        name: Interpreter started by a ScreenConnect client process
+        purpose: >-
+          Return script hosts, shells and proxy binaries whose parent is a ScreenConnect
+          process. The command feature runs through cmd.exe, so a script host may be one
+          step below; the next case does not depend on the parent. An operator who
+          renames the client binaries is missed by the parent name, and the parent's
+          path and signer are not on the event.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^ScreenConnect\./i
+          | FileName=/^(wscript|cscript|mshta|powershell|pwsh|cmd|rundll32|regsvr32|curl|bitsadmin|certutil|msiexec)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: script-host-running-numbered-or-staged-script
+        name: Script host running a numbered or staged script
+        purpose: >-
+          Return wscript and cscript on a script whose name is a number, or whose path
+          is a ScreenConnect transfer or working directory.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(wscript|cscript)\.exe$/i
+          | CommandLine=/\\\d{1,2}\.(vbs|vbe|js|jse|wsf)\b|\\(ScreenConnect|ConnectWiseControl)[^"]*\.(vbs|vbe|js|jse|wsf)\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: powershell-bypass-under-script-host
+        name: PowerShell with a policy bypass started by a script host
+        purpose: >-
+          Return PowerShell whose parent is wscript or cscript and whose command line
+          carries a bypass, hidden-window, no-profile or encoded-command switch.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(wscript|cscript)\.exe$/i
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/-e(x(ec(utionpolicy)?)?|p)\s+bypass|\s-e(nc|ncodedcommand)?\s|-w(in(dowstyle)?)?\s+hid|-nop\b/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: staged-script-written-to-temp
+        name: Numbered script or decryptor written to Temp
+        purpose: >-
+          Return numbered script files and the reported runner.ps1 decryptor written
+          under a Temp directory. The encrypted blob and the state files beside them are
+          data files and are not reported.
+        query: |
+          #event_simpleName=NewScriptWritten
+          | TargetFileName=/\\(AppData\\Local\\Temp|Windows\\Temp)\\([^\\]+\\)?(\d{1,2}\.(vbs|vbe|js)|runner\.ps1)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: run-value-pointing-at-script
+        name: Run value whose data is a script
+        purpose: >-
+          Return Run key values whose data ends in a script extension instead of an
+          executable. The campaign's value was WindowsServiceHost pointing at
+          WindowsServiceHost.vbs.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\CurrentVersion\\Run$/i
+          | RegStringValue=/\.(vbs|vbe|js|jse|hta|wsf|bat)"?\s*$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: reported-relay-name-resolved
+        name: Reported ScreenConnect relay name resolved
+        purpose: >-
+          Return DNS requests for the relay names reported for the campaign. They are
+          seeds for a retrospective search and will change.
+        query: |
+          #event_simpleName=DnsRequest
+          | DomainName=/(^|\.)opik\.net$|^borertors92\.anondns\.net$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: script_chain_under_remote_support_client
+      name: Script chain started through ScreenConnect
+      description: >-
+        A script host or PowerShell ran under a ScreenConnect client process, or a
+        numbered script chain ran with a policy-bypassing PowerShell beneath it.
+      source: process_creation
+      field: command_line
+      indicates: remote_tool_script_execution
+
+  supporting:
+    - id: screenconnect_parent
+      name: Parent is a ScreenConnect client
+      description: >-
+        The parent process name begins with ScreenConnect.
+      source: process_creation
+      field: parent_process
+      indicates: rmm_delivered_execution
+    - id: chain_shares_parent
+      name: Scripts run in sequence under one parent
+      description: >-
+        Numbered scripts start one after another under the same parent process id, which
+        the agent derives from the returned events.
+      source: process_creation
+      field: parent_process_id
+      indicates: staged_execution
+    - id: system_context
+      name: Runs as SYSTEM
+      description: >-
+        The scripts run under the client service's account.
+      source: process_creation
+      field: user
+      indicates: service_privilege_execution
+    - id: staged_script_on_disk
+      name: Staged script written to Temp
+      description: >-
+        A numbered script or runner.ps1 was written under Temp.
+      source: file_creation
+      field: file_path
+      indicates: payload_staging
+    - id: staged_script_writer
+      name: Script written by the client or its child
+      description: >-
+        The writer of the script is a ScreenConnect process or a script host.
+      source: file_creation
+      field: writer_process_name
+      indicates: payload_staging
+    - id: script_run_value
+      name: Run value points at a script
+      description: >-
+        A Run value's data is a .vbs, .js or .hta path.
+      source: registry
+      field: registry_data
+      indicates: logon_persistence
+    - id: run_value_name
+      name: Run value name imitates a Windows component
+      description: >-
+        The value name resembles a system service, such as WindowsServiceHost.
+      source: registry
+      field: registry_value
+      indicates: masqueraded_persistence
+    - id: reported_relay_resolved
+      name: Reported relay resolved
+      description: >-
+        The host resolved a relay name reported for the campaign.
+      source: dns_request
+      field: query_name
+      indicates: known_infrastructure
+
+  contradicting:
+    - id: sanctioned_instance_session
+      name: Session on the organisation's own instance
+      description: >-
+        The ScreenConnect server's audit log attributes the commands to a technician on
+        the organisation's or its MSP's instance.
+      source: asset_inventory
+      field: ComputerName
+      indicates: sanctioned_support_activity
+    - id: recurring_maintenance_script
+      name: Recurring maintenance script
+      description: >-
+        The same script runs through ScreenConnect across managed hosts on a schedule.
+      source: baseline
+      field: ComputerName
+      indicates: routine_administration
+
+  risk_logic:
+    required:
+      - script_chain_under_remote_support_client
+
+    supporting:
+      any:
+        - screenconnect_parent
+        - chain_shares_parent
+        - system_context
+        - staged_script_on_disk
+        - staged_script_writer
+        - script_run_value
+        - run_value_name
+        - reported_relay_resolved
+      all:
+        - screenconnect_parent
+        - chain_shares_parent
+
+    contradicting:
+      any:
+        - sanctioned_instance_session
+        - recurring_maintenance_script
+      all: []
+
+  verdict:
+    low_risk_when:
+      - script_chain_under_remote_support_client
+      - sanctioned_instance_session
+      - recurring_maintenance_script
+    suspicious_when:
+      - script_chain_under_remote_support_client
+      - screenconnect_parent
+    high_risk_when:
+      - script_chain_under_remote_support_client
+      - screenconnect_parent
+      - script_run_value
+
+  false_positive:
+    - condition: Help desk work through ScreenConnect.
+      explanation: >-
+        Technicians run scripts and PowerShell through the client every day. The
+        instance is the organisation's and the server log names the technician.
+    - condition: MSP maintenance.
+      explanation: >-
+        An MSP's instance is a real management channel. If security was not told about
+        it, that is a governance finding to document, not to suppress.

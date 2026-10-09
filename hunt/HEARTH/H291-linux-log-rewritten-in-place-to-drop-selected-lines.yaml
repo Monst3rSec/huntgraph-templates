@@ -1,0 +1,342 @@
+# Converted from THORCollective/HEARTH Flames/H291.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-lin-hearth-h291-linux-log-rewritten-in-place-to-drop-selected-lines-t1685-006
+version: 1.0.0
+
+info:
+  name: Linux authentication log or shell history rewritten in place to drop selected lines
+  description: >-
+    A careful operator does not empty /var/log/secure; an empty log on a running host
+    tells the responder where to look. They filter it instead: read the log, drop the
+    lines that name their address, account or tooling, and write the rest back. In the
+    DPRK activity Rapid7 documented the filter ran over root's bash history, messages,
+    audit.log, cmd.log, secure, syslog and auth.log, staged through /tmp/jasper-log, and
+    removed lines containing tmp, wget, cron and crond. HEARTH's strongest evidence is a
+    diff of the forwarded log against the file on disk, and the file's size and inode
+    over time; neither is endpoint telemetry. What the sensor records is the filter
+    itself when it is run as a command: grep -v, sed -i or awk reading one of those
+    files, a shell command line that redirects onto it, a copy or move back over it, and
+    utmpdump restoring an edited login record.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-impairment
+    - log-tampering
+    - anti-forensics
+    - auth-log
+    - bash-history
+    - dprk
+    - linux
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H291.md
+    - https://attack.mitre.org/techniques/T1685/006
+    - https://attack.mitre.org/techniques/T1070/003
+    - https://attack.mitre.org/detectionstrategies/DET0520
+    - https://www.rapid7.com/blog/post/tr-dprk-apts-ted-backdoor-curlrat-target-south-korean-media-automotive-sectors
+
+mitre:
+  tactics:
+    - TA0112
+    - TA0005
+  techniques:
+    - T1685
+    - T1070
+  sub_techniques:
+    - T1685.006
+    - T1070.003
+  detection_strategies:
+    - DET0520
+    - DET0165
+  analytics:
+    - AN1438
+    - AN0467
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An adversary on a Linux host is rewriting authentication logs, system logs and shell
+    history in place, removing only the lines that name their own activity and writing
+    the remainder back, so that the files stay plausible and keep being appended to.
+  attacker_behavior:
+    - Runs grep -v, sed -i or awk over /var/log/secure, auth.log, messages, syslog, cmd.log or audit.log.
+    - Writes the filtered output to a file in /tmp and copies or moves it back over the log.
+    - Filters on tooling keywords such as tmp, wget, cron and crond instead of an address.
+    - Applies the same filter to /root/.bash_history.
+    - Dumps wtmp or btmp with utmpdump, edits the text and restores it with utmpdump -r.
+  legitimate_behavior:
+    - logrotate rotates, truncates and compresses these files on a schedule.
+    - Administrators grep logs constantly, including with -v, without writing back.
+    - Configuration management resets log ownership and permissions.
+    - Users clear their own shell history.
+  risk_indicator:
+    - A text filter names an authentication log or a history file and the output goes back to the same path.
+    - A file under /tmp is copied or moved onto a file under /var/log.
+    - The parent is an interactive shell or a script, not logrotate or a package manager.
+    - Several of the listed logs are touched within the same minute.
+    - utmpdump is run with -r on the host.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: text-filter-over-log-or-history
+        name: Text filter run over an authentication log or shell history
+        purpose: >-
+          Return grep, sed, awk and perl whose own arguments name one of the logs or a
+          shell history file and ask for lines to be removed or the file to be edited in
+          place: grep -v, sed -i, perl -i, an awk negated match. A sed delete expression
+          without -i only prints, and its write-back is the redirection. A redirection
+          is performed by the shell and is not in these arguments, so a grep -v whose
+          output goes to /tmp appears here without its destination; the next two cases
+          return the write-back.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ImageFileName=/\/(grep|egrep|fgrep|sed|awk|gawk|mawk|perl)$/
+          | CommandLine=/\/var\/log\/(secure|auth\.log|messages|syslog|cmd\.log|audit\/audit\.log)|\.(bash|zsh)_history/
+          | CommandLine=/grep\s([^|]*\s)?(-[a-zA-Z]*v|--invert-match)|sed\s([^|]*\s)?(-[a-zA-Z]*i|--in-place)|awk\s[^|]*(!\s*\/|!~)|perl\s([^|]*\s)?-[a-zA-Z]*i/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: shell-command-redirecting-onto-log
+        name: Shell command line that redirects onto a log or history file
+        purpose: >-
+          Return shells started with -c whose command string overwrites one of the logs
+          or a history file with a single redirection. An append is left out. This is
+          the only place the redirection is visible, and only when the command was
+          passed as a string, as it is from a script, a remote command or an implant; a
+          line typed at an interactive prompt starts no shell process and is not seen.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ImageFileName=/\/(bash|sh|dash|zsh|ksh)$/
+          | CommandLine=/\s-\w*c\s/
+          | CommandLine=/(^|[^>])>\s*(\/var\/log\/(secure|auth\.log|messages|syslog|cmd\.log|audit\/audit\.log)|\S*\.(bash|zsh)_history)/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: file-copied-or-moved-over-log
+        name: File copied, moved or truncated over a log or history file
+        purpose: >-
+          Return cp, mv, install, dd, tee, truncate and shred whose arguments name one
+          of the logs or a history file, where the parent is not logrotate. The
+          write-back half of the filter shows here as a file from /tmp or /var/tmp
+          landing on the log's path. Truncation is the crude form HEARTH contrasts this
+          with and is returned by the same case.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ImageFileName=/\/(cp|mv|install|dd|tee|truncate|shred)$/
+          | CommandLine=/\/var\/log\/(secure|auth\.log|messages|syslog|cmd\.log|audit\/audit\.log)(\s|$)|\.(bash|zsh)_history(\s|$)/
+          | ParentBaseFileName!=/^(logrotate|savelog)$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: login-record-dumped-or-restored
+        name: utmpdump run against a login record
+        purpose: >-
+          Return utmpdump runs. Dumping wtmp, btmp or lastlog to text, editing it and
+          restoring it with -r is the same selective erasure applied to the binary login
+          records.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | ImageFileName=/\/utmpdump$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: reported-staging-file
+        name: Reported staging file named on a command line
+        purpose: >-
+          Return any process whose command line names /tmp/jasper-log, the staging file
+          the source campaign wrote the filtered log to. It is an indicator of that
+          campaign only.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | CommandLine=/\/tmp\/jasper-log/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: log_filter_or_write_back_command
+      name: Command that filters or overwrites a log or history file
+      description: >-
+        A process command line names an authentication log, a system log, the audit log
+        or a shell history file and either removes lines from it or writes a file over
+        it.
+      source: process_creation
+      field: command_line
+      indicates: selective_log_erasure
+
+  supporting:
+    - id: filter_then_write_back
+      name: Filter and write-back on the same file
+      description: >-
+        A filter over a log and a copy, move or redirection onto the same log come from
+        the same parent process within moments, which the agent derives from the
+        returned events.
+      source: process_creation
+      field: parent_process_id
+      indicates: rewrite_in_place
+    - id: parent_not_log_tooling
+      name: Parent is a shell or script, not log management
+      description: >-
+        The parent process is an interactive shell, an interpreter or an unknown binary,
+        not logrotate, a package manager or a configuration agent.
+      source: process_creation
+      field: parent_process
+      indicates: manual_or_implant_origin
+    - id: several_logs_touched
+      name: Several logs handled in one pass
+      description: >-
+        The agent counts distinct log paths named by the returned commands on one host
+        in a short span; the reported filter covered seven files.
+      source: process_creation
+      field: host
+      indicates: systematic_erasure
+    - id: login_record_restored
+      name: Login record restored from text
+      description: >-
+        utmpdump ran with -r, writing an edited text dump back into wtmp or btmp.
+      source: process_creation
+      field: image_path
+      indicates: login_record_tampering
+    - id: staging_file_in_tmp
+      name: Filtered copy staged in a world-writable directory
+      description: >-
+        The command names a file under /tmp, /var/tmp or /dev/shm as the source of the
+        write-back, or the reported name /tmp/jasper-log.
+      source: process_creation
+      field: image_path
+      indicates: staged_rewrite
+    - id: root_context
+      name: Commands ran as root
+      description: >-
+        The user on the events is root outside any maintenance job.
+      source: process_creation
+      field: user
+      indicates: privileged_tampering
+
+  contradicting:
+    - id: rotation_or_log_management
+      name: Rotation or log management job
+      description: >-
+        The command is part of logrotate's postrotate script, a journald vacuum or a
+        disk-pressure cleanup that recurs on the host on a schedule.
+      source: baseline
+      field: ComputerName
+      indicates: routine_log_management
+    - id: recorded_maintenance
+      name: Recorded maintenance
+      description: >-
+        A change record covers manual log handling on the host at that time.
+      source: change_management
+      field: ComputerName
+      indicates: approved_change
+
+  risk_logic:
+    required:
+      - log_filter_or_write_back_command
+
+    supporting:
+      any:
+        - filter_then_write_back
+        - parent_not_log_tooling
+        - several_logs_touched
+        - login_record_restored
+        - staging_file_in_tmp
+        - root_context
+      all:
+        - filter_then_write_back
+        - parent_not_log_tooling
+
+    contradicting:
+      any:
+        - rotation_or_log_management
+        - recorded_maintenance
+      all: []
+
+  verdict:
+    low_risk_when:
+      - log_filter_or_write_back_command
+      - rotation_or_log_management
+      - recorded_maintenance
+    suspicious_when:
+      - log_filter_or_write_back_command
+      - parent_not_log_tooling
+    high_risk_when:
+      - log_filter_or_write_back_command
+      - filter_then_write_back
+      - parent_not_log_tooling
+
+  false_positive:
+    - condition: Administrators grep -v a log to read it.
+      explanation: >-
+        Reading with an inverted match is everyday work and writes nothing. It matters
+        when a write onto the same file follows from the same shell.
+    - condition: logrotate scripts copy and truncate logs.
+      explanation: >-
+        copytruncate and postrotate scripts run cp and truncate on these paths.
+        logrotate is excluded as a direct parent; a wrapper script under it is not and
+        recurs on schedule.
+    - condition: Users clear or trim their own history.
+      explanation: >-
+        A user rewriting their own history file is common. Root's history rewritten from
+        a script or with tooling keywords removed is the reported behaviour.

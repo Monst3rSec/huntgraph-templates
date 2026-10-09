@@ -1,0 +1,303 @@
+# Converted from THORCollective/HEARTH Flames/H363.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+# HEARTH also cites T1027. The fleet census of extension keys is a registry
+# inventory the sensor does not provide; the hunt reads writes. Binary value data
+# is not carried in the string field the query tests.
+type: detection
+
+id: hg-win-hearth-h363-key-material-stored-under-fake-file-extension-class-key-t1112
+version: 1.0.0
+
+info:
+  name: Key material written to a per-user file-extension class key
+  description: >-
+    Star Blizzard's RedFlick campaign keeps the AES key for its backdoor's payloads in
+    HKEY_CURRENT_USER\Software\Classes\.mollis, a file-extension key for an extension no
+    application registers. A standard user can write there, the hive holds thousands of
+    similar keys, and the value outlives the malware's files. A real extension key's
+    default value is a short ProgID. The hunt returns values written directly under a
+    per-user extension key whose data is a long encoded string, values there under names
+    other than the ones Windows uses, the reported key by name, and commands that write
+    to such a key.
+  severity: medium
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-evasion
+    - modify-registry
+    - fileless-storage
+    - file-association
+    - star-blizzard
+    - redflick
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H363.md
+    - https://attack.mitre.org/techniques/T1112
+    - https://attack.mitre.org/detectionstrategies/DET0280
+
+mitre:
+  tactics:
+    - TA0112
+    - TA0003
+  techniques:
+    - T1112
+  sub_techniques: []
+  detection_strategies:
+    - DET0280
+  analytics:
+    - AN0781
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Windows Registry Key Modification
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    Malware on a Windows host is keeping its encryption key out of its own binary by
+    writing it into a registry location designed for something else entirely, a
+    file-extension class key under HKEY_CURRENT_USER\Software\Classes\ for an extension
+    that is not registered to any installed application and matches no file on the
+    system, so static analysis of the payload yields no key, file-based searches for a
+    key blob find nothing, and the value sits in a hive full of thousands of
+    legitimate-looking siblings.
+  attacker_behavior:
+    - Creates a key for an invented extension under the user's Classes hive.
+    - Stores an encoded or binary key in its default value or a named value.
+    - Reads the key back at each run to decrypt downloaded payloads.
+  legitimate_behavior:
+    - Applications and Open With choices write a ProgID as an extension key's default value.
+    - Some set Content Type and PerceivedType values there.
+    - Per-user installers register many extensions at once.
+  risk_indicator:
+    - The data under an extension key is a long Base64 or hex string.
+    - The value has a name Windows does not use for extension keys.
+    - The extension appears on one or a few hosts and matches no installed product.
+    - The writer is a script host, Python or an executable in a user-writable path.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: encoded-string-under-per-user-extension-key
+        name: Long encoded string written under a per-user extension key
+        purpose: >-
+          Return values written directly under a per-user file-extension key whose
+          string data is thirty-two or more Base64 or hex characters. A ProgID is short
+          and contains a dot. Whether the sensor reports writes under per-user Classes
+          extension keys should be confirmed in the tenant; data stored as binary is not
+          in the string field and is not matched by this case.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\REGISTRY\\USER\\S-1-5-21-[^\\]+(\\Software\\Classes|_Classes)\\\.[^\\]+\\?$/i
+          | RegStringValue=/^[A-Za-z0-9+\/=]{32,}$/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: non-standard-value-under-per-user-extension-key
+        name: Value with a non-standard name under a per-user extension key
+        purpose: >-
+          Return values written directly under a per-user extension key whose name is
+          not the default value, Content Type or PerceivedType. This returns key
+          material stored as binary too, since the name and not the data is tested.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\REGISTRY\\USER\\S-1-5-21-[^\\]+(\\Software\\Classes|_Classes)\\\.[^\\]+\\?$/i
+          | RegValueName=/./
+          | RegValueName!=/^(\(Default\)|Content Type|PerceivedType)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: reported-extension-key
+        name: Write under the .mollis extension key
+        purpose: >-
+          Return any write whose key path contains the reported extension.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\\.mollis(\\|$)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: command-writing-per-user-extension-key
+        name: Command writing to a per-user extension key
+        purpose: >-
+          Return reg, PowerShell and cmd command lines that name a file-extension key
+          under HKCU Software Classes together with a write verb. A write through the
+          registry API, as from a Python backdoor, starts no process and appears only in
+          the registry cases.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(reg|powershell|pwsh|cmd)\.exe$/i
+          | CommandLine=/(HKCU|HKEY_CURRENT_USER)(:)?\\Software\\Classes\\\.[a-z0-9_-]+/i
+          | CommandLine=/\sadd\s|Set-ItemProperty|New-ItemProperty|New-Item\b|\bsp\s/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: data_under_extension_key
+      name: Non-association data written under a per-user extension key
+      description: >-
+        A value written directly under a per-user file-extension key holds a long
+        encoded string or carries a name Windows does not use there.
+      source: registry
+      field: registry_path
+      indicates: registry_used_as_secret_store
+
+  supporting:
+    - id: value_is_encoded_blob
+      name: Value data is a long encoded string
+      description: >-
+        The string data is thirty-two or more Base64 or hex characters with no dot and
+        no spaces.
+      source: registry
+      field: registry_data
+      indicates: key_material_in_registry
+    - id: extension_rare
+      name: Extension appears on few hosts
+      description: >-
+        The extension in the key path is seen on one or a few hosts, which the agent
+        counts from the returned events.
+      source: registry
+      field: host
+      indicates: unregistered_extension
+    - id: non_standard_value_name
+      name: Value name is not one Windows uses
+      description: >-
+        The value name is something other than the default, Content Type or
+        PerceivedType.
+      source: registry
+      field: registry_value
+      indicates: misused_association_key
+    - id: writer_is_script_or_unmanaged_binary
+      name: Writer is a script host, interpreter or unmanaged executable
+      description: >-
+        The writer's process id belongs to a script host, Python or an executable in a
+        user-writable path, which the agent establishes by looking the process id up.
+      source: registry
+      field: writer_process_id
+      indicates: malware_writing_registry
+    - id: command_wrote_extension_key
+      name: Command wrote the key
+      description: >-
+        A reg or PowerShell command names the extension key with a write verb.
+      source: process_creation
+      field: command_line
+      indicates: scripted_registry_write
+
+  contradicting:
+    - id: extension_registered_by_product
+      name: Extension belongs to an installed application
+      description: >-
+        An approved application on the host registers the extension and stores a setting
+        under it.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_software
+    - id: extension_common_in_estate
+      name: Extension key is written on many hosts
+      description: >-
+        Earlier activity shows the same extension and value name written across the
+        estate.
+      source: baseline
+      field: RegObjectName
+      indicates: established_registration
+
+  risk_logic:
+    required:
+      - data_under_extension_key
+
+    supporting:
+      any:
+        - value_is_encoded_blob
+        - extension_rare
+        - non_standard_value_name
+        - writer_is_script_or_unmanaged_binary
+        - command_wrote_extension_key
+      all:
+        - value_is_encoded_blob
+        - extension_rare
+
+    contradicting:
+      any:
+        - extension_registered_by_product
+        - extension_common_in_estate
+      all: []
+
+  verdict:
+    low_risk_when:
+      - data_under_extension_key
+      - extension_registered_by_product
+      - extension_common_in_estate
+    suspicious_when:
+      - data_under_extension_key
+      - extension_rare
+    high_risk_when:
+      - data_under_extension_key
+      - value_is_encoded_blob
+      - extension_rare
+
+  false_positive:
+    - condition: An application stores a licence or state string under its extension key.
+      explanation: >-
+        The extension belongs to the product, the same value name is on every host with
+        it and the writer is the product.
+    - condition: Windows writes OpenWithProgids and similar data.
+      explanation: >-
+        Those go in subkeys of the extension key, which the path pattern does not match.

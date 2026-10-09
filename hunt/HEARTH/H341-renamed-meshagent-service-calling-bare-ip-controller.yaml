@@ -1,0 +1,411 @@
+# Converted from THORCollective/HEARTH Flames/H341.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+# HEARTH also cites T1543.003 and T1036.005. The template is filed under T1219.002,
+# the remote-management agent itself. The controller address inside the .msh file
+# and the agent certificate is not visible to the sensor; the hunt reads the agent's
+# own switches, registry key and outbound connections instead.
+type: detection
+
+id: hg-win-hearth-h341-renamed-meshagent-service-calling-bare-ip-controller-t1219-002
+version: 1.0.0
+
+info:
+  name: MeshAgent installed as a service under another name and calling a bare IP controller
+  description: >-
+    Two ransomware operations reported in September 2026 kept their access with
+    MeshAgent, the agent of the open-source MeshCentral remote-management platform.
+    Storm-2570 renamed it meshagent64-<organisation>.exe so that it read as the victim's
+    own packaging; a Settra affiliate renamed it mvtcs.exe in one intrusion and left it
+    unmodified in another. In both Settra cases the controller was a bare IPv4 address
+    on a rented server. A name match finds the first form and misses the second, so this
+    hunt also reads the switches the agent takes whatever it is called, the registry key
+    it keeps its state under, and the outbound connections of the agent process. The
+    controller address written in the agent's .msh file and certificate cannot be read
+    from sensor telemetry; the agent infers a bare-IP controller from a connection that
+    no DNS request by the same process precedes.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - command-and-control
+    - remote-access-tools
+    - meshagent
+    - meshcentral
+    - rmm
+    - ransomware
+    - storm-2570
+    - settra
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H341.md
+    - https://attack.mitre.org/techniques/T1219
+    - https://attack.mitre.org/techniques/T1219/002
+    - https://attack.mitre.org/detectionstrategies/DET0259
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1219
+  sub_techniques:
+    - T1219.002
+  detection_strategies:
+    - DET0259
+  analytics:
+    - AN0714
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - File Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    A ransomware affiliate has installed MeshAgent, the open-source MeshCentral
+    remote-management agent, as a Windows service on servers and domain controllers,
+    renaming the binary to blend in so it reads as sanctioned management tooling, while
+    the agent's own embedded configuration and certificate point at an attacker-run
+    MeshCentral controller on a bare IP address rather than the organization's
+    management server.
+  attacker_behavior:
+    - Copies MeshAgent to a server under the organisation's name or an unrelated short name.
+    - Installs it as a LocalSystem service with the agent's own install switch.
+    - Points the agent at a controller reached by IP address on 443 or an operator-chosen port.
+    - Opens shells and transfers files through the agent ahead of encryption.
+    - Keeps a second remote-management product on the same host as a spare route.
+  legitimate_behavior:
+    - Small IT teams and service providers run MeshCentral and deploy its agent widely.
+    - Providers repackage the agent executable with a customer name.
+    - A sanctioned agent connects to a named management host that the estate resolves by DNS.
+  risk_indicator:
+    - A process carries MeshAgent switches under an image name that is not MeshAgent.
+    - The agent process connects to a public address without resolving a name first.
+    - The agent is on a domain controller, backup host or other server and on no workstation.
+    - The agent starts cmd.exe or PowerShell.
+    - MeshCentral is not in the organisation's management inventory.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: meshagent-named-process
+        name: Process whose image name contains meshagent
+        purpose: >-
+          Return every process whose file name contains meshagent, which covers the
+          vendor default and the meshagent64-<organisation>.exe form. It does not see an
+          agent renamed to something unrelated; the next case does.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/meshagent/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: meshagent-switches-under-another-image-name
+        name: MeshAgent switches on a process not named MeshAgent
+        purpose: >-
+          Return processes that are not named after MeshAgent but carry the switches the
+          agent uses to install itself, name its service and start its helper processes.
+          The switch list is taken from the agent's documented command line; a build
+          with those strings changed is not returned. An agent already running as a
+          service with no arguments shows only its image path, so a renamed agent
+          installed before the search window is found by the registry and network cases,
+          not here.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName!=/meshagent/i
+          | CommandLine=/\s-full(un)?install\b|--meshServiceName=|--installedByUser=|--copy-msh=|\s-kvm[01]\b|\s-b64exec\s|--companyName=.*--displayName=/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: meshagent-registry-key-written
+        name: Value written under the MeshAgent registry key
+        purpose: >-
+          Return writes under SOFTWARE\Open Source\MeshAgent2, the key the agent keeps
+          its state in whatever the executable is called. Whether the sensor reports
+          writes under this key should be confirmed in the tenant.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\SOFTWARE\\(WOW6432Node\\)?Open Source\\MeshAgent/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: meshagent-executable-written
+        name: MeshAgent executable written to disk
+        purpose: >-
+          Return executables written with meshagent in the name, with the writing
+          process, so the agent can see how the file arrived. A copy written under
+          another name is not returned.
+        query: |
+          #event_simpleName=PeFileWritten
+          | TargetFileName=/meshagent[^\\]*\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: meshagent-outbound-connection
+        name: Outbound connection by a MeshAgent process to a public address
+        purpose: >-
+          Return connections from a process named after MeshAgent to addresses outside
+          the private ranges, with address and port. The destination is the controller.
+          For a renamed agent the agent reads the process id from the switches case and
+          looks for its connections separately; this case cannot name it.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | event_platform=Win
+          | ContextBaseFileName=/meshagent/i
+          | !cidr(RemoteAddressIP4, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: meshagent-dns-request
+        name: DNS request by a MeshAgent process
+        purpose: >-
+          Return the names a MeshAgent process resolves. A sanctioned agent resolves its
+          management host; an agent that connects out and never appears here is
+          configured with an address, which is how both Settra incidents presented.
+        query: |
+          #event_simpleName=DnsRequest
+          | ContextBaseFileName=/meshagent/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: process-started-by-meshagent
+        name: Process started by MeshAgent
+        purpose: >-
+          Return what the agent starts, apart from its own helpers: an operator's shell,
+          a file it runs, a discovery command.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/meshagent/i
+          | FileName!=/meshagent/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: mesh_agent_running
+      name: MeshAgent is running on the host
+      description: >-
+        A process is named after MeshAgent, or carries MeshAgent's install, service or
+        helper switches under another image name.
+      source: process_creation
+      field: command_line
+      indicates: remote_management_agent_present
+
+  supporting:
+    - id: agent_renamed
+      name: Agent runs under a name that is not the vendor's
+      description: >-
+        The image name carries an organisation name after meshagent64-, or the process
+        has MeshAgent switches and a name unrelated to the product.
+      source: process_creation
+      field: image_name
+      indicates: masqueraded_agent_binary
+    - id: controller_is_public_address
+      name: Agent connects to a public address
+      description: >-
+        The agent process opens a connection to an address outside the private ranges,
+        on 443 or another port.
+      source: network_connection
+      field: remote_address
+      indicates: external_controller
+    - id: no_name_resolved_for_controller
+      name: No DNS request precedes the connection
+      description: >-
+        The agent process connects out and the DNS case returns nothing for the same
+        process id, which the agent establishes by comparing the two result sets.
+      source: dns_request
+      field: process_id
+      indicates: controller_addressed_by_ip
+    - id: agent_state_key_written
+      name: MeshAgent registry key written
+      description: >-
+        A value is written under the Open Source\MeshAgent2 key on the host.
+      source: registry
+      field: registry_path
+      indicates: agent_installed
+    - id: agent_binary_dropped
+      name: Agent executable written by a transfer or remote-execution process
+      description: >-
+        The executable is written by a remote-execution service, a shell or a file copy
+        and not by a deployment tool.
+      source: file_creation
+      field: writer_process_name
+      indicates: hands_on_installation
+    - id: agent_started_shell
+      name: Agent started a shell or discovery command
+      description: >-
+        A child of the agent is cmd.exe, PowerShell or an enumeration utility.
+      source: process_creation
+      field: parent_process
+      indicates: interactive_operator_activity
+
+  contradicting:
+    - id: meshcentral_in_inventory
+      name: MeshCentral is a sanctioned management platform
+      description: >-
+        The organisation or its provider runs MeshCentral, and the destination the agent
+        connects to is the recorded management server.
+      source: asset_inventory
+      field: ComputerName
+      indicates: sanctioned_remote_management
+    - id: agent_on_expected_population
+      name: Agent is present across the managed workstation population
+      description: >-
+        Earlier activity shows the same agent on most managed endpoints for a long
+        period, as a rollout produces.
+      source: baseline
+      field: ComputerName
+      indicates: established_deployment
+
+  risk_logic:
+    required:
+      - mesh_agent_running
+
+    supporting:
+      any:
+        - agent_renamed
+        - controller_is_public_address
+        - no_name_resolved_for_controller
+        - agent_state_key_written
+        - agent_binary_dropped
+        - agent_started_shell
+      all:
+        - controller_is_public_address
+        - no_name_resolved_for_controller
+
+    contradicting:
+      any:
+        - meshcentral_in_inventory
+        - agent_on_expected_population
+      all: []
+
+  verdict:
+    low_risk_when:
+      - mesh_agent_running
+      - meshcentral_in_inventory
+      - agent_on_expected_population
+    suspicious_when:
+      - mesh_agent_running
+      - controller_is_public_address
+    high_risk_when:
+      - mesh_agent_running
+      - controller_is_public_address
+      - no_name_resolved_for_controller
+
+  false_positive:
+    - condition: A provider manages the estate with MeshCentral.
+      explanation: >-
+        The agent is everywhere the provider supports and connects to the provider's
+        published host. The inventory, not the binary, settles it.
+    - condition: A provider rebrands the agent with the customer's name.
+      explanation: >-
+        The file name then looks like the Storm-2570 form. The controller is still the
+        provider's and the population is still broad.
+    - condition: An administrator runs MeshCentral in a lab.
+      explanation: >-
+        The controller is an internal address, which the connection case excludes, and
+        the hosts are lab machines.

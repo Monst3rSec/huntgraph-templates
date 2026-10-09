@@ -1,0 +1,288 @@
+# Converted from THORCollective/HEARTH Flames/H322.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h322-azure-table-storage-c2-from-unexpected-process-t1102-002
+version: 1.0.0
+
+info:
+  name: Azure Table Storage used as a command channel by a process that is not Azure tooling
+  description: >-
+    A modular RAT delivered by a trojanized Exodus wallet installer runs its whole
+    command channel through the Azure Table Storage REST API. Every request goes to
+    <account>.table.core.windows.net, a Microsoft host with a Microsoft certificate. The
+    reported accounts were lgapistorage123 and winapi. HEARTH's invariant is the request
+    pattern: a GET that polls one table, a PUT that writes a row prefixed R_ and a
+    DELETE that removes the matching T_ row. Methods, paths and row keys are inside TLS
+    and the sensor sees none of them. It does see the storage host being resolved and
+    the name of the process that asked, which is the second half of the hypothesis: the
+    requester is a binary under the user's profile and not a browser, an Azure SDK
+    application or a backup agent. The DNS event carries the process name and id but not
+    its path; the agent resolves the path and parent from the process events by id, and
+    derives the polling interval from the spacing of the lookups.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - command-and-control
+    - azure-table-storage
+    - web-service
+    - living-off-trusted-sites
+    - exodus
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H322.md
+    - https://attack.mitre.org/techniques/T1102
+    - https://attack.mitre.org/techniques/T1102/002
+    - https://attack.mitre.org/detectionstrategies/DET0035
+
+mitre:
+  tactics:
+    - TA0011
+  techniques:
+    - T1102
+  sub_techniques:
+    - T1102.002
+  detection_strategies:
+    - DET0035
+  analytics:
+    - AN0100
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    A modular RAT delivered by a trojanized Exodus wallet installer tunnels its command
+    and control through the Azure Table Storage REST API at
+    <account>.table.core.windows.net, polling one table for tasks, writing results and
+    deleting completed tasks, from an unsigned binary under %APPDATA% rather than a
+    browser, an Azure SDK application or a backup agent.
+  attacker_behavior:
+    - Creates a table in an Azure storage account the operator controls.
+    - Polls the table for task rows at a regular interval.
+    - Writes result rows and deletes the task rows it has completed.
+    - Falls back to a second storage account when the first fails.
+    - Runs from a folder under the user's roaming profile that copies the Exodus name.
+  legitimate_behavior:
+    - Line-of-business applications built on the Azure SDK store state in Table Storage.
+    - Azure CLI, AzCopy, Storage Explorer and PowerShell modules reach storage accounts.
+    - Backup, monitoring and telemetry agents write to their vendor's storage accounts.
+    - Browsers load the Azure portal's storage views.
+  risk_indicator:
+    - The requesting process is not a browser or a known Azure tool.
+    - The storage account is one the organisation does not own.
+    - One process resolves a single table endpoint at a steady interval for hours.
+    - The process image is under AppData and the host has no Azure workload.
+    - A binary named Exodus.exe runs from outside the wallet's install folder.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: dns_request
+      connector: crowdstrike-ngsiem
+      event_types:
+        - DnsRequest
+      fields:
+        agent_id: aid
+        host: ComputerName
+        query_name: DomainName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: table-storage-endpoint-resolved-outside-azure-tooling
+        name: Table Storage endpoint resolved by a process that is not a browser or Azure tool
+        purpose: >-
+          Return lookups of any table.core.windows.net name with browsers and the usual
+          Azure clients removed. The storage account is the left-most label and the
+          agent compares it with the accounts the organisation owns. The exclusion list
+          is short on purpose: an SDK application the estate really runs appears until
+          it is added. A storage account reached through a custom domain or a private
+          endpoint name is not returned.
+        query: |
+          #event_simpleName=DnsRequest
+          | event_platform=Win
+          | DomainName=/\.table\.core\.windows\.net$/i
+          | ContextBaseFileName!=/^(chrome|msedge|firefox|brave|opera|msedgewebview2|az|azcopy|StorageExplorer|devenv|ServiceHub\.[A-Za-z.]+)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: reported-storage-account-resolved
+        name: Lookup of the two reported storage accounts
+        purpose: >-
+          Return lookups of lgapistorage123 and winapi under table.core.windows.net by
+          any process, browsers included. The accounts rotate, so an empty result says
+          nothing about the technique.
+        query: |
+          #event_simpleName=DnsRequest
+          | event_platform=Win
+          | DomainName=/^(lgapistorage123|winapi)\.table\.core\.windows\.net$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: exodus-named-binary-outside-wallet-install-folder
+        name: Exodus.exe running from outside the wallet's install folder
+        purpose: >-
+          Return processes named Exodus.exe whose image is not under
+          AppData\Local\exodus, where the real wallet installs. The trojanized installer
+          places its copy under the roaming profile. The process id on these events is
+          the one to look for on the DNS events above.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^Exodus\.exe$/i
+          | ImageFileName!=/\\AppData\\Local\\exodus\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: table_storage_endpoint_resolved
+      name: Azure Table Storage endpoint resolved
+      description: >-
+        A DNS request names an account under table.core.windows.net.
+      source: dns_request
+      field: query_name
+      indicates: cloud_table_service_contact
+
+  supporting:
+    - id: requester_not_azure_tooling
+      name: Requesting process is not a browser or Azure tool
+      description: >-
+        The process named on the DNS event is not a browser, the Azure CLI, AzCopy,
+        Storage Explorer or a known SDK application.
+      source: dns_request
+      field: process_name
+      indicates: unexpected_cloud_api_client
+    - id: steady_polling_from_one_process
+      name: One process resolves the endpoint at a steady interval
+      description: >-
+        The same process id resolves the same account repeatedly at an even spacing. The
+        agent derives the interval from the returned events; a resolver cache can hide
+        individual requests.
+      source: dns_request
+      field: process_id
+      indicates: task_polling_cadence
+    - id: requester_image_under_user_profile
+      name: Requester runs from the user's profile
+      description: >-
+        The process event for the requesting process id shows an image under AppData.
+        The agent resolves it by process id.
+      source: process_creation
+      field: image_path
+      indicates: user_writable_implant_location
+    - id: exodus_binary_outside_install_folder
+      name: Exodus.exe outside the wallet's install folder
+      description: >-
+        A process named Exodus.exe runs from a path other than AppData\Local\exodus.
+      source: process_creation
+      field: image_path
+      indicates: trojanized_installer_payload
+
+  contradicting:
+    - id: organisation_owned_storage_account
+      name: Storage account belongs to the organisation
+      description: >-
+        The account name is in the organisation's Azure inventory.
+      source: asset_inventory
+      field: DomainName
+      indicates: owned_cloud_resource
+    - id: known_sdk_application
+      name: Requester is a known Azure SDK application
+      description: >-
+        The process is a deployed line-of-business, backup or monitoring application
+        documented to use Table Storage.
+      source: baseline
+      field: ContextBaseFileName
+      indicates: expected_application_traffic
+
+  risk_logic:
+    required:
+      - table_storage_endpoint_resolved
+
+    supporting:
+      any:
+        - requester_not_azure_tooling
+        - steady_polling_from_one_process
+        - requester_image_under_user_profile
+        - exodus_binary_outside_install_folder
+      all:
+        - requester_not_azure_tooling
+        - requester_image_under_user_profile
+
+    contradicting:
+      any:
+        - organisation_owned_storage_account
+        - known_sdk_application
+      all: []
+
+  verdict:
+    low_risk_when:
+      - table_storage_endpoint_resolved
+      - organisation_owned_storage_account
+      - known_sdk_application
+    suspicious_when:
+      - table_storage_endpoint_resolved
+      - requester_not_azure_tooling
+    high_risk_when:
+      - table_storage_endpoint_resolved
+      - requester_not_azure_tooling
+      - requester_image_under_user_profile
+      - steady_polling_from_one_process
+
+  false_positive:
+    - condition: Applications built on the Azure SDK.
+      explanation: >-
+        Internal applications and vendor agents use Table Storage for state. The account
+        is the organisation's or the vendor's, and the process is installed under
+        Program Files.
+    - condition: Administrators using PowerShell or scripts against storage.
+      explanation: >-
+        Az modules and scripts resolve table endpoints from powershell.exe. The account
+        is owned, the user is an administrator and the activity is interactive, not
+        periodic.
+    - condition: The real Exodus wallet in a non-default location.
+      explanation: >-
+        A portable or older install can sit elsewhere. It does not resolve Table Storage
+        endpoints.

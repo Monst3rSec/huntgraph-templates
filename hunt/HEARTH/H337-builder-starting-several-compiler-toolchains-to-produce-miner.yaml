@@ -1,0 +1,344 @@
+# Converted from THORCollective/HEARTH Flames/H337.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h337-builder-starting-several-compiler-toolchains-to-produce-miner-t1027-004
+version: 1.0.0
+
+info:
+  name: One builder process starting several C and .NET compiler toolchains to build a miner on the host
+  description: >-
+    A pre-built miner has a hash antivirus already knows, so the adversary ships the
+    builder and compiles on the victim. One unsigned executable dropped into a
+    user-writable directory starts csc.exe and cvtres.exe from the .NET Framework
+    together with tcc.exe, MinGW-w64 gcc.exe and cc1.exe, and donut.exe to turn the
+    output into shellcode. The fresh binary is injected into explorer.exe and runs with
+    XMRig arguments. The hypothesis is the burst: several distinct compiler and linker
+    images under one non-developer parent within minutes. The template returns each
+    compiler start with its parent process id and the agent counts the distinct
+    toolchains per parent and the time they span. Signing state of the builder is not on
+    the event and its path is read from its own process event. The injection into
+    explorer.exe is not visible; miner arguments on a command line are, when the
+    injected code was started with them.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-evasion
+    - compile-after-delivery
+    - cryptominer
+    - xmrig
+    - tcc
+    - mingw
+    - donut
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H337.md
+    - https://attack.mitre.org/techniques/T1027
+    - https://attack.mitre.org/techniques/T1027/004
+    - https://attack.mitre.org/techniques/T1496/001
+    - https://attack.mitre.org/detectionstrategies/DET0501
+    - https://attack.mitre.org/detectionstrategies/DET0540
+
+mitre:
+  tactics:
+    - TA0005
+    - TA0040
+  techniques:
+    - T1027
+    - T1496
+  sub_techniques:
+    - T1027.004
+    - T1496.001
+  detection_strategies:
+    - DET0501
+    - DET0540
+  analytics:
+    - AN1381
+    - AN1489
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    A single unsigned builder dropped into a user-writable directory spawns several
+    compiler and linker toolchains in quick succession, csc.exe and cvtres.exe alongside
+    tcc.exe, MinGW-w64 gcc.exe and cc1.exe, plus donut.exe for shellcode conversion, to
+    compile a cryptominer on the host that is then injected into explorer.exe and run
+    with XMRig command-line arguments.
+  attacker_behavior:
+    - Drops a builder and bundled compilers into Temp, AppData or ProgramData.
+    - Starts tcc.exe, gcc.exe and cc1.exe from that folder to compile C source.
+    - Starts csc.exe, which in turn starts cvtres.exe, to compile a .NET loader.
+    - Runs donut.exe to convert the output into shellcode.
+    - Injects the result into explorer.exe and mines with XMRig arguments.
+  legitimate_behavior:
+    - Developers and build agents run compilers all day.
+    - PowerShell Add-Type and some installers start csc.exe to compile helper code.
+    - Scientific and scripting packages bundle tcc or MinGW to compile extensions.
+  risk_indicator:
+    - Two or more distinct toolchains start under one parent within minutes.
+    - The compilers themselves run from Temp or AppData.
+    - donut.exe runs on the host.
+    - The host has no development role.
+    - A process, including one named explorer.exe, carries mining pool or RandomX arguments.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: c-toolchain-binary-running-from-user-writable-path
+        name: tcc, gcc, cc1 or a MinGW tool running from a user-writable directory
+        purpose: >-
+          Return C compiler, assembler and linker processes whose image is under
+          AppData, Temp, ProgramData, Public or Downloads, which is where a builder
+          unpacks the copies it brings. An installed toolchain under Program Files or a
+          development root is not returned. Each event carries the parent process id for
+          the agent to count on.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(tcc|gcc|g\+\+|cc1|cc1plus|collect2|ld|as|windres|[a-z0-9_]+-w64-mingw32-(gcc|g\+\+|ld|as))\.exe$/i
+          | ImageFileName=/\\(AppData|Temp|ProgramData|Users\\Public|Downloads|PerfLogs)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: dotnet-compiler-started-by-unusual-parent
+        name: .NET compiler started by something other than a build tool
+        purpose: >-
+          Return csc.exe and vbc.exe processes whose parent is not MSBuild, Visual
+          Studio, the .NET host, PowerShell or a Windows servicing process. PowerShell
+          is excluded because Add-Type starts csc.exe constantly; a builder that
+          compiles through PowerShell is therefore missed here and shows only in the C
+          toolchain case.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(csc|vbc)\.exe$/i
+          | ParentBaseFileName!=/^(msbuild|devenv|dotnet|powershell|pwsh|powershell_ise|VBCSCompiler|aspnet_compiler|w3wp|mscorsvw|ngen|sdiagnhost|msiexec|rider64|ServiceHub\.[A-Za-z.]+|ccmexec|mmc)\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: donut-shellcode-converter-run
+        name: donut.exe run
+        purpose: >-
+          Return runs of the Donut shellcode generator by name. A renamed copy is not
+          matched.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^donut\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: executable-written-by-compiler-into-user-writable-path
+        name: Executable written by a compiler or linker into a user-writable directory
+        purpose: >-
+          Return PE files whose writer is one of the compilers or linkers and whose path
+          is user-writable: the freshly built binary.
+        query: |
+          #event_simpleName=PeFileWritten
+          | ContextBaseFileName=/^(tcc|gcc|g\+\+|ld|collect2|csc|vbc|donut)\.exe$/i
+          | TargetFileName=/\\(AppData|Temp|ProgramData|Users\\Public|Downloads|PerfLogs)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: miner-arguments-on-command-line
+        name: Process command line carrying XMRig or mining pool arguments
+        purpose: >-
+          Return processes of any name whose command line carries RandomX or pool
+          arguments. This is an unanchored test over all Windows process events and is
+          the most expensive case here. Code injected into a running explorer.exe starts
+          no process and has no command line; this sees a miner only when a process was
+          created with the arguments, as the report describes.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | CommandLine=/--randomx-|--algo[= ]+(rx|randomx|cn|gr)\b|--donate-level|stratum\+(tcp|ssl):\/\/|--coin[= ]+(monero|xmr)\b|--nicehash/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: compiler_started_outside_build_workflow
+      name: Compiler started outside a build workflow
+      description: >-
+        A C toolchain binary runs from a user-writable directory, or a .NET compiler is
+        started by a parent that is not a build tool.
+      source: process_creation
+      field: image_name
+      indicates: on_host_compilation
+
+  supporting:
+    - id: several_toolchains_under_one_parent
+      name: Several distinct toolchains under one parent
+      description: >-
+        Two or more different compiler images share a parent process id within a few
+        minutes. The agent derives the count and the span from the returned events.
+      source: process_creation
+      field: parent_process_id
+      indicates: multi_toolchain_burst
+    - id: toolchain_in_user_writable_path
+      name: Toolchain runs from a user-writable path
+      description: >-
+        The compiler's own image path is under AppData, Temp, ProgramData or Public.
+      source: process_creation
+      field: image_path
+      indicates: bundled_compiler
+    - id: builder_parent_name
+      name: Parent is not a development tool
+      description: >-
+        The parent named on the compiler events is not an IDE, a build runner or a shell
+        a developer works in.
+      source: process_creation
+      field: parent_process
+      indicates: non_developer_builder
+    - id: fresh_binary_written
+      name: Compiler wrote an executable to a user-writable path
+      description: >-
+        A PE file was written by a compiler or linker into Temp, AppData or ProgramData.
+      source: file_creation
+      field: file_path
+      indicates: payload_built_on_host
+    - id: compiler_named_as_writer
+      name: Writer is a compiler or linker
+      description: >-
+        The process named on the file-write event is tcc, gcc, ld, csc or donut.
+      source: file_creation
+      field: writer_process_name
+      indicates: compile_output
+    - id: miner_arguments
+      name: Mining arguments on a command line
+      description: >-
+        A process command line carries RandomX, pool or donation-level arguments.
+      source: process_creation
+      field: command_line
+      indicates: cryptomining_execution
+
+  contradicting:
+    - id: development_or_build_host
+      name: Host has a development or build role
+      description: >-
+        The host is a developer workstation or a build agent.
+      source: asset_inventory
+      field: ComputerName
+      indicates: expected_compiler_use
+    - id: known_package_compiling_extensions
+      name: Compiler belongs to a known package
+      description: >-
+        The toolchain is bundled with an installed scientific or scripting package that
+        compiles extensions.
+      source: baseline
+      field: ImageFileName
+      indicates: routine_package_behaviour
+
+  risk_logic:
+    required:
+      - compiler_started_outside_build_workflow
+
+    supporting:
+      any:
+        - several_toolchains_under_one_parent
+        - toolchain_in_user_writable_path
+        - builder_parent_name
+        - fresh_binary_written
+        - compiler_named_as_writer
+        - miner_arguments
+      all:
+        - several_toolchains_under_one_parent
+        - toolchain_in_user_writable_path
+
+    contradicting:
+      any:
+        - development_or_build_host
+        - known_package_compiling_extensions
+      all: []
+
+  verdict:
+    low_risk_when:
+      - compiler_started_outside_build_workflow
+      - development_or_build_host
+      - known_package_compiling_extensions
+    suspicious_when:
+      - compiler_started_outside_build_workflow
+      - toolchain_in_user_writable_path
+    high_risk_when:
+      - compiler_started_outside_build_workflow
+      - several_toolchains_under_one_parent
+      - miner_arguments
+
+  false_positive:
+    - condition: Developer workstations and build agents.
+      explanation: >-
+        Compilers run constantly there, but from installed locations and under an IDE, a
+        build runner or a shell. Several toolchains under one unknown parent in a
+        temporary folder is not that pattern.
+    - condition: Packages that bundle a compiler.
+      explanation: >-
+        R, Julia, Nim, Go's cgo and some Python distributions carry MinGW or tcc. The
+        path names the package and the parent is its runtime.
+    - condition: Installers compiling helper assemblies.
+      explanation: >-
+        A few installers start csc.exe once. They start one toolchain, not several.

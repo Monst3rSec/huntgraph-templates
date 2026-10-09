@@ -1,0 +1,338 @@
+# Converted from THORCollective/HEARTH Flames/H323.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h323-scheduled-clearing-of-user-proxy-configuration-t1112
+version: 1.0.0
+
+info:
+  name: User proxy configuration cleared on a schedule to move traffic off the inspected path
+  description: >-
+    The implant delivered by a trojanized Exodus installer does not stop a security
+    product; it removes the proxy. A scheduled task named INetHealth runs PowerShell
+    that sets ProxyEnable to 0 and empties ProxyServer and AutoConfigURL under the
+    user's Internet Settings key, then calls InternetSetOption so WinINet applies the
+    change at once. Because the task repeats, a policy that restores the proxy is undone
+    within the hour. A second task, ExdBackupTool, restarts
+    %APPDATA%\ExdBackupTool\Exodus.exe every hour. Both tasks are registered through the
+    Task Scheduler COM interface, so there is no schtasks command, and event 4698 is not
+    collected. The PowerShell is started as conhost.exe --headless powershell -e
+    <Base64>, so the value names are not on the command line either. The hunt therefore
+    reads the registry writes themselves, which depend on the sensor reporting that key,
+    and the process shapes the tasks leave. The InternetSetOption calls are OS API
+    execution and are not seen. Repetition is the hypothesis: the agent counts writes
+    per host and user and looks at their spacing.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-evasion
+    - proxy-settings
+    - modify-registry
+    - scheduled-task
+    - network-inspection-bypass
+    - exodus
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H323.md
+    - https://attack.mitre.org/techniques/T1112
+    - https://attack.mitre.org/detectionstrategies/DET0280
+
+mitre:
+  tactics:
+    - TA0112
+    - TA0003
+  techniques:
+    - T1112
+  sub_techniques: []
+  detection_strategies:
+    - DET0280
+  analytics:
+    - AN0781
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Windows Registry Key Modification
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    An implant runs a scheduled task that repeatedly clears ProxyEnable, ProxyServer and
+    AutoConfigURL under HKCU Internet Settings, so that its command-and-control traffic
+    leaves on a direct path the organisation's proxy does not inspect, and any
+    remediation or policy re-push is undone within the hour.
+  attacker_behavior:
+    - Registers a task named INetHealth through the Task Scheduler COM interface.
+    - Runs PowerShell hidden behind conhost.exe --headless with an encoded command.
+    - Sets ProxyEnable to 0 and empties ProxyServer and AutoConfigURL in the user hive.
+    - Calls InternetSetOption so the change applies without a logoff.
+    - Restarts a binary under AppData\Roaming\ExdBackupTool every hour from a second task.
+  legitimate_behavior:
+    - Users turn a proxy off in Settings or Internet Options.
+    - VPN clients and proxy managers rewrite these values when the network changes.
+    - Group Policy, Intune and logon scripts set the proxy values.
+    - Support scripts clear a broken proxy once.
+  risk_indicator:
+    - The three values are written together and repeatedly at an even interval.
+    - The data written is 0 or empty on a host that policy configures with a proxy.
+    - The writing process is PowerShell started by the task engine, not Settings or a management agent.
+    - conhost.exe is the parent of an encoded PowerShell command.
+    - A binary runs from AppData\Roaming\ExdBackupTool.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - RegGenericValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: user-proxy-values-written
+        name: ProxyEnable, ProxyServer or AutoConfigURL written in a user hive
+        purpose: >-
+          Return every write of the three proxy values under a user's Internet Settings
+          key, with the writing process id. The case does not test the data: ProxyEnable
+          is a number and the two strings are emptied, and the agent reads what was
+          written and counts the writes per host and user. Proxy managers and VPN
+          clients write these values too and are told apart by the writer and by setting
+          a proxy as often as clearing one.
+        query: |
+          #event_simpleName=RegGenericValueUpdate
+          | RegObjectName=/\\REGISTRY\\USER\\S-1-5-21-[^\\]+\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings$/i
+          | RegValueName=/^(ProxyEnable|ProxyServer|AutoConfigURL)$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: headless-conhost-starting-powershell
+        name: conhost.exe --headless used to start PowerShell
+        purpose: >-
+          Return conhost.exe processes started with --headless and a PowerShell command,
+          the form both tasks' actions take. Windows starts conhost as the child of a
+          console program, not as its launcher, so the argument is rare outside this
+          use.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^conhost\.exe$/i
+          | CommandLine=/--headless\s.*(powershell|pwsh)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: encoded-powershell-started-by-conhost
+        name: Encoded PowerShell command whose parent is conhost.exe
+        purpose: >-
+          Return PowerShell processes whose parent is conhost.exe and whose command line
+          carries an encoded command. The encoded text hides the registry value names;
+          the agent decodes it from the returned command line.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^conhost\.exe$/i
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/\s-e(nc|ncodedcommand)?\s+[A-Za-z0-9+\/=]{40,}/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: proxy-values-named-on-command-line
+        name: Command line that names the Internet Settings proxy values
+        purpose: >-
+          Return PowerShell, cmd and reg commands that name the Internet Settings key
+          together with one of the three values, the plain-text form of the same change.
+          Logon scripts and support tools appear here.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh|reg|cmd)\.exe$/i
+          | CommandLine=/Internet Settings/i
+          | CommandLine=/ProxyEnable|ProxyServer|AutoConfigURL/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: binary-running-from-roaming-exdbackuptool
+        name: Process running from AppData\Roaming\ExdBackupTool
+        purpose: >-
+          Return processes whose image is in the reported folder, which the second task
+          restarts hourly. The folder name is specific to this campaign and will change;
+          the hourly restart by the task engine is what the agent looks for in any
+          replacement.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ImageFileName=/\\AppData\\Roaming\\ExdBackupTool\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: proxy_value_written
+      name: Proxy value written under the user's Internet Settings key
+      description: >-
+        A registry write names ProxyEnable, ProxyServer or AutoConfigURL in a user hive.
+      source: registry
+      field: registry_value
+      indicates: proxy_configuration_change
+
+  supporting:
+    - id: proxy_value_cleared
+      name: Value was emptied or disabled
+      description: >-
+        The data written is empty for ProxyServer or AutoConfigURL, or 0 for
+        ProxyEnable, on a host that is meant to use a proxy.
+      source: registry
+      field: registry_data
+      indicates: proxy_removed
+    - id: writes_repeat_on_a_schedule
+      name: The same values are cleared at an even interval
+      description: >-
+        The writes recur on the same host at a regular spacing over days. The agent
+        derives the count and interval from the returned events.
+      source: registry
+      field: registry_path
+      indicates: scheduled_reapplication
+    - id: writer_is_task_started_powershell
+      name: Writer is PowerShell started by the task engine
+      description: >-
+        The writing process id belongs to PowerShell whose ancestry is conhost and the
+        Task Scheduler service, not Settings, inetcpl.cpl or a management agent. The
+        agent resolves it against the process events.
+      source: registry
+      field: writer_process_id
+      indicates: implant_task_action
+    - id: headless_encoded_powershell
+      name: Encoded PowerShell behind headless conhost
+      description: >-
+        conhost.exe --headless starts PowerShell with an encoded command.
+      source: process_creation
+      field: command_line
+      indicates: hidden_scripted_execution
+    - id: relaunched_roaming_binary
+      name: Binary restarted from the roaming profile
+      description: >-
+        A process runs from AppData\Roaming\ExdBackupTool, restarted at the same minute
+        each hour.
+      source: process_creation
+      field: image_path
+      indicates: task_driven_persistence
+
+  contradicting:
+    - id: user_changed_proxy_in_settings
+      name: Change made through Settings or Internet Options
+      description: >-
+        The writer is SystemSettings.exe or rundll32 running inetcpl.cpl in a user
+        session.
+      source: baseline
+      field: ContextProcessId
+      indicates: interactive_user_change
+    - id: managed_proxy_configuration
+      name: Change comes from policy or a proxy manager
+      description: >-
+        A management agent, VPN client or logon script documented for the estate writes
+        the values.
+      source: change_management
+      field: ComputerName
+      indicates: managed_configuration
+
+  risk_logic:
+    required:
+      - proxy_value_written
+
+    supporting:
+      any:
+        - proxy_value_cleared
+        - writes_repeat_on_a_schedule
+        - writer_is_task_started_powershell
+        - headless_encoded_powershell
+        - relaunched_roaming_binary
+      all:
+        - proxy_value_cleared
+        - writes_repeat_on_a_schedule
+
+    contradicting:
+      any:
+        - user_changed_proxy_in_settings
+        - managed_proxy_configuration
+      all: []
+
+  verdict:
+    low_risk_when:
+      - proxy_value_written
+      - user_changed_proxy_in_settings
+      - managed_proxy_configuration
+    suspicious_when:
+      - proxy_value_written
+      - proxy_value_cleared
+      - writes_repeat_on_a_schedule
+    high_risk_when:
+      - proxy_value_written
+      - proxy_value_cleared
+      - writes_repeat_on_a_schedule
+      - writer_is_task_started_powershell
+
+  false_positive:
+    - condition: VPN clients and proxy switchers.
+      explanation: >-
+        They rewrite all three values on every network change. The writer is the
+        client's own process and the values are set as often as they are cleared.
+    - condition: Policy refresh and logon scripts.
+      explanation: >-
+        Group Policy and Intune re-apply the proxy on a schedule. The data written is
+        the organisation's proxy, not an empty string.
+    - condition: A user or support engineer clearing a proxy once.
+      explanation: >-
+        A single write from Settings or a support script, with no recurrence.

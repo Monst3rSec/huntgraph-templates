@@ -1,0 +1,285 @@
+# Converted from THORCollective/HEARTH Flames/H332.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h332-powershell-running-fetched-text-through-parser-or-invokescript-t1059-001
+version: 1.0.0
+
+info:
+  name: PowerShell executing fetched script text through the language parser or InvokeScript
+  description: >-
+    Two ClickFix campaigns, LegionLoader and Exvicy, fetch their next stage with irm and
+    run the returned text without Invoke-Expression. LegionLoader passes the string to
+    [Management.Automation.Language.Parser]::ParseInput and invokes the script block it
+    gets back; Exvicy calls $ExecutionContext.InvokeCommand.InvokeScript. The result is
+    the same as IEX and none of the rules that look for iex match. HEARTH places the
+    hunt in Script Block Logging, event 4104, which this deployment does not collect.
+    The first stage is nonetheless a pasted one-liner, and both reported commands carry
+    the primitive in plain text on the PowerShell command line, so that is what is
+    hunted. A stage that uses the primitive only inside fetched script, a command passed
+    as -EncodedCommand, and a line typed into an already open PowerShell window are not
+    seen.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - execution
+    - powershell
+    - clickfix
+    - invokescript
+    - language-parser
+    - download-and-execute
+    - legionloader
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H332.md
+    - https://attack.mitre.org/techniques/T1059
+    - https://attack.mitre.org/techniques/T1059/001
+    - https://attack.mitre.org/detectionstrategies/DET0455
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1059
+  sub_techniques:
+    - T1059.001
+  detection_strategies:
+    - DET0455
+  analytics:
+    - AN1252
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    Download-and-execute is present in the estate under two invocation primitives that
+    are not Invoke-Expression: remote script text fetched with irm or Invoke-RestMethod
+    is handed to the PowerShell language parser and the resulting script block invoked,
+    or passed to $ExecutionContext.InvokeCommand.InvokeScript.
+  attacker_behavior:
+    - Tells the visitor to paste a PowerShell command into the Run dialog or a terminal.
+    - Fetches script text with irm, iwr or a WebClient call into a variable.
+    - Parses the text with Language.Parser ParseInput and invokes GetScriptBlock.
+    - Or passes the text to ExecutionContext.InvokeCommand.InvokeScript.
+    - Hides or minimises the window and skips the profile.
+  legitimate_behavior:
+    - Module authors and linters call the parser to inspect code, without invoking the result.
+    - Some vendor bootstrap scripts build script blocks with ScriptBlock Create.
+    - Administrators download and run their own scripts interactively.
+  risk_indicator:
+    - The parser or InvokeScript appears on the same command line as a web fetch.
+    - The parent is explorer.exe, as left by the Run dialog.
+    - The window style is hidden or minimised and the profile is skipped.
+    - The URL is a bare domain with a random path and no file extension.
+    - The user is not technical staff.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: fetch-and-run-through-parser-or-invokescript
+        name: PowerShell command line pairing a web fetch with the parser or InvokeScript
+        purpose: >-
+          Return PowerShell processes whose command line carries one of the two
+          primitives, or the related script-block constructors, together with a web
+          fetch. This is the hypothesis as stated. Casing is ignored; a command split
+          with string concatenation or backticks to break the names up is not matched.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/Language\.Parser\]::ParseInput|GetScriptBlock\(\)|InvokeCommand\.InvokeScript|InvokeCommand\.NewScriptBlock|\[ScriptBlock\]::Create/i
+          | CommandLine=/\b(irm|iwr|curl|wget)\b|Invoke-RestMethod|Invoke-WebRequest|DownloadString|DownloadData|Net\.WebClient|Net\.Http\.HttpClient/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: parser-or-invokescript-on-any-powershell-command-line
+        name: PowerShell command line naming ParseInput with GetScriptBlock, or InvokeScript
+        purpose: >-
+          Return the primitives without the fetch condition, for a command that reads
+          its text from a file, the clipboard or an environment variable. ScriptBlock
+          Create is left out here because legitimate launchers use it often.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/Language\.Parser\]::ParseInput|GetScriptBlock\(\)|InvokeCommand\.InvokeScript|InvokeCommand\.NewScriptBlock/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: explorer-started-powershell-fetching-without-iex
+        name: PowerShell started by Explorer that fetches from the web and names no Invoke-Expression
+        purpose: >-
+          Return PowerShell processes started by explorer.exe whose command line fetches
+          from the web and contains neither iex nor Invoke-Expression. A pasted fetch
+          has to run what it fetched somehow; when IEX is absent the command line shows
+          which other primitive was used, including ones this template does not name. A
+          plain download to a file matches as well and the agent separates the two.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^explorer\.exe$/i
+          | FileName=/^(powershell|pwsh)\.exe$/i
+          | CommandLine=/\b(irm|iwr)\b|Invoke-RestMethod|Invoke-WebRequest|DownloadString|DownloadData/i
+          | CommandLine!=/\biex\b|Invoke-Expression/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: alternative_invocation_primitive
+      name: Script text executed through the parser or InvokeScript
+      description: >-
+        A PowerShell command line calls Language.Parser ParseInput with GetScriptBlock,
+        or ExecutionContext.InvokeCommand.InvokeScript, or fetches from the web under
+        Explorer without naming Invoke-Expression.
+      source: process_creation
+      field: command_line
+      indicates: iex_free_script_execution
+
+  supporting:
+    - id: web_fetch_on_same_command_line
+      name: Web fetch on the same command line
+      description: >-
+        The command line also contains irm, iwr, Invoke-RestMethod or a WebClient
+        download call.
+      source: process_creation
+      field: command_line
+      indicates: remote_script_retrieval
+    - id: explorer_parent
+      name: Parent is explorer.exe
+      description: >-
+        PowerShell was started by Explorer, which is what the Run dialog leaves.
+      source: process_creation
+      field: parent_process
+      indicates: pasted_command
+    - id: hidden_window_arguments
+      name: Window hidden or minimised and profile skipped
+      description: >-
+        The command line carries -w h, -wi mi, -WindowStyle Hidden, -nop or -ep bypass.
+      source: process_creation
+      field: command_line
+      indicates: concealed_execution
+    - id: non_technical_user
+      name: User does not normally run PowerShell
+      description: >-
+        The account belongs to a non-technical role.
+      source: process_creation
+      field: user
+      indicates: activity_outside_user_role
+    - id: follow_on_children
+      name: The PowerShell process starts further processes
+      description: >-
+        Processes whose parent process id is this PowerShell appear afterwards, such as
+        msiexec or rundll32. The agent derives this from process ids.
+      source: process_creation
+      field: process_id
+      indicates: payload_stage_started
+
+  contradicting:
+    - id: developer_tooling_use
+      name: Command belongs to development tooling
+      description: >-
+        The command is part of a module build, linter or test run on a developer's
+        machine.
+      source: identity_context
+      field: UserName
+      indicates: developer_workflow
+    - id: vendor_bootstrap_script
+      name: Command is a documented vendor bootstrap
+      description: >-
+        The command and URL match a vendor's published installer for approved software.
+      source: asset_inventory
+      field: ComputerName
+      indicates: approved_software_installation
+
+  risk_logic:
+    required:
+      - alternative_invocation_primitive
+
+    supporting:
+      any:
+        - web_fetch_on_same_command_line
+        - explorer_parent
+        - hidden_window_arguments
+        - non_technical_user
+        - follow_on_children
+      all:
+        - web_fetch_on_same_command_line
+        - explorer_parent
+
+    contradicting:
+      any:
+        - developer_tooling_use
+        - vendor_bootstrap_script
+      all: []
+
+  verdict:
+    low_risk_when:
+      - alternative_invocation_primitive
+      - developer_tooling_use
+      - vendor_bootstrap_script
+    suspicious_when:
+      - alternative_invocation_primitive
+      - web_fetch_on_same_command_line
+    high_risk_when:
+      - alternative_invocation_primitive
+      - web_fetch_on_same_command_line
+      - explorer_parent
+      - hidden_window_arguments
+
+  false_positive:
+    - condition: Tools that parse PowerShell.
+      explanation: >-
+        PSScriptAnalyzer, editors and build scripts call ParseInput to inspect code.
+        They do not invoke the result and they do not fetch from the web on the same
+        line.
+    - condition: Vendor installers that build script blocks.
+      explanation: >-
+        Some bootstrap one-liners use ScriptBlock Create on downloaded text. The URL is
+        the vendor's and the software is approved.
+    - condition: Users downloading files with PowerShell from the Run dialog.
+      explanation: >-
+        The command writes to a file with -OutFile and runs nothing.

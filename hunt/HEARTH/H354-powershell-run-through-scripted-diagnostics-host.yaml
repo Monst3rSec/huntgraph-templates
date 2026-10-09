@@ -1,0 +1,332 @@
+# Converted from THORCollective/HEARTH Flames/H354.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+# HEARTH also cites T1547.001 and T1059.001. The COM activation of CScriptedDiag
+# and the load of sdiageng.dll are OS API and module-load telemetry and are not
+# collected. The registry event carries the writer's process id and no name, so
+# the agent joins Run-key writes to sdiagnhost.exe by process id.
+type: detection
+
+id: hg-win-hearth-h354-powershell-run-through-scripted-diagnostics-host-t1202
+version: 1.0.0
+
+info:
+  name: PowerShell run through the Scripted Diagnostics host so sdiagnhost.exe makes the Run-key write
+  description: >-
+    The Antino backdoor, used by UAT-11587 against government and policy bodies in Asia,
+    runs its PowerShell through the Windows Scripted Diagnostics framework. It creates
+    the CScriptedDiag COM class, starts the engine with the Program Compatibility Wizard
+    package, receives a working copy at C:\Windows\Temp\SDIAG_<GUID>, writes its own
+    script there and resumes the workflow, at which point sdiagnhost.exe -Embedding runs
+    it. A Run value written that way comes from a signed troubleshooting component. A
+    real troubleshooting session is driven by msdt.exe, which also writes the working
+    copy; here another process writes it and no msdt.exe runs. The hunt returns
+    sdiagnhost.exe starting, what it starts, scripts written into SDIAG folders by
+    anything other than msdt.exe, msdt.exe itself for comparison, and per-user Run
+    values for the agent to match by process id.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - defense-evasion
+    - indirect-execution
+    - scripted-diagnostics
+    - sdiagnhost
+    - run-key
+    - antino
+    - uat-11587
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H354.md
+    - https://attack.mitre.org/techniques/T1202
+    - https://attack.mitre.org/detectionstrategies/DET0200
+
+mitre:
+  tactics:
+    - TA0005
+  techniques:
+    - T1202
+  sub_techniques: []
+  detection_strategies:
+    - DET0200
+  analytics:
+    - AN0576
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+
+hypothesis:
+  statement: >-
+    A Rust backdoor avoids being the visible parent of its own PowerShell by driving the
+    Windows Scripted Diagnostics framework: it creates the CScriptedDiag COM class,
+    initialises the engine with the legitimate Program Compatibility Wizard package and
+    a blank Answers XML, writes its own PowerShell into the temporary working copy at
+    C:\Windows\Temp\SDIAG_<GUID>, then resumes the diagnostic workflow so the
+    Microsoft-signed native host sdiagnhost.exe -Embedding executes it, and the
+    persistence write, an HKCU Run value, appears to originate from a signed Windows
+    troubleshooting component, not from the implant.
+  attacker_behavior:
+    - Starts the diagnostics engine through COM from the implant, with no msdt.exe.
+    - Writes a PowerShell script into the engine's SDIAG working folder.
+    - Lets sdiagnhost.exe run the script.
+    - Uses the script to write a Run value or start a program.
+  legitimate_behavior:
+    - Users and support staff run Windows troubleshooters, which start msdt.exe and then sdiagnhost.exe.
+    - The Program Compatibility Assistant starts a troubleshooter after an application fails.
+    - A troubleshooter's scripts start a few system utilities.
+  risk_indicator:
+    - sdiagnhost.exe runs on a host with no msdt.exe around the same time.
+    - A script in an SDIAG folder is written by a process that is not msdt.exe.
+    - A Run value is written by the sdiagnhost.exe process id.
+    - sdiagnhost.exe starts a program outside the Windows directory.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NewScriptWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+    - source: registry
+      connector: crowdstrike-ngsiem
+      event_types:
+        - AsepValueUpdate
+      fields:
+        agent_id: aid
+        host: ComputerName
+        registry_path: RegObjectName
+        registry_value: RegValueName
+        registry_data: RegStringValue
+        writer_process_id: ContextProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: scripted-diagnostics-host-started
+        name: sdiagnhost.exe started
+        purpose: >-
+          Return every start of the Scripted Diagnostics native host, with its process
+          id. Its parent is the DCOM launcher in both the legitimate and the abused
+          case, so the parent does not separate them; the absence of msdt.exe does.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^sdiagnhost\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: process-started-by-scripted-diagnostics-host
+        name: Process started by sdiagnhost.exe
+        purpose: >-
+          Return what the host starts. PowerShell runs inside the host process, so a
+          script that only writes the registry starts nothing and is not seen here; the
+          implant's command to start a program is.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^sdiagnhost\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: script-written-to-sdiag-folder-by-non-msdt-process
+        name: Script written into an SDIAG working folder by a process other than msdt.exe
+        purpose: >-
+          Return scripts written under Windows\Temp\SDIAG_ where the writer is not
+          msdt.exe. The engine runs inside whichever process created it, so in the
+          abused case the implant writes both the package copy and its own script.
+        query: |
+          #event_simpleName=NewScriptWritten
+          | TargetFileName=/\\Windows\\Temp\\SDIAG_[^\\]+\\/i
+          | ContextBaseFileName!=/^msdt\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: troubleshooting-wizard-started
+        name: msdt.exe started
+        purpose: >-
+          Return starts of the troubleshooting wizard, so the agent can tell an
+          sdiagnhost.exe that belongs to a real session from one with no wizard.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^msdt\.exe$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: per-user-run-value-written
+        name: Run value written under a user hive
+        purpose: >-
+          Return per-user Run and RunOnce values with the writer's process id. The agent
+          keeps those whose writer is an sdiagnhost.exe process the first case returned.
+          This is every per-user autorun write on the estate and is large over a long
+          window; run it for the hosts and days the first case returns.
+        query: |
+          #event_simpleName=AsepValueUpdate
+          | RegObjectName=/\\REGISTRY\\USER\\S-1-5-21-[^\\]+\\Software\\Microsoft\\Windows\\CurrentVersion\\Run(Once)?\\?$/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: diagnostics_host_ran
+      name: Scripted Diagnostics host ran
+      description: >-
+        sdiagnhost.exe started on the host.
+      source: process_creation
+      field: image_name
+      indicates: diagnostics_framework_execution
+
+  supporting:
+    - id: no_wizard_session
+      name: No troubleshooting wizard ran
+      description: >-
+        The msdt.exe case returns nothing for the host near the time the host process
+        started, by the agent's comparison of the two result sets.
+      source: process_creation
+      field: host
+      indicates: diagnostics_started_without_wizard
+    - id: sdiag_script_from_foreign_writer
+      name: Script in the SDIAG folder written by another process
+      description: >-
+        A script under Windows\Temp\SDIAG_ was written by a process that is not the
+        troubleshooting wizard.
+      source: file_creation
+      field: writer_process_name
+      indicates: attacker_script_in_working_copy
+    - id: run_value_written_by_host
+      name: Run value written by the diagnostics host
+      description: >-
+        A per-user Run value's writer process id is that of an sdiagnhost.exe process,
+        which the agent establishes by joining the two result sets.
+      source: registry
+      field: writer_process_id
+      indicates: persistence_through_signed_host
+    - id: run_value_target
+      name: Run value points at a user-writable path
+      description: >-
+        The Run value data names an executable in AppData, ProgramData or another
+        user-writable directory.
+      source: registry
+      field: registry_data
+      indicates: implant_autostart
+    - id: host_started_non_system_program
+      name: Diagnostics host started a program outside Windows
+      description: >-
+        A child of sdiagnhost.exe has an image outside the Windows directory.
+      source: process_creation
+      field: image_path
+      indicates: proxied_program_launch
+
+  contradicting:
+    - id: wizard_session_present
+      name: Troubleshooting wizard ran in the same session
+      description: >-
+        msdt.exe ran on the host immediately before the diagnostics host, started by the
+        user, Settings or the Program Compatibility Assistant.
+      source: process_creation
+      field: parent_process
+      indicates: legitimate_troubleshooting
+    - id: support_activity
+      name: Help desk was troubleshooting the host
+      description: >-
+        A support ticket covers troubleshooting on the host at that time.
+      source: identity_context
+      field: UserName
+      indicates: authorised_support_activity
+
+  risk_logic:
+    required:
+      - diagnostics_host_ran
+
+    supporting:
+      any:
+        - no_wizard_session
+        - sdiag_script_from_foreign_writer
+        - run_value_written_by_host
+        - run_value_target
+        - host_started_non_system_program
+      all:
+        - no_wizard_session
+        - sdiag_script_from_foreign_writer
+
+    contradicting:
+      any:
+        - wizard_session_present
+        - support_activity
+      all: []
+
+  verdict:
+    low_risk_when:
+      - diagnostics_host_ran
+      - wizard_session_present
+      - support_activity
+    suspicious_when:
+      - diagnostics_host_ran
+      - no_wizard_session
+    high_risk_when:
+      - diagnostics_host_ran
+      - sdiag_script_from_foreign_writer
+      - run_value_written_by_host
+
+  false_positive:
+    - condition: A user runs a Windows troubleshooter.
+      explanation: >-
+        msdt.exe starts first, writes the SDIAG folder, and the host runs the package's
+        own scripts. No Run value is written.
+    - condition: The Program Compatibility Assistant offers a fix.
+      explanation: >-
+        The chain starts from pcwrun.exe or msdt.exe after an application fails, and the
+        user is at the console.

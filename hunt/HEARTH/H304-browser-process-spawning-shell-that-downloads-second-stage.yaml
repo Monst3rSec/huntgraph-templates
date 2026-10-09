@@ -1,0 +1,362 @@
+# Converted from THORCollective/HEARTH Flames/H304.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-win-hearth-h304-browser-process-spawning-shell-that-downloads-second-stage-t1203
+version: 1.0.0
+
+info:
+  name: Browser process spawning a command shell that downloads a second stage
+  description: >-
+    A browser exploit chain that reaches code execution outside the sandbox has to
+    create a process. In the Chrome and Windows zero-day chain Volexity attributed to
+    several Chinese threat actors the renderer exploit and the sandbox escape stay in
+    memory, and the step to persistent access is a plain CreateProcess of cmd.exe /c
+    curl fetching the next stage into %TEMP%. That crossing point does not depend on the
+    CVEs and normal browsing does not produce it. The hunt returns interpreters and
+    download utilities whose parent is a Chromium browser, the subset that fetches from
+    a URL, msiexec installing a file that is not named .msi (the chain ran msiexec /i
+    Temp.txt), executables those utilities write into Temp, and msiexec holding an
+    outbound connection. Whether the parent was a renderer is on the parent's command
+    line, not the child's event.
+  severity: critical
+  author: huntgraph
+  tags:
+    - hearth
+    - execution
+    - browser-exploit
+    - chrome
+    - zero-day
+    - second-stage-download
+    - msiexec
+    - windows
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H304.md
+    - https://attack.mitre.org/techniques/T1203
+    - https://attack.mitre.org/detectionstrategies/DET0287
+
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1203
+  sub_techniques: []
+  detection_strategies:
+    - DET0287
+  analytics:
+    - AN0797
+  platforms:
+    - Windows
+  data_sources:
+    - WinEventLog:Sysmon
+  data_components:
+    - Process Creation
+    - File Creation
+    - Network Connection Creation
+
+hypothesis:
+  statement: >-
+    An adversary who has exploited a Chromium-based browser is using the browser process
+    to start a command interpreter that downloads and runs a second stage, the one step
+    of an otherwise memory-resident chain that must create a process.
+  attacker_behavior:
+    - Exploits the renderer and escapes the sandbox without writing a file.
+    - Starts cmd.exe /c curl from the browser process to fetch a payload into %TEMP%.
+    - Saves an MSI under a non-installer extension and runs it with msiexec /i.
+    - Creates a scheduled task named like a Windows component for persistence.
+    - Beacons from within msiexec.exe.
+  legitimate_behavior:
+    - Browsers start native messaging hosts through cmd.exe with a chrome-extension origin argument.
+    - Opening a downloaded installer or script starts it as a child of the browser.
+    - Protocol handlers start helper applications from the browser.
+  risk_indicator:
+    - The child of the browser is cmd or PowerShell with a download utility and a URL.
+    - The output path is in Temp and the file is executed in the same line.
+    - msiexec is given a file whose extension is not .msi.
+    - The parent browser process is a renderer or utility process, not the main browser.
+    - The same command appears on several hosts after visiting one site.
+
+requires:
+  platforms:
+    - windows
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+    - source: file_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - PeFileWritten
+      fields:
+        agent_id: aid
+        host: ComputerName
+        file_path: TargetFileName
+        writer_process_name: ContextBaseFileName
+        writer_process_id: ContextProcessId
+    - source: network_connection
+      connector: crowdstrike-ngsiem
+      event_types:
+        - NetworkConnectIP4
+      fields:
+        agent_id: aid
+        host: ComputerName
+        process_name: ContextBaseFileName
+        process_id: ContextProcessId
+        remote_address: RemoteAddressIP4
+        remote_port: RemotePort
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: browser-spawning-download-command
+        name: Browser starting a shell or utility that downloads from a URL
+        purpose: >-
+          Return children of a Chromium browser that are a shell, a script host or a
+          download utility and whose command line names a download verb and a URL. This
+          is the crossing point the hypothesis describes. The child's event carries the
+          parent's name and process id, not the parent's command line, so
+          --type=renderer has to be read from the parent's own process event.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(chrome|msedge|brave|opera|vivaldi|chromium)\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh|curl|certutil|bitsadmin|mshta|wscript|cscript)\.exe$/i
+          | CommandLine=/\b(curl|wget|certutil|bitsadmin|Invoke-WebRequest|iwr|irm|Invoke-RestMethod|DownloadFile|DownloadString|Start-BitsTransfer)\b/i
+          | CommandLine=/https?:\/\//i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: browser-spawning-interpreter
+        name: Browser starting an interpreter or proxy binary
+        purpose: >-
+          Return every interpreter or proxy-execution binary a Chromium browser starts,
+          leaving out the native messaging form, whose command line carries a
+          chrome-extension origin. Files the user opens from the downloads bar also
+          start under the browser and appear here; the agent separates them by command
+          line. H271 covers abuse of native messaging itself.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | ParentBaseFileName=/^(chrome|msedge|brave|opera|vivaldi|chromium)\.exe$/i
+          | FileName=/^(cmd|powershell|pwsh|wscript|cscript|mshta|rundll32|regsvr32|msiexec)\.exe$/i
+          | CommandLine!=/chrome-extension:\/\/|--parent-window=/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: msiexec-installing-file-without-msi-extension
+        name: msiexec installing a file not named .msi
+        purpose: >-
+          Return msiexec /i whose package argument is a local file ending in a document,
+          text, image or temporary extension. The reported chain saved the MSI as
+          Temp.txt. This does not depend on the browser being the ancestor.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Win
+          | FileName=/^msiexec\.exe$/i
+          | CommandLine=/\s[\/-]i\s+"?[^"]+\.(txt|log|dat|tmp|jpg|jpeg|png|gif|pdf|bin|ico)"?(\s|$)/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: executable-written-to-temp-by-download-utility
+        name: Executable written into Temp by a shell or download utility
+        purpose: >-
+          Return PE files written under a Temp directory by curl, certutil, bitsadmin,
+          cmd or PowerShell, with the writer's process id for matching to the first
+          case. A payload saved under a non-executable name is still reported if its
+          content is a PE file; an MSI is not a PE file and is seen only through the
+          msiexec case.
+        query: |
+          #event_simpleName=PeFileWritten
+          | ContextBaseFileName=/^(curl|certutil|bitsadmin|cmd|powershell|pwsh)\.exe$/i
+          | TargetFileName=/\\(AppData\\Local\\Temp|Windows\\Temp)\\/i
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: msiexec-connecting-to-public-address
+        name: msiexec holding a connection to a public address
+        purpose: >-
+          Return outbound connections from msiexec.exe to public addresses. msiexec
+          fetches packages from URLs legitimately and exits; the reported backdoor ran
+          inside it and kept connecting, which the agent judges from repetition.
+        query: |
+          #event_simpleName=NetworkConnectIP4
+          | event_platform=Win
+          | ContextBaseFileName=/^msiexec\.exe$/i
+          | !cidr(RemoteAddressIP4, subnet=["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"])
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: browser_child_downloads
+      name: Browser child downloads from a URL
+      description: >-
+        A shell or download utility whose parent is a Chromium browser carries a
+        download verb and a URL on its command line.
+      source: process_creation
+      field: command_line
+      indicates: post_exploitation_stage_fetch
+
+  supporting:
+    - id: browser_is_parent
+      name: Parent is the browser
+      description: >-
+        The parent process is chrome.exe, msedge.exe or another Chromium browser, and
+        the agent confirms from the parent's process event whether it was a renderer.
+      source: process_creation
+      field: parent_process
+      indicates: browser_origin_execution
+    - id: payload_written_to_temp
+      name: Executable written to Temp by the fetch
+      description: >-
+        A PE file appears under Temp, written by the downloading process.
+      source: file_creation
+      field: file_path
+      indicates: second_stage_on_disk
+    - id: payload_writer_matches
+      name: Writer is the browser's child
+      description: >-
+        The writer process id on the file event is the process the first case returned.
+      source: file_creation
+      field: writer_process_id
+      indicates: same_chain
+    - id: payload_writer_name
+      name: Writer is a download utility
+      description: >-
+        The file was written by curl, certutil, bitsadmin or a shell.
+      source: file_creation
+      field: writer_process_name
+      indicates: download_utility_use
+    - id: installer_with_disguised_extension
+      name: msiexec given a non-MSI file name
+      description: >-
+        msiexec installs a file whose name ends in .txt or another non-installer
+        extension.
+      source: process_creation
+      field: image_name
+      indicates: extension_control_evasion
+    - id: msiexec_beaconing
+      name: msiexec connects out repeatedly
+      description: >-
+        msiexec holds or repeats connections to a public address. The agent derives the
+        repetition from the returned events.
+      source: network_connection
+      field: remote_address
+      indicates: command_and_control
+    - id: msiexec_connection_process
+      name: Connecting msiexec is the staged install
+      description: >-
+        The connecting process id is the msiexec that installed the disguised package.
+      source: network_connection
+      field: process_id
+      indicates: same_chain
+
+  contradicting:
+    - id: user_opened_download
+      name: User opened a downloaded file
+      description: >-
+        The command line is a file from the Downloads folder that the user opened from
+        the browser, with no fetch in it.
+      source: baseline
+      field: UserName
+      indicates: user_initiated_open
+    - id: managed_browser_helper
+      name: Managed browser helper
+      description: >-
+        The child is a helper an installed extension or enterprise tool starts on every
+        host.
+      source: asset_inventory
+      field: ComputerName
+      indicates: sanctioned_software
+
+  risk_logic:
+    required:
+      - browser_child_downloads
+
+    supporting:
+      any:
+        - browser_is_parent
+        - payload_written_to_temp
+        - payload_writer_matches
+        - payload_writer_name
+        - installer_with_disguised_extension
+        - msiexec_beaconing
+        - msiexec_connection_process
+      all:
+        - browser_is_parent
+        - payload_written_to_temp
+
+    contradicting:
+      any:
+        - user_opened_download
+        - managed_browser_helper
+      all: []
+
+  verdict:
+    low_risk_when:
+      - browser_child_downloads
+      - user_opened_download
+      - managed_browser_helper
+    suspicious_when:
+      - browser_child_downloads
+      - browser_is_parent
+    high_risk_when:
+      - browser_child_downloads
+      - browser_is_parent
+      - payload_written_to_temp
+      - payload_writer_matches
+
+  false_positive:
+    - condition: Native messaging hosts.
+      explanation: >-
+        Browsers start them through cmd.exe /d /c with a chrome-extension origin. The
+        second case leaves that form out; a host that itself downloads would still show
+        under its own process.
+    - condition: Files opened from the downloads bar.
+      explanation: >-
+        An installer, script or MSI the user opens starts as a child of the browser. The
+        command line names the downloaded file and no URL.
+    - condition: Web-based installers.
+      explanation: >-
+        A few vendor pages hand off to a protocol handler that runs a download command.
+        They are the vendor's URL and recur across users.

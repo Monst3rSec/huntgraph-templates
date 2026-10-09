@@ -1,0 +1,314 @@
+# Converted from THORCollective/HEARTH Flames/H353.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+# HEARTH also cites T1036.004 and T1070.006. The mtime and ctime of the unit file
+# and its ownership at rest are file metadata the sensor does not report; the
+# hunt reads the mv, chown, touch and systemctl commands that produced them.
+type: detection
+
+id: hg-lin-hearth-h353-systemd-unit-staged-in-tmp-reowned-and-timestamped-to-match-sshd-t1543-002
+version: 1.0.0
+
+info:
+  name: systemd unit moved from /tmp, given to a service account and timestamped to match another unit
+  description: >-
+    With root on a Zimbra mail server, an operator installed a unit called
+    zimlog.service. The name reads as a Zimbra logging component, but the file was
+    staged in /tmp, moved into /etc/systemd/system with sudo, assigned to the zimbra
+    account, and had its timestamps set to match rsync.service and sshd.service before
+    being enabled. The same report names chronyd-helper.service and syslog_init.service.
+    Comparing a unit file's mtime with its ctime, or listing unit owners, needs file
+    metadata from the host. The commands are visible: a move or copy from a temporary
+    directory into a systemd unit directory, chown on a unit file, touch with a
+    reference file or a date on a unit file, and systemctl enable.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - persistence
+    - systemd
+    - masquerading
+    - timestomp
+    - zimbra
+    - cve-2026-73570
+    - linux
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H353.md
+    - https://attack.mitre.org/techniques/T1543
+    - https://attack.mitre.org/techniques/T1543/002
+    - https://attack.mitre.org/detectionstrategies/DET0253
+
+mitre:
+  tactics:
+    - TA0003
+    - TA0004
+  techniques:
+    - T1543
+  sub_techniques:
+    - T1543.002
+  detection_strategies:
+    - DET0253
+  analytics:
+    - AN0701
+  platforms:
+    - Linux
+  data_sources:
+    - auditd:SYSCALL
+  data_components:
+    - Process Creation
+    - Command Execution
+
+hypothesis:
+  statement: >-
+    An operator who already has root on a mail server establishes host persistence with
+    a systemd unit called zimlog.service, a name that reads as a legitimate Zimbra
+    logging component, staged in /tmp, moved into /etc/systemd/system/ with sudo,
+    assigned to the Zimbra service account, given timestamps modified to match existing
+    units such as rsync.service and sshd.service, and enabled with systemctl enable for
+    execution at boot.
+  attacker_behavior:
+    - Writes a unit file in /tmp and moves it into /etc/systemd/system.
+    - Names it after a logging, time-sync or housekeeping component.
+    - Changes its owner to a service account.
+    - Sets its timestamps from another unit with touch -r or a fixed date.
+    - Runs systemctl enable and checks the unit's status.
+  legitimate_behavior:
+    - Packages install units under /usr/lib/systemd/system through the package manager.
+    - Administrators and configuration management write units into /etc/systemd/system as root.
+    - Unit files are owned by root and keep the time they were written.
+  risk_indicator:
+    - A unit file arrives in a systemd directory from /tmp, /var/tmp or /dev/shm.
+    - touch sets a unit file's time from another file or to a given date.
+    - chown gives a unit file to an account that is not root.
+    - The unit name imitates an application or system component that ships no such unit.
+    - The commands run under a shell started by a service process.
+
+requires:
+  platforms:
+    - linux
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: unit-file-moved-from-temporary-directory
+        name: Unit file moved or copied from a temporary directory into a systemd unit directory
+        purpose: >-
+          Return mv, cp, install and ln commands, including those run through sudo, that
+          name both a temporary directory and a systemd unit directory.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | FileName=/^(mv|cp|install|ln|sudo)$/
+          | CommandLine=/\/(etc|usr\/lib|lib|run)\/systemd\/system\//
+          | CommandLine=/\/(tmp|var\/tmp|dev\/shm)\//
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: timestamp-set-on-unit-file
+        name: touch setting the time of a systemd unit file
+        purpose: >-
+          Return touch commands that take a reference file or an explicit time and name
+          a path in a systemd unit directory. Timestamps set with the utimensat system
+          call from a program start no touch process and are not seen.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | FileName=/^(touch|sudo)$/
+          | CommandLine=/\btouch\b.*(\s-[a-zA-Z]*[rtd]\b|--reference|--date)/
+          | CommandLine=/\/systemd\/system\//
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: unit-file-ownership-changed
+        name: chown or chgrp on a systemd unit file
+        purpose: >-
+          Return ownership changes on files in a systemd unit directory. Unit files are
+          root's; the new owner is on the command line.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | FileName=/^(chown|chgrp|sudo)$/
+          | CommandLine=/\bch(own|grp)\b/
+          | CommandLine=/\/systemd\/system\//
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: reported-unit-names
+        name: Command naming one of the reported units
+        purpose: >-
+          Return any command that names zimlog.service, chronyd-helper.service or
+          syslog_init.service, the three unit names in the report.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | CommandLine=/\b(zimlog|chronyd-helper|syslog_init)(\.service)?\b/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: unit-enabled-with-systemctl
+        name: systemctl enabling a unit
+        purpose: >-
+          Return systemctl enable commands with the unit name, so the agent can match an
+          enablement to a unit file that was moved, re-owned or re-timed on the same
+          host. Package installation enables units too and is returned.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Lin
+          | FileName=/^systemctl$/
+          | CommandLine=/\senable\b/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: unit_file_staged_or_altered
+      name: Unit file moved from a temporary directory, re-owned or re-timed
+      description: >-
+        A command moves a file from a temporary directory into a systemd unit directory,
+        changes a unit file's owner, or sets a unit file's timestamp.
+      source: process_creation
+      field: command_line
+      indicates: manually_installed_service_unit
+
+  supporting:
+    - id: unit_timestamp_copied
+      name: Unit timestamp set from another file
+      description: >-
+        touch ran with a reference file or a date against a unit file.
+      source: process_creation
+      field: command_line
+      indicates: timestomped_unit_file
+    - id: unit_owned_by_service_account
+      name: Unit given to a non-root account
+      description: >-
+        chown named an account other than root as the owner of a unit file.
+      source: process_creation
+      field: command_line
+      indicates: anomalous_unit_ownership
+    - id: unit_enabled_after_staging
+      name: Unit enabled after it was staged
+      description: >-
+        systemctl enable names the same unit shortly after the move, by the agent's
+        ordering of the returned events.
+      source: process_creation
+      field: process_id
+      indicates: boot_persistence_established
+    - id: unit_name_imitates_component
+      name: Unit name imitates an application or system component
+      description: >-
+        The unit is named after a logging, time-sync or housekeeping component, or after
+        an application that ships no such unit.
+      source: process_creation
+      field: command_line
+      indicates: masqueraded_service_name
+    - id: commands_under_service_shell
+      name: Commands run under a shell started by a service
+      description: >-
+        The parent of the commands is a shell whose ancestry is a mail or web service
+        and not a login session.
+      source: process_creation
+      field: parent_process
+      indicates: post_exploitation_of_service
+
+  contradicting:
+    - id: package_or_config_management
+      name: Unit installed by a package manager or configuration management
+      description: >-
+        The parent chain is a package manager or a management agent and the unit belongs
+        to a known package or playbook.
+      source: process_creation
+      field: parent_process
+      indicates: managed_service_installation
+    - id: administrator_deployment
+      name: Administrator deployed the unit under a change record
+      description: >-
+        A named administrator installed the unit as part of a recorded change.
+      source: identity_context
+      field: UserName
+      indicates: authorised_administration
+
+  risk_logic:
+    required:
+      - unit_file_staged_or_altered
+
+    supporting:
+      any:
+        - unit_timestamp_copied
+        - unit_owned_by_service_account
+        - unit_enabled_after_staging
+        - unit_name_imitates_component
+        - commands_under_service_shell
+      all:
+        - unit_timestamp_copied
+        - unit_owned_by_service_account
+
+    contradicting:
+      any:
+        - package_or_config_management
+        - administrator_deployment
+      all: []
+
+  verdict:
+    low_risk_when:
+      - unit_file_staged_or_altered
+      - package_or_config_management
+      - administrator_deployment
+    suspicious_when:
+      - unit_file_staged_or_altered
+      - unit_enabled_after_staging
+    high_risk_when:
+      - unit_file_staged_or_altered
+      - unit_timestamp_copied
+      - unit_enabled_after_staging
+
+  false_positive:
+    - condition: An administrator writes a unit in /tmp and moves it into place.
+      explanation: >-
+        It happens. The unit is owned by root, no timestamp is set and the user is an
+        administrator in a login session.
+    - condition: A deployment tool preserves timestamps when it copies units.
+      explanation: >-
+        The tool is the parent and the same commands run on every host it deploys to.

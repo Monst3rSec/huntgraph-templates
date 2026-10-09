@@ -1,0 +1,329 @@
+# Converted from THORCollective/HEARTH Flames/H338.md. hunt/HEARTH/ sits outside the
+# validated corpus; see hunt/HEARTH/README.md.
+type: detection
+
+id: hg-mac-hearth-h338-zshrc-and-global-git-hooks-persistence-with-btm-agents-killed-t1546-004
+version: 1.0.0
+
+info:
+  name: macOS stealer persisting through .zshrc and global git hooks while killing the BTM notification agents
+  description: >-
+    Since Ventura, Background Task Management tells the user when a login item is added.
+    MacSync persists where BTM does not look and silences it where it does. It appends a
+    loader line to ~/.zshrc that points at a dot-prefixed helper named .repair-run, sets
+    a global git hooks path so pre-commit and post-checkout run its code during ordinary
+    work, keeps a copy of itself under ~/Library/Application Support/System, and runs
+    killall against BTMNotificationAgent, NotificationCenter and
+    BackgroundTaskManagementAgent so no notification is shown. The sensor does not
+    report a modification of .zshrc or of a hook file, so a stealer that edits them from
+    its own code leaves no write to read. The hunt returns the commands: the killall,
+    the git config change, shell commands that append to a zsh start-up file, and
+    processes running from the two reported locations.
+  severity: high
+  author: huntgraph
+  tags:
+    - hearth
+    - persistence
+    - zshrc
+    - git-hooks
+    - background-task-management
+    - macsync
+    - infostealer
+    - macos
+  references:
+    - https://github.com/THORCollective/HEARTH/blob/main/Flames/H338.md
+    - https://attack.mitre.org/techniques/T1546
+    - https://attack.mitre.org/techniques/T1546/004
+    - https://attack.mitre.org/detectionstrategies/DET0020
+
+mitre:
+  tactics:
+    - TA0004
+    - TA0003
+  techniques:
+    - T1546
+  sub_techniques:
+    - T1546.004
+  detection_strategies:
+    - DET0020
+  analytics:
+    - AN0060
+  platforms:
+    - macOS
+  data_sources:
+    - macos:unifiedlog
+  data_components:
+    - Process Creation
+
+hypothesis:
+  statement: >-
+    A macOS stealer persists by appending a loader line to the user's ~/.zshrc that
+    points at a dot-prefixed helper, by setting a global git hooks path so pre-commit
+    and post-checkout run attacker code, and by keeping a copy under
+    ~/Library/Application Support/System, and it kills BTMNotificationAgent,
+    NotificationCenter and BackgroundTaskManagementAgent so the Background Task
+    Management notification never reaches the user.
+  attacker_behavior:
+    - Appends a line to ~/.zshrc that runs a hidden helper such as .repair-run.
+    - Runs git config --global core.hooksPath to point every repository at its hooks.
+    - Copies itself to ~/Library/Application Support/System.
+    - Runs killall on BTMNotificationAgent, NotificationCenter and BackgroundTaskManagementAgent.
+  legitimate_behavior:
+    - Developers edit .zshrc and installers of developer tools append to it.
+    - Teams set a global hooks path for shared hooks or secret scanning.
+    - Support staff restart NotificationCenter to clear a stuck banner.
+  risk_indicator:
+    - killall names a Background Task Management process.
+    - The appended line points at a dot-prefixed file or a path under Application Support.
+    - The global hooks path is set to a hidden or temporary folder.
+    - The commands share a parent that is osascript, a script interpreter or an unsigned application.
+    - A process runs from ~/Library/Application Support/System.
+
+requires:
+  platforms:
+    - macos
+  connectors:
+    - crowdstrike-ngsiem
+  logs:
+    - source: process_creation
+      connector: crowdstrike-ngsiem
+      event_types:
+        - ProcessRollup2
+      fields:
+        agent_id: aid
+        host: ComputerName
+        user: UserName
+        image_name: FileName
+        image_path: ImageFileName
+        command_line: CommandLine
+        parent_process: ParentBaseFileName
+        process_id: TargetProcessId
+        parent_process_id: ParentProcessId
+
+query:
+  - platform: crowdstrike
+    language: cql
+
+    cases:
+      - id: background-task-management-agents-killed
+        name: killall or pkill naming a Background Task Management agent
+        purpose: >-
+          Return killall and pkill runs that name BTMNotificationAgent,
+          BackgroundTaskManagementAgent or the management daemon. NotificationCenter
+          alone is left to the next case because restarting it is a common support step.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=/^(killall|pkill)$/
+          | CommandLine=/BTMNotificationAgent|BackgroundTaskManagementAgent|backgroundtaskmanagementd/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: notificationcenter-killed
+        name: killall or pkill naming NotificationCenter
+        purpose: >-
+          Return the NotificationCenter kill on its own. It is weak alone and matters
+          when its parent process id is shared with the previous case or with the
+          persistence commands.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=/^(killall|pkill)$/
+          | CommandLine=/NotificationCenter/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: global-git-hooks-path-set
+        name: git config setting core.hooksPath globally
+        purpose: >-
+          Return git config runs that set core.hooksPath at global or system scope, with
+          the path given. A hooks path written straight into ~/.gitconfig without git is
+          a file modification and is not seen.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=git
+          | CommandLine=/core\.hooksPath/i
+          | CommandLine=/--global|--system/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: zsh-startup-file-appended-by-command
+        name: Command that appends or writes to a zsh start-up file
+        purpose: >-
+          Return shells and file utilities whose command line names .zshrc, .zshenv,
+          .zprofile or .zlogin together with a redirect, tee, an in-place sed or a copy.
+          echo is a shell builtin, so the append shows on the command line of the shell
+          that was given it with -c. A script that appends from inside its own body, and
+          a stealer that opens the file itself, are not returned.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | FileName=/^(sh|bash|zsh|tee|sed|cp|mv|osascript|python[0-9.]*|perl|ruby)$/
+          | CommandLine=/\.(zshrc|zshenv|zprofile|zlogin)\b/
+          | CommandLine=/>>|\btee\b|\bsed\s+-i|\bcp\s|\bmv\s|do shell script/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+      - id: process-running-from-application-support-system-or-repair-run
+        name: Process running from Application Support/System or named on a .repair-run path
+        purpose: >-
+          Return processes whose image is under ~/Library/Application Support/System, or
+          whose command line names the .repair-run helper. Both names are the reported
+          ones and will change.
+        query: |
+          #event_simpleName=ProcessRollup2
+          | event_platform=Mac
+          | ImageFileName=/^\/Users\/[^\/]+\/Library\/Application Support\/System\// or CommandLine=/\/\.repair-run\b/
+        filters:
+          include: []
+          exclude: []
+        baseline:
+          required: false
+          window: null
+          compare: []
+
+evidence:
+  required:
+    - id: shell_or_git_persistence_command
+      name: Command sets up zsh or git hook persistence, or silences BTM
+      description: >-
+        A command appends to a zsh start-up file, sets a global git hooks path, or kills
+        a Background Task Management agent.
+      source: process_creation
+      field: command_line
+      indicates: user_level_persistence_setup
+
+  supporting:
+    - id: btm_agent_killed
+      name: Background Task Management agent killed
+      description: >-
+        killall or pkill names BTMNotificationAgent or BackgroundTaskManagementAgent.
+      source: process_creation
+      field: command_line
+      indicates: persistence_notification_suppressed
+    - id: hooks_path_hidden_or_temporary
+      name: Global hooks path points at a hidden or temporary folder
+      description: >-
+        The path given to core.hooksPath begins with a dot folder, /tmp or Application
+        Support.
+      source: process_creation
+      field: command_line
+      indicates: git_hook_persistence
+    - id: loader_points_at_hidden_helper
+      name: Appended line runs a hidden helper
+      description: >-
+        The text appended to the start-up file names a dot-prefixed file or a path under
+        Application Support.
+      source: process_creation
+      field: command_line
+      indicates: shell_startup_persistence
+    - id: commands_share_one_parent
+      name: Persistence and silencing share one parent
+      description: >-
+        The kill, the git config and the append carry the same parent process id, which
+        the agent derives from the returned events.
+      source: process_creation
+      field: parent_process_id
+      indicates: single_installer_chain
+    - id: unusual_parent
+      name: Parent is a script interpreter or an application, not a terminal
+      description: >-
+        The parent is osascript, a shell started by an application, or a binary outside
+        /Applications.
+      source: process_creation
+      field: parent_process
+      indicates: non_interactive_origin
+    - id: copy_in_application_support_system
+      name: Process runs from Application Support/System
+      description: >-
+        A process image is under ~/Library/Application Support/System.
+      source: process_creation
+      field: image_path
+      indicates: masqueraded_install_location
+
+  contradicting:
+    - id: developer_shell_configuration
+      name: User configures their own shell and git
+      description: >-
+        The account is a developer's and the commands were typed in a terminal session.
+      source: identity_context
+      field: UserName
+      indicates: developer_workflow
+    - id: organisation_hook_tooling
+      name: Hooks path is the organisation's
+      description: >-
+        The global hooks path is the one the organisation's secret-scanning or hook
+        tooling sets.
+      source: baseline
+      field: CommandLine
+      indicates: managed_git_configuration
+
+  risk_logic:
+    required:
+      - shell_or_git_persistence_command
+
+    supporting:
+      any:
+        - btm_agent_killed
+        - hooks_path_hidden_or_temporary
+        - loader_points_at_hidden_helper
+        - commands_share_one_parent
+        - unusual_parent
+        - copy_in_application_support_system
+      all:
+        - btm_agent_killed
+        - commands_share_one_parent
+
+    contradicting:
+      any:
+        - developer_shell_configuration
+        - organisation_hook_tooling
+      all: []
+
+  verdict:
+    low_risk_when:
+      - shell_or_git_persistence_command
+      - developer_shell_configuration
+      - organisation_hook_tooling
+    suspicious_when:
+      - shell_or_git_persistence_command
+      - btm_agent_killed
+    high_risk_when:
+      - shell_or_git_persistence_command
+      - btm_agent_killed
+      - commands_share_one_parent
+
+  false_positive:
+    - condition: Developer tool installers.
+      explanation: >-
+        Homebrew, nvm, conda and similar append to .zshrc. The line names the tool and
+        the parent is its installer run from a terminal.
+    - condition: Shared git hooks.
+      explanation: >-
+        Security teams set core.hooksPath globally through device management. The path
+        is documented and identical across the fleet.
+    - condition: Restarting NotificationCenter.
+      explanation: >-
+        Support staff and users kill NotificationCenter to clear a stuck banner. Nothing
+        else accompanies it.
